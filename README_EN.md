@@ -2,19 +2,28 @@
 
 [**English**](README_EN.md) | [**简体中文**](README.md)
 
-> A deeply customized fork of [RikkaHub](https://github.com/rikkahub/rikkahub) — a native Android LLM chat client —
+> A customized fork of [RikkaHub](https://github.com/rikkahub/rikkahub) — a native Android LLM chat client —
 > with a **built-in SillyTavern compatibility layer**: character cards, lorebooks, macros, slash commands,
 > personas, group chats, and a runtime that actually runs real Tavern third-party extensions.
 >
 > Per-file differences and the upstream merge workflow live in [DIVERGENCE.md](DIVERGENCE.md).
 > The full ecosystem-compatibility audit is in [docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md).
 
+### A note before we start
+
+I'm a beginner developer, and this project was built step by step with AI assistance — a lot of it is me learning as I go.
+It works mainly because it stands on other people’s shoulders: the code, docs and design of [RikkaHub](https://github.com/rikkahub/rikkahub), [SillyTavern](https://github.com/SillyTavern/SillyTavern) and [Kelivo](https://github.com/Chevey339/kelivo) helped me a lot (see [Credits](#credits)).
+
+So **please keep your expectations modest**: it is not perfect, it certainly has bugs, and plenty is still unfinished (see [Known limitations](#known-limitations)).
+If something is wrong, badly written, or you know a better way, please open an issue or just tell me — I'll fix it.
+
+
 ---
 
 ## Table of contents
 
+- [A note before we start](#a-note-before-we-start)
 - [Why this exists](#why-this-exists)
-- [Up and running in three minutes](#up-and-running-in-three-minutes)
 - [What you get (organised by experience)](#what-you-get-organised-by-experience)
 - [Tavern compatibility: the honest version](#tavern-compatibility-the-honest-version)
 - [Relationship to upstream RikkaHub](#relationship-to-upstream-rikkahub)
@@ -28,35 +37,22 @@
 ## Why this exists
 
 SillyTavern is a web app, and its whole ecosystem — cards, lorebooks, presets, regex, extensions — is built around the browser.
-On a phone you have two options today, and both are mediocre: run Tavern itself in a browser (battery drain, janky scrolling, killed in the background), or use a client that only handles the "import a character card" slice.
-
-**rikkaST does a third thing: make Tavern's *semantics* native, while leaving Tavern's *extensions* where they are.**
+I play Tavern on my phone, and the browser experience felt sluggish to me. I was also using [RikkaHub](https://github.com/rikkahub/rikkahub), so I wondered: why not combine the two? That is how this project started.
 
 - **Native semantics.** Cards, lorebooks, macros and presets don't need a browser. They're reimplemented in Kotlin — fast, battery-friendly, lossless, and visually editable.
 - **Extensions stay as they are.** Tavern's JS extension ecosystem is far too large to rewrite one by one. So the app ships a WebView runtime that emulates Tavern's front-end API (`SillyTavern.getContext()`, `eventSource`, `TavernHelper`, the `#extensions_settings` DOM…), letting **real Tavern extensions run unmodified**.
 
-In one sentence: **upstream is a base chat client; this is a complete toolbox for AI roleplay.**
-
----
-
-## Up and running in three minutes
-
-1. **Install the APK** (from `dist/`, or build it yourself — see [Build and install](#build-and-install)).
-2. **Add a provider**: Settings → Providers → any OpenAI / Anthropic / Google-compatible endpoint (custom base URLs supported).
-3. **Import a character card**: Assistants → Import → pick a PNG or JSON card. Every field is preserved, and you can edit it right away in the detail page.
-4. **Start chatting.** Want more? Import a lorebook, install a Tavern extension, or spin up a group chat.
-
-No account. No sign-up.
+My goal: implement the browser-independent parts natively in Kotlin, and for the extension ecosystem, adapt a few popular extensions first, then work through other kinds of extensions over time.
 
 ---
 
 ## What you get (organised by experience)
 
-> Scale, measured file by file: card import `AssistantImporter.kt` 902 lines · lorebook engine `PromptInjectionTransformer.kt` 994 · lorebook editor `PromptPage.kt` 2717 · card editor `TavernCharacterCard.kt` 1942 · exporter `CardExporter.kt` 316 · macro engine `MacroEngine.kt` 866 · slash commands `SlashCommands.kt` 630 · group chat `GroupChatPage.kt` 1558 · extension runtime `TavernRuntimeManager.kt` 1178.
+> Code size reference (lines per file): card import `AssistantImporter.kt` 902 lines · lorebook engine `PromptInjectionTransformer.kt` 994 · lorebook editor `PromptPage.kt` 2717 · card editor `TavernCharacterCard.kt` 1942 · exporter `CardExporter.kt` 316 · macro engine `MacroEngine.kt` 866 · slash commands `SlashCommands.kt` 630 · group chat `GroupChatPage.kt` 1558 · extension runtime `TavernRuntimeManager.kt` 1178.
 
 ### 🎴 Character cards: import, then keep editing
 
-Upstream parses 6 fields (name / first_mes / system_prompt / description / personality / scenario), flattens them into one system-prompt string, drops everything else, and offers no export and no editor.
+Upstream doesn't parse every field of a Tavern character card, so this fork fills in and completes them.
 
 Here:
 
@@ -65,11 +61,11 @@ Here:
 - **Official Chat Completion injection structure**: main prompt, standalone character-field messages, `<START>`-split example dialogue turned into real user/assistant turns, PHI appended after history, depth prompts injected at their configured depth and role.
 - **PNG / JSON export** (`CardExporter.kt`) using official field names.
 - **Visual editor**: all 25 fields + embedded-lorebook management + export, on one screen.
-- **Validated against a real card**: the test resources include a genuine V3 card (47 lorebook entries, 11 regex scripts, 3 Tavern Helper scripts) used as a regression sample.
+- **Complex-card regression sample**: the test resources include a structurally equivalent synthetic V3 card (47 lorebook entries, 11 regex scripts, 3 Tavern Helper scripts) used for regression tests.
 
 ### 📚 Lorebooks: so characters actually *remember*
 
-Upstream is a 5-field model with keyword matching. Here, entry handling is aligned rule by rule with official `world-info.js` — **44 fields per entry**:
+Lorebook entry handling is aligned rule by rule with official `world-info.js` — **44 fields per entry**:
 
 | Capability | Notes |
 |---|---|
@@ -92,7 +88,7 @@ The editor offers a global settings panel (scan depth, budget, minimum activatio
 
 ### 🧩 Programmable prompts: Macro Engine 2.0
 
-Upstream is string replacement over 6 placeholders. Here, prompts become programs (`MacroEngine.kt`):
+Macros are handled by a small engine (`MacroEngine.kt`):
 
 - **Variables**: `/setvar` `/getvar` `/incvar` … manage conversation variables; read them with `{{getvar::key}}` or the `.key` shorthand — a card can change how it speaks as the story state changes.
 - **Conditionals**: `{{if}} / {{else}} / !`, comparison operators, `&&` / `||`, with nesting.
@@ -116,7 +112,7 @@ There is also an **STscript executor** (`StSlashParser` + `StSlashExecutor`, ali
 
 ### 🎭 Personas · Author's Note · Group chats
 
-Three systems upstream doesn't have, all matching official semantics:
+These three systems follow official semantics as closely as I could manage:
 
 - **Personas**: the official five injection positions (IN_PROMPT / TOP / BOTTOM / AT_DEPTH / NONE), per-character binding, standalone SYSTEM-message injection, disabled means not injected.
 - **Author's Note**: official interval semantics (1 = every user message, N = every Nth), injection depth, injection role, master switch.
@@ -124,7 +120,7 @@ Three systems upstream doesn't have, all matching official semantics:
 
 ### 🔌 The Tavern extension ecosystem: install real extensions
 
-This is the most interesting part of the project. It isn't "we support these few extensions" — it's **a runtime that runs Tavern extensions**:
+Right now I've mainly adapted the two extensions below (plus the built-in MVU framework); others are still being adapted over time. The approach is not per-extension patching — it is **a runtime that runs Tavern extensions**:
 
 - **Install**: Extensions hub → Third-party extensions → give it a zip, or an http(s) URL (GitHub / GitLab repos and bare `manifest.json` links all work; it probes `main` / `master`; source-style extensions get their relative imports fetched recursively).
 - **Asset endpoint**: extension files are served at their real paths, `/scripts/extensions/third-party/<folder>/<path>`, and **loaded by the WebView exactly like real Tavern** — rather than the runtime interpreting extension code.
@@ -136,8 +132,14 @@ This is the most interesting part of the project. It isn't "we support these few
 - **Offline-friendly**: bare jsDelivr `import`s in card scripts are localised to the bundled `vendor/` — served locally when present, falling back to the real network otherwise.
 - **Capability gate**: `/version` returns a deliberately chosen `pkgVersion` to unlock extension feature branches.
 
-**Three lines are explicitly, by name, adapted today**: Tavern Helper (JS-Slash-Runner), Prompt Template (ST-Prompt-Template), and the MVU variable framework.
-Whether any other extension runs depends on whether it needs Tavern's server API — see the full analysis and gap list in **[docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md)**.
+**Extensions adapted so far** (just these two, plus the built-in MVU framework):
+
+| Extension | What works |
+|---|---|
+| **Tavern Helper (JS-Slash-Runner)** | script iframes, script buttons, events, variables, lorebooks, `triggerSlash`, `generate()` / `generateRaw()` end to end |
+| **Prompt Template (ST-Prompt-Template)** | EJS rendering, `getCharacterDefine()`, PromptManager, variable scope semantics |
+
+Other extensions are still being adapted; whether one runs mainly depends on whether it needs Tavern's server API — see the full analysis and gap list in **[docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md)**.
 
 ### 🧠 MVU variable framework
 
@@ -152,9 +154,9 @@ The MVU (MagVarUpdate, MIT) runtime bundle is built in, usable directly by card 
 
 ### 🛠 Skills & tools
 
-**Skills**: upstream only loads a skill when the model calls `use_skill`. This fork adds keyword-based **automatic triggering**, a public skills directory `/Rikkahub/skills` (drop files in via a file manager), GitHub one-click install, whole-repo batch download, update detection (repo source + directory hash), install-source tracking, and a skill registry.
+**Skills**: on top of loading a skill when the model calls `use_skill`, this fork adds keyword-based **automatic triggering**, a public skills directory `/Rikkahub/skills` (drop files in via a file manager), GitHub one-click install, whole-repo batch download, update detection (repo source + directory hash), install-source tracking, and a skill registry.
 
-**Tools**: upstream has time, clipboard, calendar, JavaScript, screen time, TTS, ask-user, memory, search, skills, workspace. This fork adds file operations, shell, task tools, calculator, database query, a Python engine, and web scraping — plus a **Python / JS dual bridge** (read/write conversations, assistant settings, group chats; run Python / JS engines) and a system-prompt assembler. 17 local-tool options in total.
+**Tools**: alongside time, clipboard, calendar, JavaScript, screen time, TTS, ask-user, memory, search, skills and workspace, this fork adds file operations, shell, task tools, calculator, database query, a Python engine, and web scraping — plus a **Python / JS dual bridge** (read/write conversations, assistant settings, group chats; run Python / JS engines) and a system-prompt assembler. 17 local-tool options in total.
 
 **Workspace**: a sandboxed directory with a terminal, where the agent can run commands and edit files.
 
@@ -168,19 +170,11 @@ Chat isn't the only input — you can turn a folder, a stack of documents, or ev
 - **Injection budget**: results are trimmed to a token budget before entering the generation chain, so they never blow up your context.
 - **Embeddings**: uses whichever embedding model you configure, with automatic embedding, progress reporting and an LRU vector cache; it also works purely on FTS5 if you don't configure one.
 
-### 🖼 Image generation · 🔊 Text-to-speech · 🎙 Speech-to-text
-
-- **Image generation**: a dedicated page plus native providers (OpenAI `/images/generations`, Claude); also available as a built-in tool the model can call itself.
-- **TTS**: 11 providers — ElevenLabs, FishAudio, Gemini, Groq, MiMo, MiniMax, OpenAI, Qwen, Step, System, xAI. Reading aloud, autoplay, chunked synthesis.
-- **ASR**: 5 providers — DashScope, MiMo, OpenAI Realtime, Step, Volcengine.
-
-> ⚠️ These are **native features**, not Tavern extensions. Tavern's Image Generation / TTS extensions will *not* work, because they need the unimplemented `/api/sd` and `/api/tts` endpoints. See the compatibility report §6.
-
 ### ⚡ Stability
 
 - **Background keep-alive**: foreground service + async start + 600 ms debounce + failure fallback — switching apps doesn't interrupt generation.
 - **Runtime log**: extension-runtime logs persist to `Android/data/<pkg>/files/tavern-runtime.log`, the first place to look when debugging an extension.
-- **Upstream cruft removed**: GitHub tool, sleep tool, log-debug pages (see [DIVERGENCE.md](DIVERGENCE.md) §5).
+- **Trimmed**: removed the GitHub tool, sleep tool and log-debug pages that I don't use (see [DIVERGENCE.md](DIVERGENCE.md) §5).
 
 ---
 
@@ -210,8 +204,8 @@ Chat isn't the only input — you can turn a folder, a stack of documents, or ev
 
 - **Direct upstream**: `github.com/rikkahub/rikkahub` (RikkaHub), AGPL-3.0.
 - **Preserved**: Material You theming, multi-provider support, streaming, conversation forking & regeneration, message edit / delete / translate, full-text search (jieba), favourites, image generation, TTS / ASR, MCP, workspace sandbox, backup (S3 / WebDAV / reminders), web server, chat export — all working as before.
-- **Removed**: GitHub tool, sleep tool, log-debug pages (upstream has no equivalent; see [DIVERGENCE.md](DIVERGENCE.md) §5).
-- **Divergence map**: which upstream files were modified, which files are unique to this fork, and how to resolve conflicts — all recorded file by file in [DIVERGENCE.md](DIVERGENCE.md). Upstream updates can be pulled in anytime via `git fetch upstream && git merge upstream/master`.
+- **Removed**: GitHub tool, sleep tool, log-debug pages (shipped upstream, not used here; see [DIVERGENCE.md](DIVERGENCE.md) §5).
+- **Divergence map**: which upstream files were modified, which files are unique to this fork, and how to resolve conflicts — all recorded file by file in [DIVERGENCE.md](DIVERGENCE.md). When upstream updates, I compare and merge the changes by hand.
 
 ---
 
@@ -228,7 +222,7 @@ Full instructions in [BUILDING.md](BUILDING.md). Shortest path:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Artifacts land in `app/build/outputs/apk/`. Prebuilt APKs live in `dist/`.
+Artifacts land in `app/build/outputs/apk/`. Prebuilt APKs are on GitHub Releases.
 
 > After editing `app/src/main/assets/st-runtime/*.js`, run an ES-module syntax check before building.
 
@@ -237,7 +231,7 @@ Artifacts land in `app/build/outputs/apk/`. Prebuilt APKs live in `dist/`.
 ## Known limitations
 
 - **Extension compatibility is not 100%** — see the coverage table above and the compatibility report. The rule of thumb is simple: does the extension touch Tavern's server API?
-- **Real-device acceptance is incomplete**: the third-party extension load path, some event emissions, group-chat strategies, and Tavern backup import currently rest on unit tests plus code-path review, without recorded device regression runs.
+- **Tavern's Image Generation / TTS extensions don't work yet**: they need the unimplemented `/api/sd` and `/api/tts` endpoints (the app's built-in image generation and TTS are a different path, not the Tavern extension one).
 - **Signing**: the key was rotated, so this cannot be installed over earlier builds with the same package name without uninstalling first.
 - **Platform**: prebuilt APKs are `arm64-v8a` only.
 
@@ -247,7 +241,7 @@ Artifacts land in `app/build/outputs/apk/`. Prebuilt APKs live in `dist/`.
 
 - [**RikkaHub**](https://github.com/rikkahub/rikkahub): the upstream project.
 - [**SillyTavern**](https://github.com/SillyTavern/SillyTavern): the compatibility target and event-contract reference. This project's Tavern layer is a **compatible implementation** of its data formats and extension contracts.
-- [**Kelivo**](https://github.com/Chevey339/kelivo) (Flutter / AGPL-3.0): **UI and interaction design reference**. It's an excellent project with a beautiful interface, and this project's visual and interaction direction draws heavily on it. No Kelivo Dart code was copied line by line.
+- [**Kelivo**](https://github.com/Chevey339/kelivo) (Flutter / AGPL-3.0): **UI and interaction design reference**. It's a great project, and this project's visual and interaction direction takes inspiration from it (no Kelivo Dart code was copied).
 - Other third-party components, fonts and full license texts: see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ---
@@ -268,4 +262,4 @@ The AGPL choice isn't arbitrary: upstream [RikkaHub](https://github.com/rikkahub
 
 ---
 
-If this fork is useful to you, please leave a ⭐ Star — it keeps the project alive ✨
+If this fork is useful to you, feel free to open an issue about anything that doesn't work well; a ⭐ is also very welcome ✨

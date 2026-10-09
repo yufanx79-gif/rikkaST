@@ -2,19 +2,27 @@
 
 [**简体中文**](README.md) | [**English**](README_EN.md)
 
-> 基于 [RikkaHub](https://github.com/rikkahub/rikkahub) 的深度定制分支：一个原生 Android LLM 聊天客户端，
+> 基于 [RikkaHub](https://github.com/rikkahub/rikkahub) 的定制分支：一个原生 Android LLM 聊天客户端，
 > 在此之上**内建了一套 SillyTavern 兼容层** —— 角色卡、世界书、宏、斜杠命令、人设、群聊，
 > 以及一个能真正跑起酒馆第三方插件的运行时。
 >
 > 逐文件差异与上游合并工作流见 [DIVERGENCE.md](DIVERGENCE.md)；
 > 酒馆生态兼容覆盖度的完整报告见 [docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md)。
 
+### 写在前面
+
+我是个刚入门的新手开发者，这个项目是在 AI 辅助下一步步做出来的，很多东西都是边学边写。
+它能跑起来，主要是站在别人的肩膀上 —— [RikkaHub](https://github.com/rikkahub/rikkahub)、[SillyTavern](https://github.com/SillyTavern/SillyTavern)、[Kelivo](https://github.com/Chevey339/kelivo) 的代码、文档和设计帮了我很多（详见 [致谢](#致谢)）。
+
+所以**别对它抱太高期待**：它不完美、肯定有 bug，也有不少没做完的地方（见 [已知限制](#已知限制)）。
+如果哪里做错了、写得不对，或者你有更好的做法，欢迎提 issue 或者直接告诉我 —— 我会认真改。
+
 ---
 
 ## 目录
 
+- [写在前面](#写在前面)
 - [为什么会有这个项目](#为什么会有这个项目)
-- [三分钟上手](#三分钟上手)
 - [功能总览（按体验组织）](#功能总览按体验组织)
 - [酒馆兼容覆盖度：诚实版](#酒馆兼容覆盖度诚实版)
 - [与上游 RikkaHub 的关系](#与上游-rikkahub-的关系)
@@ -28,35 +36,22 @@
 ## 为什么会有这个项目
 
 酒馆（SillyTavern）是网页应用，它的整个生态 —— 角色卡、世界书、预设、正则、插件 —— 都围绕浏览器构建。
-手机上有两种用法，体验都不好：要么用浏览器跑酒馆本体（耗电、滚动卡、后台被杀），要么用客户端但只能吃到「角色卡导入」这一小块。
-
-**rikkaST 想做的是第三件事：把酒馆的「语义」原生化，同时把酒馆的「插件」留在原处。**
+本人在游玩酒馆的时候，发现手机端的浏览器用起来比较卡顿；当时又在使用 [RikkaHub](https://github.com/rikkahub/rikkahub) 这个优秀的开源项目，于是就想到：为什么不能把二者结合起来呢？于是就有了这个项目。
 
 - **语义原生化**：角色卡、世界书、宏、预设这些不依赖浏览器的部分，用 Kotlin 重写成原生实现 —— 快、省电、字段无损、可可视化编辑。
 - **插件留在原处**：酒馆的 JS 插件生态太大，不可能逐个重写。所以内置一个 WebView 运行时，仿真出酒馆的前端 API（`SillyTavern.getContext()`、`eventSource`、`TavernHelper`、`#extensions_settings` DOM……），让**真正的酒馆插件原样跑起来**。
 
-一句话：**上游是基础聊天客户端，这是一个给 AI 角色扮演准备的完整工具箱。**
-
----
-
-## 三分钟上手
-
-1. **装 APK**（`dist/` 目录，或自己构建 —— 见 [构建与安装](#构建与安装)）。
-2. **加一个提供商**：设置 → 提供商 → 任意 OpenAI / Anthropic / Google 兼容端点（也支持自定义 Base URL）。
-3. **导入一张角色卡**：助手页 → 导入 → 选 PNG 卡或 JSON 卡。字段全部保留，导入后可以直接进详情页改。
-4. **开始聊**。想更进一步：导入一本世界书、装一个酒馆插件、开一条群聊。
-
-不需要账号，不需要联网注册。
+我的目标是：不依赖浏览器的部分，直接用 Kotlin 重新实现；插件生态方面，先适配一些热门插件，然后再按类型逐步适配。
 
 ---
 
 ## 功能总览（按体验组织）
 
-> 规模参照（逐文件实测行数）：角色卡导入 `AssistantImporter.kt` 902 行 · 世界书引擎 `PromptInjectionTransformer.kt` 994 行 · 世界书编辑页 `PromptPage.kt` 2717 行 · 角色卡编辑页 `TavernCharacterCard.kt` 1942 行 · 导出器 `CardExporter.kt` 316 行 · 宏引擎 `MacroEngine.kt` 866 行 · 斜杠命令 `SlashCommands.kt` 630 行 · 群聊页 `GroupChatPage.kt` 1558 行 · 插件运行时 `TavernRuntimeManager.kt` 1178 行。
+> 代码量参考（逐文件行数）：角色卡导入 `AssistantImporter.kt` 902 行 · 世界书引擎 `PromptInjectionTransformer.kt` 994 行 · 世界书编辑页 `PromptPage.kt` 2717 行 · 角色卡编辑页 `TavernCharacterCard.kt` 1942 行 · 导出器 `CardExporter.kt` 316 行 · 宏引擎 `MacroEngine.kt` 866 行 · 斜杠命令 `SlashCommands.kt` 630 行 · 群聊页 `GroupChatPage.kt` 1558 行 · 插件运行时 `TavernRuntimeManager.kt` 1178 行。
 
 ### 🎴 角色卡：导入之后你还能改
 
-上游只解析 6 个字段（name / first_mes / system_prompt / description / personality / scenario）并拼成一段系统提示，其余全丢，而且没有导出、没有编辑页。
+上游没有完整解析酒馆角色卡的全部字段，这个分支做了补充和完善。
 
 这里：
 
@@ -65,11 +60,11 @@
 - **官方 Chat Completion 注入结构**：主提示、角色卡字段独立消息、`<START>` 分块解析成真正的 user/assistant 示例消息、PHI 放历史末尾、深度提示按配置的深度与角色注入。
 - **PNG / JSON 导出**（`CardExporter.kt`），字段名对齐官方规范。
 - **可视化编辑页**：25 个字段 + 内嵌世界书管理 + 导出按钮，一张卡一个页面搞定。
-- **真实卡验证**：测试资源里有一张真实 V3 卡（47 条世界书 + 11 条正则 + 3 个酒馆助手脚本）作为回归样本。
+- **复杂卡回归样本**：测试资源里有一张结构等价的合成 V3 卡（47 条世界书 + 11 条正则 + 3 个酒馆助手脚本），用于回归测试。
 
 ### 📚 世界书：让角色真的「记得住」
 
-上游是 5 字段模型 + 关键词包含匹配。这里逐条对齐官方 `world-info.js` 语义，**条目字段 44 个**：
+世界书这块尽量逐条对齐官方 `world-info.js` 的语义，**条目字段 44 个**：
 
 | 能力 | 说明 |
 |---|---|
@@ -92,7 +87,7 @@
 
 ### 🧩 提示词可编程：宏引擎 2.0
 
-上游是 6 个占位符的字符串替换。这里提示词变成了程序（`MacroEngine.kt`）：
+宏这块做成了一个小引擎（`MacroEngine.kt`）：
 
 - **变量**：`/setvar` `/getvar` `/incvar` … 管理对话变量，宏里用 `{{getvar::key}}` 或 `.key` 简写 —— 一张卡可以随剧情状态切换说法。
 - **条件**：`{{if}} / {{else}} / !`、比较运算符、`&&` / `||`，支持嵌套。
@@ -116,7 +111,7 @@
 
 ### 🎭 人设 · 导演备注 · 群聊
 
-三个上游完全没有的系统，语义都对齐官方：
+这三个系统的语义都尽量对齐官方：
 
 - **人设（Persona）**：官方五档注入位置（IN_PROMPT / TOP / BOTTOM / AT_DEPTH / NONE）、按角色绑定、独立 SYSTEM 消息注入、禁用即不注入。
 - **导演备注（Author's Note）**：官方间隔语义（1 = 每次，N = 每 N 条用户消息）、注入深度、注入角色、总开关。
@@ -124,7 +119,7 @@
 
 ### 🔌 酒馆扩展生态：装真正的酒馆插件
 
-这是本项目最有意思的一块。不是「支持某几个插件」，而是**搭了一个能跑酒馆插件的运行时**：
+目前我主要适配了下面这两个插件（另有内置 MVU 支持），其他插件还在陆续适配中。做法上不是逐个插件打补丁，而是搭一个能跑酒馆插件的运行时：
 
 - **安装**：扩展中心 → 第三方扩展 → 给一个 zip，或一个 http(s) 直链（GitHub / GitLab 仓库、`manifest.json` 直链都认，自动试 `main` / `master` 分支，源码型扩展会递归抓取相对 import）。
 - **资源端点**：扩展文件按真实路径伺服为 `/scripts/extensions/third-party/<folder>/<path>`，**在 WebView 里像真酒馆一样被加载**，而不是在 runtime 里解释代码。
@@ -136,7 +131,7 @@
 - **离线友好**：卡脚本里裸 `import` 的 jsDelivr CDN 会被本地化到内置 `vendor/`，命中就离线加载，没命中才回退真实网络。
 - **能力闸门**：`/version` 返回刻意选定的 `pkgVersion`，用来打开插件的特性分支。
 
-**✅ 已实测兼容的插件**：
+**目前适配的插件**：
 
 | 插件 | 兼容范围 |
 |---|---|
@@ -144,7 +139,7 @@
 | **提示词模板（ST-Prompt-Template）** | EJS 模板渲染、`getCharacterDefine()`、PromptManager、变量 scope 语义 |
 
 另有内置 **MVU 变量框架**（MagVarUpdate）支持。
-其余插件的可运行性取决于它是否需要酒馆的服务端 API —— 完整分析与缺口清单见 **[docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md)**。
+其余插件还在陆续适配中，能不能跑主要取决于它是否需要酒馆的服务端 API —— 完整分析与缺口清单见 **[docs/ST-COMPATIBILITY.md](docs/ST-COMPATIBILITY.md)**。
 
 ### 🧠 MVU 变量框架
 
@@ -159,9 +154,9 @@
 
 ### 🛠 技能与工具
 
-**技能**：上游只有「模型主动调用 `use_skill` 才加载」。这里加了关键词**自动触发**、公共技能目录 `/Rikkahub/skills`（文件管理器直接丢进去就认）、GitHub 一键安装、整仓库批量下载、更新检测（记录仓库源与整目录哈希）、安装源识别与技能注册表。
+**技能**：在「模型主动调用 `use_skill` 才加载」的基础上，加了关键词**自动触发**、公共技能目录 `/Rikkahub/skills`（文件管理器直接丢进去就认）、GitHub 一键安装、整仓库批量下载、更新检测（记录仓库源与整目录哈希）、安装源识别与技能注册表。
 
-**工具**：上游有时间 / 剪贴板 / 日历 / JavaScript / 屏幕时间 / TTS / 提问 / 记忆 / 搜索 / 技能 / 工作区。这里新增文件操作、Shell、任务、计算器、数据库查询、Python 引擎、网页抓取，并提供 **Python / JS 双桥接**（AI 可读写对话、助手设置、群聊，运行 Python / JS 引擎）与系统提示组装器。本地工具共 17 个可选项。
+**工具**：在时间 / 剪贴板 / 日历 / JavaScript / 屏幕时间 / TTS / 提问 / 记忆 / 搜索 / 技能 / 工作区之外，新增了文件操作、Shell、任务、计算器、数据库查询、Python 引擎、网页抓取，并提供 **Python / JS 双桥接**（AI 可读写对话、助手设置、群聊，运行 Python / JS 引擎）与系统提示组装器。本地工具共 17 个可选项。
 
 **工作区**：带终端的沙箱目录，Agent 可以在里面跑命令、编辑文件。
 
@@ -175,19 +170,11 @@
 - **注入预算**：结果按 token 预算裁剪后注入生成链，不会把上下文挤爆。
 - **向量化**：用你配置的 embedding 模型，支持自动向量化、进度显示与向量 LRU 缓存；不配 embedding 也能纯靠 FTS5 工作。
 
-### 🖼 图像生成 · 🔊 语音朗读 · 🎙 语音输入
-
-- **文生图**：独立页面 + 原生 Provider（OpenAI `/images/generations`、Claude），也可作为内置工具让模型自己调用。
-- **TTS**：11 个 Provider —— ElevenLabs、FishAudio、Gemini、Groq、MiMo、MiniMax、OpenAI、Qwen、Step、System、xAI。支持朗读、自动播放、分块合成。
-- **ASR**：5 个 Provider —— DashScope、MiMo、OpenAI Realtime、Step、Volcengine。
-
-> ⚠️ 这三项是**原生功能**，不是酒馆扩展。酒馆的 Image Generation / TTS 插件因为需要未实现的 `/api/sd`、`/api/tts` 端点，装进来不会工作。详见兼容报告 §6。
-
 ### ⚡ 稳定性
 
 - **后台生成保活**：前台服务 + 异步启动 + 600ms 防抖 + 失败兜底，切后台不打断生成。
 - **运行时日志**：插件运行时的日志持久化到 `Android/data/<pkg>/files/tavern-runtime.log`，排查插件问题第一现场。
-- **上游冗余已清理**：GitHub 工具、sleep 工具、日志调试页已移除（见 [DIVERGENCE.md](DIVERGENCE.md) §5）。
+- **精简**：去掉了自己用不到的 GitHub 工具、sleep 工具、日志调试页（见 [DIVERGENCE.md](DIVERGENCE.md) §5）。
 
 ---
 
@@ -217,8 +204,8 @@
 
 - **直接上游**：`github.com/rikkahub/rikkahub`（RikkaHub），AGPL-3.0。
 - **保留**：Material You 主题、多提供商、流式输出、对话分支与重新生成、消息编辑 / 删除 / 翻译、全文搜索（jieba）、收藏、图像生成、TTS / ASR、MCP、工作区沙箱、备份（S3 / WebDAV / 提醒）、Web 服务端、聊天导出 —— 全部照常可用。
-- **移除**：GitHub 工具、sleep 工具、日志调试页（上游没有对应功能，见 [DIVERGENCE.md](DIVERGENCE.md) §5）。
-- **差异地图**：哪些上游文件被改、哪些是本分支独有、合并时的冲突怎么办 —— 全部逐条记录在 [DIVERGENCE.md](DIVERGENCE.md)。上游更新可随时 `git fetch upstream && git merge upstream/master` 合入。
+- **移除**：GitHub 工具、sleep 工具、日志调试页（上游自带、本分支用不到的功能，见 [DIVERGENCE.md](DIVERGENCE.md) §5）。
+- **差异地图**：哪些上游文件被改、哪些是本分支独有、合并时的冲突怎么办 —— 全部逐条记录在 [DIVERGENCE.md](DIVERGENCE.md)。上游有更新时，我会逐条对比后手动合入。
 
 ---
 
@@ -235,7 +222,7 @@
 ./gradlew :app:testDebugUnitTest
 ```
 
-产物在 `app/build/outputs/apk/`。预编译 APK 见 `dist/`。
+产物在 `app/build/outputs/apk/`。预编译 APK 见 GitHub Releases。
 
 > 改了 `app/src/main/assets/st-runtime/*.js` 之后建议先做一次 ES module 语法自检，再出包。
 
@@ -244,7 +231,7 @@
 ## 已知限制
 
 - **插件兼容不是 100%**：见上方覆盖度表与兼容报告。判断标准很明确 —— 插件碰不碰酒馆的服务端 API。
-- **真机验收未完全覆盖**：第三方扩展装载链路、部分事件发射、群聊策略、ST 备份导入等场景目前只有单测 + 代码路径确认，缺真机回归记录。
+- **酒馆的 Image Generation / TTS 扩展目前跑不了**：它们依赖还没实现的 `/api/sd`、`/api/tts` 端点（App 自带的生图与朗读不是酒馆扩展那条路径）。
 - **签名**：换过密钥，与更早的构建不能直接覆盖安装（同包名下需要先卸载）。
 - **平台**：预编译 APK 目前只含 `arm64-v8a`。
 
@@ -254,7 +241,7 @@
 
 - [**RikkaHub**](https://github.com/rikkahub/rikkahub)：本项目的上游。
 - [**SillyTavern**](https://github.com/SillyTavern/SillyTavern)：兼容目标与事件契约参考。本项目的酒馆兼容层是对其数据格式与扩展契约的**兼容实现**。
-- [**Kelivo**](https://github.com/Chevey339/kelivo)（Flutter / AGPL-3.0）：**UI 与交互设计参考**。这个项目非常优秀，界面也很漂亮，本项目的视觉与交互方向大量参照了它；没有逐行复制 Kelivo 的 Dart 代码。
+- [**Kelivo**](https://github.com/Chevey339/kelivo)（Flutter / AGPL-3.0）：**UI 与交互设计参考**。这个项目很优秀，本项目的视觉与交互方向参考了它（没有复制它的 Dart 代码）。
 - 其余第三方组件、字体与许可证全文见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
@@ -276,7 +263,7 @@
 
 ---
 
-如果这个分支对你有用，请点个 ⭐ Star 支持一下 ✨
+如果这个分支对你有用，欢迎提 issue 说说哪里不好用；顺手点个 ⭐ 我也会很开心 ✨
 
 ## 隐私与网络
 
