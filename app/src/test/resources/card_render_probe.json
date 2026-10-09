@@ -1,0 +1,116 @@
+{
+  "name": "card_render_probe",
+  "description": "rikkaST render/message-lifecycle probe card (task-4). Self-asserting via window.parent.__rikkaLog.",
+  "personality": "",
+  "scenario": "Probe scenario: exercise card-script iframe globals, message lifecycle events, read-only worldbook APIs and host-side regex recognition.",
+  "first_mes": "[card_render_probe] rikkaST 渲染/消息面生命周期探针卡。\n\n本条 first_mes 内嵌占位符 [[CARD_RENDER_PROBE_REGEX_SLOT]]，卡内 regex_scripts 会在展示管线把它替换为 CARD_RENDER_PROBE_REGEX_APPLIED。\n若宿主只在展示层应用正则、存储层保留原文，则 getChatMessages 里仍是原占位符（探针会如实上报，不静默）。\n\n操作指引：编辑 / swipe / 删除任意一条消息，观察 [CARD] card_render_probe event_received 行。",
+  "mes_example": "",
+  "creatorcomment": "Probe card for rikkaST PC build. Every assertion logs '[CARD] card_render_probe <check> PASS|FAIL <detail>'.",
+  "avatar": "none",
+  "talkativeness": "0.5",
+  "fav": "False",
+  "tags": [
+    "probe",
+    "test",
+    "rikkaST",
+    "render"
+  ],
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "card_render_probe",
+    "description": "rikkaST render/message-lifecycle probe card (task-4). Self-asserting via window.parent.__rikkaLog.",
+    "personality": "",
+    "scenario": "Probe scenario: exercise card-script iframe globals, message lifecycle events, read-only worldbook APIs and host-side regex recognition.",
+    "first_mes": "[card_render_probe] rikkaST 渲染/消息面生命周期探针卡。\n\n本条 first_mes 内嵌占位符 [[CARD_RENDER_PROBE_REGEX_SLOT]]，卡内 regex_scripts 会在展示管线把它替换为 CARD_RENDER_PROBE_REGEX_APPLIED。\n若宿主只在展示层应用正则、存储层保留原文，则 getChatMessages 里仍是原占位符（探针会如实上报，不静默）。\n\n操作指引：编辑 / swipe / 删除任意一条消息，观察 [CARD] card_render_probe event_received 行。",
+    "mes_example": "",
+    "creator_notes": "Probe card for rikkaST PC build. Every assertion logs '[CARD] card_render_probe <check> PASS|FAIL <detail>'.",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "tags": [
+      "probe",
+      "test",
+      "rikkaST",
+      "render"
+    ],
+    "creator": "rikkaST-probe",
+    "character_version": "1.0.0",
+    "alternate_greetings": [],
+    "extensions": {
+      "talkativeness": "0.5",
+      "fav": "False",
+      "world": "card render probe book with spaces",
+      "depth_prompt": {
+        "prompt": "",
+        "depth": 4,
+        "role": "system"
+      },
+      "regex_scripts": [
+        {
+          "id": "c7a1e0d2-0000-4000-8000-0000000000a4",
+          "scriptName": "card_render_probe_regex",
+          "findRegex": "/\\[\\[CARD_RENDER_PROBE_REGEX_SLOT\\]\\]/g",
+          "replaceString": "[CARD] card_render_probe regex_applied CARD_RENDER_PROBE_REGEX_APPLIED",
+          "trimStrings": [],
+          "placement": [
+            2
+          ],
+          "disabled": false,
+          "markdownOnly": true,
+          "promptOnly": false,
+          "runOnEdit": true,
+          "substituteRegex": 0,
+          "minDepth": null,
+          "maxDepth": null
+        }
+      ],
+      "tavern_helper": {
+        "scripts": [
+          {
+            "type": "script",
+            "enabled": true,
+            "name": "card_render_probe",
+            "id": "card-render-probe-script",
+            "content": "/* card_render_probe - rikkaST render / message-lifecycle probe (task-4) */\n(function () {\n  'use strict';\n\n  var TAG = '[CARD] card_render_probe';\n  var MARKER = 'CARD_RENDER_PROBE_REGEX_APPLIED';\n  var PLACEHOLDER = '[[CARD_RENDER_PROBE_REGEX_SLOT]]';\n  var PROBE_REGEX_NAME = 'card_render_probe_regex';\n  var PROBE_BOOK = 'card render probe book with spaces';\n  var EVENT_WANT = {\n    MESSAGE_UPDATED: 'message_updated',\n    MESSAGE_SWIPED: 'message_swiped',\n    MESSAGE_EDITED: 'message_edited',\n    MESSAGE_DELETED: 'message_deleted'\n  };\n\n  function errName(e) {\n    try { return String(((e && (e.name || 'Error')) || 'Error') + ': ' + ((e && e.message) || e)); }\n    catch (_) { return 'unknown-error'; }\n  }\n  function json(v) {\n    try { var s = JSON.stringify(v); return s === undefined ? String(v) : s; }\n    catch (_) { return String(v); }\n  }\n  function emit(level, text) {\n    var t = String(text);\n    try { if (window.parent && typeof window.parent.__rikkaLog === 'function') window.parent.__rikkaLog(level, t); } catch (_) {}\n    try { console.log(t); } catch (_) {}\n  }\n  function check(name, pass, detail) {\n    emit(pass ? 'info' : 'warn', TAG + ' ' + name + ' ' + (pass ? 'PASS' : 'FAIL') + ' ' + (detail == null ? '' : String(detail)));\n    return !!pass;\n  }\n  function api(name) {\n    try { if (typeof window[name] === 'function') return window[name]; } catch (_) {}\n    try { if (window.TavernHelper && typeof window.TavernHelper[name] === 'function') return window.TavernHelper[name]; } catch (_) {}\n    return null;\n  }\n  function getCtx() {\n    try { if (window.SillyTavern && typeof window.SillyTavern.getContext === 'function') return window.SillyTavern.getContext(); } catch (_) {}\n    return null;\n  }\n  function tavernEvents() {\n    try { if (window.TavernHelper && window.TavernHelper.tavern_events) return window.TavernHelper.tavern_events; } catch (_) {}\n    try { if (window.tavern_events) return window.tavern_events; } catch (_) {}\n    return null;\n  }\n\n  try {\n    var msgs = null;\n    var te = tavernEvents();\n\n    /* ---------------- 1. window.parent / window.top ---------------- */\n    var parentOk = false, parentIsIframe = false, parentLogOk = false, parentErr = null;\n    try {\n      parentOk = !!(window.parent);\n      parentIsIframe = (window.parent !== window);\n      parentLogOk = !!(window.parent && typeof window.parent.__rikkaLog === 'function');\n    } catch (e) { parentErr = errName(e); }\n    check('window_parent_reachable', parentOk && parentLogOk,\n      'parent=' + parentOk + ' parentIsIframe=' + parentIsIframe + ' parentHasRikkaLog=' + parentLogOk + (parentErr ? ' err=' + parentErr : ''));\n\n    var topOk = false, topErr = null, topSameAsParent = 'n/a';\n    try { topOk = !!(window.top); } catch (e) { topErr = errName(e); }\n    try { topSameAsParent = (window.top === window.parent); } catch (e) { topSameAsParent = 'ERR:' + errName(e); }\n    check('window_top_reachable', topOk, 'top=' + topOk + ' top===parent=' + topSameAsParent + (topErr ? ' err=' + topErr : ''));\n\n    var topStOk = false, topStErr = null, topStDetail = '';\n    try {\n      var tw = window.top;\n      topStOk = !!(tw && tw.SillyTavern && typeof tw.SillyTavern.getContext === 'function');\n      topStDetail = 'top.SillyTavern=' + (tw ? typeof tw.SillyTavern : 'null') + ' getContext=' + (tw && tw.SillyTavern ? typeof tw.SillyTavern.getContext : 'null');\n    } catch (e) { topStErr = errName(e); }\n    check('window_top_sillytavern', topStOk, topStDetail + (topStErr ? ' err=' + topStErr : ''));\n\n    /* ---------------- 2. TavernHelper.getChatMessages ---------------- */\n    var noArg = 'n/a';\n    try {\n      var gcm0 = api('getChatMessages');\n      var r0 = gcm0 ? gcm0() : null;\n      if (Array.isArray(r0)) { msgs = r0; noArg = 'array(len=' + r0.length + ')'; }\n      else { noArg = 'non-array:' + (typeof r0); }\n    } catch (e) { noArg = 'throw:' + errName(e); }\n\n    var chatLen = -1;\n    try { var c0 = getCtx(); chatLen = (c0 && Array.isArray(c0.chat)) ? c0.chat.length : -1; } catch (_) {}\n    var resolvePath = 'noarg';\n    if (!Array.isArray(msgs)) {\n      try {\n        var gcm1 = api('getChatMessages');\n        var hi = chatLen > 0 ? chatLen - 1 : 0;\n        var r1 = gcm1 ? gcm1('0-' + hi) : null;\n        if (Array.isArray(r1)) { msgs = r1; resolvePath = 'range(0-' + hi + ')'; }\n        else { resolvePath = 'range-failed'; }\n      } catch (e2) { noArg += ' fallbackThrow:' + errName(e2); }\n    }\n    check('getchatmessages_array', Array.isArray(msgs),\n      'isArray=' + Array.isArray(msgs) + ' count=' + (Array.isArray(msgs) ? msgs.length : 'null') +\n      ' ctx.chat.length=' + chatLen + ' noarg=' + noArg + ' path=' + resolvePath);\n\n    var lastRole = null, lastIsUser = null, lastMid = null;\n    try {\n      if (Array.isArray(msgs) && msgs.length > 0) {\n        var last = msgs[msgs.length - 1];\n        lastRole = last ? String(last.role) : null;\n        lastIsUser = last ? !!last.is_user : null;\n        lastMid = last ? last.message_id : null;\n      }\n    } catch (e) { lastRole = 'ERR:' + errName(e); }\n    var roleOk = (lastRole === 'user' || lastRole === 'assistant' || lastRole === 'system' || lastRole === 'unknown');\n    check('getchatmessages_last_role', roleOk,\n      'count=' + (Array.isArray(msgs) ? msgs.length : 'null') + ' last_role=' + json(lastRole) +\n      ' last_is_user=' + json(lastIsUser) + ' last_message_id=' + json(lastMid));\n\n    /* ---------------- 3. 事件常量 + eventOn 监听 ---------------- */\n    var missing = [], wrong = [];\n    Object.keys(EVENT_WANT).forEach(function (k) {\n      if (!te || te[k] === undefined) missing.push(k);\n      else if (te[k] !== EVENT_WANT[k]) wrong.push(k + '=' + te[k]);\n    });\n    check('tavern_events_constants', !!te && missing.length === 0 && wrong.length === 0,\n      'tavern_events=' + (te ? 'object' : 'null') + ' missing=' + json(missing) + ' wrong=' + json(wrong));\n\n    var received = {};\n    var registered = {};\n    function makeHandler(name) {\n      return function () {\n        var args = Array.prototype.slice.call(arguments);\n        received[name] = (received[name] || 0) + 1;\n        emit('info', TAG + ' event_received name=' + name + ' args=' + json(args));\n      };\n    }\n    Object.keys(EVENT_WANT).forEach(function (k) {\n      var eon = api('eventOn');\n      if (!eon) { registered[k] = 'ERR:no-eventOn'; return; }\n      var name = (te && te[k]) || EVENT_WANT[k];\n      try { eon(name, makeHandler(name)); registered[k] = 'ok'; }\n      catch (e) { registered[k] = 'ERR:' + errName(e); }\n    });\n    var regOk = Object.keys(EVENT_WANT).every(function (k) { return registered[k] === 'ok'; });\n    check('event_listeners_registered', regOk, json(registered));\n\n    /* ---------------- 4. 世界书只读（名字带空格容错） ---------------- */\n    var wbNames = null, wbErr = null;\n    try { var f1 = api('getWorldbookNames'); wbNames = f1 ? f1() : null; } catch (e) { wbErr = errName(e); }\n    check('worldbook_names_array', Array.isArray(wbNames),\n      'isArray=' + Array.isArray(wbNames) + ' names=' + json(wbNames) + (wbErr ? ' err=' + wbErr : ''));\n\n    var cw = null, cwErr = null, cwShapeOk = false, cwDetail = '';\n    try { var f2 = api('getCharWorldbookNames'); cw = f2 ? f2() : null; } catch (e) { cwErr = errName(e); }\n    try {\n      cwShapeOk = !!cw && typeof cw === 'object' && !Array.isArray(cw) && ('primary' in cw) && Array.isArray(cw.additional);\n      cwDetail = 'primary=' + json(cw && cw.primary) + ' additional=' + json(cw && cw.additional);\n    } catch (e) { cwDetail = 'err=' + errName(e); }\n    check('char_worldbook_names_shape', cwShapeOk,\n      cwDetail + ' note=contract-is-{primary,additional[]}-not-array' + (cwErr ? ' err=' + cwErr : ''));\n\n    var spaceOk = false, spaceDetail = '';\n    try {\n      var n1 = Array.isArray(wbNames) ? wbNames : [];\n      var spaced = n1.filter(function (n) { return typeof n === 'string' && n.indexOf(' ') >= 0; });\n      var primarySpaced = !!(cw && typeof cw.primary === 'string' && cw.primary.indexOf(' ') >= 0);\n      var byName = null, byNameErr = null;\n      try { var f3 = api('getCharWorldbookNames'); byName = f3 ? f3(PROBE_BOOK) : null; }\n      catch (e) { byNameErr = errName(e); }\n      spaceOk = spaced.length > 0 && primarySpaced;\n      spaceDetail = 'spaced_names=' + json(spaced) + ' primary_spaced=' + primarySpaced +\n        ' lookup_by_book_name=' + (byNameErr ? 'throw(documented):' + byNameErr : json(byName));\n    } catch (e) { spaceDetail = 'err=' + errName(e); }\n    check('worldbook_space_name_tolerated', spaceOk, spaceDetail);\n\n    /* ---------------- 5. 正则脚本被宿主识别 ---------------- */\n    var ext = null, rs = null, rsErr = null;\n    try {\n      var c = getCtx();\n      var chars = c && c.characters;\n      ext = (chars && chars[0] && chars[0].data && chars[0].data.extensions) || null;\n      rs = ext ? ext.regex_scripts : null;\n    } catch (e) { rsErr = errName(e); }\n    var rsArr = Array.isArray(rs);\n    var rsNames = [], foundScript = null;\n    if (rsArr) {\n      rs.forEach(function (x) {\n        if (x && x.scriptName) rsNames.push(String(x.scriptName));\n        if (x && x.scriptName === PROBE_REGEX_NAME) foundScript = x;\n      });\n    }\n    check('regex_scripts_recognized', rsArr && !!foundScript,\n      'isArray=' + rsArr + ' count=' + (rsArr ? rs.length : 'null') + ' names=' + json(rsNames) +\n      ' probe_found=' + !!foundScript + (rsErr ? ' err=' + rsErr : ''));\n\n    var fr = foundScript ? String(foundScript.findRegex || '') : '';\n    var compiledOk = false, compDetail = '';\n    try {\n      var mm = fr.match(/^\\/([\\s\\S]*)\\/([a-zA-Z]*)$/);\n      var src = mm ? mm[1] : fr;\n      var flags = mm ? mm[2] : '';\n      var re = new RegExp(src, flags);\n      compiledOk = re.test(PLACEHOLDER);\n      compDetail = 'findRegex=' + json(fr) + ' compiled=' + compiledOk + ' matches_placeholder=' + compiledOk;\n    } catch (e) { compDetail = 'findRegex=' + json(fr) + ' compile_err=' + errName(e); }\n    check('regex_pattern_compiles', compiledOk, compDetail);\n\n    var scanned = 0, hasMarker = false, hasPlaceholder = false;\n    try {\n      if (Array.isArray(msgs)) {\n        msgs.forEach(function (m) {\n          var t = (m && typeof m.message === 'string') ? m.message : '';\n          if (t) scanned++;\n          if (t.indexOf(MARKER) >= 0) hasMarker = true;\n          if (t.indexOf(PLACEHOLDER) >= 0) hasPlaceholder = true;\n        });\n      }\n    } catch (_) {}\n    check('regex_marker_in_stored_chat', hasMarker,\n      'marker=' + hasMarker + ' raw_placeholder_present=' + hasPlaceholder + ' scanned=' + scanned +\n      ' note=rikkaST-applies-card-regex-at-display-only,stored-chat-keeps-raw-first_mes');\n\n    /* ---------------- 6. $(ready)+500ms 重建后二次断言 ---------------- */\n    var jqOk = false;\n    try { jqOk = (typeof window.$ === 'function' || typeof window.jQuery === 'function'); } catch (_) {}\n    check('jquery_available', jqOk, '$=' + (typeof window.$) + ' jQuery=' + (typeof window.jQuery));\n\n    function phase2(reason) {\n      var pOk = false, pErr = null, pLog = false;\n      try {\n        pOk = !!(window.parent);\n        pLog = !!(window.parent && typeof window.parent.__rikkaLog === 'function');\n      } catch (e) { pErr = errName(e); }\n      check('rerender_parent_reachable', pOk && pLog,\n        'trigger=' + reason + ' parent=' + pOk + ' parentHasRikkaLog=' + pLog + (pErr ? ' err=' + pErr : ''));\n\n      var tOk = false, tErr = null;\n      try { tOk = !!(window.top && window.top.SillyTavern); } catch (e) { tErr = errName(e); }\n      check('rerender_top_sillytavern', tOk, 'trigger=' + reason + ' top.SillyTavern=' + tOk + (tErr ? ' err=' + tErr : ''));\n\n      var eon2 = api('eventOn');\n      check('rerender_eventon_function', typeof eon2 === 'function',\n        'trigger=' + reason + ' typeof(eventOn)=' + (typeof eon2));\n    }\n\n    try {\n      var jq = window.$ || window.jQuery;\n      if (typeof jq === 'function') {\n        jq(function () { setTimeout(function () { phase2('$(ready)+500ms'); }, 500); });\n      } else {\n        setTimeout(function () { phase2('no-jquery+500ms'); }, 500);\n      }\n    } catch (e) {\n      check('rerender_schedule', false, 'err=' + errName(e));\n      setTimeout(function () { phase2('schedule-error+500ms'); }, 500);\n    }\n  } catch (e) {\n    emit('error', TAG + ' probe_bootstrap_error FAIL ' + errName(e));\n  }\n})();\n",
+            "info": "rikkaST render/lifecycle probe: parent/top, getChatMessages, message_* events, worldbook, regex, rerender",
+            "button": {
+              "enabled": false,
+              "buttons": []
+            },
+            "data": {},
+            "export_with": {
+              "data": true,
+              "button": true
+            }
+          }
+        ],
+        "variables": {}
+      }
+    },
+    "character_book": {
+      "name": "card render probe book with spaces",
+      "description": "probe book (name intentionally contains spaces)",
+      "extensions": {},
+      "entries": [
+        {
+          "id": 0,
+          "keys": [
+            "card_render_probe"
+          ],
+          "secondary_keys": [],
+          "comment": "card_render_probe probe entry",
+          "content": "card_render_probe probe book entry (read-only worldbook assertion target)",
+          "constant": false,
+          "selective": false,
+          "enabled": true,
+          "extensions": {},
+          "insertion_order": 100,
+          "position": 1,
+          "use_regex": false
+        }
+      ]
+    },
+    "group_only_greetings": []
+  },
+  "create_date": "2026-01-01T00:00:00.000Z"
+}

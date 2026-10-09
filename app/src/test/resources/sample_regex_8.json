@@ -1,0 +1,138 @@
+[
+  {
+    "id": "SYNTH-TEXT-2333",
+    "scriptName": "SYNTH-TEXT-2334",
+    "findRegex": "SYNTH-TEXT-2335",
+    "replaceString": "SYNTH-TEXT-2336",
+    "trimStrings": [],
+    "placement": [
+      2
+    ],
+    "disabled": false,
+    "markdownOnly": true,
+    "promptOnly": true,
+    "runOnEdit": true,
+    "substituteRegex": 0,
+    "minDepth": 10,
+    "maxDepth": null
+  },
+  {
+    "id": "SYNTH-TEXT-2337",
+    "scriptName": "SYNTH-TEXT-2338",
+    "findRegex": "SYNTH-TEXT-2335",
+    "replaceString": "SYNTH-TEXT-2339",
+    "trimStrings": [],
+    "placement": [
+      2
+    ],
+    "disabled": false,
+    "markdownOnly": true,
+    "promptOnly": false,
+    "runOnEdit": true,
+    "substituteRegex": 0,
+    "minDepth": null,
+    "maxDepth": null
+  },
+  {
+    "id": "SYNTH-TEXT-2340",
+    "scriptName": "SYNTH-TEXT-2341",
+    "findRegex": "SYNTH-TEXT-2335",
+    "replaceString": "SYNTH-TEXT-2342",
+    "trimStrings": [],
+    "placement": [
+      2
+    ],
+    "disabled": true,
+    "markdownOnly": true,
+    "promptOnly": false,
+    "runOnEdit": true,
+    "substituteRegex": 0,
+    "minDepth": null,
+    "maxDepth": null
+  },
+  {
+    "id": "SYNTH-TEXT-2343",
+    "scriptName": "SYNTH-TEXT-2344",
+    "disabled": false,
+    "runOnEdit": true,
+    "findRegex": "SYNTH-TEXT-2345",
+    "trimStrings": [],
+    "replaceString": "",
+    "placement": [
+      2
+    ],
+    "substituteRegex": 0,
+    "minDepth": 2,
+    "maxDepth": null,
+    "markdownOnly": true,
+    "promptOnly": true
+  },
+  {
+    "id": "SYNTH-TEXT-2346",
+    "scriptName": "SYNTH-TEXT-2347",
+    "disabled": false,
+    "runOnEdit": true,
+    "findRegex": "SYNTH-TEXT-2348",
+    "trimStrings": [],
+    "replaceString": "",
+    "placement": [
+      2
+    ],
+    "substituteRegex": 0,
+    "minDepth": 2,
+    "maxDepth": null,
+    "markdownOnly": true,
+    "promptOnly": true
+  },
+  {
+    "id": "SYNTH-TEXT-2349",
+    "scriptName": "SYNTH-TEXT-2350",
+    "disabled": false,
+    "runOnEdit": true,
+    "findRegex": "SYNTH-TEXT-2351",
+    "trimStrings": [],
+    "replaceString": "SYNTH-TEXT-2352",
+    "placement": [
+      2
+    ],
+    "substituteRegex": 0,
+    "minDepth": null,
+    "maxDepth": 4,
+    "markdownOnly": true,
+    "promptOnly": false
+  },
+  {
+    "id": "SYNTH-TEXT-2353",
+    "scriptName": "SYNTH-TEXT-2354",
+    "disabled": true,
+    "runOnEdit": true,
+    "findRegex": "SYNTH-TEXT-2351",
+    "trimStrings": [],
+    "replaceString": "SYNTH-TEXT-2355",
+    "placement": [
+      2
+    ],
+    "substituteRegex": 0,
+    "minDepth": null,
+    "maxDepth": 4,
+    "markdownOnly": true,
+    "promptOnly": false
+  },
+  {
+    "id": "SYNTH-TEXT-2356",
+    "scriptName": "SYNTH-TEXT-2357",
+    "findRegex": "SYNTH-TEXT-2358",
+    "replaceString": "SYNTH-TEXT-2359",
+    "trimStrings": [],
+    "placement": [
+      2
+    ],
+    "disabled": false,
+    "markdownOnly": true,
+    "promptOnly": false,
+    "runOnEdit": true,
+    "substituteRegex": 0,
+    "minDepth": null,
+    "maxDepth": null
+  }
+]

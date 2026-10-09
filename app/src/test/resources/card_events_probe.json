@@ -1,0 +1,83 @@
+{
+  "name": "Card Events Probe",
+  "description": "Automated JSR event / iframe identity / eventOn-rebuild probe (task-2).",
+  "personality": "",
+  "scenario": "",
+  "first_mes": "[card_events_probe] 事件/身份回归测试卡已加载。请查看宿主日志中形如 [CARD] card_events_probe <check> PASS|FAIL 的断言行。",
+  "mes_example": "",
+  "creatorcomment": "card_events_probe",
+  "avatar": "none",
+  "talkativeness": "0.5",
+  "fav": false,
+  "tags": [
+    "test",
+    "probe",
+    "jsr",
+    "events"
+  ],
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "create_date": "2026-07-11T00:00:00.000Z",
+  "data": {
+    "name": "Card Events Probe",
+    "description": "Automated JSR event / iframe identity / eventOn-rebuild probe (task-2).",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "[card_events_probe] 事件/身份回归测试卡已加载。请查看宿主日志中形如 [CARD] card_events_probe <check> PASS|FAIL 的断言行。",
+    "mes_example": "",
+    "creator_notes": "card_events_probe",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "tags": [
+      "test",
+      "probe",
+      "jsr",
+      "events"
+    ],
+    "creator": "card-events",
+    "character_version": "1.0.0",
+    "alternate_greetings": [],
+    "extensions": {
+      "talkativeness": "0.5",
+      "fav": false,
+      "world": "",
+      "depth_prompt": {
+        "prompt": "",
+        "depth": 4,
+        "role": "system"
+      },
+      "regex_scripts": [],
+      "tavern_helper": {
+        "scripts": [
+          {
+            "name": "events_probe_main",
+            "id": "577383d6-5b2f-4591-a4e8-ce07486a259e",
+            "content": "\n/* ============================================================\n * card_events_probe / main script\n * 覆盖：裸全局 eventOn / eventEmit 往返 / eventOnce / 重复注册 no-op /\n *       stop() 取消 / 任意字符串事件名 / iframe 身份 / parent 可达 /\n *       ready+500ms 二次断言（force 重装 / 后注入回归）。\n * 每条断言：[CARD] card_events_probe <check> PASS|FAIL <detail>\n * 通道：console.log + window.parent.__rikkaLog(level, line)\n * ============================================================ */\n(function () {\n  'use strict';\n  var TAG = 'card_events_probe';\n  var EXPECTED_NAME = 'events_probe_main';\n  var EXPECTED_ID = '577383d6-5b2f-4591-a4e8-ce07486a259e';\n  var EXPECTED_IFRAME = 'TH-script--events_probe_main--577383d6-5b2f-4591-a4e8-ce07486a259e';\n  var counts = { pass: 0, fail: 0 };\n\n  function safe(v) {\n    try { return (typeof v === 'string') ? v : JSON.stringify(v); }\n    catch (e) { return String(v); }\n  }\n  function report(name, status, detail) {\n    if (status === 'PASS') { counts.pass++; } else { counts.fail++; }\n    var line = '[CARD] ' + TAG + ' ' + name + ' ' + status + ' ' + String(detail == null ? '' : detail);\n    try { console.log(line); } catch (e) {}\n    try {\n      var p = window.parent;\n      if (p && typeof p.__rikkaLog === 'function') { p.__rikkaLog(status === 'FAIL' ? 'error' : 'info', line); }\n    } catch (e) {}\n  }\n  function check(name, fn) {\n    try {\n      var r = fn();\n      if (r && r.ok === true) { report(name, 'PASS', r.detail); }\n      else { report(name, 'FAIL', (r && r.detail) ? r.detail : 'assertion returned false'); }\n    } catch (err) {\n      report(name, 'FAIL', String((err && err.message) || err));\n    }\n  }\n\n  /* ---- 0) parent.__rikkaLog 可达性（独立于事件系统） ---- */\n  check('parent_rikka_log_reachable', function () {\n    var p = window.parent;\n    var has = !!(p && typeof p.__rikkaLog === 'function');\n    return { ok: has, detail: 'window.parent=' + (p ? 'present' : 'MISSING') + ' typeof parent.__rikkaLog=' + (p ? (typeof p.__rikkaLog) : 'n/a') };\n  });\n\n  /* ---- 1) 裸全局事件 API 存在性 ---- */\n  var helperNames = ['eventOn','eventOnce','eventEmit','eventEmitAndWait','eventRemoveListener','eventMakeLast','eventMakeFirst','eventClearEvent','eventClearListener','eventClearAll'];\n  var missing = [];\n  for (var hi = 0; hi < helperNames.length; hi++) {\n    if (typeof window[helperNames[hi]] !== 'function') { missing.push(helperNames[hi]); }\n  }\n  var hasEventOn = (typeof eventOn === 'function');\n  check('eventOn_exists', function () {\n    return { ok: hasEventOn, detail: 'typeof eventOn=' + (typeof eventOn) };\n  });\n  check('event_helpers_exist', function () {\n    return { ok: missing.length === 0, detail: 'missing=' + JSON.stringify(missing) };\n  });\n\n  /* ---- 2) 脚本身份（不依赖事件系统） ---- */\n  check('identity_script_name', function () {\n    if (typeof getScriptName !== 'function') { return { ok: false, detail: 'getScriptName not a function' }; }\n    var v = getScriptName();\n    return { ok: v === EXPECTED_NAME, detail: 'getScriptName()=' + safe(v) + ' expected=' + EXPECTED_NAME };\n  });\n  check('identity_script_id', function () {\n    if (typeof getScriptId !== 'function') { return { ok: false, detail: 'getScriptId not a function' }; }\n    var v = getScriptId();\n    return { ok: v === EXPECTED_ID, detail: 'getScriptId()=' + safe(v) + ' expected=' + EXPECTED_ID };\n  });\n  check('identity_iframe_name', function () {\n    if (typeof getIframeName !== 'function') { return { ok: false, detail: 'getIframeName not a function' }; }\n    var v = getIframeName();\n    var n = window.name;\n    return { ok: v === EXPECTED_IFRAME && n === EXPECTED_IFRAME, detail: 'getIframeName()=' + safe(v) + ' window.name=' + safe(n) + ' expected=' + EXPECTED_IFRAME };\n  });\n  check('identity_tavern_helper_mirror', function () {\n    if (!window.TavernHelper || typeof window.TavernHelper.getScriptName !== 'function') { return { ok: false, detail: 'TavernHelper.getScriptName missing' }; }\n    var a = getScriptName();\n    var b = window.TavernHelper.getScriptName();\n    return { ok: a === EXPECTED_NAME && b === EXPECTED_NAME, detail: 'bare=' + safe(a) + ' helper=' + safe(b) };\n  });\n\n  /* ---- 3) 事件往返与语义（依赖 eventOn） ---- */\n  if (!hasEventOn) {\n    var dependent = ['event_emit_roundtrip','event_once_single_fire','event_duplicate_register_noop','event_stop_cancels','arbitrary_event_name_registrable','event_multi_listener_isolated','eventOn_alive_after_ready_500ms'];\n    for (var di = 0; di < dependent.length; di++) {\n      report(dependent[di], 'FAIL', 'skipped: eventOn missing (typeof=' + (typeof eventOn) + ')');\n    }\n  } else {\n    check('event_emit_roundtrip', function () {\n      var got = [];\n      var sub = eventOn('card_probe.evt.roundtrip', function (v) { got.push(v); });\n      eventEmit('card_probe.evt.roundtrip', 'hello-1');\n      if (sub && typeof sub.stop === 'function') { sub.stop(); }\n      return { ok: got.length === 1 && got[0] === 'hello-1', detail: 'got=' + safe(got) };\n    });\n\n    check('event_once_single_fire', function () {\n      var n = 0;\n      eventOnce('card_probe.evt.once', function () { n++; });\n      eventEmit('card_probe.evt.once', 'a');\n      eventEmit('card_probe.evt.once', 'b');\n      return { ok: n === 1, detail: 'count=' + n + ' (expected 1)' };\n    });\n\n    check('event_duplicate_register_noop', function () {\n      var n = 0;\n      var listener = function () { n++; };\n      eventOn('card_probe.evt.dup', listener);\n      eventOn('card_probe.evt.dup', listener);\n      eventEmit('card_probe.evt.dup', 'x');\n      eventRemoveListener('card_probe.evt.dup', listener);\n      return { ok: n === 1, detail: 'count=' + n + ' (expected 1)' };\n    });\n\n    check('event_stop_cancels', function () {\n      var n = 0;\n      var listener = function () { n++; };\n      var sub = eventOn('card_probe.evt.stop', listener);\n      var hasStop = !!(sub && typeof sub.stop === 'function');\n      eventEmit('card_probe.evt.stop', 'before');\n      if (hasStop) { sub.stop(); }\n      eventEmit('card_probe.evt.stop', 'after');\n      return { ok: hasStop && n === 1, detail: 'hasStop=' + hasStop + ' count=' + n + ' (expected 1)' };\n    });\n\n    check('arbitrary_event_name_registrable', function () {\n      var got = [];\n      eventOn('mag_variable_update_ended', function () { got.push('mvu'); });\n      eventOn('card probe weird.name/with space', function () { got.push('weird'); });\n      eventEmit('mag_variable_update_ended', { ok: true });\n      eventEmit('card probe weird.name/with space');\n      return { ok: got.length === 2, detail: 'got=' + safe(got) };\n    });\n\n    check('event_multi_listener_isolated', function () {\n      var a = 0, b = 0;\n      eventOn('card_probe.evt.multi', function () { a++; });\n      eventOn('card_probe.evt.multi', function () { b++; });\n      eventEmit('card_probe.evt.multi');\n      return { ok: a === 1 && b === 1, detail: 'a=' + a + ' b=' + b };\n    });\n  }\n\n  /* ---- 4) ready + 500ms 二次断言（force 重装 / 后注入路径） ---- */\n  function aliveCheck() {\n    check('eventOn_alive_after_ready_500ms', function () {\n      return { ok: typeof eventOn === 'function', detail: 'typeof eventOn=' + (typeof eventOn) + ' at ready+500ms' };\n    });\n    setTimeout(function () {\n      var p = counts.pass, f = counts.fail;\n      report('summary', f === 0 ? 'PASS' : 'FAIL', 'pass=' + p + ' fail=' + f);\n      try { if (window.toastr && typeof toastr.info === 'function') { toastr.info('card_events_probe: pass=' + p + ' fail=' + f); } } catch (e) {}\n    }, 50);\n  }\n  if (typeof $ === 'function') {\n    check('jquery_available', function () { return { ok: true, detail: 'typeof $=' + (typeof $) }; });\n    $(function () { setTimeout(aliveCheck, 500); });\n  } else {\n    check('jquery_available', function () { return { ok: false, detail: 'typeof $=' + (typeof $) }; });\n    setTimeout(aliveCheck, 500);\n  }\n})();\n",
+            "enabled": true,
+            "type": "script"
+          },
+          {
+            "name": "events_probe_identity_b",
+            "id": "6d4a5b75-f7f0-4fd1-8035-560b5213aa1d",
+            "content": "\n/* card_events_probe / second iframe：per-iframe 身份 + 事件往返（跨 iframe 独立断言） */\n(function () {\n  'use strict';\n  var TAG = 'card_events_probe';\n  var EXPECTED_NAME = 'events_probe_identity_b';\n  var EXPECTED_ID = '6d4a5b75-f7f0-4fd1-8035-560b5213aa1d';\n  var EXPECTED_IFRAME = 'TH-script--events_probe_identity_b--6d4a5b75-f7f0-4fd1-8035-560b5213aa1d';\n  function safe(v) { try { return (typeof v === 'string') ? v : JSON.stringify(v); } catch (e) { return String(v); } }\n  function report(name, status, detail) {\n    var line = '[CARD] ' + TAG + ' ' + name + ' ' + status + ' ' + String(detail == null ? '' : detail);\n    try { console.log(line); } catch (e) {}\n    try { var p = window.parent; if (p && typeof p.__rikkaLog === 'function') { p.__rikkaLog(status === 'FAIL' ? 'error' : 'info', line); } } catch (e) {}\n  }\n  function check(name, fn) {\n    try {\n      var r = fn();\n      if (r && r.ok === true) { report(name, 'PASS', r.detail); }\n      else { report(name, 'FAIL', (r && r.detail) ? r.detail : 'assertion returned false'); }\n    } catch (err) { report(name, 'FAIL', String((err && err.message) || err)); }\n  }\n  check('b_parent_rikka_log_reachable', function () {\n    var p = window.parent;\n    return { ok: !!(p && typeof p.__rikkaLog === 'function'), detail: 'typeof parent.__rikkaLog=' + (p ? (typeof p.__rikkaLog) : 'n/a') };\n  });\n  check('b_eventOn_exists', function () { return { ok: typeof eventOn === 'function', detail: 'typeof eventOn=' + (typeof eventOn) }; });\n  check('b_identity_script_name', function () {\n    if (typeof getScriptName !== 'function') { return { ok: false, detail: 'getScriptName not a function' }; }\n    var v = getScriptName();\n    return { ok: v === EXPECTED_NAME, detail: 'getScriptName()=' + safe(v) + ' expected=' + EXPECTED_NAME };\n  });\n  check('b_identity_script_id', function () {\n    if (typeof getScriptId !== 'function') { return { ok: false, detail: 'getScriptId not a function' }; }\n    var v = getScriptId();\n    return { ok: v === EXPECTED_ID, detail: 'getScriptId()=' + safe(v) + ' expected=' + EXPECTED_ID };\n  });\n  check('b_identity_iframe_name', function () {\n    if (typeof getIframeName !== 'function') { return { ok: false, detail: 'getIframeName not a function' }; }\n    var v = getIframeName();\n    return { ok: v === EXPECTED_IFRAME && window.name === EXPECTED_IFRAME, detail: 'getIframeName()=' + safe(v) + ' window.name=' + safe(window.name) + ' expected=' + EXPECTED_IFRAME };\n  });\n  check('b_event_emit_roundtrip', function () {\n    var n = 0;\n    var sub = eventOn('card_probe_b.evt.roundtrip', function () { n++; });\n    eventEmit('card_probe_b.evt.roundtrip', 'b');\n    if (sub && typeof sub.stop === 'function') { sub.stop(); }\n    return { ok: n === 1, detail: 'count=' + n + ' (expected 1)' };\n  });\n})();\n",
+            "enabled": true,
+            "type": "script"
+          },
+          {
+            "name": "events_probe_disabled_canary",
+            "id": "95f215d5-2bda-4656-9452-2d2834ec2db7",
+            "content": "\n/* card_events_probe / disabled canary —— enabled:false，正常情况下永不执行。\n * 若该行出现在日志里，说明宿主忽略了 enabled 标志。 */\n(function () {\n  'use strict';\n  try {\n    var line = '[CARD] card_events_probe disabled_canary_ran FAIL disabled script executed despite enabled=false';\n    try { console.log(line); } catch (e) {}\n    try { if (window.parent && typeof window.parent.__rikkaLog === 'function') { window.parent.__rikkaLog('error', line); } } catch (e) {}\n  } catch (err) {\n    try { console.log('[CARD] card_events_probe disabled_canary_ran FAIL ' + String((err && err.message) || err)); } catch (e) {}\n  }\n})();\n",
+            "enabled": false,
+            "type": "script"
+          }
+        ],
+        "variables": {}
+      }
+    },
+    "character_book": {
+      "entries": [],
+      "name": ""
+    },
+    "group_only_greetings": []
+  }
+}
