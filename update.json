@@ -1,0 +1,12 @@
+{
+  "version": "2.4.6",
+  "publishedAt": "2026-10-08T14:18:09Z",
+  "changelog": "基于上游 RikkaHub 2.4.6 的 rikkaST 分支：保留酒馆兼容层、群聊、宏引擎与工具系统，不含命理/占星模块。",
+  "downloads": [
+    {
+      "name": "rikkaST-2.4.6-public.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.4.6/rikkaST-2.4.6-public.apk",
+      "size": "58,613,333 bytes (约 58.6 MB)"
+    }
+  ]
+}
