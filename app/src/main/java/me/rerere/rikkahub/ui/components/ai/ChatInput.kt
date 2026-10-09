@@ -1,0 +1,1804 @@
+package me.rerere.rikkahub.ui.components.ai
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.content.MediaType
+import androidx.compose.foundation.content.ReceiveContentListener
+import androidx.compose.foundation.content.consume
+import androidx.compose.foundation.content.contentReceiver
+import androidx.compose.foundation.content.hasMediaType
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.material3.BasicAlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
+import com.dokar.sonner.ToastType
+import dev.chrisbanes.haze.HazeInput
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.blur.HazeBlurStyle
+import dev.chrisbanes.haze.blur.hazeBlur
+import dev.chrisbanes.haze.blur.material3.Material3
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.collectLatest
+import me.rerere.ai.core.MessageRole
+import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelAbility
+import me.rerere.ai.provider.ModelType
+import me.rerere.asr.ASRStatus
+import com.composables.icons.lucide.ChevronDown
+import com.composables.icons.lucide.ChevronUp
+import com.composables.icons.lucide.Lucide
+import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Add01
+import me.rerere.hugeicons.stroke.ArrowUp02
+import me.rerere.hugeicons.stroke.Cancel01
+import me.rerere.hugeicons.stroke.FullScreen
+import me.rerere.hugeicons.stroke.Zap
+import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.BlurStrength
+import me.rerere.rikkahub.data.datastore.BlurStyle
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.findModelById
+import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+import me.rerere.rikkahub.data.datastore.getCurrentChatModel
+import me.rerere.rikkahub.data.datastore.getQuickMessagesOfAssistant
+import me.rerere.rikkahub.data.files.FilesManager
+import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.QuickMessage
+import me.rerere.rikkahub.data.st.script.StSlashParser
+import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionContext
+import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionItem
+import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionList
+import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionProvider
+import me.rerere.rikkahub.ui.components.ai.SlashCommand
+import me.rerere.rikkahub.ui.components.ai.collectSlashCommands
+import me.rerere.rikkahub.ui.components.ai.matchSlashCommand
+import me.rerere.rikkahub.ui.components.ui.KeepScreenOn
+import me.rerere.rikkahub.ui.components.ui.permission.PermissionManager
+import me.rerere.rikkahub.ui.components.ui.permission.PermissionRecordAudio
+import me.rerere.rikkahub.ui.components.ui.permission.rememberPermissionState
+import me.rerere.rikkahub.ui.context.LocalASRState
+import me.rerere.rikkahub.ui.context.LocalSettings
+import me.rerere.rikkahub.ui.context.LocalToaster
+import me.rerere.rikkahub.ui.hooks.ChatInputState
+import me.rerere.rikkahub.ui.theme.AppRadii
+import me.rerere.rikkahub.ui.theme.AppSpacing
+import me.rerere.rikkahub.ui.theme.AppType
+import me.rerere.rikkahub.utils.SoundEffectPlayer
+import org.koin.compose.koinInject
+import kotlin.time.Duration.Companion.seconds
+import kotlin.uuid.Uuid
+
+/**
+ * [v225 F9/P5] 聊天输入栏底部留白（dp）。
+ *
+ * - 键盘弹出态 = 4dp（主人 2026-10-04 拍板 P5：与输入法留一条可见的缝；v224 是 0dp 贴脸）；
+ * - 静止态 = 8dp（沿用 v224，不要把已验收的静止态改坏）。
+ *
+ * 抽成常量是为了让单测能钉住这两个数字（见 ChatInputImeContractTest）。
+ */
+internal const val CHAT_INPUT_IME_BOTTOM_PADDING_DP = 4
+internal const val CHAT_INPUT_IDLE_BOTTOM_PADDING_DP = 8
+
+@Composable
+fun ChatInput(
+    state: ChatInputState,
+    loading: Boolean,
+    settings: Settings,
+    hazeState: HazeState,
+    enableSearch: Boolean,
+    onUpdateSearchMode: (SearchMode) -> Unit,
+    modifier: Modifier = Modifier,
+    completionProviders: List<ChatCompletionProvider> = emptyList(),
+    chatModelId: Uuid? = null,
+    onUpdateChatModel: (Model) -> Unit,
+    onUpdateAssistant: (Assistant) -> Unit,
+    onUpdateSearchService: (Int) -> Unit,
+    onMoreClick: () -> Unit,
+    onCancelClick: () -> Unit,
+    onSendClick: () -> Unit,
+    onUpdateConversation: (Conversation) -> Unit = {},
+    onCompressContext: (String, String, String) -> Unit = { _, _, _ -> },
+    onLongSendClick: () -> Unit,
+    onSlashDuplicate: (() -> Unit)? = null,
+    onSlashInsert: ((MessageRole, String, String?, Int?) -> Unit)? = null,
+    onSlashPersona: ((String, String) -> Unit)? = null,
+    onSlashTrigger: (() -> Unit)? = null,
+    onSlashSysgen: ((String, String?, Int?, Boolean) -> Unit)? = null,
+    onSlashVar: ((SlashVarOp, String, String) -> String?)? = null,
+    onSlashContinue: ((String) -> Unit)? = null,
+    onSlashImpersonate: ((String) -> Unit)? = null,
+    onSlashRerollPick: ((String) -> Unit)? = null,
+    onSlashGen: ((ChatService.GenArgs, (String) -> Unit) -> Unit)? = null,
+    onSlashJs: ((String) -> Unit)? = null,
+    onSlashTavern: ((String) -> Unit)? = null,
+    // 消息级操作（对齐官方 /hide /unhide /swipe）
+    onSlashHide: ((String, Boolean, String?) -> Unit)? = null,
+    onSlashSwipe: ((String, Boolean) -> Unit)? = null,
+    // checkpoint 族（/checkpoint-*、/branch-create）：整条命令转交 STscript 中枢执行
+    onSlashScript: ((String) -> String?)? = null,
+    // 快速回复自动执行（对齐酒馆 QR；为 null 时点击一律填入输入框）
+    onQuickMessageExecute: ((QuickMessage) -> Unit)? = null,
+) {
+    val toaster = LocalToaster.current
+    val assistant = settings.getCurrentAssistant()
+    val skillManager: SkillManager = koinInject()
+    val slashContext = LocalContext.current
+    val slashCommands = remember(assistant.enabledSkills) {
+        val allSkills = skillManager.listSkills()
+        val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
+        collectSlashCommands(enabledSkills, slashContext)
+    }
+    val hazeTintColor = MaterialTheme.colorScheme.surfaceContainerLow
+    // [v225 F3] 输入栏模糊/磨砂由「消息样式」驱动（v222~v224 只读旧的 displaySetting 开关，
+    // 所以选了磨砂玻璃输入栏毫无变化）。总闸 = displaySetting.enableBlurEffect（与 messageStyle.style
+    // != DEFAULT 互为镜像，P2 拍板保留为总闸）：
+    //   - blurStyle == FROSTED_GLASS -> Haze 真实 backdrop blur，半径 = 模糊强度档位 sigma，
+    //     叠半透明磨砂 tint + hairline 细边框 + 大圆角胶囊（P1 = A）；
+    //   - blurStyle == TRANSPARENT -> 维持 RikkaHub 现状（轻模糊 + 低不透明度）。
+    val messageStyle = settings.messageStyle
+    val blurMasterOn = settings.displaySetting.enableBlurEffect
+    val frostedGlass = blurMasterOn && messageStyle.blurStyle == BlurStyle.FROSTED_GLASS
+    val inputHazeStyle = HazeBlurStyle.Material3 {
+        blurRadius(
+            if (frostedGlass) BlurStrength.sigmaDp(messageStyle.blurStrength).dp else 12.dp
+        )
+    }
+
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+
+    // [v225 F9] 键盘弹出时也保持四角全圆（v224：上方两角圆、下方两角方，主人判为丑），
+    // 与输入法之间改为 4dp 间距（P5 拍板），见下方 bottom padding。
+    val imeVisible = WindowInsets.isImeVisible
+    // /help 弹窗状态：手动输入 /help 和点命令建议共用同一状态
+    var showHelpDialog by remember { mutableStateOf(false) }
+    val containerShape = MaterialTheme.shapes.largeIncreased
+
+    fun sendMessage() {
+        focusManager.clearFocus(force = true)
+        keyboardController?.hide()
+        if (loading) {
+            // 生成中：斜杠命令不打断当前生成（官方 waitUntilCondition 语义），提示等待；普通消息仍可取消
+            val pendingText = state.textContent.text.toString().trimStart()
+            if (pendingText.startsWith("/")) {
+                toaster.show(slashContext.getString(R.string.slash_toast_generating))
+                return
+            }
+            onCancelClick()
+            return
+        }
+        val text = state.textContent.text.toString().trimStart()
+        if (text.startsWith("/")) {
+            val cmd = matchSlashCommand(text, slashCommands)
+            if (cmd != null) {
+                val args = text.substringAfter(" ", "").trim()
+                if (cmd.builtinKind != null) {
+                    handleBuiltinSlash(
+                        cmd = cmd,
+                        args = args,
+                        onShowHelp = { showHelpDialog = true },
+                        onSlashJs = onSlashJs,
+                        onSlashTavern = onSlashTavern,
+                        onSlashHide = onSlashHide,
+                        onSlashSwipe = onSlashSwipe,
+                        onSlashScript = onSlashScript,
+                        state = state,
+                        toaster = toaster,
+                        settings = settings,
+                        assistant = assistant,
+                        onUpdateAssistant = onUpdateAssistant,
+                        onSlashDuplicate = onSlashDuplicate,
+                        onSlashInsert = onSlashInsert,
+                        onSlashPersona = onSlashPersona,
+                        onSlashTrigger = onSlashTrigger,
+                        onSlashSysgen = onSlashSysgen,
+                        onSlashVar = onSlashVar,
+                        onSlashContinue = onSlashContinue,
+                        onSlashImpersonate = onSlashImpersonate,
+                        onSlashRerollPick = onSlashRerollPick,
+                        onSlashGen = onSlashGen,
+                        context = slashContext,
+                    )
+                } else {
+                    // 技能命令：与弹窗点击一致，把替换后的内容填回输入框
+                    val argsList = args.split(" ", limit = 10)
+                    var content = cmd.content
+                        .replace("\$ARGUMENTS", args)
+                        .replace("\$ARGS", args)
+                    for (i in 0..9) {
+                        val value = argsList.getOrElse(i) { "" }
+                        content = content.replace("\$ARGS.$i", value)
+                    }
+                    state.setMessageText(content)
+                }
+                return
+            }
+        }
+        onSendClick()
+    }
+
+    fun sendMessageWithoutAnswer() {
+        focusManager.clearFocus(force = true)
+        keyboardController?.hide()
+        if (loading) onCancelClick() else onLongSendClick()
+    }
+
+    val asr = LocalASRState.current
+    val asrState by asr.state.collectAsState()
+    val hapticFeedback = LocalHapticFeedback.current
+    val soundEffectPlayer: SoundEffectPlayer = koinInject()
+    LaunchedEffect(Unit) {
+        soundEffectPlayer.preload(R.raw.asr_start, R.raw.asr_stop)
+    }
+    val asrPermission = rememberPermissionState(PermissionRecordAudio)
+    PermissionManager(permissionState = asrPermission)
+    var asrBaseText by remember { mutableStateOf("") }
+    LaunchedEffect(asrState.status) {
+        when (asrState.status) {
+            ASRStatus.Listening -> {
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
+                soundEffectPlayer.play(R.raw.asr_start)
+            }
+
+            ASRStatus.Stopping -> {
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureEnd)
+                soundEffectPlayer.play(R.raw.asr_stop)
+            }
+
+            else -> {}
+        }
+    }
+    LaunchedEffect(asrState.errorMessage) {
+        asrState.errorMessage?.takeIf { it.isNotBlank() }?.let { message ->
+            toaster.show(message = message, type = ToastType.Error)
+        }
+    }
+
+    Surface(
+        color = Color.Transparent,
+    ) {
+        Column(
+            modifier = modifier
+                .imePadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 8.dp)
+                .padding(
+                    bottom = if (imeVisible) {
+                        CHAT_INPUT_IME_BOTTOM_PADDING_DP.dp
+                    } else {
+                        CHAT_INPUT_IDLE_BOTTOM_PADDING_DP.dp
+                    }
+                ),
+            verticalArrangement = Arrangement.spacedBy(AppSpacing.sm)
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(containerShape)
+                    .then(
+                        if (blurMasterOn) Modifier.hazeBlur(
+                            input = HazeInput.Sources(hazeState),
+                            style = inputHazeStyle,
+                        )
+                        else Modifier
+                    ),
+                shape = containerShape,
+                tonalElevation = 0.dp,
+                border = if (frostedGlass) {
+                    BorderStroke(0.8.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                } else {
+                    BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                },
+                color = when {
+                    !blurMasterOn -> hazeTintColor
+                    frostedGlass -> hazeTintColor.copy(alpha = 0.5f)
+                    else -> Color.Transparent
+                },
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    if (state.messageContent.isNotEmpty()) {
+                        MediaFileInputRow(state = state)
+                    }
+
+                    TextInputRow(
+                        state = state,
+                        completionProviders = completionProviders,
+                        onSendMessage = { sendMessage() },
+                        toaster = toaster,
+                        onUpdateAssistant = onUpdateAssistant,
+                        onSlashDuplicate = onSlashDuplicate,
+                        onSlashInsert = onSlashInsert,
+                        onSlashPersona = onSlashPersona,
+                        onSlashTrigger = onSlashTrigger,
+                        onSlashSysgen = onSlashSysgen,
+                        onSlashVar = onSlashVar,
+                        onSlashContinue = onSlashContinue,
+                        onSlashImpersonate = onSlashImpersonate,
+                        onSlashRerollPick = onSlashRerollPick,
+                        onSlashGen = onSlashGen,
+                        onSlashHide = onSlashHide,
+                        onSlashSwipe = onSlashSwipe,
+                        onSlashScript = onSlashScript,
+                        onQuickMessageExecute = onQuickMessageExecute,
+                        helpDialogVisible = showHelpDialog,
+                        onDismissHelpDialog = { showHelpDialog = false },
+                        onShowHelp = { showHelpDialog = true },
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(AppSpacing.xs),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            // Model Picker
+                            ModelSelector(
+                                modelId = chatModelId ?: assistant.chatModelId ?: settings.chatModelId,
+                                providers = settings.providers,
+                                onSelect = {
+                                    onUpdateChatModel(it)
+                                },
+                                type = ModelType.CHAT,
+                                onlyIcon = true,
+                                modifier = Modifier,
+                            )
+
+                            // Search
+                            val enableSearchMsg = stringResource(R.string.web_search_enabled)
+                            val disableSearchMsg = stringResource(R.string.web_search_disabled)
+                            val chatModel = settings.getCurrentChatModel()
+                            SearchPickerButton(
+                                enableSearch = enableSearch,
+                                settings = settings,
+                                onUpdateSearchMode = { mode ->
+                                    onUpdateSearchMode(mode)
+                                    val enabled = mode != SearchMode.OFF
+                                    toaster.show(
+                                        message = if (enabled) enableSearchMsg else disableSearchMsg,
+                                        duration = 1.seconds,
+                                        type = if (enabled) {
+                                            ToastType.Success
+                                        } else {
+                                            ToastType.Normal
+                                        }
+                                    )
+                                },
+                                onUpdateSearchService = onUpdateSearchService,
+                                model = chatModel,
+                            )
+
+                            // Reasoning
+                            val model = settings.getCurrentChatModel()
+                            if (model?.abilities?.contains(ModelAbility.REASONING) == true) {
+                                ReasoningButton(
+                                    reasoningLevel = assistant.reasoningLevel,
+                                    onUpdateReasoningLevel = {
+                                        onUpdateAssistant(assistant.copy(reasoningLevel = it))
+                                    },
+                                    onlyIcon = true,
+                                )
+                            }
+
+                        }
+
+                        ActionIconButton(
+                            onClick = onMoreClick
+                        ) {
+                            Icon(
+                                imageVector = HugeIcons.Add01,
+                                contentDescription = stringResource(R.string.more_options)
+                            )
+                        }
+
+                        if (asrState.isAvailable || asrState.isRecording) {
+                            AsrButton(
+                                state = asrState,
+                                onClick = {
+                                    when (asrState.status) {
+                                        ASRStatus.Listening -> asr.stop()
+                                        ASRStatus.Idle, ASRStatus.Error -> {
+                                            if (!asrPermission.allRequiredPermissionsGranted) {
+                                                asrPermission.requestPermissions()
+                                            } else {
+                                                asrBaseText = state.textContent.text.toString()
+                                                asr.start { transcript ->
+                                                    val spacer =
+                                                        if (asrBaseText.isBlank() || transcript.isBlank()) "" else " "
+                                                    state.setMessageText(asrBaseText + spacer + transcript)
+                                                }
+                                            }
+                                        }
+
+                                        ASRStatus.Connecting, ASRStatus.Stopping -> {}
+                                    }
+                                }
+                            )
+                        }
+
+                        AnimatedVisibility(
+                            visible = !asrState.isRecording,
+                            enter = fadeIn() + scaleIn(),
+                            exit = fadeOut() + scaleOut(),
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .testTag("chat_send_button")
+                                    .clip(CircleShape)
+                                    .combinedClickable(
+                                        enabled = loading || !state.isEmpty(),
+                                        onClick = {
+                                            sendMessage()
+                                        }, onLongClick = {
+                                            sendMessageWithoutAnswer()
+                                        }
+                                    )
+                            ) {
+                                val containerColor = when {
+                                    loading -> MaterialTheme.colorScheme.errorContainer
+                                    state.isEmpty() -> MaterialTheme.colorScheme.surfaceContainerHigh
+                                    else -> MaterialTheme.colorScheme.primary
+                                }
+                                val contentColor = when {
+                                    loading -> MaterialTheme.colorScheme.onErrorContainer
+                                    state.isEmpty() -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                                    else -> MaterialTheme.colorScheme.onPrimary
+                                }
+                                Surface(
+                                    modifier = Modifier.fillMaxSize(),
+                                    shape = CircleShape,
+                                    color = containerColor,
+                                    content = {})
+                                if (loading) {
+                                    KeepScreenOn()
+                                    Icon(
+                                        imageVector = HugeIcons.Cancel01,
+                                        contentDescription = stringResource(R.string.stop),
+                                        tint = contentColor,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = HugeIcons.ArrowUp02,
+                                        contentDescription = stringResource(R.string.send),
+                                        tint = contentColor,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+}
+
+@Composable
+private fun ActionIconButton(
+    onClick: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.size(30.dp),
+        shape = CircleShape,
+        tonalElevation = 0.dp,
+        color = Color.Transparent,
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
+private fun TextInputRow(
+    state: ChatInputState,
+    completionProviders: List<ChatCompletionProvider>,
+    onSendMessage: () -> Unit,
+    toaster: com.dokar.sonner.ToasterState,
+    onUpdateAssistant: (Assistant) -> Unit,
+    onSlashDuplicate: (() -> Unit)?,
+    onSlashInsert: ((MessageRole, String, String?, Int?) -> Unit)?,
+    onSlashPersona: ((String, String) -> Unit)?,
+    onSlashTrigger: (() -> Unit)?,
+    onSlashSysgen: ((String, String?, Int?, Boolean) -> Unit)?,
+    onSlashVar: ((SlashVarOp, String, String) -> String?)?,
+    onSlashContinue: ((String) -> Unit)? = null,
+    onSlashImpersonate: ((String) -> Unit)? = null,
+    onSlashRerollPick: ((String) -> Unit)? = null,
+    onSlashGen: ((ChatService.GenArgs, (String) -> Unit) -> Unit)? = null,
+    onSlashHide: ((String, Boolean, String?) -> Unit)? = null,
+    onSlashSwipe: ((String, Boolean) -> Unit)? = null,
+    onSlashScript: ((String) -> String?)? = null,
+    helpDialogVisible: Boolean,
+    onDismissHelpDialog: () -> Unit,
+    onShowHelp: () -> Unit,
+    onQuickMessageExecute: ((QuickMessage) -> Unit)? = null,
+) {
+    val settings = LocalSettings.current
+    val filesManager: FilesManager = koinInject()
+    val skillManager: SkillManager = koinInject()
+    val assistant = settings.getCurrentAssistant()
+    val quickMessages = remember(settings.quickMessages, assistant.quickMessageIds) {
+        settings.getQuickMessagesOfAssistant(assistant)
+    }
+    // 斜杠命令
+    val slashContext = LocalContext.current
+    val slashCommands = remember(assistant.enabledSkills) {
+        val allSkills = skillManager.listSkills()
+        val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
+        collectSlashCommands(enabledSkills, slashContext)
+    }
+    var showSlashPopup by remember { mutableStateOf(false) }
+    var slashFilter by remember { mutableStateOf("") }
+    var slashArgs by remember { mutableStateOf("") }
+
+    // 监听文本变化，检测斜杠命令
+    val currentText = state.textContent.text
+    LaunchedEffect(currentText) {
+        if (currentText.startsWith("/") && currentText.length <= 30) {
+            val parts = currentText.split(" ", limit = 2)
+            val cmdName = parts[0].removePrefix("/").lowercase()
+            slashArgs = parts.getOrElse(1) { "" }
+            if (slashCommands.any { it.name.lowercase().startsWith(cmdName) }) {
+                slashFilter = cmdName
+                showSlashPopup = true
+            } else {
+                showSlashPopup = false
+            }
+        } else {
+            showSlashPopup = false
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(AppSpacing.xs)
+    ) {
+        if (state.isEditing()) {
+            Surface(
+                shape = RoundedCornerShape(AppRadii.lg),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(text = stringResource(R.string.editing))
+                    Spacer(Modifier.weight(1f))
+                    Icon(
+                        imageVector = HugeIcons.Cancel01,
+                        contentDescription = stringResource(R.string.cancel_edit),
+                        modifier = Modifier.clickable { state.clearInput() }
+                    )
+                }
+            }
+        }
+
+        var isFocused by remember { mutableStateOf(false) }
+        var isFullScreen by remember { mutableStateOf(false) }
+        var completionList by remember { mutableStateOf<ChatCompletionList?>(null) }
+        val receiveContentListener = remember(
+            settings.displaySetting.pasteLongTextAsFile, settings.displaySetting.pasteLongTextThreshold
+        ) {
+            ReceiveContentListener { transferableContent ->
+                when {
+                    transferableContent.hasMediaType(MediaType.Image) -> {
+                        transferableContent.consume { item ->
+                            val uri = item.uri
+                            if (uri != null) {
+                                state.addImages(
+                                    filesManager.createChatFilesByContents(
+                                        listOf(uri)
+                                    )
+                                )
+                            }
+                            uri != null
+                        }
+                    }
+
+                    settings.displaySetting.pasteLongTextAsFile && transferableContent.hasMediaType(MediaType.Text) -> {
+                        transferableContent.consume { item ->
+                            val text = item.text?.toString()
+                            if (text != null && text.length > settings.displaySetting.pasteLongTextThreshold) {
+                                val document = filesManager.createChatTextFile(text)
+                                state.addFiles(listOf(document))
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+
+                    else -> transferableContent
+                }
+            }
+        }
+
+        LaunchedEffect(completionProviders, isFocused) {
+            if (!isFocused || completionProviders.isEmpty()) {
+                completionList = null
+                return@LaunchedEffect
+            }
+
+            snapshotFlow {
+                ChatCompletionContext(
+                    text = state.textContent.text.toString(),
+                    selection = state.textContent.selection,
+                )
+            }.collectLatest { context ->
+                val lists = completionProviders.mapNotNull { provider ->
+                    try {
+                        provider.complete(context)
+                            ?.takeIf { it.items.isNotEmpty() }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                val primary = lists.firstOrNull()
+                completionList = primary?.let { list ->
+                    val mergedItems = lists
+                        .filter { it.replacementRange == list.replacementRange }
+                        .flatMap { it.items }
+                        .distinctBy { it.label to it.insertText }
+                        .sortedWith(
+                            compareByDescending<ChatCompletionItem> { it.sortScore }
+                                .thenBy { it.label.length }
+                                .thenBy { it.label.lowercase() }
+                        )
+                        .take(8)
+                    list.copy(items = mergedItems)
+                }
+            }
+        }
+
+        completionList?.takeIf { it.items.isNotEmpty() }?.let { list ->
+            CompletionPopup(
+                completionList = list,
+                onItemClick = { item ->
+                    state.applyCompletion(list.replacementRange, item)
+                    completionList = null
+                },
+            )
+        }
+
+        // /help 命令列表：复用斜杠弹窗同款卡片样式，列出全部命令 + 完整描述，点击可执行或填入输入框
+        if (helpDialogVisible) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(AppRadii.md),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                shadowElevation = 8.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(AppSpacing.xs)
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = stringResource(R.string.slash_help_title),
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = onDismissHelpDialog) {
+                            Text(stringResource(R.string.slash_help_close))
+                        }
+                    }
+                    Text(
+                        text = stringResource(R.string.slash_help_tip),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+                    )
+                    val groupedCommands = slashCommands.groupBy { cmd ->
+                        when (cmd.builtinKind) {
+                            BuiltinSlashKind.VAR -> stringResource(R.string.slash_category_variables)
+                            BuiltinSlashKind.UPDATE_CHAR,
+                            BuiltinSlashKind.DUPLICATE,
+                            BuiltinSlashKind.RENAME -> stringResource(R.string.slash_category_character)
+                            BuiltinSlashKind.HELP -> stringResource(R.string.slash_category_other)
+                            null -> stringResource(R.string.slash_category_skills)
+                            else -> stringResource(R.string.slash_category_message)
+                        }
+                    }
+                    var expandedCmd by remember { mutableStateOf<String?>(null) }
+                    val categoryOrder = listOf(stringResource(R.string.slash_category_message), stringResource(R.string.slash_category_character), stringResource(R.string.slash_category_variables), stringResource(R.string.slash_category_skills), stringResource(R.string.slash_category_other))
+                    categoryOrder.forEach { category ->
+                        val cmds = groupedCommands[category] ?: return@forEach
+                        Text(
+                            text = category,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        )
+                        cmds.forEachIndexed { index, cmd ->
+                            SlashCommandItem(
+                                cmd = cmd,
+                                fullDescription = true,
+                                expanded = expandedCmd == cmd.name,
+                                onToggleExpand = if (cmd.params.isNotEmpty() || cmd.examples.isNotEmpty()) {
+                                    { expandedCmd = if (expandedCmd == cmd.name) null else cmd.name }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    if (cmd.builtinKind != null) {
+                                        if (cmd.argumentHint.isBlank()) {
+                                            // 无参数命令：点击直接执行
+                                            handleBuiltinSlash(
+                                                cmd = cmd,
+                                                args = "",
+                                                state = state,
+                                                toaster = toaster,
+                                                settings = settings,
+                                                assistant = assistant,
+                                                onUpdateAssistant = onUpdateAssistant,
+                                                onSlashDuplicate = onSlashDuplicate,
+                                                onSlashInsert = onSlashInsert,
+                                                onSlashPersona = onSlashPersona,
+                                                onSlashTrigger = onSlashTrigger,
+                                                onSlashSysgen = onSlashSysgen,
+                                                                        onSlashVar = onSlashVar,
+                                                onShowHelp = onShowHelp,
+                                                onSlashContinue = onSlashContinue,
+                                                onSlashImpersonate = onSlashImpersonate,
+                                                onSlashRerollPick = onSlashRerollPick,
+                                                onSlashGen = onSlashGen,
+                                                onSlashHide = onSlashHide,
+                                                onSlashSwipe = onSlashSwipe,
+                                                onSlashScript = onSlashScript,
+                                                context = slashContext,
+                                            )
+                                        } else {
+                                            // 需要参数的命令：填入输入框，补参数后发送
+                                            state.setMessageText("/${cmd.name} ")
+                                        }
+                                    } else {
+                                        // 技能命令：展开内容填入输入框
+                                        var text = cmd.content
+                                            .replace("\$ARGUMENTS", "")
+                                            .replace("\$ARGS", "")
+                                        for (i in 0..9) {
+                                            text = text.replace("\$ARGS.$i", "")
+                                        }
+                                        state.setMessageText(text)
+                                    }
+                                    onDismissHelpDialog()
+                                },
+                            )
+                            if (index < cmds.size - 1) {
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(horizontal = 10.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                                    thickness = 0.5.dp,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 斜杠命令弹窗
+        if (showSlashPopup && slashCommands.isNotEmpty()) {
+            val filtered = slashCommands.filter {
+                it.name.contains(slashFilter, ignoreCase = true)
+            }
+            if (filtered.isNotEmpty()) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(AppRadii.md),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shadowElevation = 8.dp,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .padding(AppSpacing.xs)
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        filtered.forEachIndexed { index, cmd ->
+                            SlashCommandItem(
+                                cmd = cmd,
+                                onClick = {
+                                    if (cmd.builtinKind != null) {
+                                        if (cmd.argumentHint.isBlank()) {
+                                            // 无参数命令（argumentHint 为空）：点击直接执行（如 /trigger /help），不污染聊天
+                                            handleBuiltinSlash(
+                                                cmd = cmd,
+                                                args = slashArgs,
+                                                state = state,
+                                                toaster = toaster,
+                                                settings = settings,
+                                                assistant = assistant,
+                                                onUpdateAssistant = onUpdateAssistant,
+                                                onSlashDuplicate = onSlashDuplicate,
+                                                onSlashInsert = onSlashInsert,
+                                                onSlashPersona = onSlashPersona,
+                                                onSlashTrigger = onSlashTrigger,
+                                                onSlashSysgen = onSlashSysgen,
+                                                                        onSlashVar = onSlashVar,
+                                                onShowHelp = onShowHelp,
+                                                onSlashContinue = onSlashContinue,
+                                                onSlashImpersonate = onSlashImpersonate,
+                                                onSlashRerollPick = onSlashRerollPick,
+                                                onSlashGen = onSlashGen,
+                                                onSlashHide = onSlashHide,
+                                                onSlashSwipe = onSlashSwipe,
+                                                onSlashScript = onSlashScript,
+                                                context = slashContext,
+                                            )
+                                        } else {
+                                            // 需要参数的命令：填入输入框，补参数后按发送执行（官方 AutoComplete 行为）
+                                            state.setMessageText("/${cmd.name} ${slashArgs}".trimEnd())
+                                        }
+                                    } else {
+                                        val argsList = slashArgs.split(" ", limit = 10)
+                                        var text = cmd.content
+                                            .replace("\$ARGUMENTS", slashArgs)
+                                            .replace("\$ARGS", slashArgs)
+                                        // $ARGS.0, $ARGS.1 ... 按位置替换
+                                        for (i in 0..9) {
+                                            val value = argsList.getOrElse(i) { "" }
+                                            text = text.replace("\$ARGS.$i", value)
+                                        }
+                                        state.setMessageText(text)
+                                    }
+                                    showSlashPopup = false
+                                },
+                            )
+                            if (index < filtered.size - 1) {
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(horizontal = 10.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                                    thickness = 0.5.dp,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        TextField(
+            state = state.textContent,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("chat_input")
+                .contentReceiver(receiveContentListener)
+                .onFocusChanged {
+                    isFocused = it.isFocused
+                },
+            shape = MaterialTheme.shapes.largeIncreased,
+            placeholder = {
+                Text(stringResource(R.string.chat_input_placeholder))
+            },
+            lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 5),
+            keyboardOptions = KeyboardOptions(
+                imeAction = if (settings.displaySetting.sendOnEnter) ImeAction.Send else ImeAction.Default
+            ),
+            onKeyboardAction = {
+                if (settings.displaySetting.sendOnEnter && !state.isEmpty()) {
+                    onSendMessage()
+                }
+            },
+            colors = TextFieldDefaults.colors().copy(
+                unfocusedIndicatorColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+            ),
+            trailingIcon = {
+                if (isFocused) {
+                    IconButton(
+                        onClick = {
+                            isFullScreen = !isFullScreen
+                        }) {
+                        Icon(HugeIcons.FullScreen, null)
+                    }
+                }
+            },
+            leadingIcon = if (quickMessages.isNotEmpty()) {
+                {
+                    QuickMessageButton(
+                        quickMessages = quickMessages,
+                        state = state,
+                        onQuickMessageExecute = onQuickMessageExecute,
+                    )
+                }
+            } else null,
+        )
+        if (isFullScreen) {
+            FullScreenEditor(state = state) {
+                isFullScreen = false
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompletionPopup(
+    completionList: ChatCompletionList,
+    onItemClick: (ChatCompletionItem) -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 280.dp),
+        shape = RoundedCornerShape(18.dp),
+        tonalElevation = 2.dp,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+        ) {
+            items(
+                items = completionList.items,
+                key = { item -> "${item.label}:${item.insertText}" },
+            ) { item ->
+                Surface(
+                    onClick = { onItemClick(item) },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color.Transparent,
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        item.icon?.let { icon ->
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = item.label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            item.detail?.let { detail ->
+                                Text(
+                                    text = detail,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun ChatInputState.applyCompletion(
+    replacementRange: TextRange,
+    item: ChatCompletionItem,
+) {
+    val textLength = textContent.text.length
+    val start = replacementRange.min.coerceIn(0, textLength)
+    val end = replacementRange.max.coerceIn(start, textLength)
+    textContent.edit {
+        replace(start, end, item.insertText)
+        selection = TextRange(start + item.insertText.length)
+    }
+}
+
+/**
+ * 斜杠命令行（斜杠建议弹窗与 /help 列表共用）
+ * fullDescription=true 时显示完整描述（/help 用），否则单行省略（建议弹窗用）
+ * /help 模式下有参数/例句的命令可点击箭头展开详情
+ */
+@Composable
+private fun SlashCommandItem(
+    cmd: SlashCommand,
+    onClick: () -> Unit,
+    fullDescription: Boolean = false,
+    expanded: Boolean = false,
+    onToggleExpand: (() -> Unit)? = null,
+) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        color = Color.Transparent,
+    ) {
+        Column(modifier = Modifier.padding(12.dp, 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "/${cmd.name}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                if (cmd.argumentHint.isNotBlank()) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = cmd.argumentHint,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = cmd.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = if (fullDescription) Int.MAX_VALUE else 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (cmd.disableModelInvocation) {
+                    Spacer(Modifier.width(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(AppRadii.xs),
+                        color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.slash_ui_script_badge),
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = AppType.micro),
+                            color = MaterialTheme.colorScheme.tertiary,
+                        )
+                    }
+                }
+                if (onToggleExpand != null && (cmd.params.isNotEmpty() || cmd.examples.isNotEmpty())) {
+                    Spacer(Modifier.width(6.dp))
+                    IconButton(
+                        onClick = onToggleExpand,
+                        modifier = Modifier.size(24.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (expanded) Lucide.ChevronUp else Lucide.ChevronDown,
+                            contentDescription = if (expanded) stringResource(R.string.slash_ui_collapse) else stringResource(R.string.slash_ui_expand),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
+            if (expanded) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp),
+                    shape = RoundedCornerShape(AppRadii.sm),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                        if (cmd.params.isNotEmpty()) {
+                            Text(
+                                text = stringResource(R.string.slash_help_params),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(bottom = 4.dp),
+                            )
+                            cmd.params.forEach { param ->
+                                Column(modifier = Modifier.padding(bottom = 5.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Surface(
+                                            shape = RoundedCornerShape(AppRadii.xs),
+                                            color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f),
+                                        ) {
+                                            Text(
+                                                text = stringResource(param.nameRes),
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            )
+                                        }
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = stringResource(param.descRes),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Text(
+                                        text = stringResource(R.string.slash_help_example_prefix) + stringResource(param.exampleRes),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                                        modifier = Modifier.padding(start = 2.dp, top = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                        if (cmd.examples.isNotEmpty()) {
+                            Text(
+                                text = stringResource(R.string.slash_help_examples),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 2.dp, bottom = 4.dp),
+                            )
+                            cmd.examples.forEach { example ->
+                                Column(modifier = Modifier.padding(bottom = 5.dp)) {
+                                    Text(
+                                        text = stringResource(example.commandRes),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Text(
+                                        text = stringResource(example.descRes),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 2.dp, top = 1.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 执行内置斜杠命令（官方常用命令的实用子集）
+ */
+private fun handleBuiltinSlash(
+    cmd: SlashCommand,
+    args: String,
+    state: ChatInputState,
+    toaster: com.dokar.sonner.ToasterState,
+    settings: Settings,
+    assistant: Assistant,
+    onUpdateAssistant: (Assistant) -> Unit,
+    onSlashDuplicate: (() -> Unit)?,
+    onSlashInsert: ((MessageRole, String, String?, Int?) -> Unit)?,
+    onSlashPersona: ((String, String) -> Unit)?,
+    onSlashTrigger: (() -> Unit)?,
+    onSlashSysgen: ((String, String?, Int?, Boolean) -> Unit)?,
+    onSlashVar: ((SlashVarOp, String, String) -> String?)?,
+    onShowHelp: () -> Unit = {},
+    onSlashContinue: ((String) -> Unit)? = null,
+    onSlashImpersonate: ((String) -> Unit)? = null,
+    onSlashRerollPick: ((String) -> Unit)? = null,
+    onSlashGen: ((ChatService.GenArgs, (String) -> Unit) -> Unit)? = null,
+    onSlashJs: ((String) -> Unit)? = null,
+    onSlashTavern: ((String) -> Unit)? = null,
+    onSlashHide: ((String, Boolean, String?) -> Unit)? = null,
+    onSlashSwipe: ((String, Boolean) -> Unit)? = null,
+    onSlashScript: ((String) -> String?)? = null,
+    context: android.content.Context,
+) {
+    when (cmd.builtinKind) {
+        BuiltinSlashKind.HELP -> {
+            // 在 UI 里列出全部可用命令，不再弹 toast
+            onShowHelp()
+        }
+
+        BuiltinSlashKind.CONTINUE -> {
+            if (onSlashContinue == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashContinue(args.trim())
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.IMPERSONATE -> {
+            if (onSlashImpersonate == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // 官方：生成前清空输入框（防递归），结果流式写入输入框
+                state.clearInput()
+                onSlashImpersonate(args.trim())
+            }
+        }
+
+        BuiltinSlashKind.REROLL_PICK -> {
+            if (onSlashRerollPick == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashRerollPick(args.trim())
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.GEN -> {
+            val parsed = parseGenArgs(args)
+            if (parsed.prompt.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_gen_usage))
+            } else if (onSlashGen == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // 官方 /gen 结果走管道（常配 /setinput 写输入框）；本地无管道，直接填输入框：
+                // trim=true 替换；否则追加到输入框原有文本之后（官方 setInputTextAfterPrompt 语义，
+                // 追加在 prompt 之后）。执行命令时输入框里只有命令本身，命令外文本为空，
+                // 若把命令本身也算进去再写回输入框，会再次匹配 /gen 无限递归。
+                val full = state.textContent.text.toString().trimEnd()
+                val keep = if (full.startsWith("/")) "" else full
+                state.clearInput()
+                onSlashGen(parsed) { draft ->
+                    val merged = if (parsed.trim || keep.isBlank()) draft else "$keep\n\n$draft"
+                    state.setMessageText(merged)
+                    toaster.show(if (parsed.trim) context.getString(R.string.slash_toast_gen_done_replace) else context.getString(R.string.slash_toast_gen_done_append))
+                }
+            }
+        }
+
+        BuiltinSlashKind.SYS -> {
+            val parsed = parseInsertArgs(args)
+            // 官方 NARRATOR_NAME_DEFAULT = "System"（/sys 默认名），可 /sysname 修改（本地不支持，固定 System）
+            val name = parsed.name ?: "System"
+            if (parsed.text.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_sys_usage))
+            } else if (onSlashInsert == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashInsert(MessageRole.SYSTEM, parsed.text, name, parsed.at)
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.SENDAS -> {
+            val parsed = parseInsertArgs(args)
+            // 官方行为：不带 name= 时默认使用当前角色卡名字（name2），让 AI 明确认领这条消息
+            val charName = assistant.tavernData?.name?.takeIf { it.isNotBlank() } ?: assistant.name
+            val name = parsed.name ?: charName.ifBlank { null }
+            if (parsed.text.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_sendas_usage))
+            } else if (onSlashInsert == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashInsert(MessageRole.ASSISTANT, parsed.text, name, parsed.at)
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.SEND -> {
+            val parsed = parseInsertArgs(args)
+            if (parsed.text.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_send_usage))
+            } else if (onSlashInsert == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // 官方 /send 默认 name1（当前人设名/用户名）
+                val personaName = settings.personas.firstOrNull { it.id == settings.activePersonaId }?.name
+                val defaultName = personaName
+                    ?: settings.displaySetting.userNickname.ifBlank { null }
+                onSlashInsert(MessageRole.USER, parsed.text, parsed.name ?: defaultName, parsed.at)
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.PERSONA -> {
+            val mode = Regex("mode=(\\S+)", RegexOption.IGNORE_CASE)
+                .find(args)?.groupValues?.get(1)?.lowercase() ?: "all"
+            if (mode !in listOf("lookup", "temp", "all")) {
+                toaster.show(context.getString(R.string.slash_toast_persona_mode))
+            } else if (onSlashPersona != null) {
+                val name = args.replace(Regex("mode=(\"[^\"]*\"|\\S+)", RegexOption.IGNORE_CASE), "").trim()
+                onSlashPersona(name, mode)
+                state.clearInput()
+            } else {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            }
+        }
+
+        BuiltinSlashKind.TRIGGER -> {
+            if (onSlashTrigger != null) {
+                onSlashTrigger()
+                state.clearInput()
+            } else {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            }
+        }
+
+        BuiltinSlashKind.SYSGEN -> {
+            val parsed = parseInsertArgs(args, allowTrim = true)
+            // 官方 NARRATOR_NAME_DEFAULT = "System"（/sysgen 默认名，sendNarratorMessage 同 /sys）
+            val name = parsed.name ?: "System"
+            if (parsed.text.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_sysgen_usage))
+            } else if (onSlashSysgen == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashSysgen(parsed.text, name, parsed.at, parsed.trim)
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.JS -> {
+            val code = args.trim()
+            if (code.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_js_usage))
+            } else if (onSlashJs == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                onSlashJs(code)
+                state.clearInput()
+            }
+        }
+        BuiltinSlashKind.TAVERN -> {
+            val sub = args.trim().lowercase()
+            if (onSlashTavern == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else if (sub == "reload" || sub == "status") {
+                onSlashTavern(sub)
+                state.clearInput()
+            } else {
+                toaster.show(context.getString(R.string.slash_toast_tavern_usage))
+            }
+        }
+
+        BuiltinSlashKind.HIDE, BuiltinSlashKind.UNHIDE -> {
+            if (onSlashHide == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // 官方 /hide [索引/范围] [name=过滤器]：value 为空 = 最后一条（hideMessageCallback 语义）
+                val (named, rest) = StSlashParser.extractNamedArgs(args)
+                val value = StSlashParser.unwrapQuotes(rest)
+                onSlashHide(
+                    value,
+                    cmd.builtinKind == BuiltinSlashKind.UNHIDE,
+                    named["name"]?.trim()?.takeIf { it.isNotBlank() },
+                )
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.SWIPE -> {
+            if (onSlashSwipe == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // 官方 /swipe [direction=left|right] [await=true|false]：direction 仅 left 视为左向
+                val (named, _) = StSlashParser.extractNamedArgs(args)
+                val direction = if (named["direction"].equals("left", ignoreCase = true)) "left" else "right"
+                val await = isTrueBoolean(named["await"] ?: "")
+                onSlashSwipe(direction, await)
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.CHECKPOINT_CREATE,
+        BuiltinSlashKind.CHECKPOINT_GO,
+        BuiltinSlashKind.CHECKPOINT_EXIT,
+        BuiltinSlashKind.CHECKPOINT_PARENT,
+        BuiltinSlashKind.CHECKPOINT_GET,
+        BuiltinSlashKind.CHECKPOINT_LIST,
+        BuiltinSlashKind.BRANCH_CREATE -> {
+            if (onSlashScript == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                // checkpoint 族：整条命令转交 STscript 中枢执行（与 JS / 快速回复同通道，语义一致）
+                val script = "/${cmd.name}" + if (args.isBlank()) "" else " $args"
+                val result = onSlashScript(script)
+                if (!result.isNullOrBlank()) {
+                    toaster.show(result)
+                }
+                state.clearInput()
+            }
+        }
+
+        BuiltinSlashKind.VAR -> {
+            val op = when (cmd.name) {
+                "setvar" -> SlashVarOp.SET
+                "getvar" -> SlashVarOp.GET
+                "addvar" -> SlashVarOp.ADD
+                "incvar" -> SlashVarOp.INC
+                "decvar" -> SlashVarOp.DEC
+                "flushvar" -> SlashVarOp.FLUSH
+                "listvar" -> SlashVarOp.LIST
+                else -> null
+            } ?: return
+
+            if (op == SlashVarOp.LIST) {
+                val result = onSlashVar?.invoke(op, "", "")
+                if (result == null) {
+                    toaster.show(context.getString(R.string.slash_toast_not_supported))
+                } else {
+                    toaster.show(result)
+                }
+                state.clearInput()
+                return
+            }
+
+            val trimmed = args.trim()
+            // 官方：key= 命名参数可出现在任意位置、支持引号；剩余内容作为值
+            val keyMatch = Regex("(^|\\s)key=(\"[^\"]*\"|\\S+)", RegexOption.IGNORE_CASE).find(trimmed)
+            val key: String
+            val value: String
+            if (keyMatch != null) {
+                var kv = keyMatch.groupValues[2]
+                if (kv.startsWith("\"") && kv.endsWith("\"")) {
+                    kv = kv.substring(1, kv.length - 1)
+                }
+                key = kv
+                value = trimmed.removeRange(keyMatch.range.first, keyMatch.range.last + 1).trim()
+            } else {
+                key = trimmed.substringBefore(" ").trim()
+                value = trimmed.substringAfter(" ", "").trim()
+            }
+            val needsValue = op == SlashVarOp.SET || op == SlashVarOp.ADD
+            if (key.isBlank() || (needsValue && value.isBlank())) {
+                toaster.show(
+                    if (needsValue) context.getString(R.string.slash_toast_var_usage_value, cmd.name) else context.getString(R.string.slash_toast_var_usage, cmd.name)
+                )
+                return
+            }
+
+            val result = onSlashVar?.invoke(op, key, value)
+            if (result == null) {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            } else {
+                toaster.show(result)
+            }
+            state.clearInput()
+        }
+
+        BuiltinSlashKind.RENAME -> {
+            val newName = args.trim()
+            if (newName.isBlank()) {
+                toaster.show(context.getString(R.string.slash_toast_rename_usage))
+            } else {
+                onUpdateAssistant(
+                    assistant.copy(
+                        name = newName,
+                        tavernData = assistant.tavernData?.copy(name = newName),
+                    )
+                )
+                toaster.show(context.getString(R.string.slash_toast_renamed, newName))
+            }
+        }
+
+        BuiltinSlashKind.UPDATE_CHAR -> {
+            // 官方 char-update：多个 字段=值 同时更新，字段名为驼峰（firstMessage/messageExamples/...），
+            // 兼容本地下划线别名；命名参数可从任意位置提取
+            val updates = mutableListOf<Pair<String, String>>()
+            var rest = args
+            while (true) {
+                val m = Regex("(^|\\s)([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"]*\"|\\S+)").find(rest) ?: break
+                var value = m.groupValues[3]
+                if (value.startsWith("\"") && value.endsWith("\"")) {
+                    value = value.substring(1, value.length - 1)
+                }
+                updates += m.groupValues[2].lowercase() to value
+                rest = rest.removeRange(m.range.first, m.range.last + 1).trim()
+            }
+            if (updates.isEmpty()) {
+                toaster.show(context.getString(R.string.slash_toast_char_update_usage))
+                return
+            }
+            var currentTav = assistant.tavernData ?: run {
+                toaster.show(context.getString(R.string.slash_toast_no_char_card))
+                return
+            }
+            var nameChanged = false
+            val applied = mutableListOf<String>()
+            var unknown: String? = null
+            for ((field, value) in updates) {
+                when (field) {
+                    "name" -> { currentTav = currentTav.copy(name = value); nameChanged = true; applied += context.getString(R.string.slash_field_name) }
+                    "description" -> { currentTav = currentTav.copy(description = value); applied += context.getString(R.string.slash_field_description) }
+                    "personality" -> { currentTav = currentTav.copy(personality = value); applied += context.getString(R.string.slash_field_personality) }
+                    "scenario" -> { currentTav = currentTav.copy(scenario = value); applied += context.getString(R.string.slash_field_scenario) }
+                    "systemprompt", "system_prompt" -> { currentTav = currentTav.copy(systemPrompt = value); applied += context.getString(R.string.slash_field_system_prompt) }
+                    "firstmessage", "first_mes" -> { currentTav = currentTav.copy(firstMessage = value); applied += context.getString(R.string.slash_field_first_message) }
+                    "messageexamples", "mesexample", "mes_example" -> { currentTav = currentTav.copy(mesExample = value); applied += context.getString(R.string.slash_field_message_examples) }
+                    "posthistoryinstructions", "post_history_instructions", "phi" -> { currentTav = currentTav.copy(postHistoryInstructions = value); applied += context.getString(R.string.slash_field_post_history_instructions) }
+                    "creator" -> { currentTav = currentTav.copy(creator = value); applied += context.getString(R.string.slash_field_creator) }
+                    "creatornotes", "creator_notes" -> { currentTav = currentTav.copy(creatorNotes = value); applied += context.getString(R.string.slash_field_creator_notes) }
+                    "characterversion", "character_version" -> { currentTav = currentTav.copy(characterVersion = value); applied += context.getString(R.string.slash_field_character_version) }
+                    "tags" -> { currentTav = currentTav.copy(tags = value.split(',').map { it.trim() }.filter { it.isNotBlank() }); applied += context.getString(R.string.slash_field_tags) }
+                    else -> unknown = field
+                }
+            }
+            onUpdateAssistant(assistant.copy(name = if (nameChanged) currentTav.name else assistant.name, tavernData = currentTav))
+            if (applied.isNotEmpty()) toaster.show(context.getString(R.string.slash_toast_char_updated, applied.joinToString(context.getString(R.string.slash_field_sep))))
+            if (unknown != null) toaster.show(context.getString(R.string.slash_toast_unknown_field, unknown))
+        }
+
+        BuiltinSlashKind.DUPLICATE -> {
+            if (onSlashDuplicate != null) {
+                onSlashDuplicate()
+            } else {
+                toaster.show(context.getString(R.string.slash_toast_not_supported))
+            }
+        }
+
+        null -> Unit
+    }
+}
+
+@Composable
+private fun QuickMessageButton(
+    quickMessages: List<QuickMessage>,
+    state: ChatInputState,
+    onQuickMessageExecute: ((QuickMessage) -> Unit)? = null,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    IconButton(
+        onClick = {
+            expanded = !expanded
+        }) {
+        Icon(HugeIcons.Zap, null)
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier
+                .widthIn(min = 200.dp, max = 360.dp)
+        ) {
+            quickMessages.forEach { quickMessage ->
+                Surface(
+                    onClick = {
+                        // 自动执行（对齐酒馆 QR）：有宿主时直接运行，否则退回填入输入框
+                        if (quickMessage.autoExecute && onQuickMessageExecute != null) {
+                            onQuickMessageExecute.invoke(quickMessage)
+                        } else {
+                            state.appendText(quickMessage.content)
+                        }
+                        expanded = false
+                    },
+                    color = Color.Transparent,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(AppSpacing.sm)
+                    ) {
+                        Text(
+                            text = if (quickMessage.autoExecute) "${quickMessage.title} ⚡" else quickMessage.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = quickMessage.content,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FullScreenEditor(
+    state: ChatInputState, onDone: () -> Unit
+) {
+    BasicAlertDialog(
+        onDismissRequest = {
+            onDone()
+        },
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false, decorFitsSystemWindows = false
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+                .imePadding(),
+            verticalArrangement = Arrangement.Bottom
+        ) {
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = 800.dp)
+                    .fillMaxHeight(0.9f),
+                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(AppSpacing.sm)
+                        .fillMaxSize(),
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(AppSpacing.sm),
+                ) {
+                    Row {
+                        TextButton(
+                            onClick = {
+                                onDone()
+                            }) {
+                            Text(stringResource(R.string.chat_page_save))
+                        }
+                    }
+                    TextField(
+                        state = state.textContent,
+                        modifier = Modifier
+                            .padding(bottom = 2.dp)
+                            .fillMaxSize(),
+                        shape = RoundedCornerShape(AppRadii.xxxl),
+                        placeholder = {
+                            Text(stringResource(R.string.chat_input_placeholder))
+                        },
+                        colors = TextFieldDefaults.colors().copy(
+                            unfocusedIndicatorColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 解析消息插入类命令（/sys /sendas /send /sysgen）的参数：
+ * 支持任意顺序的 name="显示名" / name=显示名、at=位置、trim=布尔（sysgen 专用）参数，
+ * 其余部分为消息文本；不带 name= 时使用默认身份，不带 at= 时追加到末尾。
+ */
+private data class InsertArgs(val name: String?, val at: Int?, val text: String, val trim: Boolean = false)
+
+/**
+ * 官方 isTrueBoolean：true/1/on（大小写不敏感）。
+ */
+private fun isTrueBoolean(value: String): Boolean =
+    value.equals("true", ignoreCase = true) || value == "1" || value.equals("on", ignoreCase = true)
+
+/**
+ * 解析插消息类命令参数（sys/send/sendas/sysgen）。
+ * 官方 SlashCommandParser 允许命名参数出现在任意位置（不仅开头），
+ * 解析后从原文剥离，剩余作为正文。
+ */
+private fun parseInsertArgs(raw: String, allowTrim: Boolean = false): InsertArgs {
+    var args = raw.trim()
+    var name: String? = null
+    var at: Int? = null
+    var trim = false
+    while (true) {
+        // 官方命名参数可从任意位置提取（不在开头也能解析）
+        val m = Regex("(^|\\s)(name|at|trim)=(\"[^\"]*\"|\\S+)", RegexOption.IGNORE_CASE).find(args) ?: break
+        val key = m.groupValues[2].lowercase()
+        var value = m.groupValues[3]
+        if (value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length - 1)
+        }
+        when (key) {
+            "name" -> name = value
+            "at" -> at = value.toIntOrNull()
+            // 官方 /sys /send /sendas 没有 trim 参数，正文里的 "trim=..." 应原样保留
+            "trim" -> if (allowTrim) trim = isTrueBoolean(value)
+        }
+        args = args.removeRange(m.range.first, m.range.last + 1).trim()
+    }
+    return InsertArgs(name, at, args.trim(), trim)
+}
+
+/**
+ * 解析 /gen 参数（官方 generateCallback：trim/lock/name/length/as）。
+ * 官方 as 缺省即 'system'，只有 char 特殊（quietToLoud），其他值一律按 system 处理。
+ */
+private fun parseGenArgs(raw: String): ChatService.GenArgs {
+    var args = raw.trim()
+    var asRole = ChatService.QuietPromptAs.SYSTEM
+    var lock = false
+    var length = 0
+    var name: String? = null
+    var trim = false
+    while (true) {
+        val m = Regex("(^|\\s)(as|lock|length|name|trim)=(\"[^\"]*\"|\\S+)", RegexOption.IGNORE_CASE).find(args) ?: break
+        val key = m.groupValues[2].lowercase()
+        var value = m.groupValues[3]
+        if (value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length - 1)
+        }
+        when (key) {
+            "as" -> asRole = when (value.lowercase()) {
+                "char" -> ChatService.QuietPromptAs.CHAR
+                else -> ChatService.QuietPromptAs.SYSTEM
+            }
+            "lock" -> lock = isTrueBoolean(value)
+            "length" -> length = value.toIntOrNull() ?: 0
+            "name" -> name = value
+            "trim" -> trim = isTrueBoolean(value)
+        }
+        args = args.removeRange(m.range.first, m.range.last + 1).trim()
+    }
+    return ChatService.GenArgs(prompt = args, asRole = asRole, lock = lock, length = length, name = name, trim = trim)
+}
