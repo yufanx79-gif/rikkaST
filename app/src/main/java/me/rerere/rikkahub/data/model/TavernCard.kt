@@ -1,0 +1,118 @@
+package me.rerere.rikkahub.data.model
+
+import kotlinx.serialization.Serializable
+import me.rerere.rikkahub.data.st.regex.RegexScript
+
+/**
+ * 酒馆角色卡结构化数据
+ * 从 V2/V3 spec 完整解析，不丢失任何字段
+ */
+@Serializable
+data class TavernCharacterData(
+    val spec: String = "",                          // "chara_card_v2" or "chara_card_v3"
+    val specVersion: String = "",                    // e.g. "3.0"
+    val name: String = "",
+    val description: String = "",
+    val personality: String = "",
+    val scenario: String = "",
+    val firstMessage: String = "",                   // 开场白
+    val alternateGreetings: List<String> = emptyList(), // 备选开场白
+    val mesExample: String = "",                     // 示例对话
+    val systemPrompt: String = "",                   // 系统提示词（角色卡原始system_prompt）
+    val creator: String = "",                        // 作者
+    val creatorNotes: String = "",                   // 作者备注
+    val characterVersion: String = "",               // 角色版本
+    val tags: List<String> = emptyList(),            // 文本标签
+    val postHistoryInstructions: String = "",        // 历史后指令
+    val extensions: Map<String, String> = emptyMap(), // V3 扩展字段
+    val extensionsRaw: String = "",                  // V3 扩展字段原始 JSON（无损保留，导出时原样带回）
+    val assets: List<TavernAsset> = emptyList(),     // V3 资源引用
+    val groupOnlyGreetings: List<String> = emptyList(), // 群聊专用开场白
+    // V3 高级字段（官方 spec，导入解析、导出原样写回）
+    val nickname: String = "",                       // 角色别名（{{char}} 占位符替换用）
+    val creatorNotesMultilingual: String = "",       // 多语言作者备注原始 JSON（无损保留）
+    val source: List<String> = emptyList(),          // 来源引用 URL/ID 列表
+    val creationDate: String = "",                   // 创建时间戳原始 JSON 文本（数字/字符串原样带回）
+    val modificationDate: String = "",               // 修改时间戳原始 JSON 文本
+    // 官方深度提示（extensions.depth_prompt）：按指定深度/角色注入对话
+    val depthPrompt: String = "",                    // depth_prompt.prompt 文本
+    val depthPromptDepth: Int = 4,                   // depth_prompt.depth（官方默认 4）
+    val depthPromptRole: String = "system",          // depth_prompt.role（官方默认 system）
+    // 内嵌世界书
+    val embeddedBook: TavernEmbeddedBook? = null,
+    // 角色卡内嵌正则（data.extensions.regex_scripts，酒馆 RegexScriptData 数组；导入时自动识别）
+    val embeddedRegexScripts: List<RegexScript> = emptyList(),
+)
+
+@Serializable
+data class TavernAsset(
+    val type: String = "",      // "image", "audio", etc.
+    val name: String = "",
+    val uri: String = "",       // asset URI
+    val ext: String = "",       // file extension
+)
+
+/**
+ * 内嵌世界书（character_book）
+ * 对齐酒馆 V2/V3 world book 格式
+ */
+@Serializable
+data class TavernEmbeddedBook(
+    val name: String = "",
+    val description: String = "",
+    val extensions: Map<String, String> = emptyMap(),
+    val extensionsRaw: String = "",              // 顶层 extensions 原始 JSON（无损保留，导出优先）
+    val entries: List<TavernBookEntry> = emptyList(),
+)
+
+@Serializable
+data class TavernBookEntry(
+    val id: Int = 0,
+    val keys: List<String> = emptyList(),
+    val secondaryKeys: List<String> = emptyList(),
+    val comment: String = "",
+    val content: String = "",
+    val constant: Boolean = false,
+    val selective: Boolean = false,
+    val selectiveLogic: Int = 0,  // 官方 world_info_logic: 0=AND_ANY 1=NOT_ALL 2=NOT_ANY 3=AND_ALL
+    val group: String = "",
+    val position: Int = 1,        // 官方枚举: 0=before_char 1=after_char 2=ANTop 3=ANBottom 4=atDepth 5=EMTop 6=EMBottom 7=outlet
+    val priority: Int = 100,      // order/priority，官方降序注入（order 大的先）
+    val disable: Boolean = false,
+    val caseSensitive: Boolean = false,
+    val matchWholeWords: Boolean = false, // 整词匹配（酒馆 extensions.match_whole_words）
+    val useRegex: Boolean = false,
+    val probability: Int = 100,   // 0-100, 触发概率
+    val sticky: Int = 0,          // 激活后持续保留N轮（0=不粘）
+    val cooldown: Int = 0,       // 冷却轮数
+    val depth: Int = 4,          // @D 模式插入深度
+    val scanDepth: Int? = null,  // 扫描最近N条消息；null = 用全局默认（官方 world_info_depth=2）
+    val role: String = "system", // system/user/assistant（JSON兼容数字和字符串）
+    val groupWeight: Int = 100,  // 同组权重（随机选择时使用）
+    val groupOverride: Boolean = false, // 是否覆盖同组其他条目
+    val delay: Int = 0,          // 延迟激活轮数（0=立即，酒馆 extensions.delay）
+    val excludeRecursion: Boolean = false, // 内容不参与递归扫描（酒馆 extensions.exclude_recursion）
+    val preventRecursion: Boolean = false, // 禁止被递归触发（酒馆 extensions.prevent_recursion）
+    // 官方 extensions.delay_until_recursion：true 或数字层级（1/2/3…）；0=关闭
+    @Serializable(with = DelayUntilRecursionSerializer::class)
+    val delayUntilRecursion: Int = 0,
+    val useProbability: Boolean = false, // 是否启用概率过滤（酒馆默认false）
+    val inclusionGroup: String = "", // 本地遗留字段（官方无此字段；官方分组用顶层 group 逗号分隔）
+    val useGroupScoring: Boolean = false, // 酒馆 extensions.use_group_scoring
+    val groupPriority: Boolean = false, // 本地遗留字段（官方无此字段；官方优先用 group_override）
+    val automationId: String = "", // 酒馆 extensions.automation_id
+    val displayIndex: Int = 0, // 酒馆 display_index
+    val displayPosition: Int = 0, // 酒馆 display_position
+    val triggers: List<String> = emptyList(), // 酒馆 triggers
+    val extensionsRaw: String = "", // 条目 extensions 原始 JSON（无损保留，导出优先）
+    // 酒馆 match_* 扫描开关（默认 false = 只扫聊天，与官方一致）
+    val matchPersonaDescription: Boolean = false,    // extensions.match_persona_description
+    val matchCharacterDescription: Boolean = false,  // extensions.match_character_description
+    val matchCharacterPersonality: Boolean = false,  // extensions.match_character_personality
+    val matchCharacterDepthPrompt: Boolean = false,  // extensions.match_character_depth_prompt
+    val matchScenario: Boolean = false,              // extensions.match_scenario
+    val matchCreatorNotes: Boolean = false,          // extensions.match_creator_notes
+    val ignoreBudget: Boolean = false,               // extensions.ignore_budget（跳过预算上限）
+    // 官方 extensions.outlet_name：position=7（outlet）条目的出口名（被 {{outlet::name}} 宏引用时展开）
+    val outletName: String = "",
+)
