@@ -1,0 +1,86 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.cursor
+.history
+.kotlin
+__pycache__/
+tmp_stellium/
+build.log
+stelli/
+# 本地调研/验证报告，不推远程
+*research_*.json
+*验证报告*
+*_verification_report.*
+verification_report.*
+
+# ============================================================
+# 本地私有仓库补充（2026-09-30）
+# 原则：仓库里只放"能重建出 APK 的东西"，不放任何构建产物/缓存
+# ============================================================
+
+# 前端依赖与产物（web-ui/node_modules 有 328 MB，绝不入库）
+**/node_modules/
+**/.pnpm-store/
+
+# Kotlin / Gradle / R8 缓存与产物
+# （app/build 有 1.7 GB：mapping.txt 200 MB、APK 171 MB×2）
+**/build/
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+**/.idea/
+
+# Python 缓存
+**/__pycache__/
+*.pyc
+
+# 构建与调试产物
+*.apk
+*.aab
+*.ap_
+*.hprof
+
+# 本流水线自己的日志
+_build.log
+_build.err
+
+
+# ============================================================
+# 隐私 / 安全：绝不入库（2026-10-07）
+# ============================================================
+# 签名密钥库与密码（local.properties 含 storePassword/keyPassword 明文）
+local.properties
+*.jks
+*.keystore
+*.p12
+keystore.properties
+signing.properties
+
+# 本机私有环境
+.idea/
+.vscode/
+*.log
+
+# 内部开发笔记（含本机路径 / 设备 IP / 交接文档，不随开源仓库发布）
+notes/
+
+# 只读参考依赖（含 SillyTavern 完整源码与第三方扩展，切勿提交）
+refdeps/
+
+# 构建产物 / 出包
+dist/
+*.apk
+*.aab
+*.ap_
+
+# v241: unreferenced key container, excluded before first push
+app/app.key

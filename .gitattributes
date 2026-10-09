@@ -1,0 +1,5 @@
+# 本仓库追求"逐字节可回滚"：全项目默认不做换行符转换
+# （工程是 Linux 来源，但部分文件在 Windows 上被改成了 CRLF，混着；不转换才与磁盘一致）
+* -text
+# Baseline Profile 生成文件：标记为文本，统一使用 LF 换行，避免 CRLF 抖动
+app/src/release/generated/baselineProfiles/*.txt text eol=lf
