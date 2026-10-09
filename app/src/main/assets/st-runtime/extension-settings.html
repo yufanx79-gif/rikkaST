@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>rikkaST Extension Settings</title>
+    <!-- [v197] 扩展设置页模式：runtime.js 只装载第三方扩展的设置 UI，不加载卡脚本 / MVU。 -->
+    <script>window.__RIKKA_EXT_SETTINGS_MODE__ = true;</script>
+    <script src="./vendor/lib/jquery-3.5.1.min.js"></script>
+    <script src="./vendor/lib/lodash.min.js"></script>
+    <script src="./vendor/lib/toastr.min.js"></script>
+    <script src="./vendor/lib/ejs.umd.js"></script>
+    <script src="./vendor/lib/vue.runtime.global.prod.js"></script>
+    <script src="./vendor/lib/vue-router.global.prod.js"></script>
+    <link rel="stylesheet" href="./extension-settings.css">
+</head>
+<body>
+    <div id="rikka-ext-settings-status">正在加载扩展设置…</div>
+    <!-- 第三方扩展把设置 UI append 到这些 ST 兼容节点上。
+         这里必须保持可见，否则就是之前「设置 UI 存在但用户永远看不到」的状态。 -->
+    <div id="rikka-st-compat-dom">
+        <div id="extensions_settings"></div>
+        <div id="extensions_settings2"></div>
+        <div id="extensionsMenu"></div>
+        <div id="extensions_menu"></div>
+        <div id="extensions-settings-button"></div>
+        <div id="translation_container"></div>
+        <div id="extensions_details"></div>
+        <div id="mvu-standalone-buttons"></div>
+        <!-- v207：JSR 的 v7() 会 `$('#send_form')` 再 `new MutationObserver(...).observe(n[0], …)`；
+             宿主没有这个节点 → n[0] === undefined → 真机 `TypeError: parameter 1 is not of type 'Node'`
+             （报告 notes/recon-B-dom.md）。ST 里它是 <form>，但这里**故意用 div**：
+             扩展会对它调 .submit()，真 <form> 会导航刷新整个 WebView。 -->
+        <div id="send_form"></div>
+    </div>
+    <!-- [v212 · §5.F] highlight.js 11.9.0（BSD-3，真库，来自 Rikkahub-Revised assets）必须在 third-party-globals.js 之前加载，
+         让占位守卫因 "window.hljs !== undefined" 自动让位；此前 JSR /code、斜杠帮助、<pre><code> 均无高亮。 -->
+    <script src="./vendor/lib/hljs.min.js"></script>
+    <link rel="stylesheet" href="./vendor/lib/hljs-theme.css">
+    <script src="./vendor/lib/third-party-globals.js"></script>
+    <!-- [v209] select2 4.1.0（MIT/GPL，ST 自带同款）：st-memory-enhancement 等扩展的
+         jQuery 插件依赖；必须在 jQuery 之后加载。此前缺失 → [global] unhandledrejection:
+         TypeError: $(...).select2 is not a function（真机 v207/v208 会话 x3）。 -->
+    <link rel="stylesheet" href="./vendor/lib/select2.min.css">
+    <link rel="stylesheet" href="./vendor/lib/select2-overrides.css">
+    <script src="./vendor/lib/select2.min.js"></script>
+    <script src="./vendor/lib/select2-search-placeholder.js"></script>
+    <script type="module" src="./runtime.js"></script>
+</body>
+</html>

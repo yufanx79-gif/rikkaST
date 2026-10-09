@@ -1,0 +1,142 @@
+/* [v197] 扩展设置页最小 ST 兼容样式。
+   目标不是复刻整个 SillyTavern 主题，而是让第三方扩展的设置 DOM 在移动端可见、可点。
+   ST 常见的 inline-drawer / drawer / menu_button / list-group-item 先给一个安全兜底。 */
+:root {
+    color-scheme: dark;
+    --ext-bg: #111;
+    --ext-fg: #e6e6e6;
+    --ext-muted: #9a9a9a;
+    --ext-panel: #1c1c1c;
+    --ext-border: #444;
+    --ext-button: #333;
+    --ext-button-hover: #444;
+}
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--ext-bg);
+    color: var(--ext-fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+}
+* { box-sizing: border-box; }
+#rikka-st-compat-dom {
+    display: block;
+    width: 100%;
+    padding: 12px 12px 32px;
+    overflow-x: hidden;
+}
+#extensions_settings,
+#extensions_settings2,
+#extensionsMenu,
+#extensions_menu,
+#extensions-settings-button,
+#translation_container,
+#extensions_details,
+#mvu-standalone-buttons {
+    display: block;
+    width: 100%;
+}
+img, video, canvas, svg { max-width: 100%; }
+input, select, textarea, button { max-width: 100%; }
+input[type="text"], input[type="password"], input[type="number"], textarea, select {
+    background: #222;
+    color: var(--ext-fg);
+    border: 1px solid var(--ext-border);
+    border-radius: 6px;
+    padding: 5px 7px;
+    min-height: 30px;
+}
+.menu_button, .menu_button_icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-height: 30px;
+    padding: 5px 9px;
+    margin: 2px;
+    border: 1px solid var(--ext-border);
+    border-radius: 6px;
+    background: var(--ext-button);
+    color: var(--ext-fg);
+    cursor: pointer;
+}
+.menu_button:hover, .menu_button_icon:hover { background: var(--ext-button-hover); }
+.menu_button_icon i { pointer-events: none; }
+.inline-drawer {
+    margin: 8px 0;
+    padding: 9px;
+    border: 1px solid var(--ext-border);
+    border-radius: 8px;
+    background: var(--ext-panel);
+}
+.inline-drawer-toggle, .inline-drawer-header { cursor: pointer; font-weight: 600; }
+.inline-drawer-content { padding-top: 8px; }
+.drawer {
+    position: relative;
+    margin: 8px 0;
+}
+.drawer-toggle { display: flex; align-items: center; }
+.drawer-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 7px;
+    background: var(--ext-button);
+    cursor: pointer;
+}
+.drawer-content {
+    margin-top: 8px;
+    padding: 9px;
+    border: 1px solid var(--ext-border);
+    border-radius: 8px;
+    background: var(--ext-panel);
+}
+/* 设置页直接展开：缺少 ST 主题 CSS 时，closedDrawer 不应导致整个面板不可见。 */
+.drawer-content.closedDrawer { display: block; }
+.list-group-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 9px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.list-group-item:hover { background: #2a2a2a; }
+small, .small { color: var(--ext-muted); }
+hr { border: 0; border-top: 1px solid var(--ext-border); margin: 10px 0; }
+
+
+/* v197 hotfix: 设置页诊断状态 + JSR/Tailwind 常用主题变量 + 确保 inline-drawer 内容可见 */
+:root {
+    --SmartThemeBodyColor: #e6e6e6;
+    --SmartThemeQuoteColor: #7aa2f7;
+    --SmartThemeBorderColor: #555;
+    --SmartThemeEmColor: #bb9af7;
+    --mainFontSize: 14px;
+    --grey50: #9a9a9a;
+    --grey5050a: rgba(154, 154, 154, 0.5);
+}
+#rikka-ext-settings-status {
+    margin: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--ext-border);
+    border-radius: 8px;
+    background: #1c1c1c;
+    color: #d8d8d8;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+#rikka-ext-settings-status[data-error="true"] {
+    border-color: #a33;
+    color: #ff9a9a;
+}
+/* 没有 ST 主主题时，扩展的 inline-drawer 经常默认收起或 display:none；设置页先强制展开，避免黑屏。 */
+.inline-drawer > .inline-drawer-content,
+.inline-drawer-content {
+    display: block !important;
+}
