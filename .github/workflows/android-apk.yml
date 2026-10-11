@@ -43,10 +43,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Check installed Gradle
+        run: |
+          if command -v gradle >/dev/null 2>&1; then
+            gradle --version
+          else
+            echo "No system Gradle installation found."
+            exit 1
+          fi
+
       - name: Build APK
         run: |
-          chmod +x gradlew
-          ./gradlew :app:assembleDebug -x :app:installDebugPythonRequirements --stacktrace
+          gradle :app:assembleDebug -x :app:installDebugPythonRequirements --stacktrace
 
       - name: Upload APK
         if: success()
