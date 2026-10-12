@@ -21,10 +21,10 @@ plugins {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        mavenLocal()
         google()
         mavenCentral()
         maven("https://jitpack.io")
-        mavenLocal()
     }
 }
 
@@ -42,3 +42,5 @@ include(":material3")
 // Build 1779956616 — force cache refresh
 include(":workspace")
 include(":app:baselineprofile")
+include(":videogen")
+include(":oauth")

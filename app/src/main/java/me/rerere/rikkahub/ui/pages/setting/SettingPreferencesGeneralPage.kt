@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.ui.pages.setting
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -12,6 +13,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -25,6 +27,7 @@ import androidx.compose.foundation.layout.Column
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.BlurStrength
 import me.rerere.rikkahub.data.datastore.BlurStyle
+import me.rerere.rikkahub.data.datastore.BackgroundEffectType
 import me.rerere.rikkahub.data.datastore.DisplaySetting
 import me.rerere.rikkahub.data.datastore.MessageBubbleStyle
 import me.rerere.rikkahub.data.datastore.MessageStyleSetting
@@ -34,15 +37,20 @@ import me.rerere.rikkahub.ui.components.ui.LevelPickerRow
 import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.components.ui.SegmentedTabs
 import me.rerere.rikkahub.ui.pages.setting.components.DeveloperModeSwitch
+import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
+import kotlin.math.roundToInt
 
 @Composable
 fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
     var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
     val messageStyle = settings.messageStyle
+    var ttsPlaybackSpeed by remember(settings.defaultTTSPlaybackSpeed) {
+        mutableFloatStateOf(settings.defaultTTSPlaybackSpeed)
+    }
 
     fun updateDisplaySetting(setting: DisplaySetting) {
         // [v227 D4] 本地镜像立刻更新（按下即有反馈，不等写回），写回走**窄接口**：
@@ -199,8 +207,8 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                         },
                     )
                     item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_enable_blur_effect_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_enable_blur_effect_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_background_effect_desc)) },
                         trailingContent = {
                             // [v225 P2] 这个开关就是「输入栏模糊」的总闸（见 strings：
                             // setting_display_page_enable_blur_effect_desc = 在聊天输入栏启用模糊效果）。
@@ -257,6 +265,27 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                                         updateMessageStyle(
                                             messageStyle.copy(blurStrength = BlurStrength.clampIndex(it))
                                         )
+                                    },
+                                )
+                            },
+                        )
+                    }
+                    if (displaySetting.enableBlurEffect) {
+                        item(
+                            headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_type)) },
+                            supportingContent = {
+                                Select(
+                                    options = BackgroundEffectType.entries,
+                                    selectedOption = displaySetting.backgroundEffectType,
+                                    onOptionSelected = {
+                                        updateDisplaySetting(displaySetting.copy(backgroundEffectType = it))
+                                    },
+                                    modifier = Modifier.padding(top = 4.dp).fillMaxWidth(),
+                                    optionToString = {
+                                        when (it) {
+                                            BackgroundEffectType.BLUR -> stringResource(R.string.setting_display_page_background_effect_blur)
+                                            BackgroundEffectType.GLASS -> stringResource(R.string.setting_display_page_background_effect_glass)
+                                        }
                                     },
                                 )
                             },
@@ -363,6 +392,37 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                     modifier = Modifier.padding(horizontal = 8.dp),
                     title = { Text(stringResource(R.string.setting_page_tts_settings)) },
                 ) {
+                    item(
+                        headlineContent = {
+                            Text(stringResource(R.string.setting_tts_page_default_playback_speed))
+                        },
+                        supportingContent = {
+                            Column {
+                                Text(stringResource(R.string.setting_tts_page_default_playback_speed_description))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Slider(
+                                        value = ttsPlaybackSpeed,
+                                        onValueChange = {
+                                            ttsPlaybackSpeed = (it * 10).roundToInt() / 10f
+                                        },
+                                        onValueChangeFinished = {
+                                            vm.updateSettings(
+                                                settings.copy(defaultTTSPlaybackSpeed = ttsPlaybackSpeed)
+                                            )
+                                        },
+                                        valueRange = 0.5f..2.0f,
+                                        steps = 14,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Text(text = "x${"%.1f".format(ttsPlaybackSpeed)}")
+                                }
+                            }
+                        },
+                    )
                     item(
                         headlineContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_title)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_desc)) },

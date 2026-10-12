@@ -85,6 +85,8 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.rememberSwipeToDismissBoxState
+import androidx.compose.material3.SheetValue
+import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -130,10 +132,14 @@ import me.rerere.rikkahub.ui.components.ui.IntTextField
 import me.rerere.rikkahub.ui.components.ui.NullableIntTextField
 import me.rerere.rikkahub.ui.components.ui.InsertionStrategySelector
 import me.rerere.rikkahub.ui.components.ui.FormItem
+import me.rerere.rikkahub.ui.components.ui.ItemAction
+import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
+import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.components.ui.SegmentedTabs
 import me.rerere.rikkahub.ui.components.ui.Tag
 import me.rerere.rikkahub.ui.components.ui.TagType
+import me.rerere.rikkahub.ui.components.ui.longPressReorder
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.hooks.useEditState
 import me.rerere.rikkahub.ui.theme.CustomColors
@@ -334,21 +340,7 @@ private fun ModeInjectionTab(
                     ) { isDragging ->
                         ModeInjectionCard(
                             injection = injection,
-                            modifier = Modifier
-                                .longPressDraggableHandle()
-                                .graphicsLayer {
-                                    if (isDragging) {
-                                        scaleX = 1.05f
-                                        scaleY = 1.05f
-                                    }
-                                },
-                            selectMode = selectMode,
-                            selected = injection.id in selectedIds,
-                            onToggleSelect = {
-                                selectedIds =
-                                    if (injection.id in selectedIds) selectedIds - injection.id
-                                    else selectedIds + injection.id
-                            },
+                            modifier = longPressReorder(isDragging, enabled = !selectMode),
                             onEdit = { editState.open(injection) },
                             onDelete = { onUpdate(modeInjections - injection) }
                         )
@@ -472,72 +464,46 @@ private fun ModeInjectionCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val swipeState = rememberSwipeToDismissBoxState()
-    val scope = rememberCoroutineScope()
     var showExportDialog by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
     val exporter = rememberExporter(injection, ModeInjectionSerializer)
-    SwipeToDismissBox(
-        state = swipeState,
-        backgroundContent = {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = { scope.launch { swipeState.reset() } }) {
-                    Icon(HugeIcons.Cancel01, null)
-                }
-                FilledIconButton(onClick = {
-                    scope.launch {
-                        onDelete()
-                        swipeState.reset()
-                    }
-                }) {
-                    Icon(HugeIcons.Delete01, stringResource(R.string.prompt_page_delete))
-                }
-            }
-        },
-        enableDismissFromStartToEnd = false,
-        enableDismissFromEndToStart = !selectMode,
-        modifier = modifier
+
+    Card(
+        onClick = if (selectMode) onToggleSelect else onEdit,
+        modifier = modifier,
+        colors = CardDefaults.cardColors(
+            containerColor = CustomColors.listItemColors.containerColor
+        )
     ) {
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = CustomColors.listItemColors.containerColor
-            )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                Text(
+                    text = injection.name.ifEmpty { stringResource(R.string.prompt_page_unnamed) },
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Text(
-                        text = injection.name.ifEmpty { stringResource(R.string.prompt_page_unnamed) },
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Tag(type = TagType.INFO) {
-                            Text(getPositionLabel(injection.position))
-                        }
-                        Tag(type = TagType.DEFAULT) {
-                            Text(stringResource(R.string.prompt_page_priority_format, injection.priority))
-                        }
-                        if (!injection.enabled) {
-                            Tag(type = TagType.WARNING) {
-                                Text(stringResource(R.string.prompt_page_disabled))
-                            }
+                    Tag(type = TagType.INFO) {
+                        Text(getPositionLabel(injection.position))
+                    }
+                    Tag(type = TagType.DEFAULT) {
+                        Text(stringResource(R.string.prompt_page_priority_format, injection.priority))
+                    }
+                    if (!injection.enabled) {
+                        Tag(type = TagType.WARNING) {
+                            Text(stringResource(R.string.prompt_page_disabled))
                         }
                     }
                 }
@@ -555,7 +521,36 @@ private fun ModeInjectionCard(
                     }
                 }
             }
+            ItemActionMenu(
+                actions = listOf(
+                    ItemAction(
+                        text = stringResource(R.string.export_title),
+                        icon = HugeIcons.Share03,
+                        onClick = { showExportDialog = true },
+                    ),
+                    ItemAction(
+                        text = stringResource(R.string.prompt_page_delete),
+                        icon = HugeIcons.Delete01,
+                        destructive = true,
+                        onClick = { showDeleteDialog = true },
+                    ),
+                )
+            )
         }
+    }
+
+    RikkaConfirmDialog(
+        show = showDeleteDialog,
+        title = stringResource(R.string.confirm_delete),
+        confirmText = stringResource(R.string.delete),
+        dismissText = stringResource(R.string.cancel),
+        onConfirm = {
+            showDeleteDialog = false
+            onDelete()
+        },
+        onDismiss = { showDeleteDialog = false },
+    ) {
+        Text(stringResource(R.string.common_delete_confirm_message, injection.name))
     }
 
     if (showExportDialog) {
@@ -1143,21 +1138,7 @@ private fun LorebookTab(
                     ) { isDragging ->
                         LorebookCard(
                             book = book,
-                            modifier = Modifier
-                                .longPressDraggableHandle()
-                                .graphicsLayer {
-                                    if (isDragging) {
-                                        scaleX = 1.05f
-                                        scaleY = 1.05f
-                                    }
-                                },
-                            selectMode = selectMode,
-                            selected = book.id in selectedIds,
-                            onToggleSelect = {
-                                selectedIds =
-                                    if (book.id in selectedIds) selectedIds - book.id
-                                    else selectedIds + book.id
-                            },
+                            modifier = longPressReorder(isDragging, enabled = !selectMode),
                             onEdit = { editState.open(book) },
                             onDelete = { onUpdate(lorebooks - book) }
                         )
@@ -1282,83 +1263,57 @@ private fun LorebookCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val swipeState = rememberSwipeToDismissBoxState()
-    val scope = rememberCoroutineScope()
     var showExportDialog by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
     val exporter = rememberExporter(book, LorebookSerializer)
-    SwipeToDismissBox(
-        state = swipeState,
-        backgroundContent = {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = { scope.launch { swipeState.reset() } }) {
-                    Icon(HugeIcons.Cancel01, null)
-                }
-                FilledIconButton(onClick = {
-                    scope.launch {
-                        onDelete()
-                        swipeState.reset()
-                    }
-                }) {
-                    Icon(HugeIcons.Delete01, stringResource(R.string.prompt_page_delete))
-                }
-            }
-        },
-        enableDismissFromStartToEnd = false,
-        enableDismissFromEndToStart = !selectMode,
-        modifier = modifier
+
+    Card(
+        onClick = if (selectMode) onToggleSelect else onEdit,
+        modifier = modifier,
+        colors = CardDefaults.cardColors(
+            containerColor = CustomColors.listItemColors.containerColor
+        )
     ) {
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = CustomColors.listItemColors.containerColor
-            )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
+                Text(
+                    text = book.name.ifEmpty { stringResource(R.string.prompt_page_unnamed_lorebook) },
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (book.description.isNotEmpty()) {
                     Text(
-                        text = book.name.ifEmpty { stringResource(R.string.prompt_page_unnamed_lorebook) },
-                        style = MaterialTheme.typography.titleSmall,
+                        text = book.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    if (book.description.isNotEmpty()) {
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Tag(type = TagType.INFO) {
                         Text(
-                            text = book.description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            stringResource(
+                                R.string.prompt_page_entries_count_format,
+                                book.entries.size
+                            )
                         )
                     }
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Tag(type = TagType.INFO) {
-                            Text(
-                                stringResource(
-                                    R.string.prompt_page_entries_count_format,
-                                    book.entries.size
-                                )
-                            )
-                        }
-                        if (!book.enabled) {
-                            Tag(type = TagType.WARNING) {
-                                Text(stringResource(R.string.prompt_page_disabled))
-                            }
+                    if (!book.enabled) {
+                        Tag(type = TagType.WARNING) {
+                            Text(stringResource(R.string.prompt_page_disabled))
                         }
                     }
                 }
@@ -1376,7 +1331,36 @@ private fun LorebookCard(
                     }
                 }
             }
+            ItemActionMenu(
+                actions = listOf(
+                    ItemAction(
+                        text = stringResource(R.string.export_title),
+                        icon = HugeIcons.Share03,
+                        onClick = { showExportDialog = true },
+                    ),
+                    ItemAction(
+                        text = stringResource(R.string.prompt_page_delete),
+                        icon = HugeIcons.Delete01,
+                        destructive = true,
+                        onClick = { showDeleteDialog = true },
+                    ),
+                )
+            )
         }
+    }
+
+    RikkaConfirmDialog(
+        show = showDeleteDialog,
+        title = stringResource(R.string.confirm_delete),
+        confirmText = stringResource(R.string.delete),
+        dismissText = stringResource(R.string.cancel),
+        onConfirm = {
+            showDeleteDialog = false
+            onDelete()
+        },
+        onDismiss = { showDeleteDialog = false },
+    ) {
+        Text(stringResource(R.string.common_delete_confirm_message, book.name))
     }
 
     if (showExportDialog) {

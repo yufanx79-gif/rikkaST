@@ -241,7 +241,7 @@ private fun DashScopeASRConfiguration(
         OutlinedNumberInput(
             value = setting.vadThreshold,
             onValueChange = { value ->
-                if (value in 0.0f..1.0f) {
+                if (value in -1.0f..1.0f) {
                     onValueChange(setting.copy(vadThreshold = value))
                 }
             },
@@ -257,7 +257,7 @@ private fun DashScopeASRConfiguration(
         OutlinedNumberInput(
             value = setting.silenceDurationMs,
             onValueChange = { value ->
-                if (value in 100..5000) {
+                if (value in 200..6000) {
                     onValueChange(setting.copy(silenceDurationMs = value))
                 }
             },
@@ -292,7 +292,7 @@ private fun VolcengineASRConfiguration(
             value = setting.websocketUrl,
             onValueChange = { onValueChange(setting.copy(websocketUrl = it)) },
             modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("wss://openspeech.bytedance.com/api/v3/sauc/bigmodel") }
+            placeholder = { Text("wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async") }
         )
     }
 
@@ -304,7 +304,7 @@ private fun VolcengineASRConfiguration(
             value = setting.resourceId,
             onValueChange = { onValueChange(setting.copy(resourceId = it)) },
             modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("volc.bigasr.sauc.duration") }
+            placeholder = { Text("volc.seedasr.sauc.duration") }
         )
     }
 
@@ -319,6 +319,20 @@ private fun VolcengineASRConfiguration(
             placeholder = { Text("auto") }
         )
     }
+    FormItem(
+        label = { Text(stringResource(R.string.setting_page_asr_silence_duration)) },
+        description = { Text(stringResource(R.string.setting_page_asr_silence_duration_desc)) },
+    ) {
+        OutlinedNumberInput(
+            value = setting.silenceDurationMs,
+            onValueChange = { value ->
+                if (value in 300..5000) onValueChange(setting.copy(silenceDurationMs = value))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            label = stringResource(R.string.setting_page_asr_milliseconds),
+        )
+    }
+
 }
 
 @Composable

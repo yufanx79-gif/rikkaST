@@ -512,12 +512,12 @@ class SkillsVM(
                     return@launch
                 }
 
-                val fileContents = LinkedHashMap<String, String>()
+                val fileContents = LinkedHashMap<String, ByteArray>()
                 val sem = Semaphore(5)
                 val results = coroutineScope {
                     files.map { (path, url) ->
                         async(Dispatchers.IO) {
-                            sem.withPermit { path to downloadText(url) }
+                            sem.withPermit { path to downloadBytes(url) }
                         }
                     }.awaitAll()
                 }
@@ -529,7 +529,7 @@ class SkillsVM(
                     fileContents[relativePath] = content
                 }
 
-                val saved = skillManager.saveSkillFilesAtomically(skill.name, fileContents)
+                val saved = skillManager.saveSkillFileBytesAtomically(skill.name, fileContents)
                 if (!saved) {
                     withContext(Dispatchers.Main) { onResult(false, "保存失败") }
                     return@launch
@@ -811,7 +811,7 @@ class SkillsVM(
                 val fileContents = downloadSkillFiles(info.owner, info.repo, branch, dirPath, tree)
                     ?: run { withContext(Dispatchers.Main) { onResult(false, "下载失败") }; return@launch }
 
-                if (!skillManager.saveSkillFilesAtomically(skillName, fileContents)) {
+                if (!skillManager.saveSkillFileBytesAtomically(skillName, fileContents)) {
                     withContext(Dispatchers.Main) { onResult(false, "保存失败") }; return@launch
                 }
 
@@ -837,7 +837,7 @@ class SkillsVM(
     private suspend fun downloadSkillFiles(
         owner: String, repo: String, branch: String, dirPath: String,
         tree: org.json.JSONArray,
-    ): LinkedHashMap<String, String>? {
+    ): LinkedHashMap<String, ByteArray>? {
         val prefix = dirPath.trimEnd('/').let { if (it.isBlank()) "" else "$it/" }
 
         val files = mutableListOf<Pair<String, String>>()
@@ -852,12 +852,12 @@ class SkillsVM(
         }
         if (files.isEmpty()) return null
 
-        val fileContents = LinkedHashMap<String, String>()
+        val fileContents = LinkedHashMap<String, ByteArray>()
         val sem = Semaphore(5)
         val results = coroutineScope {
             files.map { (path, url) ->
                 async(Dispatchers.IO) {
-                    sem.withPermit { path to downloadText(url) }
+                    sem.withPermit { path to downloadBytes(url) }
                 }
             }.awaitAll()
         }
@@ -896,24 +896,24 @@ class SkillsVM(
                     return@launch
                 }
 
-                val skillMdContent = downloadText(skillMdEntry.second) ?: run {
+                val skillMdBytes = downloadBytes(skillMdEntry.second) ?: run {
                     withContext(Dispatchers.Main) { onResult(false, "下载 SKILL.md 失败，请检查链接或网络") }
                     return@launch
                 }
 
-                val frontmatter = SkillFrontmatterParser.parse(skillMdContent)
+                val frontmatter = SkillFrontmatterParser.parse(skillMdBytes.toString(Charsets.UTF_8))
                 val name = frontmatter["name"]
                 if (name.isNullOrBlank()) {
                     withContext(Dispatchers.Main) { onResult(false, "SKILL.md 格式错误：缺少 name 字段") }
                     return@launch
                 }
 
-                val fileContents = LinkedHashMap<String, String>()
+                val fileContents = LinkedHashMap<String, ByteArray>()
                 val sem = Semaphore(5)
                 val results = coroutineScope {
                     files.map { (path, url) ->
                         async(Dispatchers.IO) {
-                            sem.withPermit { path to downloadText(url) }
+                            sem.withPermit { path to downloadBytes(url) }
                         }
                     }.awaitAll()
                 }
@@ -925,7 +925,7 @@ class SkillsVM(
                     fileContents[relativePath] = content
                 }
 
-                val saved = skillManager.saveSkillFilesAtomically(name, fileContents)
+                val saved = skillManager.saveSkillFileBytesAtomically(name, fileContents)
                 if (!saved) {
                     withContext(Dispatchers.Main) { onResult(false, "保存失败") }
                     return@launch
@@ -1047,7 +1047,7 @@ class SkillsVM(
         return true
     }
 
-    private fun downloadText(url: String): String? {
+    private fun downloadBytes(url: String): ByteArray? {
         try {
             val connection = URL(url).openConnection() as HttpURLConnection
             connection.connectTimeout = 15_000
@@ -1059,15 +1059,24 @@ class SkillsVM(
                 connection.setRequestProperty("Authorization", "token $token")
             }
             val code = connection.responseCode
-            if (code == 200) {
-                val text = connection.inputStream.bufferedReader().readText()
+            if ((code == 403 || code == 429) && connection.getHeaderField("X-RateLimit-Remaining") == "0") {
                 connection.disconnect()
-                return text
+                error("GitHub API 请求次数已达上限，请稍后再试")
+            }
+            if (code == 200) {
+                val bytes = connection.inputStream.use { it.readBytes() }
+                connection.disconnect()
+                return bytes
             }
             connection.disconnect()
             return null
+        } catch (e: IllegalStateException) {
+            throw e
         } catch (e: Exception) {
             return null
         }
     }
+
+    private fun downloadText(url: String): String? =
+        downloadBytes(url)?.toString(Charsets.UTF_8)
 }

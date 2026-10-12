@@ -1,188 +1,73 @@
-# DIVERGENCE — rikkaST 与上游 RikkaHub 的差异地图
+# DIVERGENCE — rikkaST 与官方 RikkaHub 2.5.6 的差异地图
 
-> 用途：合并上游（`git fetch upstream && git merge upstream/master`）时的冲突处理手册。
-> 维护：每次合入上游后更新本节“状态”；每次改动核心文件后更新对应条目。
+> 本次迁移目标：**以官方 RikkaHub `2.5.6` tag（commit `447bb7e89710d31f1204d7a2973baa19fdbd5b28`）为底座**，在官方新架构上重新叠加 rikkaST 的酒馆与自研功能层。
+> 本文取代旧版“基于 Rikka Plus / 合并 upstream master”的合并规则。旧规则不再适用于本分支。
 
-## 0. 当前状态
+## 0. 基线
 
 | 项 | 值 |
 |---|---|
-| 本地分支 | `main` |
-| 上游 | `upstream/master`（github.com/rikkahub/rikkahub） |
-| 最近合入 | `aac6e9638`（2026-08-13，含 AI 模块重构 / 搜索模式 / 构建重构） |
-| 领先提交数 | 约 1780+ |
-| 上游文件被本地修改 | 约 100 个（含重命名） |
-| 本地独有文件 | 约 50 个 |
+| 官方底座 | `rikkahub/rikkahub` tag `2.5.6`，commit `447bb7e89710d31f1204d7a2973baa19fdbd5b28` |
+| 本地迁移前 HEAD | `a94f2363f6e724a9125b6cdb25d1db072d044a88`（`main`，v2.4.6 + README 提交） |
+| 迁移方式 | 官方 2.5.6 为基底；以 `2.4.6` 为共同祖先做 rename-aware 三方合并，再逐冲突人工合并 |
+| 独立产品身份 | `applicationId = me.rerere.rikkahub.st`，namespace `me.rerere.rikkahub`，继续与官方 App 共存 |
+| 数据库 | 本地版本链 28 → **29**；新增 `Migration_28_29`，绝不回退到官方 25 |
+| 版本号 | `versionCode = 238`（必须大于已发布 237），`versionName = "2.5.6"` |
 
-## 1. 合并工作流（推荐）
+## 1. 吸收的上游 2.5.6 架构变化
 
-1. **频繁合**：上游每次更新就 `git fetch upstream`，需要时 `git merge upstream/master`。不要攒几百个提交再合。
-2. 2026-08-13 合入注意事项：AI 流式接口已改为 `StreamChunkHandler` / `handleTextGenerationResult`（旧 `handleMessageChunk`/`MessageChunk` 已删除）；搜索改为 `SearchMode`（OFF/LOCAL/BUILT_IN）；keep 规则迁移到 `app/src/main/keepRules/rikkahub.keep`（本地 Chaquopy/Compose 规则已并入，不要再改 `app/proguard-rules.pro`）；应用版本与上游一致（2.4.6/173）；更新检查已切换到本仓库 `update.json`（`raw.githubusercontent.com/yufanx79-gif/rikkaST/main/update.json`），不再指向官方服务器。以后发版：改 `update.json`（版本号+下载链接）+ 发布 GitHub Release，用户端即可收到更新。。
-2. 冲突按本文件分类处理：
-   - 本地**独有文件**（第 3 节）→ 永不冲突，忽略。
-   - **核心生成链**（第 2 节 A 组）→ 人工逐块审，两边语义都要保留。
-   - **酒馆/工具/群聊**（本地方向，上游没有）→ 冲突时以上游文件为基底，把本地功能重新叠上去。
-   - **可回退项**（第 5 节）→ 尽量保持上游原样。
-3. 合并后本地检查（不本地编译）：`git diff --check`；推送后靠 CI 验证。
-4. 若上游新增了本地没有的功能，且不与本地冲突 → 直接收下，并补进本文件。
+- `GenerationHandler.kt` → `GenerationLoop.kt`：本地生成逻辑已重新挂到官方新命名/新结构上；本地新增的
+  `statusTrackedTools`、工具去重/递归保护、并行工具执行、DeepSeek 尾部注入、Persona 注入、
+  `withMessageNames`、Tavern `STREAM_TOKEN_RECEIVED` 事件保留在新调用点。
+- 官方新 `TranslationHandler` 接管翻译；本地 `GenerationLoop.translateText` 已移除，ChatService/TranslatorVM
+  改用 `translationHandler`。
+- `Export.kt` → `ConversationExport.kt`：按官方 rename 吸收。
+- 官方 `ChatToolFactory` 成为工具装配入口；rikkaST 自研 File/Shell/Python/Database/Calculator/WebFetch/Task
+  工具作为 local extra tools 在 `ChatService` 中追加并去重。
+- 官方 `ConversationSessionManager` / `ConversationSession` / `MessageQueue` 成为会话与队列骨架；
+  本地旧的 `sessions`/`getOrCreateSession` 平行实现已移除，前台服务/Tavern 事件/斜杠命令重新接到官方 session。
+- 官方 `:oauth`、`:videogen` 模块已接入 `settings.gradle.kts` 与 app 依赖。
+- 官方 AI SDK、Provider、消息模型、Navigation3、Room 2.8.5、Compose BOM 2026.09.00、AGP 9.4.0、
+  Kotlin 2.4.20 等版本变化按官方 2.5.6 catalog 吸收。
+- 官方技能系统新增 builtin skills / `SkillMetadata.builtin` / XML 安全提示；本地技能目录与公共目录规则保留，
+  `SkillManager` 同时扫描本地 skills、`/Rikkahub/skills/` 与 builtin skills。
 
-## 2. 上游文件被本地修改（按合并风险分组）
+## 2. rikkaST 有意保留的差异（不是未迁移）
 
-### A. 核心生成链（最高风险，冲突需人工审）
-
-| 文件 | 改动量 | 本地改了什么 | 合并建议 |
-|---|---|---|---|
-| `service/ChatService.kt` | +509/-55 | 工具构建、前台服务、群聊生成、斜杠注入、发送链路；v240 W3 加 `classifyExpression`（表情分类 best-effort） | 上游更新先合，再叠本地逻辑 |
-| `data/ai/GenerationHandler.kt` | +638/-185 | 系统提示组装、transform 链、预构建 system | 同上 |
-| `data/ai/transformers/PromptInjectionTransformer.kt` | +540/-11 | 世界书官方对齐（选择性逻辑/分组/递归/粘性/预算）；v240 W2 加 `@@` 装饰器（扫描副本剥壳）；v240 W5 预算/maxContext 改用真 tokenizer | 本地逻辑已对照酒馆官方，合时保留 |
-| `data/ai/transformers/PlaceholderTransformer.kt` | +358/-6 | 宏引擎 2.0 接入、`{{original}}` 等修正 | 保留本地 |
-| `data/ai/transformers/Transformer.kt` | +36/-2 | TransformerContext 扩展字段 | 保留 |
-| `data/model/Assistant.kt` | +382/-22 | 工具/技能/群聊/酒馆/宏/知识库 字段 | 合时保留本地字段 |
-| `data/model/Conversation.kt` | +3 | 小改 | 低风险 |
-| `data/datastore/PreferencesStore.kt` | +105/-1 | 本地设置（群聊/酒馆/工具/压缩等）；v240 加 `expression_enabled` / `expression_classifier` / `expression_fallback_label` / `tokenizer_mode` | 保留本地设置项 |
-| `data/ai/GenerationPrompts.kt` | +33 | 本地提示词 | 保留 |
-| `ai/ui/Message.kt` | +184 | 消息模型扩展（UIMessagePart/Annotation 合并进此文件） | 上游也改此文件时容易冲突 |
-| `ai/registry/ModelRegistry.kt` | ±20 | 本地模型注册 | 低风险 |
-
-### B. 酒馆兼容（本地独有方向，上游没有对应功能）
-
-| 文件 | 改动量 | 说明 |
-|---|---|---|
-| `ui/pages/assistant/detail/TavernCharacterCard.kt` | +1796 | 角色卡详情/内嵌世界书编辑器（本地新增） |
-| `ui/pages/assistant/detail/AssistantImporter.kt` | +778/-183 | 角色卡导入解析（V2/V3、世界书、PHI、深度提示） |
-| `ui/pages/extensions/PromptPage.kt` | +1169/-55 | 世界书/提示注入编辑页 |
-| `data/model/TavernCard.kt` | +118 | 角色卡数据模型 |
-| `utils/CardExporter.kt` | +317 | 角色卡导出（PNG/JSON） |
-| `data/ai/transformers/AuthorsNoteTransformer.kt` / `ui/pages/setting/AuthorsNotePage.kt` | +84 / +413 | 导演备注（官方语义） |
-| `data/model/Persona.kt` / `ui/pages/setting/PersonaPage.kt` | +28 / +680 | 人设 |
-| `data/model/AuthorNotePosition.kt` / `GenerationType.kt` | +44 / +29 | 枚举 |
-| `data/ai/transformers/MacroEngine.kt` | +879 | 宏引擎 2.0 |
-| `ui/components/ai/SlashCommands.kt` / `MacroVarSlashOps.kt` | +257 / +92 | 斜杠命令 |
-| `ui/pages/extensions/PromptVM.kt` | +77 | 世界书双向同步 |
-
-### C. 群聊（本地独有）
-
-`data/model/GroupChat.kt`(+52)、`GroupSpeakerSelector.kt`(+148)、`ui/pages/chat/GroupChatPage.kt`(+1167)、`GroupChatListPage.kt`(+242)
-
-### D. 工具与 Agent（本地独有）
-
-`data/ai/tools/LocalTools.kt`(+489，从 `tools/local/` 移动)、`FileTools.kt`(+430)、`TaskTools.kt`(+430)、`DatabaseQueryTool.kt`(+326)、`ShellTools.kt`(+81)、`PythonTools.kt`(+152)、`CalculatorTool.kt`(+127)、`WebFetchTool.kt`(+111)、`data/ai/python/PythonBridge.kt`(+235)、`JsBridge.kt`(+37)、`data/ai/prompts/SystemPromptAssembler.kt`(+134)、`data/ai/transformers/SkillAutoTriggerTransformer.kt`(+94)、`data/files/PluginManifest.kt`(+119)、`SkillRegistry.kt`(+43)、`SkillFrontmatterParser.kt`(+21)
-
-上游的 `data/ai/tools/SkillsTools.kt` 本地改了 +64/-35（技能工具）；`data/files/SkillManager.kt` +78/-5（**已回退缓存改动**，仅剩外部存储/公共目录两个早期差异，见第 5 节）。
-
-### E. 数据库与迁移
-
-| 文件 | 说明 |
+| 差异 | 原因 |
 |---|---|
-| `data/db/AppDatabase.kt` | 版本 28；本地实体增减（知识库实体于 27→28 恢复，见下）、DAO 增删 |
-| `data/db/migrations/Migration_20_21.kt` ~ `27_28.kt` | 本地新增/修改；知识库表的三段历史：`20_21` 建表 → `25_26` 删除 → `27_28` 重建（当前版本 28，知识库功能可用）。**迁移链不可删**，否则升级崩溃 |
-| `data/db/dao/MessageNodeDAO.kt` | +3，小改 |
+| `applicationId = me.rerere.rikkahub.st`、独立签名/更新源/品牌 | 独立产品，与官方共存 |
+| Chaquopy/Python、QuickJS、Termux、Web UI、ABI arm64-v8a | rikkaST 运行时能力 |
+| `GenerationForegroundService` 与官方 `ChatGenerationForegroundService` 并存 | 本地前台保活路径 + 官方 session 路径均保留，避免丢功能 |
+| 本地 QuickJS 引擎（`wang.harlon.quickjs:wrapper-android:3.2.3`） | 本地 JS 工具依赖持久化 context；未切到官方 `dokar3`，作为明确的有意差异记录 |
+| Firebase/Crashlytics 未接入 | 本地产品无 `google-services.json`，不误用官方云服务配置；官方相关代码在 app 层未启用 |
+| 本地 skills 根目录 `context.getExternalFilesDir(null)/skills` + `/Rikkahub/skills` | 保持已安装用户技能可见/可迁移，不改为官方 `filesDir/skills` |
+| 世界书、宏、Slash、Persona、导演备注、表情立绘、群聊、知识库、自研工具 | 本项目核心功能，完整保留 |
 
-### F. 路由 / DI / Web
+## 3. 数据库与数据安全
 
-`RouteActivity.kt` ±1501（本地页面入口最多，冲突高）、`RikkaHubApp.kt` +36/-49、`di/AppModule.kt`、`DataSourceModule.kt`、`RepositoryModule.kt`、`ViewModelModule.kt`。
-Web 相关只有小改（`web/routes/ConversationRoutes.kt` +47/-25、`SettingsRoutes.kt` +15、`WebApiModule.kt` +12、`FolderRoutes.kt` +6、`WebServerManager.kt` +4）——**约定：尽量不动 web**。
+- 本地数据库版本 28 是已发布用户的实际版本；官方 2.5.6 的 25 不是同一条迁移链。
+- 新增 `Migration_28_29`：仅补官方 2.5.6 引入的 `workspaces.shell_compatibility_mode INTEGER NOT NULL DEFAULT 0`。
+- 已发布迁移 `20_21` ~ `27_28` 全部保留，未删除、未改写、未使用 destructive fallback。
+- `AppDatabase.version = 29`，`app/schemas/.../29.json` 已生成；`DataSourceModule` 与 `AppDatabaseFactory`
+  均已注册 `Migration_28_29`。
+- 真实旧库升级测试尚未在本轮执行（首次对话禁止 APK 构建），需在下一轮用 Room migration test 从真实 28 库验证。
 
-### G. 其余 UI/工具
+## 4. 尚未完成/未验证项（必须诚实记录）
 
-`ui/components/ai/ChatInput.kt`(+455)、`ui/pages/chat/ChatPage.kt`(+312/-79)、`ChatDrawer.kt`(+173/-189)、`ChatDrawerVM.kt`、`ChatVM.kt`(+54)、`ui/components/message/ChatMessageTools.kt`(+774)、`ChatMessage.kt`、`ChatMessageActions.kt`、`AssistantDetailPage.kt`(+519)、`AssistantDetailVM.kt`、`AssistantLocalToolPage.kt`(+169/-7)、`AssistantBasicPage.kt`、`AssistantVM.kt`、`AssistantPage.kt`、`SettingPage.kt`(+183)、`SettingPreferencesUIPage.kt`(+326)、`ui/pages/chat/Export.kt`、`utils/ImageUtils.kt`、`ContextUtil.kt`、`CrashHandler.kt`、`service/ChatNotificationManager.kt`、`ui/components/richtext/Markdown.kt`、`MarkdownNew.kt`、`FilesPicker.kt`、`ChatList.kt`、`data/repository/ConversationRepository.kt`(+32/-50)、`FolderRepository.kt`、`data/export/ExportSerializer.kt`(+85/-8)
+- 未执行 APK 构建（遵守用户“第一次对话不要进行编译 APK”的约束），因此未获得编译级验证。
+- 未完成全量 3,267 个文本版本的逐文件语义回执；`rikkaST-migration-audit/reports/reading-coverage.md`
+  仍为未通过状态。本轮完成的是 rename-aware 三方合并、冲突消解、结构清理和关键文件静态审查。
+- 官方 2.4.6→2.5.6 的 464 条变更未逐条人工复核；合并树已按 rename-aware 方式吸收，但需要下一轮用编译和测试确认。
+- 旧技能页已删除，保留本地 flat 页面；官方 2.5.6 技能页的 readOnly/内置技能 UI 改动尚未完全回移到 flat 页面。
+- 官方 Firebase/Crashlytics、部分新测试 fixture、`.agents` 文档的处理策略已在报告中说明。
+- 更新 JSON 已改为 2.5.6，但 Release/APK 未发布、未推送、未签名。
 
-### H. [v240] 本批新增：W1–W5（导演备注宏 / @@ 装饰器 / 表情立绘 / 闭包 / 真 tokenizer）
+## 5. 后续合并规则（替换旧规则）
 
-#### H.1 修改的上游文件（合并建议）
-
-| 文件 | 本批改动 | 合并建议 |
-|---|---|---|
-| `data/ai/transformers/PromptInjectionTransformer.kt` | W2 `@@` 装饰器（扫描副本剥壳，判定先于关键词）；W5 `countTokens(text, tokenizerMode)` 替换启发式调用点 | 保留本地 |
-| `service/ChatService.kt` | W3 `classifyExpression`（独立一次性分类，20s 超时，异常返回 null） | 保留本地 |
-| `data/datastore/PreferencesStore.kt` | W3/W5 四个新设置项（key：`expression_enabled` / `expression_classifier` / `expression_fallback_label` / `tokenizer_mode`） | 保留本地 |
-| `RikkaHubApp.kt` | W5 `TikToken.attach { assets.open(it) }`（懒加载，失败回退启发式） | 保留本地 |
-| `ui/pages/chat/ChatPage.kt` | W3 挂载 `CharacterExpressionHost` / `CharacterExpressionOverlay` | 低风险 |
-| `ui/pages/chat/ChatSlashHost.kt` | W3 `/expression-fallback` 宿主实现 | 保留本地 |
-| `ui/pages/chat/ChatVM.kt` | W3 `classifyExpression` 透传 | 低风险 |
-| `ui/pages/assistant/detail/AssistantImporter.kt` | W3 V3 卡 `assets` 内嵌立绘落盘（best-effort） | 保留本地 |
-| `data/st/import/StArchiveImporter.kt` | W3 归档导入同步内嵌立绘 | 保留本地 |
-| `ui/pages/extensions/PromptPage.kt` | W5 世界书设置新增分词器选择 | 保留本地（B 组文件） |
-| `ui/pages/setting/SettingPreferencesPage.kt` / `RouteActivity.kt` | W3 新设置页入口 + 路由 | 保留本地 |
-| `data/st/script/StSlashExecutor.kt` | W4 闭包运行时 + `/run(/call/exec)` `/abort` `/delay` `/switch` | 保留本地 |
-
-#### H.2 本地新增文件（同步补第 3 节）
-
-- `data/model/WorldInfoDecorators.kt`（W2）
-- `data/st/expressions/`：`ExpressionLabels.kt` / `ExpressionStore.kt` / `ExpressionClassifier.kt` / `SpriteRepository.kt`（W3）
-- `ui/pages/chat/CharacterExpression.kt`、`ui/pages/setting/SettingPreferencesExpressionPage.kt`（W3 UI）
-- `data/st/script/StClosure.kt`（W4 闭包语法 + 闭包表）
-- `data/st/tokenizer/TikToken.kt`（W5 真 tokenizer + `TokenizerMode`）
-- 测试：`WorldInfoDecoratorTest` / `WorldInfoDecoratorLosslessTest` / `ExpressionLabelsTest` / `ExpressionStoreTest` / `StClosureTest` / `TikTokenTest`；`MacroEngineTest` 加 W1 三条
-
-#### H.3 本批语义差异 / PORT NOTE（与官方的有意差异，逐条登记）
-
-1. **W1 导演备注宏**：官方 `{{authorsNote}}` 读 `chat_metadata[prompt]`（按对话）、`{{charAuthorsNote}}` 读按角色卡绑定的备注、`{{defaultAuthorsNote}}` 读全局默认模板；rikkaST 只有全局 `Settings.authorNote`，因此 `authorsNote` / `defaultAuthorsNote` 同源、`charAuthorsNote` 恒空串（见 `MacroEnv.AuthorNotes` 注释）。
-2. **W2 `@@` 装饰器**：官方在 `getSortedEntries` 把剥壳结果写进条目副本；rikkaST 不改存储结构 —— 装饰器是派生字段、剥离只作用扫描副本 → 导入/导出无损（`WorldInfoDecoratorLosslessTest`：47 条真实卡往返 + `@@` 行原样保留）。`parseDecorators` 的 `@@@` 转义、未知装饰器行丢弃、全 `@@` 行时 content 保持原样等边角行为逐字复刻官方。
-3. **W3 表情立绘**：**原生重写**，不移植官方 `index.js`（依赖浏览器 DOM + classify 服务端）。只保留官方 5 种分类方式的 `llm` / `none`；未做：visual novel（群聊并排）、`#emoji` 立绘资源、`/expression` 强制设置、`/expression-folder-override`、local(BERT)/extras/webllm。分类只在生成完成后触发（+官方 10s 节流 `STREAMING_UPDATE_INTERVAL`）、按 messageId 缓存、该角色无立绘不调用、失败回退兜底标签（默认 joy）。立绘存储：`filesDir/sprites/<assistantId>/<label>.(png|jpg|jpeg|webp|gif)`。
-4. **W4 控制流**：
-   - `/switch` 是**本地扩展**（官方 1.18 没有该命令，已源码核实）：值匹配 → 执行对应闭包分支，`default=` 兜底。
-   - `/delay` 在 UI 线程跳过等待（防 ANR），非 UI 线程真实 `Thread.sleep`；单次上限 30s。
-   - 闭包表 `StClosureStore` 为进程内存、按 `host.chatKey` 分作用域（官方 `SlashCommandScope` 同样是会话内存，不落盘）。
-   - 闭包递归深度上限 **32**（防栈溢出；官方无显式上限，靠 abortController）。
-   - `{{arg::key}}`：进入闭包体前做一次文本替换；未提供的 key 展开为空串（对齐官方 `arg::*` 通配默认），支持 `{{arg::*}}`。
-   - 官方 1.18 **没有** `/if` `/while` `/times` `/break` `/let` `/var`（已源码核实），本批不实现、不假实现。
-#### H.4 [v241] 真实卡兼容修复（导入 / 导出 / JSR 注入）
-
-**触发**：用主人桌面 `Desktop/角色卡/` 的真实成品卡（校园恋爱综漫1.7 / 星羽学院 / 千纱-DS鲸鱼版 / 偏航的东京日常v0.1）做导入审计，发现 3 类真实兼容缺陷，全部修复并加回归测试：
-
-| # | 缺陷（v241 前） | 影响 | 修复 |
-|---|---|---|---|
-| 1 | `character_book.entries[].enabled` 被忽略（只读 `disable`） | ST 1.18 规范写/读 `enabled`；真实卡 422/499 条本应禁用却被全部启用 → 世界书注入量与 token 预算严重不符 | `AssistantImporter.parseEntriesArray/Map`：`enabled` 优先 → `disable` → 默认启用；`RealCardV3ImportTest` 新增 3 条断言 |
-| 2 | 导出 `character_book.entries` 是「以 id 为键的对象」、不写 `enabled`、`extensions.role` 写字符串 | 导出的卡在酒馆里 `convertCharacterBook` 用 `.forEach` 读数组 → 失败；`enabled` 缺失 → 条目全禁用 | `CardExporter`：`entries` 改数组 + 显式 `id` + 写 `enabled`；`extensions.role` 写数字（0/1/2）；`RealCardImportAuditTest` 钉死形状 |
-| 3 | `regex_scripts` 用严格 kotlinx 序列化，字段类型漂移时整条丢 | `id` 数字 / `placement` 标量 / `trimStrings` 字符串 / 布尔 0-1 的真实卡正则会静默丢失 | `parseCardRegexScripts` 改宽容解析（数字 id、标量或数组 placement、字符串 trimStrings、0/1 布尔、camel/snake 双写法）；「坏字段忽略、脚本保留」，仅无 `findRegex`/非对象才丢 |
-
-**JSR `injectPrompts` 移植（v241）**：
-
-- 来源：`refs/C-st-ext/N0VI028__JS-Slash-Runner/src/function/inject.ts` + `@types/function/inject.d.ts`；
-- 新增：`shims/inject-shims.js`（ES module，`node --check` 通过）、`TavernJsBridge.injectPrompts/uninjectPrompts`、`InjectedPromptStore`（按会话隔离内存态）、`InjectedPromptsTransformer` + `InjectedPromptCleanupTransformer`（输入链首尾）；
-- 已对齐：`position: in_chat | none`、`depth`、`role`、`should_scan`、`once`、`{uninject}` 返回值、`uninjectPrompts(ids)`；
-- 有意差异（逐条登记）：
-  1. `filter`（JS 函数）跨 Kotlin 桥无法传递 → 忽略（本批真实卡的 filter 恒为 `() => true`，影响为零）；
-  2. `once` 在「注入进提示词」瞬间消费（官方在 GENERATION_ENDED/STOPPED 移除；对「只影响下一次生成」等价）；
-  3. `position='none'` 的扫描承载消息在宿主侧用 USER 角色（世界书扫描只取非 SYSTEM 消息），发送前由 cleanup 整条丢弃；
-  4. 未提供 `getPromptsInjected`（JSR 公开类型里也没有该签名）。
-
-## 3. 本地独有文件（永不参与上游冲突）
-
-约 50 个新文件，包括：
-- 酒馆：`data/ai/transformers/ContextInjectorTransformer.kt`、`ui/components/ai/SlashCommands.kt`、`MacroVarSlashOps.kt`、`utils/CardExporter.kt` 等
-- 群聊：`GroupChat.kt`、`GroupChatPage.kt`、`GroupChatListPage.kt`、`GroupSpeakerSelector.kt`
-- 工具：`FileTools.kt`、`TaskTools.kt`、`DatabaseQueryTool.kt`、`ShellTools.kt`、`PythonTools.kt`、`CalculatorTool.kt`、`WebFetchTool.kt`、`PythonBridge.kt`、`JsBridge.kt`、`SystemPromptAssembler.kt`、`SkillAutoTriggerTransformer.kt`
-- 宏/斜杠：`MacroEngine.kt`
-- 服务：`service/GenerationForegroundService.kt`
-
-合并时这些文件直接保留本地版本即可。
-
-## 4. 上游文件被本地删除/移动
-
-| 文件 | 处理 |
-|---|---|
-| `data/ai/tools/local/JavascriptTool.kt` / `LocalToolOption.kt` / `LocalTools.kt` | 移动到 `data/ai/tools/`（功能保留） |
-| `ui/pages/extensions/skills/SkillsPage.kt` / `SkillsVM.kt` / `SkillDetailPage.kt` / `SkillDetailVM.kt` | 移动到 `ui/pages/extensions/`（本地重写） |
-| `ai/ui/UIMessagePart.kt` / `UIMessageAnnotation.kt` | 合并进 `ai/ui/Message.kt` |
-| `ui/pages/setting/SettingMcpPage.kt` | 本地移除（MCP 设置并入别处） |
-| `data/ai/tools/GitHubTool.kt`、`SleepTool.kt` | 已按“上游没有”删除，**不要再加回** |
-
-## 5. 已对齐 / 已回退项（保持）
-
-- GitHub 工具及其 UI：已删（上游没有）
-- sleep 工具：已删（上游没有）
-- **知识库（RAG）：曾被删，已于 v27→28 恢复，当前可用**。历史：`Migration_20_21` 建表 → `Migration_25_26` 删除 → `Migration_27_28` 重建；对应代码 `data/knowledge/KnowledgeBaseService.kt`、`data/ai/transformers/KnowledgeBaseTransformer.kt`（已挂在 `ChatService` 生成链上）、`ui/pages/knowledge/KnowledgeBasePage.kt`。**上游合并时不要按「已删除」处理**。
-- SkillManager：已回退本轮缓存改动；**剩余两个早期差异**（技能目录用外部存储 + `/Rikkahub/skills` 公共目录）是技能安装依赖，默认保留
-- MCP：工具名与校验对齐上游
-- 文件工具：已去掉 skill 目录拼接
-- 日志调试（DeveloperPage/AILogging）：已删（上游没有）
-
-## 6. 冲突处理速查
-
-1. `ChatService.kt` / `GenerationHandler.kt`：上游改动先收，本地功能块（工具构建、transform 链）重新叠上去。
-2. `RouteActivity.kt`：各页面 entry 是追加式，冲突通常可两边都留。
-3. `Assistant.kt` / `PreferencesStore.kt`：字段是追加式，上游删字段时检查本地是否在用。
-4. 数据库：上游加 migration 时，注意本地版本号（当前 28）与迁移链；不要在本地重写已发布的迁移。
-5. 合完：`git diff --check` + 推送 + CI；**不在本地编译**。
+1. 上游目标始终固定为官方 tag；不得用 master 替代目标版本。
+2. 官方文件是骨架；本地差异通过扩展点（Transformer、Tool、Repository、Session 钩子、UI 入口）接入。
+3. 双方都改的文件：先保留官方结构，再按最小补丁接回本地语义；禁止整份旧文件覆盖。
+4. 本地独有文件必须可追溯到入口、DI、路由、数据、测试；不能只拷 class 不注册。
+5. 数据库只允许在当前本地版本向前追加迁移；禁止回退版本、改写已发布迁移、destructive fallback。
+6. 每次变更后更新本文件，并保留上游版本、commit、证据路径。

@@ -1,7 +1,15 @@
 import * as React from "react";
 
 import { useMutation } from "@tanstack/react-query";
-import { Brain, BrainCircuit, ChevronDown, Lightbulb, LightbulbOff, LoaderCircle, Sparkles } from "lucide-react";
+import {
+  Brain,
+  BrainCircuit,
+  ChevronDown,
+  Lightbulb,
+  LightbulbOff,
+  LoaderCircle,
+  Sparkles,
+} from "lucide-react";
 import { Slider as SliderPrimitive } from "radix-ui";
 import { useTranslation } from "react-i18next";
 
@@ -17,9 +25,9 @@ import { Popover, PopoverContent, PopoverTrigger } from "~/components/ui/popover
 
 import { PickerErrorAlert } from "./picker-error-alert";
 
-type ReasoningLevel = "off" | "auto" | "low" | "medium" | "high" | "xhigh";
+type ReasoningLevel = "off" | "auto" | "low" | "medium" | "high" | "xhigh" | "max";
 
-const REASONING_LEVELS: ReasoningLevel[] = ["off", "auto", "low", "medium", "high", "xhigh"];
+const REASONING_LEVELS: ReasoningLevel[] = ["off", "auto", "low", "medium", "high", "xhigh", "max"];
 
 // Thumb size in px, keep in sync with `size-7` on the thumb below
 const THUMB_SIZE = 28;
@@ -43,12 +51,20 @@ function isReasoningModel(model: ProviderModel | null): boolean {
 function ReasoningIcon({ level, className }: { level: ReasoningLevel; className?: string }) {
   const props = { className: cn("size-4", className) };
   switch (level) {
-    case "off":    return <LightbulbOff {...props} />;
-    case "auto":   return <Sparkles {...props} />;
-    case "low":    return <Lightbulb {...props} />;
-    case "medium": return <Lightbulb {...props} />;
-    case "high":   return <BrainCircuit {...props} />;
-    case "xhigh":  return <Brain {...props} />;
+    case "off":
+      return <LightbulbOff {...props} />;
+    case "auto":
+      return <Sparkles {...props} />;
+    case "low":
+      return <Lightbulb {...props} />;
+    case "medium":
+      return <Lightbulb {...props} />;
+    case "high":
+      return <BrainCircuit {...props} />;
+    case "xhigh":
+      return <Brain {...props} />;
+    case "max":
+      return <Brain {...props} />;
   }
 }
 
@@ -76,7 +92,12 @@ function ReasoningSlider({
       className="relative flex h-7 w-full touch-none items-center select-none data-[disabled]:opacity-50"
     >
       <SliderPrimitive.Track className="relative h-7 w-full grow overflow-hidden rounded-full bg-muted">
-        <SliderPrimitive.Range className="absolute h-full bg-primary/75" />
+        {/* Match the thumb's right edge, including its inset at both ends. */}
+        <span
+          aria-hidden="true"
+          className="absolute left-0 h-full rounded-r-lg bg-primary/75"
+          style={{ width: `calc(${THUMB_SIZE}px + (100% - ${THUMB_SIZE}px) * ${value / max})` }}
+        />
         {/* Tick dots inside the track, aligned with thumb travel positions */}
         {REASONING_LEVELS.map((level, i) => (
           <span
@@ -105,17 +126,47 @@ export function ReasoningPickerButton({ disabled = false, className }: Reasoning
 
   const reasoningPresets = React.useMemo<ReasoningPreset[]>(
     () => [
-      { key: "off",    label: t("reasoning.presets.off.label"),    description: t("reasoning.presets.off.description") },
-      { key: "auto",   label: t("reasoning.presets.auto.label"),   description: t("reasoning.presets.auto.description") },
-      { key: "low",    label: t("reasoning.presets.low.label"),    description: t("reasoning.presets.low.description") },
-      { key: "medium", label: t("reasoning.presets.medium.label"), description: t("reasoning.presets.medium.description") },
-      { key: "high",   label: t("reasoning.presets.high.label"),   description: t("reasoning.presets.high.description") },
-      { key: "xhigh",  label: t("reasoning.presets.xhigh.label"),  description: t("reasoning.presets.xhigh.description") },
+      {
+        key: "off",
+        label: t("reasoning.presets.off.label"),
+        description: t("reasoning.presets.off.description"),
+      },
+      {
+        key: "auto",
+        label: t("reasoning.presets.auto.label"),
+        description: t("reasoning.presets.auto.description"),
+      },
+      {
+        key: "low",
+        label: t("reasoning.presets.low.label"),
+        description: t("reasoning.presets.low.description"),
+      },
+      {
+        key: "medium",
+        label: t("reasoning.presets.medium.label"),
+        description: t("reasoning.presets.medium.description"),
+      },
+      {
+        key: "high",
+        label: t("reasoning.presets.high.label"),
+        description: t("reasoning.presets.high.description"),
+      },
+      {
+        key: "xhigh",
+        label: t("reasoning.presets.xhigh.label"),
+        description: t("reasoning.presets.xhigh.description"),
+      },
+      {
+        key: "max",
+        label: t("reasoning.presets.max.label"),
+        description: t("reasoning.presets.max.description"),
+      },
     ],
     [t],
   );
 
-  const currentLevel = ((currentAssistant?.reasoningLevel as ReasoningLevel | null | undefined) ?? "auto");
+  const currentLevel =
+    (currentAssistant?.reasoningLevel as ReasoningLevel | null | undefined) ?? "auto";
   const currentIndex = Math.max(0, REASONING_LEVELS.indexOf(currentLevel));
 
   const [localIndex, setLocalIndex] = React.useState(currentIndex);
@@ -137,7 +188,13 @@ export function ReasoningPickerButton({ disabled = false, className }: Reasoning
   }, [open]);
 
   const updateReasoningLevelMutation = useMutation({
-    mutationFn: ({ assistantId, reasoningLevel }: { assistantId: string; reasoningLevel: ReasoningLevel }) =>
+    mutationFn: ({
+      assistantId,
+      reasoningLevel,
+    }: {
+      assistantId: string;
+      reasoningLevel: ReasoningLevel;
+    }) =>
       api.post<{ status: string }>("settings/assistant/thinking-budget", {
         assistantId,
         reasoningLevel,
@@ -180,7 +237,7 @@ export function ReasoningPickerButton({ disabled = false, className }: Reasoning
         </Button>
       </PopoverTrigger>
 
-      <PopoverContent align="end" className="w-[min(92vw,20rem)] space-y-3 px-4 py-4">
+      <PopoverContent side="top" sideOffset={8} align="end" className="w-[min(92vw,20rem)] space-y-3 px-4 py-4">
         <PickerErrorAlert error={error} />
 
         {/* Faster / Smarter labels */}

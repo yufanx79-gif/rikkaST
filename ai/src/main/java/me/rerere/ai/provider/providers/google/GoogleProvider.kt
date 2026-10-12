@@ -9,6 +9,7 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
@@ -44,6 +45,9 @@ import me.rerere.ai.provider.providers.groupPartsByToolBoundary
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.GoogleThoughtMetadata
+import me.rerere.ai.ui.ServerToolMetadata
+import me.rerere.ai.ui.ServerToolProtocol
+import me.rerere.ai.ui.ServerToolStatus
 import me.rerere.ai.ui.StreamChunk
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessageAnnotation
@@ -52,13 +56,14 @@ import me.rerere.ai.ui.metadataAs
 import me.rerere.ai.ui.toMetadata
 import me.rerere.ai.util.KeyRoulette
 import me.rerere.ai.util.configureReferHeaders
+import me.rerere.ai.util.configureSessionHeaders
 import me.rerere.ai.util.encodeBase64
 import me.rerere.ai.util.json
 import me.rerere.ai.util.mergeCustomBody
 import me.rerere.ai.util.normalizeInputSchema
+import me.rerere.ai.util.mergeCustomHeaders
 import me.rerere.ai.util.removeElements
 import me.rerere.ai.util.stringSafe
-import me.rerere.ai.util.toHeaders
 import me.rerere.common.http.await
 import me.rerere.common.http.jsonPrimitiveOrNull
 import okhttp3.HttpUrl
@@ -82,6 +87,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
     private val serviceAccountTokenProvider by lazy {
         ServiceAccountTokenProvider(client)
     }
+    private val interactionsAPI = InteractionsAPI(client = client, keyRoulette = keyRoulette)
+
+    // Interactions API 目前只有 Gemini Developer API 提供，Vertex AI 仍走 generateContent
+    private fun ProviderSetting.Google.usesInteractionsApi() = useInteractionsApi && !vertexAI
 
     private fun buildUrl(providerSetting: ProviderSetting.Google, path: String): HttpUrl {
         return if (!providerSetting.vertexAI) {
@@ -126,6 +135,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 providerSetting = providerSetting,
                 request = Request.Builder()
                     .url(url)
+                    .headers(providerSetting.mergeCustomHeaders())
                     .get()
                     .build()
             )
@@ -163,6 +173,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): TextGenerationResult = withContext(Dispatchers.IO) {
+        if (providerSetting.usesInteractionsApi()) {
+            return@withContext interactionsAPI.generateText(providerSetting, messages, params)
+        }
+
         val requestBody = buildCompletionRequestBody(messages, params)
 
         val url = buildUrl(
@@ -178,7 +192,8 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             providerSetting = providerSetting,
             request = Request.Builder()
                 .url(url)
-                .headers(params.customHeaders.toHeaders())
+                .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+                .configureSessionHeaders(url.toString(), params.sessionId)
                 .post(
                     json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
                 )
@@ -209,6 +224,16 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         providerSetting: ProviderSetting.Google,
         messages: List<UIMessage>,
         params: TextGenerationParams,
+    ): Flow<StreamChunk> = if (providerSetting.usesInteractionsApi()) {
+        interactionsAPI.streamText(providerSetting, messages, params)
+    } else {
+        streamGenerateContent(providerSetting, messages, params)
+    }
+
+    private fun streamGenerateContent(
+        providerSetting: ProviderSetting.Google,
+        messages: List<UIMessage>,
+        params: TextGenerationParams,
     ): Flow<StreamChunk> = callbackFlow {
         val requestBody = buildCompletionRequestBody(messages, params)
 
@@ -225,7 +250,8 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             providerSetting = providerSetting,
             request = Request.Builder()
                 .url(url)
-                .headers(params.customHeaders.toHeaders())
+                .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+                .configureSessionHeaders(url.toString(), params.sessionId)
                 .post(
                     json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
                 )
@@ -314,7 +340,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             eventSource.cancel()
         }
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
-    }.buffer(Channel.UNLIMITED)
+    }.buffer(Channel.UNLIMITED).flowOn(Dispatchers.IO)
 
     private fun buildCompletionRequestBody(
         messages: List<UIMessage>,
@@ -352,12 +378,15 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
 
                     val isGeminiPro =
                         params.model.modelId.contains(Regex("2\\.5.*pro", RegexOption.IGNORE_CASE))
+                    val useThinkingLevel =
+                        ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId) ||
+                            ModelRegistry.GEMINI_4.match(modelId = params.model.modelId)
 
                     when (params.reasoningLevel) {
                         ReasoningLevel.AUTO -> {} // 自动模式，不设置参数
 
                         ReasoningLevel.OFF -> {
-                            if (ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId)) {
+                            if (useThinkingLevel) {
                                 put("thinkingLevel", "minimal")
                             } else if (!isGeminiPro) {
                                 put("thinkingBudget", 0)
@@ -366,7 +395,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                         }
 
                         else -> {
-                            if (ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId)) {
+                            if (useThinkingLevel) {
                                 when (params.reasoningLevel) {
                                     ReasoningLevel.LOW -> put("thinkingLevel", "low")
                                     ReasoningLevel.MEDIUM -> put("thinkingLevel", "medium")
@@ -387,41 +416,43 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             buildContents(messages)
         )
 
-        // Tools
-        if (params.tools.isNotEmpty() && params.model.abilities.contains(ModelAbility.TOOL)) {
-            put("tools", buildJsonArray {
-                add(buildJsonObject {
-                    put("functionDeclarations", buildJsonArray {
-                        params.tools.forEach { tool ->
-                            add(buildJsonObject {
-                                put("name", JsonPrimitive(tool.name))
-                                put("description", JsonPrimitive(tool.description))
-                                put(
-                                    key = "parameters",
-                                    element = json.encodeToJsonElement(tool.parameters())
-                                        // Gemini / Vertex 拒绝缺 items 的数组 schema（400: missing field），统一兜底
-                                        .normalizeInputSchema()
-                                        .removeElements(
-                                            listOf(
-                                                "const",
-                                                "exclusiveMaximum",
-                                                "exclusiveMinimum",
-                                                "format",
-                                                "additionalProperties",
-                                                "enum",
+        // Client function tools and model built-in tools share the same array.
+        val useFunctionTools =
+            params.tools.isNotEmpty() && params.model.abilities.contains(ModelAbility.TOOL)
+        val useBuiltInTools = params.model.tools.any {
+            it == BuiltInTools.Search || it == BuiltInTools.UrlContext
+        }
+        if (useFunctionTools || useBuiltInTools) {
+            putJsonArray("tools") {
+                if (useFunctionTools) {
+                    add(buildJsonObject {
+                        putJsonArray("functionDeclarations") {
+                            params.tools.forEach { tool ->
+                                add(buildJsonObject {
+                                    put("name", JsonPrimitive(tool.name))
+                                    put("description", JsonPrimitive(tool.description))
+                                    put(
+                                        key = "parameters",
+                                        element = json.encodeToJsonElement(tool.parameters())
+                                            // Gemini / Vertex 拒绝缺 items 的数组 schema（400: missing field），统一兜底
+                                            .normalizeInputSchema()
+                                            .removeElements(
+                                                listOf(
+                                                    "const",
+                                                    "exclusiveMaximum",
+                                                    "exclusiveMinimum",
+                                                    "format",
+                                                    "additionalProperties",
+                                                    "propertyNames",
+                                                    "enum",
+                                                )
                                             )
-                                        )
-                                )
-                            })
+                                    )
+                                })
+                            }
                         }
                     })
-                })
-            })
-        }
-        // Model BuiltIn Tools
-        // 目前不能和工具调用兼容
-        if (params.model.tools.isNotEmpty()) {
-            put("tools", buildJsonArray {
+                }
                 params.model.tools.forEach { builtInTool ->
                     when (builtInTool) {
                         BuiltInTools.Search -> {
@@ -439,6 +470,11 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                         else -> {}
                     }
                 }
+            }
+        }
+        if (useFunctionTools && useBuiltInTools) {
+            put("toolConfig", buildJsonObject {
+                put("includeServerSideToolInvocations", true)
             })
         }
 
@@ -490,9 +526,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             message["role"]?.jsonPrimitive?.contentOrNull ?: "model"
         )
         val content = message["content"]?.jsonObject ?: error("No content")
-        val parts = content["parts"]?.jsonArray?.map { part ->
-            parseMessagePart(part.jsonObject)
-        } ?: emptyList()
+        val parts = parseMessageParts(content["parts"]?.jsonArray)
 
         val groundingMetadata = message["groundingMetadata"]?.jsonObject
         Log.i(TAG, "parseMessage: $groundingMetadata")
@@ -521,7 +555,35 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         return chunks
     }
 
-    private fun parseMessagePart(jsonObject: JsonObject): UIMessagePart {
+    private fun parseMessageParts(parts: JsonArray?): List<UIMessagePart> = buildList {
+        parts.orEmpty().forEachIndexed { index, element ->
+            val part = parseMessagePart(element.jsonObject, index)
+            if (part !is UIMessagePart.ServerTool) {
+                add(part)
+                return@forEachIndexed
+            }
+
+            val existingIndex = indexOfFirst {
+                it is UIMessagePart.ServerTool && it.toolCallId == part.toolCallId
+            }
+            if (existingIndex < 0) {
+                add(part)
+            } else {
+                val existing = get(existingIndex) as UIMessagePart.ServerTool
+                set(
+                    existingIndex, existing.copy(
+                        toolName = part.toolName.ifBlank { existing.toolName },
+                        input = part.input ?: existing.input,
+                        output = part.output ?: existing.output,
+                        status = if (part.isFinished) part.status else existing.status,
+                        metadata = mergeGoogleMetadata(existing.metadata, part.metadata),
+                    )
+                )
+            }
+        }
+    }
+
+    private fun parseMessagePart(jsonObject: JsonObject, index: Int): UIMessagePart {
         return when {
             jsonObject.containsKey("text") -> {
                 val thought = jsonObject["thought"]?.jsonPrimitive?.booleanOrNull ?: false
@@ -529,19 +591,58 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 if (thought) UIMessagePart.Reasoning(
                     reasoning = text,
                     createdAt = Clock.System.now(),
-                    finishedAt = null
-                ) else UIMessagePart.Text(text)
+                    finishedAt = null,
+                    metadata = jsonObject.toGoogleThoughtMetadata(),
+                ) else UIMessagePart.Text(
+                    text = text,
+                    metadata = jsonObject.toGoogleThoughtMetadata(),
+                )
             }
 
             jsonObject.containsKey("functionCall") -> {
+                val functionCall = jsonObject["functionCall"]!!.jsonObject
+                val toolCallId = functionCall["id"]?.jsonPrimitive?.contentOrNull
+                    ?: Uuid.random().toString()
                 UIMessagePart.Tool(
-                    toolCallId = Uuid.random().toString(),
-                    toolName = jsonObject["functionCall"]!!.jsonObject["name"]!!.jsonPrimitive.content,
-                    input = json.encodeToString(jsonObject["functionCall"]!!.jsonObject["args"]),
+                    toolCallId = toolCallId,
+                    toolName = functionCall["name"]!!.jsonPrimitive.content,
+                    input = json.encodeToString(functionCall["args"]),
                     output = emptyList(),
                     metadata = GoogleThoughtMetadata(
-                        thoughtSignature = jsonObject["thoughtSignature"]?.jsonPrimitive?.contentOrNull
+                        thoughtSignature = jsonObject["thoughtSignature"]?.jsonPrimitive?.contentOrNull,
                     ).toMetadata()
+                )
+            }
+
+            jsonObject.containsKey("toolCall") -> {
+                val toolCall = jsonObject["toolCall"]!!.jsonObject
+                UIMessagePart.ServerTool(
+                    toolCallId = toolCall["id"]?.jsonPrimitive?.contentOrNull
+                        ?: Uuid.random().toString(),
+                    toolName = toolCall["toolType"]?.jsonPrimitive?.contentOrNull ?: "",
+                    input = toolCall["args"],
+                    status = ServerToolStatus.IN_PROGRESS,
+                    metadata = ServerToolMetadata(
+                        protocol = ServerToolProtocol.GOOGLE_GENERATE_CONTENT,
+                        call = jsonObject,
+                        callIndex = index,
+                    ).toMetadata(),
+                )
+            }
+
+            jsonObject.containsKey("toolResponse") -> {
+                val toolResponse = jsonObject["toolResponse"]!!.jsonObject
+                UIMessagePart.ServerTool(
+                    toolCallId = toolResponse["id"]?.jsonPrimitive?.contentOrNull
+                        ?: Uuid.random().toString(),
+                    toolName = toolResponse["toolType"]?.jsonPrimitive?.contentOrNull ?: "",
+                    output = toolResponse["response"],
+                    status = ServerToolStatus.COMPLETED,
+                    metadata = ServerToolMetadata(
+                        protocol = ServerToolProtocol.GOOGLE_GENERATE_CONTENT,
+                        result = jsonObject,
+                        resultIndex = index,
+                    ).toMetadata(),
                 )
             }
 
@@ -564,7 +665,9 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 }
                 UIMessagePart.Image(
                     url = "data:$mime;base64,$data",
-                    metadata = GoogleThoughtMetadata(thoughtSignature = thoughtSignature).toMetadata()
+                    metadata = GoogleThoughtMetadata(thoughtSignature = thoughtSignature)
+                        .takeIf { thoughtSignature != null }
+                        ?.toMetadata()
                 )
             }
 
@@ -593,7 +696,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         for (group in groups) {
             when (group) {
                 is PartGroup.Content -> {
-                    group.parts.mapNotNull { it.toGooglePart() }.forEach { partsBuffer.add(it) }
+                    group.parts.flatMap { it.toGoogleParts() }.forEach { partsBuffer.add(it) }
                 }
 
                 is PartGroup.Tools -> {
@@ -634,14 +737,32 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             put("role", commonRoleToGoogleRole(message.role))
             message.name?.takeIf { it.isNotBlank() }?.let { put("name", it) }
             putJsonArray("parts") {
-                message.parts.mapNotNull { it.toGooglePart() }.forEach { add(it) }
+                message.parts.flatMap { it.toGoogleParts() }.forEach { add(it) }
             }
         })
     }
 
+    private fun UIMessagePart.toGoogleParts(): List<JsonObject> = when (this) {
+        is UIMessagePart.ServerTool -> toGoogleServerToolParts()
+        else -> listOfNotNull(toGooglePart())
+    }
+
     private fun UIMessagePart.toGooglePart(): JsonObject? = when (this) {
-        is UIMessagePart.Text -> buildJsonObject {
-            put("text", text)
+        is UIMessagePart.Text -> {
+            val thoughtSignature = metadataAs<GoogleThoughtMetadata>()?.thoughtSignature
+            buildJsonObject {
+                put("text", text)
+                thoughtSignature?.let { put("thoughtSignature", it) }
+            }
+        }
+
+        is UIMessagePart.Reasoning -> {
+            val thoughtSignature = metadataAs<GoogleThoughtMetadata>()?.thoughtSignature
+            buildJsonObject {
+                put("text", reasoning)
+                put("thought", true)
+                thoughtSignature?.let { put("thoughtSignature", it) }
+            }
         }
 
         is UIMessagePart.Image -> {
@@ -687,6 +808,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         put("functionCall", buildJsonObject {
             put("name", toolName)
             put("args", inputAsJson())
+            put("id", toolCallId)
         })
         metadataAs<GoogleThoughtMetadata>()?.thoughtSignature?.let {
             put("thoughtSignature", it)
@@ -696,6 +818,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
     private fun UIMessagePart.Tool.toFunctionResponsePart() = buildJsonObject {
             put("functionResponse", buildJsonObject {
                 put("name", toolName)
+                put("id", toolCallId)
 
                 // 1. 拆分出纯文本部分
                 val textParts = output.filterIsInstance<UIMessagePart.Text>()
@@ -755,6 +878,30 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 }
             })
         }
+
+    private fun UIMessagePart.ServerTool.toGoogleServerToolParts(): List<JsonObject> {
+        val metadata = metadataAs<ServerToolMetadata>()
+        val protocol = metadata?.protocol
+        if (protocol != null && protocol != ServerToolProtocol.GOOGLE_GENERATE_CONTENT) {
+            return emptyList()
+        }
+
+        return buildList {
+            metadata?.call?.let(::add)
+            metadata?.result?.let(::add)
+        }
+    }
+
+    private fun JsonObject.toGoogleThoughtMetadata() =
+        this["thoughtSignature"]?.jsonPrimitive?.contentOrNull?.let {
+            GoogleThoughtMetadata(thoughtSignature = it).toMetadata()
+        }
+
+    private fun mergeGoogleMetadata(first: JsonObject?, second: JsonObject?): JsonObject? = when {
+        first == null -> second
+        second == null -> first
+        else -> JsonObject(first + second)
+    }
 
     private fun parseUsageMeta(jsonObject: JsonObject?): TokenUsage? {
         if (jsonObject == null) {

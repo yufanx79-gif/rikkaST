@@ -22,6 +22,7 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.ai.tools.local.buildCalendarCreateTool
+import me.rerere.rikkahub.data.ai.tools.local.buildChartDisplayTool
 import me.rerere.rikkahub.data.ai.tools.local.buildCalendarQueryTool
 import me.rerere.rikkahub.data.ai.tools.local.buildScreenTimeTool
 import me.rerere.rikkahub.data.ai.tools.local.buildAskUserTool
@@ -119,6 +120,10 @@ sealed class LocalToolOption {
     @Serializable
     @SerialName("calendar")
     data object Calendar : LocalToolOption()
+
+    @Serializable
+    @SerialName("chart_display")
+    data object ChartDisplay : LocalToolOption()
 }
 
 class LocalTools(
@@ -399,6 +404,8 @@ class LocalTools(
 
     val calendarCreateTool by lazy { buildCalendarCreateTool(context) }
 
+    val chartDisplayTool by lazy { buildChartDisplayTool() }
+
     fun getTools(options: List<LocalToolOption>): List<Tool> {
         val tools = mutableListOf<Tool>()
         if (options.contains(LocalToolOption.JavascriptEngine)) {
@@ -425,6 +432,9 @@ class LocalTools(
         if (options.contains(LocalToolOption.Calendar)) {
             tools.add(calendarQueryTool)
             tools.add(calendarCreateTool)
+        }
+        if (options.contains(LocalToolOption.ChartDisplay)) {
+            tools.add(chartDisplayTool)
         }
         return tools
     }

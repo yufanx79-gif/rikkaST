@@ -1,12 +1,12 @@
 {
-  "version": "2.4.6",
-  "publishedAt": "2026-10-08T14:18:09Z",
-  "changelog": "基于上游 RikkaHub 2.4.6 的 rikkaST 分支：保留酒馆兼容层、群聊、宏引擎与工具系统，不含命理/占星模块。",
+  "version": "2.5.6",
+  "publishedAt": "2026-10-12T00:00:00Z",
+  "changelog": "rikkaST 2.5.6：底座迁移到官方 RikkaHub 2.5.6 tag（含 AI SDK、生成链、Navigation3、oauth/videogen 模块等上游变更），保留 rikkaST 酒馆兼容层、群聊、宏引擎、知识库与自研工具；数据库在本地版本 28 基础上新增 28→29 迁移，保留已安装用户数据。",
   "downloads": [
     {
-      "name": "rikkaST-2.4.6-public.apk",
-      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.4.6/rikkaST-2.4.6-public.apk",
-      "size": "58,613,333 bytes (约 58.6 MB)"
+      "name": "rikkaST-2.5.6-public.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.6/rikkaST-2.5.6-public.apk",
+      "size": "59,857,224 bytes (约 59.9 MB)"
     }
   ]
 }

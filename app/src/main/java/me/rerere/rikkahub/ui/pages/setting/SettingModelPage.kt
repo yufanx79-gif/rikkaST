@@ -31,6 +31,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
+import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderSetting
@@ -42,6 +43,7 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.ui.components.ai.ModelListSheet
+import me.rerere.rikkahub.ui.components.ai.ReasoningButton
 import me.rerere.rikkahub.ui.components.ai.rememberModelListState
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
@@ -122,20 +124,14 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
                 modelId = settings.fastModelId,
                 providers = settings.providers,
                 onSelect = { vm.updateSettings(settings.copy(fastModelId = it.id)) },
+                reasoningLevel = settings.fastModelReasoningLevel,
+                onUpdateReasoningLevel = {
+                    vm.updateSettings(settings.copy(fastModelReasoningLevel = it))
+                },
             )
         }
         item {
-            ModelSettingItem(
-                title = stringResource(R.string.setting_model_page_title_model),
-                description = stringResource(R.string.setting_model_page_title_model_desc),
-                modelId = settings.titleModelId,
-                providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(titleModelId = it.id)) },
-                onClear = { vm.updateSettings(settings.copy(titleModelId = null)) },
-            )
-        }
-        item {
-            SuggestionModelSettingItem(
+            SuggestionSettingItem(
                 settings = settings,
                 vm = vm,
             )
@@ -171,7 +167,7 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
 }
 
 @Composable
-private fun SuggestionModelSettingItem(
+private fun SuggestionSettingItem(
     settings: Settings,
     vm: SettingVM,
 ) {
@@ -249,7 +245,8 @@ private fun ModelSettingItem(
     modelId: Uuid?,
     providers: List<ProviderSetting>,
     onSelect: (Model) -> Unit,
-    onClear: (() -> Unit)? = null,
+    reasoningLevel: ReasoningLevel? = null,
+    onUpdateReasoningLevel: ((ReasoningLevel) -> Unit)? = null,
 ) {
     val state = rememberModelListState(
         modelId = modelId,
@@ -275,20 +272,25 @@ private fun ModelSettingItem(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        if (onClear != null && state.currentModel != null) {
-                            IconButton(onClick = onClear, modifier = Modifier.size(20.dp)) {
-                                Icon(HugeIcons.Cancel01, contentDescription = null, modifier = Modifier.size(14.dp))
-                            }
-                        } else {
-                            Icon(
-                                HugeIcons.ArrowRight01,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                        }
+                        Icon(
+                            HugeIcons.ArrowRight01,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
                     }
                 },
             )
+            if (reasoningLevel != null && onUpdateReasoningLevel != null) {
+                item(
+                    headlineContent = { Text(stringResource(R.string.assistant_page_thinking_budget)) },
+                    trailingContent = {
+                        ReasoningButton(
+                            reasoningLevel = reasoningLevel,
+                            onUpdateReasoningLevel = onUpdateReasoningLevel,
+                        )
+                    },
+                )
+            }
         }
         Text(
             text = description,

@@ -116,7 +116,7 @@ import kotlin.math.roundToInt
  *   - 点击轨道任意位置 → 吸附到最近档位（Kelivo 的 onTapDown 语义）。
  *
  * 约束：
- *   - 纯观感 / 手感改动，不动数据模型：档位仍来自 [ReasoningLevel.entries]（6 档，无 Max）；
+ *   - 纯观感 / 手感改动，不动数据模型：档位来自 [ReasoningLevel.entries]（含 MAX 档）；
  *   - [ReasoningButton] 的调用签名保持不变（ChatInput / AssistantBasicPage / SettingModelPromptPage）；
  *   - 尺寸 / 间距走 AppSpacing / AppSizes，动效走 MaterialTheme.motionScheme 与 AppMotion，
  *     取色走 colorScheme。
@@ -555,6 +555,7 @@ private fun ReasoningIcon(
         ReasoningLevel.MEDIUM -> Icon(ReasoningMedium, null, modifier = modifier, tint = tint)
         ReasoningLevel.HIGH -> Icon(ReasoningHigh, null, modifier = modifier, tint = tint)
         ReasoningLevel.XHIGH -> Icon(ReasoningHigh, null, modifier = modifier, tint = tint)
+        ReasoningLevel.MAX -> Icon(ReasoningHigh, null, modifier = modifier, tint = tint)
     }
 }
 
@@ -566,6 +567,7 @@ private fun ReasoningLevel.label(): String = when (this) {
     ReasoningLevel.MEDIUM -> stringResource(R.string.reasoning_medium)
     ReasoningLevel.HIGH -> stringResource(R.string.reasoning_heavy)
     ReasoningLevel.XHIGH -> stringResource(R.string.reasoning_xhigh)
+    ReasoningLevel.MAX -> stringResource(R.string.reasoning_max)
 }
 
 @Composable
@@ -576,6 +578,7 @@ private fun ReasoningLevel.description(): String = when (this) {
     ReasoningLevel.MEDIUM -> stringResource(R.string.reasoning_medium_desc)
     ReasoningLevel.HIGH -> stringResource(R.string.reasoning_heavy_desc)
     ReasoningLevel.XHIGH -> stringResource(R.string.reasoning_xhigh_desc)
+    ReasoningLevel.MAX -> stringResource(R.string.reasoning_max_desc)
 }
 
 @Preview(showBackground = true)

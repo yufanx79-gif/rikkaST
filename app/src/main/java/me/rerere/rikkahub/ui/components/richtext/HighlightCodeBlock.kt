@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -106,7 +108,7 @@ fun HighlightCodeBlock(
     val normalizedLanguage = remember(language) { language.lowercase() }
     val canInlinePreview = completeCodeBlock && normalizedLanguage in PREVIEWABLE_LANGUAGES
     var previewMode by remember(canInlinePreview, code, normalizedLanguage) {
-        mutableStateOf(canInlinePreview)
+        mutableStateOf(false)
     }
 
     var isExpanded by remember(settings.displaySetting.codeBlockAutoCollapse) {
@@ -119,10 +121,10 @@ fun HighlightCodeBlock(
         contract = ActivityResultContracts.CreateDocument("*/*")
     ) { uri: Uri? ->
         uri?.let {
-            scope.launch {
+            scope.launch(Dispatchers.IO) {
                 try {
-                    context.contentResolver.openOutputStream(it)?.use { outputStream ->
-                        outputStream.write(code.toByteArray())
+                    context.contentResolver.openOutputStream(it, "wt")?.use { outputStream ->
+                        outputStream.write(code.toByteArray(Charsets.UTF_8))
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -265,15 +267,17 @@ private fun CodeBlockWithLineNumbersWrapped(
                 Row(
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(
-                        text = (index + 1).toString().padStart(lineNumberWidth, ' '),
-                        fontSize = textStyle.fontSize,
-                        lineHeight = textStyle.lineHeight,
-                        fontFamily = JetbrainsMono,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                        softWrap = false,
-                        modifier = Modifier.padding(end = 8.dp)
-                    )
+                    DisableSelection {
+                        Text(
+                            text = (index + 1).toString().padStart(lineNumberWidth, ' '),
+                            fontSize = textStyle.fontSize,
+                            lineHeight = textStyle.lineHeight,
+                            fontFamily = JetbrainsMono,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                            softWrap = false,
+                            modifier = Modifier.padding(end = 8.dp)
+                        )
+                    }
                     CodeHighlightText(
                         code = line,
                         language = language,

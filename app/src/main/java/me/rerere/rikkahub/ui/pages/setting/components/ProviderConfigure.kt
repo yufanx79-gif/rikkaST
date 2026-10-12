@@ -103,19 +103,19 @@ fun ProviderSetting.convertTo(type: KClass<out ProviderSetting>): ProviderSettin
     return when (type) {
         ProviderSetting.OpenAI::class -> ProviderSetting.OpenAI(
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
-            balanceOption = this.balanceOption, builtIn = this.builtIn,
+            balanceOption = this.balanceOption, customHeaders = this.customHeaders, builtIn = this.builtIn,
             description = this.description, shortDescription = this.shortDescription,
             apiKey = apiKey, baseUrl = convertedBaseUrl
         )
         ProviderSetting.Google::class -> ProviderSetting.Google(
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
-            balanceOption = this.balanceOption, builtIn = this.builtIn,
+            balanceOption = this.balanceOption, customHeaders = this.customHeaders, builtIn = this.builtIn,
             description = this.description, shortDescription = this.shortDescription,
             apiKey = apiKey, baseUrl = convertedBaseUrl
         )
         ProviderSetting.Claude::class -> ProviderSetting.Claude(
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
-            balanceOption = this.balanceOption, builtIn = this.builtIn,
+            balanceOption = this.balanceOption, customHeaders = this.customHeaders, builtIn = this.builtIn,
             description = this.description, shortDescription = this.shortDescription,
             apiKey = apiKey, baseUrl = convertedBaseUrl
         )
@@ -209,7 +209,7 @@ private fun ProviderConfigureOpenAI(
 
     OutlinedTextField(
         value = provider.name,
-        onValueChange = { onEdit(provider.copy(name = it.trim())) },
+        onValueChange = { onEdit(provider.copy(name = it)) },
         label = { Text(stringResource(R.string.setting_provider_page_name)) },
         modifier = Modifier.fillMaxWidth(),
     )
@@ -237,15 +237,21 @@ private fun ProviderConfigureOpenAI(
         isError = provider.baseUrl.isNotBlank() && !provider.baseUrl.isValidBaseUrl(),
     )
 
-    if (!provider.useResponseApi) {
-        OutlinedTextField(
-            value = provider.chatCompletionsPath,
-            onValueChange = { onEdit(provider.copy(chatCompletionsPath = it.trim())) },
-            label = { Text(stringResource(R.string.setting_provider_page_api_path)) },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !provider.builtIn,
-        )
-    }
+    OutlinedTextField(
+        value = if (provider.useResponseApi) provider.responsesPath else provider.chatCompletionsPath,
+        onValueChange = {
+            onEdit(
+                if (provider.useResponseApi) {
+                    provider.copy(responsesPath = it.trim())
+                } else {
+                    provider.copy(chatCompletionsPath = it.trim())
+                }
+            )
+        },
+        label = { Text(stringResource(R.string.setting_provider_page_api_path)) },
+        modifier = Modifier.fillMaxWidth(),
+        enabled = !provider.builtIn,
+    )
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -299,7 +305,7 @@ private fun ProviderConfigureClaude(
 
     OutlinedTextField(
         value = provider.name,
-        onValueChange = { onEdit(provider.copy(name = it.trim())) },
+        onValueChange = { onEdit(provider.copy(name = it)) },
         label = { Text(stringResource(R.string.setting_provider_page_name)) },
         modifier = Modifier.fillMaxWidth(),
         maxLines = 3,
@@ -411,7 +417,7 @@ private fun ProviderConfigureGoogle(
 
     OutlinedTextField(
         value = provider.name,
-        onValueChange = { onEdit(provider.copy(name = it.trim())) },
+        onValueChange = { onEdit(provider.copy(name = it)) },
         label = { Text(stringResource(R.string.setting_provider_page_name)) },
         modifier = Modifier.fillMaxWidth(),
     )
@@ -470,6 +476,20 @@ private fun ProviderConfigureGoogle(
             checked = provider.vertexAI,
             onCheckedChange = { onEdit(provider.copy(vertexAI = it)) }
         )
+    }
+
+    if (!provider.vertexAI) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Interactions API (Beta)")
+            Switch(
+                checked = provider.useInteractionsApi,
+                onCheckedChange = { onEdit(provider.copy(useInteractionsApi = it)) }
+            )
+        }
     }
 
     if (provider.vertexAI) {

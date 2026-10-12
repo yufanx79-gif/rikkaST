@@ -19,7 +19,13 @@ chaquopy {
         // 都没有则交给 Chaquopy 用 PATH 上的 python。
         // （原先这里写死了本机绝对路径，已移除以避免泄露个人环境；本机可写入 local.properties：）
         //   chaquopy.python=C:/Users/<you>/AppData/Roaming/uv/python/cpython-3.12.13-windows-x86_64-none/python.exe
-        val chaquopyPython = (project.findProperty("chaquopy.python") as String?)
+        val localProperties = Properties().apply {
+            val f = rootProject.file("local.properties")
+            if (f.exists()) {
+                f.inputStream().use { load(it) }
+            }
+        }
+        val chaquopyPython = localProperties.getProperty("chaquopy.python")
             ?.takeIf { it.isNotBlank() }
             ?: System.getenv("CHAQUOPY_PYTHON")?.takeIf { it.isNotBlank() }
         if (chaquopyPython != null) buildPython(chaquopyPython)
@@ -39,13 +45,17 @@ chaquopy {
 }
 android {
     namespace = "me.rerere.rikkahub"
-    compileSdk = 37
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 2
+        }
+    }
     defaultConfig {
         applicationId = "me.rerere.rikkahub.st"  // 独立包名：可与官方 RikkaHub 共存，互不覆盖（debug 变体自动加 .debug 后缀）
         minSdk = 26
         targetSdk = 37
-                versionCode = 237 // 2026-10-05: v235 - S3 depth 注入对齐 ST(同深度角色序修复)+S4 charJailbreak 别名; R2 KaTeX 0.16.45 离线(60 字体+mhchem, stMessageFormatting 接入); I3 eventOn per-iframe 隔离行为测试; I4 MVU owner-guard 修复; I5 EJS 边界收口; 单测 530/0; ESM 48/0
-        versionName = "2.4.6"
+        versionCode = 238 // 2.5.6 base migration; must be > previous 237
+        versionName = "2.5.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -156,6 +166,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(libs.wang.quickjs)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.process)
@@ -184,10 +195,13 @@ dependencies {
     // Image metadata extractor
     // https://github.com/drewnoakes/metadata-extractor
     implementation(libs.metadata.extractor)
-    // Haze (background blur)
+
+    // Haze (background blur and glass)
     implementation(libs.haze)
     implementation(libs.haze.blur)
     implementation(libs.haze.blur.material3)
+    implementation(libs.haze.glass)
+    implementation(libs.haze.glass.material3)
 
     // koin
     implementation(platform(libs.koin.bom))
@@ -222,8 +236,10 @@ dependencies {
     implementation(libs.coil.cache.control)
     // serialization
     implementation(libs.kotlinx.serialization.json)
-    // QuickJS (JS 引擎执行; 原由 highlight 模块 api 传递, 上游重写 highlight 后需显式声明)
-    implementation(libs.quickjs)
+
+    // YAML front matter
+    implementation(libs.snakeyaml)
+
     // zxing
     implementation(libs.zxing.core)
     // 相机扫码三方库已全部移除（Quickie / ML Kit barcode-scanning / CameraX）：
@@ -272,9 +288,11 @@ dependencies {
     implementation(project(":highlight"))
     implementation(project(":search"))
     implementation(project(":speech"))
+    implementation(project(":videogen"))
     implementation(project(":common"))
     implementation(project(":material3"))
     implementation(project(":workspace"))
+    implementation(project(":oauth"))
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
     implementation(kotlin("reflect"))
     // Leak Canary

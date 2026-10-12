@@ -9,6 +9,10 @@ sealed class ASRProviderSetting {
     abstract val id: Uuid
     abstract val name: String
 
+    // Describes our adapter, not every API offered by this vendor.
+    val supportsServerVadVoiceMode: Boolean
+        get() = this is OpenAIRealtime || this is DashScope || this is Volcengine
+
     abstract fun copyProvider(
         id: Uuid = this.id,
         name: String = this.name,
@@ -46,12 +50,12 @@ sealed class ASRProviderSetting {
         override val id: Uuid = Uuid.random(),
         override val name: String = "DashScope ASR",
         val apiKey: String = "",
-        val websocketUrl: String = "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+        val websocketUrl: String = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
         val model: String = "qwen3-asr-flash-realtime",
         val language: String = "",
         val sampleRate: Int = 16000,
-        val vadThreshold: Float = 0.2f,
-        val silenceDurationMs: Int = 800,
+        val vadThreshold: Float = 0.0f,
+        val silenceDurationMs: Int = 400,
     ) : ASRProviderSetting() {
         override fun copyProvider(
             id: Uuid,
@@ -70,9 +74,10 @@ sealed class ASRProviderSetting {
         override val id: Uuid = Uuid.random(),
         override val name: String = "Volcengine ASR",
         val apiKey: String = "",
-        val websocketUrl: String = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        val websocketUrl: String = VOLCENGINE_ASR_WEBSOCKET_URL,
         val resourceId: String = "volc.seedasr.sauc.duration",
         val language: String = "",
+        val silenceDurationMs: Int = 800,
     ) : ASRProviderSetting() {
         override fun copyProvider(
             id: Uuid,
@@ -181,3 +186,5 @@ sealed class ASRProviderSetting {
         }
     }
 }
+
+const val VOLCENGINE_ASR_WEBSOCKET_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"

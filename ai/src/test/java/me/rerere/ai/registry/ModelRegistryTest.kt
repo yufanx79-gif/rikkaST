@@ -40,12 +40,25 @@ class ModelRegistryTest {
     }
 
     @Test
+    fun testGemini4() {
+        val visionInput = listOf(Modality.TEXT, Modality.IMAGE)
+        val toolReasoning = listOf(ModelAbility.TOOL, ModelAbility.REASONING)
+        assertTrue(ModelRegistry.GEMINI_4.match("gemini-4-pro"))
+        assertTrue(ModelRegistry.GEMINI_4.match("gemini-4-flash-preview"))
+        assertTrue(ModelRegistry.GEMINI_SERIES.match("gemini-4-pro"))
+        assertFalse(ModelRegistry.GEMINI_4.match("gemini-3-pro"))
+        assertFalse(ModelRegistry.GEMINI_4.match("gemini-2.5-flash-preview-04-17"))
+        assertFalse(ModelRegistry.GEMINI_3_SERIES.match("gemini-4-pro"))
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("gemini-4-pro"))
+        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("gemini-4-flash"))
+    }
+
+    @Test
     fun testClaudeSeries() {
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-4.5-20250929"))
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-4.5-sonnet"))
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-4-20250929"))
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-4-sonnet"))
-        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-3.5-sonnet"))
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-5"))
         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-opus-5"))
         assertEquals(
@@ -56,6 +69,25 @@ class ModelRegistryTest {
             listOf(ModelAbility.TOOL, ModelAbility.REASONING),
             ModelRegistry.MODEL_ABILITIES.getData("claude-opus-5")
         )
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-sonnet-5"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-opus-5"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-sonnet-5-20260305"))
+        assertEquals(null, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-sonnet-4.5"))
+    }
+
+    @Test
+    fun testClaude55() {
+        val visionInput = listOf(Modality.TEXT, Modality.IMAGE)
+        val toolReasoning = listOf(ModelAbility.TOOL, ModelAbility.REASONING)
+        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-5-5"))
+        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-opus-5-5"))
+        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-opus-5.5"))
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("claude-sonnet-5-5"))
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("claude-opus-5-5"))
+        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("claude-sonnet-5-5"))
+        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("claude-opus-5-5"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-sonnet-5-5"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-opus-5-5"))
     }
 
     @Test
@@ -123,5 +155,48 @@ class ModelRegistryTest {
             reasonerAbilities,
             ModelRegistry.MODEL_ABILITIES.getData("deepseek-v4-pro")
         )
+        assertEquals(
+            listOf(Modality.TEXT, Modality.IMAGE),
+            ModelRegistry.MODEL_INPUT_MODALITIES.getData("deepseek-v4-flash-vision-exp")
+        )
+        assertEquals(
+            reasonerAbilities,
+            ModelRegistry.MODEL_ABILITIES.getData("deepseek-v4-flash-vision-exp")
+        )
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("deepseek-v4-flash"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("deepseek-v4-pro"))
+        assertEquals(1_000_000, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("deepseek-v4-flash-vision-exp"))
+        assertEquals(null, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("deepseek-v3"))
+    }
+
+    @Test
+    fun testStep5() {
+        val visionInput = listOf(Modality.TEXT, Modality.IMAGE)
+        val toolReasoning = listOf(ModelAbility.TOOL, ModelAbility.REASONING)
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("step-5"))
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("step-5-preview"))
+        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("step-5"))
+        assertEquals(visionInput, ModelRegistry.MODEL_INPUT_MODALITIES.getData("step-3"))
+    }
+
+    @Test
+    fun testContextLengthDefault() {
+        assertEquals(null, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("unknown-model-xyz"))
+        assertEquals(null, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("gpt-4o"))
+        assertEquals(null, ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-4-sonnet"))
+    }
+
+    @Test
+    fun testContextLengthDsl() {
+        val model = defineModel {
+            tokens("custom", "ctx")
+            contextLength(1_000_000)
+        }
+        assertEquals(1_000_000, model.contextLength)
+
+        val defaultModel = defineModel {
+            tokens("custom", "default")
+        }
+        assertEquals(null, defaultModel.contextLength)
     }
 }
