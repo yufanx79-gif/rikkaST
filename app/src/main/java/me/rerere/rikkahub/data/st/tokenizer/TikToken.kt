@@ -112,11 +112,37 @@ object TikToken {
         );
 
         /**
-         * Java 正则 + `UNICODE_CHARACTER_CLASS`：
          * tiktoken（Rust regex）的 `\s` 是 Unicode White_Space，Java 默认 `\s` 只有 ASCII，
-         * 不开这个 flag 会把 NBSP/全角空格等切错（W5 调研结论 7）。
+         * 不处理会把 NBSP / 全角空格等切错（W5 调研结论 7）。
+         *
+         * [v243 BUGFIX E1] **Android 的 java.util.regex 是 ICU 实现，不支持
+         * `Pattern.UNICODE_CHARACTER_CLASS`** —— 真机直接抛
+         * `UnsupportedOperationException: UNICODE_CHARACTER_CLASS flag not supported`，
+         * 于是 tokenizer 整条链路（上下文预算 / 裁剪）在第一次用到时就废掉。
+         *
+         * 修法：**不用那个 flag，改成把 `\s` / `\S` 在 pattern 字符串里显式展开成
+         * Unicode White_Space 的字符类**（`\p{L}` / `\p{N}` / `\p{Lu}` 这类属性转义
+         * Android 是支持的，不需要动）。
+         *
+         * 注意 `\s` 也出现在字符类内部（`[^\s\p{L}\p{N}]`）：Java 的字符类支持嵌套联合
+         * （`[^[WS]\p{L}\p{N}]` == `[^WS\p{L}\p{N}]`），所以同一个替换对两种位置都成立。
          */
-        val pattern: Pattern by lazy { Pattern.compile(patternString, Pattern.UNICODE_CHARACTER_CLASS) }
+        val pattern: Pattern by lazy {
+            Pattern.compile(
+                patternString
+                    .replace("\\S", "[^" + WS_BODY + "]")
+                    .replace("\\s", "[" + WS_BODY + "]")
+            )
+        }
+
+        /**
+         * Unicode White_Space（tiktoken `\s` 的语义）的字符类**内容**。
+         * = U+0009..U+000D / U+0020 / U+0085 / U+00A0 / U+1680 / U+2000..U+200A /
+         *   U+2028 / U+2029 / U+202F / U+205F / U+3000 / U+FEFF
+         * （Java 默认 `\s` 只有 [ \t\n\x0B\f\r]，会漏掉 NBSP/窄不换行空格/全角空格等）
+         */
+        private val WS_BODY =
+            "\\t\\n\\x0B\\f\\r \\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF"
     }
 
     private class State {

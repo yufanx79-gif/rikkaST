@@ -32,6 +32,10 @@ object InjectedPromptStore {
         val shouldScan: Boolean,
         /** 是否只生效一次 */
         val once: Boolean,
+        /** 是否在 JS 侧注册了动态 filter 回调 */
+        val hasFilter: Boolean = false,
+        /** 最近一次 JS filter 求值结果（无 filter 时恒为 true；filter 抛错或返回 false 时为 false） */
+        val filterPassed: Boolean = true,
     )
 
     private val byConversation = ConcurrentHashMap<String, ConcurrentHashMap<String, InjectedPrompt>>()
@@ -56,9 +60,22 @@ object InjectedPromptStore {
         ids.forEach { map.remove(it) }
     }
 
-    /** 当前注入快照（按登记顺序不保证；排序交给消费方） */
+    /** 当前注入快照（已按 JS filter 求值结果过滤；无 filter 或 filterPassed=true 的条目保留） */
     fun snapshot(conversationId: String?): List<InjectedPrompt> =
+        scope(conversationId).values.filter { !it.hasFilter || it.filterPassed }
+
+    /** 原始注入快照（含被 filter 过滤的条目，供管理与重求值使用） */
+    fun rawSnapshot(conversationId: String?): List<InjectedPrompt> =
         scope(conversationId).values.toList()
+
+    /** 更新 JS 侧动态 filter 回调的求值结果 */
+    fun updateFilterResults(conversationId: String?, results: Map<String, Boolean>) {
+        if (results.isEmpty()) return
+        val map = scope(conversationId)
+        results.forEach { (id, passed) ->
+            map.computeIfPresent(id) { _, existing -> existing.copy(filterPassed = passed) }
+        }
+    }
 
     /** 消费 once 注入（注入进提示词后调用） */
     fun consumeOnce(conversationId: String?, ids: Collection<String>) {

@@ -23,7 +23,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.foundation.layout.Column
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.BlurStrength
 import me.rerere.rikkahub.data.datastore.BlurStyle

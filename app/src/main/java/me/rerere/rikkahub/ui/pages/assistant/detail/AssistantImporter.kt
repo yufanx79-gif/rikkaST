@@ -178,13 +178,15 @@ internal suspend fun parseCardFromUri(
         ?: when (uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase()) {
             "png" -> "image/png"
             "json" -> "application/json"
+            "charx" -> "application/x-charx"
+            "byaf" -> "application/x-byaf"
             else -> null
         }
-    val (jsonString, backgroundStr, avatarUri) = withContext(Dispatchers.IO) {
+    return withContext(Dispatchers.IO) {
         when (mime) {
             "image/png" -> {
                 val result = ImageUtils.getTavernCharacterMeta(context, uri)
-                result.map { base64Data ->
+                val (jsonString, backgroundStr, avatarUri) = result.map { base64Data ->
                     val json = String(Base64.decode(base64Data, Base64.DEFAULT))
                     // PNG本身既是背景源也是头像
                     val savedUris = filesManager.createChatFilesByContents(listOf(uri))
@@ -192,18 +194,29 @@ internal suspend fun parseCardFromUri(
                     val avatar = savedUris.first().toString()
                     Triple(json, bg, avatar)
                 }.getOrElse { throw it }
+                val json = Json.parseToJsonElement(jsonString).jsonObject
+                parseCardJson(json, backgroundStr, avatarUri, context)
             }
             "application/json" -> {
-                val json = context.contentResolver.openInputStream(uri)?.bufferedReader()
+                val jsonString = context.contentResolver.openInputStream(uri)?.bufferedReader()
                     .use { it?.readText() }
                     ?: error(context.getString(R.string.assistant_importer_read_json_failed))
-                Triple(json, null, null)
+                val json = Json.parseToJsonElement(jsonString).jsonObject
+                parseCardJson(json, null, null, context)
+            }
+            "application/x-charx", "application/zip" -> {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error(context.getString(R.string.assistant_importer_read_json_failed))
+                parseCharxBytes(bytes, context)
+            }
+            "application/x-byaf" -> {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error(context.getString(R.string.assistant_importer_read_json_failed))
+                parseByafBytes(bytes, context)
             }
             else -> error(context.getString(R.string.assistant_importer_unsupported_file_type, mime ?: "unknown"))
         }
     }
-    val json = Json.parseToJsonElement(jsonString).jsonObject
-    return parseCardJson(json, backgroundStr, avatarUri, context)
 }
 
 /** 本地化错误文案：无 Context（JVM 单测/纯解析路径）时回退中文默认串。 */
@@ -223,11 +236,37 @@ internal fun parseCardJson(
     avatarUri: String? = null,
     context: Context? = null,
 ): Pair<Assistant, List<Lorebook>> {
-    val spec = json["spec"]?.jsonPrimitive?.contentOrNull
-        ?: importError(context, R.string.assistant_importer_missing_spec_field, "角色卡缺少 spec 字段")
+    val spec = json["spec"]?.jsonPrimitiveOrNull?.contentOrNull
     return when (spec) {
         "chara_card_v2" -> parseV2Card(context, json, background, avatarUri)
         "chara_card_v3" -> parseV3Card(context, json, background, avatarUri)
+        null -> {
+            // 兼容旧版 TavernAI / V1 角色卡 JSON（无顶层 spec 字段，但顶层或 data 对象包含 name 与角色卡核心字段）
+            val dataObj = json["data"]?.jsonObjectOrNull ?: json
+            val hasName = !dataObj["name"]?.jsonPrimitiveOrNull?.contentOrNull.isNullOrBlank()
+            val hasV1Fields = dataObj.containsKey("description") ||
+                dataObj.containsKey("first_mes") ||
+                dataObj.containsKey("personality") ||
+                dataObj.containsKey("scenario") ||
+                dataObj.containsKey("mes_example")
+            if (hasName && hasV1Fields) {
+                val upgraded = if (json["data"]?.jsonObjectOrNull != null) {
+                    JsonObject(json + ("spec" to kotlinx.serialization.json.JsonPrimitive("chara_card_v2")))
+                } else {
+                    val baseMap = mutableMapOf<String, JsonElement>(
+                        "spec" to kotlinx.serialization.json.JsonPrimitive("chara_card_v2"),
+                        "spec_version" to kotlinx.serialization.json.JsonPrimitive("2.0"),
+                        "data" to dataObj,
+                    )
+                    json["talkativeness"]?.let { baseMap["talkativeness"] = it }
+                    json["fav"]?.let { baseMap["fav"] = it }
+                    JsonObject(baseMap)
+                }
+                parseV2Card(context, upgraded, background, avatarUri)
+            } else {
+                importError(context, R.string.assistant_importer_missing_spec_field, "角色卡缺少 spec 字段")
+            }
+        }
         else -> importError(context, R.string.assistant_importer_unsupported_spec, "不支持的角色卡 spec：$spec", spec)
     }
 }
@@ -582,6 +621,18 @@ private fun applyEntryExtensions(entry: TavernBookEntry, e: JsonObject?): Tavern
             // 官方 extensions.outlet_name：outlet 条目出口名
             outletName = extensions["outlet_name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
                 ?: entry.outletName,
+            characterFilterNames = parseCharacterFilterField(extensions["character_filter"] ?: e["characterFilter"], "names")
+                .ifEmpty { entry.characterFilterNames },
+            characterFilterTags = parseCharacterFilterField(extensions["character_filter"] ?: e["characterFilter"], "tags")
+                .ifEmpty { entry.characterFilterTags },
+            characterFilterIsExclude = parseCharacterFilterExclude(extensions["character_filter"] ?: e["characterFilter"])
+                ?: entry.characterFilterIsExclude,
+            vectorized = extensions["vectorized"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                ?: e["vectorized"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                ?: entry.vectorized,
+            addMemo = extensions["add_memo"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                ?: e["addMemo"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                ?: entry.addMemo,
         )
     } catch (_: Exception) { entry }
 }
@@ -732,14 +783,19 @@ private fun tavernEntryToInjection(entry: TavernBookEntry): PromptInjection.Rege
         matchCreatorNotes = entry.matchCreatorNotes,
         ignoreBudget = entry.ignoreBudget,
         outletName = entry.outletName,
+        characterFilterNames = entry.characterFilterNames,
+        characterFilterTags = entry.characterFilterTags,
+        characterFilterIsExclude = entry.characterFilterIsExclude,
+        vectorized = entry.vectorized,
+        addMemo = entry.addMemo,
     )
 }
 
 internal fun mapTavernPosition(pos: Int): InjectionPosition = when (pos) {
     0 -> InjectionPosition.BEFORE_CHARACTER    // 官方 before_char：主提示之后、角色卡之前
     1 -> InjectionPosition.AFTER_CHARACTER     // 官方 after_char：角色卡之后
-    2 -> InjectionPosition.AUTHOR_NOTE        // 跟随用户 AN 位置设置
-    3 -> InjectionPosition.AUTHOR_NOTE        // 官方 ANBottom（作者备注下方），本地跟随 AN 位置
+    2 -> InjectionPosition.BEFORE_AUTHOR_NOTE // 官方 ANTop（作者备注上方）
+    3 -> InjectionPosition.AFTER_AUTHOR_NOTE  // 官方 ANBottom（作者备注下方）
     4 -> InjectionPosition.AT_DEPTH
     5 -> InjectionPosition.EM_TOP             // 官方 EMTop：示例消息之前
     6 -> InjectionPosition.EM_BOTTOM          // 官方 EMBottom：示例消息之后
@@ -864,7 +920,8 @@ private fun mapInjectionToPosition(pos: InjectionPosition): Int = when (pos) {
     InjectionPosition.TOP_OF_CHAT -> 2
     InjectionPosition.BOTTOM_OF_CHAT -> 3
     InjectionPosition.AT_DEPTH -> 4
-    InjectionPosition.AUTHOR_NOTE -> 2
+    InjectionPosition.AUTHOR_NOTE, InjectionPosition.BEFORE_AUTHOR_NOTE -> 2
+    InjectionPosition.AFTER_AUTHOR_NOTE -> 3
     // 本地扩展位置写入官方枚举时落到最接近的出口（outlet=7），避免产生官方不存在的 8
     InjectionPosition.ANTAGONIZE, InjectionPosition.AFTER_DIALOG -> 7
     InjectionPosition.EM_TOP -> 5
@@ -944,4 +1001,217 @@ private fun buildPresetMessages(d: TavernCharacterData): List<UIMessage> {
         messages.add(UIMessage.assistant(d.firstMessage))
     }
     return messages
+}
+
+
+private fun parseCharacterFilterField(el: JsonElement?, key: String): List<String> {
+    val obj = el as? JsonObject ?: return emptyList()
+    return parseStringArray(obj[key])
+}
+
+private fun parseCharacterFilterExclude(el: JsonElement?): Boolean? {
+    val obj = el as? JsonObject ?: return null
+    return (obj["isExclude"] ?: obj["is_exclude"])?.jsonPrimitiveOrNull?.contentOrNull?.toBooleanStrictOrNull()
+}
+
+/**
+ * 解析 CCv3 `.charx` ZIP 角色卡（对齐官方 `src/charx.js`）：
+ * - 提取归档根目录的 `card.json`；
+ * - 提取 `assets/` 下的内嵌资源（如图标、表情立绘、背景等），将 `embeded://` 或相对路径映射为 `TavernAsset`。
+ */
+internal fun parseCharxBytes(
+    bytes: ByteArray,
+    context: Context? = null,
+): Pair<Assistant, List<Lorebook>> {
+    var cardJsonStr: String? = null
+    val zipAssets = mutableMapOf<String, ByteArray>()
+    java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(bytes)).use { zis ->
+        var entry = zis.nextEntry
+        while (entry != null) {
+            if (!entry.isDirectory) {
+                val normName = entry.name.replace('\\', '/').trimStart('/')
+                val entryBytes = zis.readBytes()
+                if (normName.equals("card.json", ignoreCase = true) || normName.endsWith("/card.json", ignoreCase = true)) {
+                    cardJsonStr = entryBytes.toString(Charsets.UTF_8)
+                } else {
+                    zipAssets[normName] = entryBytes
+                }
+            }
+            zis.closeEntry()
+            entry = zis.nextEntry
+        }
+    }
+    val rawCard = cardJsonStr ?: importError(context, R.string.assistant_importer_read_json_failed, ".charx 归档中未找到 card.json")
+    val jsonObj = Json.parseToJsonElement(rawCard).jsonObject
+    val (assistant, lorebooks) = parseCardJson(jsonObj, null, null, context)
+    if (zipAssets.isEmpty()) return assistant to lorebooks
+    val existingAssets = assistant.tavernData?.assets.orEmpty()
+    val enrichedAssets = if (existingAssets.isNotEmpty()) {
+        existingAssets.map { asset ->
+            val cleanUri = asset.uri.removePrefix("embeded://").removePrefix("embedded://").removePrefix("ccdefault:").trimStart('/')
+            val matchedBytes = zipAssets[cleanUri]
+            if (matchedBytes != null) {
+                val b64 = java.util.Base64.getEncoder().encodeToString(matchedBytes)
+                val ext = asset.ext.ifBlank { cleanUri.substringAfterLast('.', "png") }
+                asset.copy(uri = "data:image/$ext;base64,$b64")
+            } else {
+                asset
+            }
+        }
+    } else {
+        zipAssets.entries.map { (path, data) ->
+            val ext = path.substringAfterLast('.', "png").lowercase()
+            val name = path.substringAfterLast('/').substringBeforeLast('.')
+            val type = when {
+                path.contains("emotion", ignoreCase = true) || path.contains("sprite", ignoreCase = true) -> "emotion"
+                path.contains("icon", ignoreCase = true) -> "icon"
+                else -> "image"
+            }
+            val b64 = java.util.Base64.getEncoder().encodeToString(data)
+            TavernAsset(type = type, name = name, uri = "data:image/$ext;base64,$b64", ext = ext)
+        }
+    }
+    val uriRewriteMap = LinkedHashMap<String, String>()
+    val charxBaseDir = context?.filesDir?.let { java.io.File(it, "charx_assets/${assistant.id}").apply { mkdirs() } }
+    zipAssets.forEach { (rawPath, assetBytes) ->
+        val cleanRel = rawPath.replace('\\', '/').trimStart('/')
+        val ext = cleanRel.substringAfterLast('.', "png").lowercase()
+        val targetUrl = if (charxBaseDir != null) {
+            val outFile = java.io.File(charxBaseDir, cleanRel)
+            val canonicalBase = charxBaseDir.canonicalPath
+            val canonicalOut = outFile.canonicalFile
+            if (canonicalOut.path.startsWith(canonicalBase)) {
+                canonicalOut.parentFile?.mkdirs()
+                runCatching { canonicalOut.writeBytes(assetBytes) }
+            }
+            "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$cleanRel"
+        } else {
+            val b64 = java.util.Base64.getEncoder().encodeToString(assetBytes)
+            "data:image/$ext;base64,$b64"
+        }
+        uriRewriteMap["embeded://$cleanRel"] = targetUrl
+        uriRewriteMap["embedded://$cleanRel"] = targetUrl
+        uriRewriteMap["ccdefault:$cleanRel"] = targetUrl
+    }
+    fun rewriteCharxText(text: String): String {
+        if (uriRewriteMap.isEmpty() || (!text.contains("embed", ignoreCase = true) && !text.contains("ccdefault:", ignoreCase = true))) {
+            return text
+        }
+        var out = text
+        for ((k, v) in uriRewriteMap) {
+            out = out.replace(k, v, ignoreCase = true)
+        }
+        return out
+    }
+    val oldTav = assistant.tavernData
+    val updatedTav = oldTav?.copy(
+        firstMessage = rewriteCharxText(oldTav.firstMessage),
+        alternateGreetings = oldTav.alternateGreetings.map(::rewriteCharxText),
+        groupOnlyGreetings = oldTav.groupOnlyGreetings.map(::rewriteCharxText),
+        description = rewriteCharxText(oldTav.description),
+        systemPrompt = rewriteCharxText(oldTav.systemPrompt),
+        assets = enrichedAssets,
+        embeddedBook = oldTav.embeddedBook?.let { eb ->
+            eb.copy(entries = eb.entries.map { it.copy(content = rewriteCharxText(it.content)) })
+        },
+        embeddedRegexScripts = oldTav.embeddedRegexScripts.map { rx ->
+            rx.copy(replaceString = rewriteCharxText(rx.replaceString))
+        },
+    )
+    val updatedPresetMessages = assistant.presetMessages.map { msg ->
+        msg.copy(
+            parts = msg.parts.map { part ->
+                if (part is me.rerere.ai.ui.UIMessagePart.Text) part.copy(text = rewriteCharxText(part.text)) else part
+            }
+        )
+    }
+    val updatedLorebooks = lorebooks.map { lb ->
+        lb.copy(entries = lb.entries.map { it.copy(content = rewriteCharxText(it.content)) })
+    }
+    val updatedAssistant = assistant.copy(
+        systemPrompt = rewriteCharxText(assistant.systemPrompt),
+        presetMessages = updatedPresetMessages,
+        tavernData = updatedTav,
+    )
+    return updatedAssistant to updatedLorebooks
+}
+
+/**
+ * 解析 Backyard AI `.byaf` 归档格式（对齐官方 `src/byaf.js`）：
+ * - 读取归档中的角色 JSON（`characters/` 目录下的 `.json` 或 `character.json`），将 Backyard 字段转换为 CCv2 结构并导入。
+ */
+internal fun parseByafBytes(
+    bytes: ByteArray,
+    context: Context? = null,
+): Pair<Assistant, List<Lorebook>> {
+    var charJsonObj: JsonObject? = null
+    java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(bytes)).use { zis ->
+        var entry = zis.nextEntry
+        while (entry != null) {
+            if (!entry.isDirectory) {
+                val normName = entry.name.replace('\\', '/').trimStart('/')
+                if (normName.endsWith(".json", ignoreCase = true) && !normName.endsWith("manifest.json", ignoreCase = true)) {
+                    val text = zis.readBytes().toString(Charsets.UTF_8)
+                    val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
+                    if (obj != null && (obj.containsKey("aiName") || obj.containsKey("name") || obj.containsKey("aiPersona"))) {
+                        charJsonObj = obj
+                        break
+                    }
+                }
+            }
+            zis.closeEntry()
+            entry = zis.nextEntry
+        }
+    }
+    val src = charJsonObj ?: importError(context, R.string.assistant_importer_read_json_failed, ".byaf 归档中未找到角色定义 JSON")
+    val name = src["aiName"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: src["name"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: "Backyard Character"
+    val desc = src["aiPersona"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: src["description"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+    val scenario = src["scenario"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+    val firstMes = src["firstMessage"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: src["greeting"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+    val sysPrompt = src["systemPrompt"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: src["basePrompt"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+    val mesEx = src["exampleMessages"]?.jsonPrimitiveOrNull?.contentOrNull
+        ?: src["mes_example"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+    val v2Json = kotlinx.serialization.json.buildJsonObject {
+        put("spec", kotlinx.serialization.json.JsonPrimitive("chara_card_v2"))
+        put("spec_version", kotlinx.serialization.json.JsonPrimitive("2.0"))
+        put("data", kotlinx.serialization.json.buildJsonObject {
+            put("name", kotlinx.serialization.json.JsonPrimitive(name))
+            put("description", kotlinx.serialization.json.JsonPrimitive(desc))
+            put("personality", kotlinx.serialization.json.JsonPrimitive(""))
+            put("scenario", kotlinx.serialization.json.JsonPrimitive(scenario))
+            put("first_mes", kotlinx.serialization.json.JsonPrimitive(firstMes))
+            put("mes_example", kotlinx.serialization.json.JsonPrimitive(mesEx))
+            put("system_prompt", kotlinx.serialization.json.JsonPrimitive(sysPrompt))
+            val loreItems = src["loreItems"] as? JsonArray
+            if (loreItems != null && loreItems.isNotEmpty()) {
+                put("character_book", kotlinx.serialization.json.buildJsonObject {
+                    put("name", kotlinx.serialization.json.JsonPrimitive("$name Lore"))
+                    put("entries", kotlinx.serialization.json.buildJsonArray {
+                        loreItems.forEachIndexed { idx, el ->
+                            val item = el as? JsonObject ?: return@forEachIndexed
+                            val keyStr = item["key"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+                            val valStr = item["value"]?.jsonPrimitiveOrNull?.contentOrNull
+                                ?: item["content"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
+                            add(kotlinx.serialization.json.buildJsonObject {
+                                put("id", kotlinx.serialization.json.JsonPrimitive(idx))
+                                put("keys", kotlinx.serialization.json.buildJsonArray {
+                                    keyStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach {
+                                        add(kotlinx.serialization.json.JsonPrimitive(it))
+                                    }
+                                })
+                                put("content", kotlinx.serialization.json.JsonPrimitive(valStr))
+                                put("enabled", kotlinx.serialization.json.JsonPrimitive(true))
+                            })
+                        }
+                    })
+                })
+            }
+        })
+    }
+    return parseCardJson(v2Json, null, null, context)
 }

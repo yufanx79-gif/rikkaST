@@ -92,6 +92,61 @@ class ChatToolFactory(
                 )
             )
         }
+
+        // 酒馆兼容层动态注册的 JS 函数工具（registerFunctionTool）与 STscript 闭包工具（/tools-register）：
+        // 严格保护原生与 MCP 工具名称不被覆盖（仅在同名工具不存在时追加）。
+        val jsTools = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.getRegisteredJsFunctionTools()
+        for (spec in jsTools) {
+            if (any { it.name.equals(spec.name, ignoreCase = true) }) continue
+            val parsedSchema = parseStToolInputSchema(json, spec.parametersJson)
+            add(
+                Tool(
+                    name = spec.name,
+                    description = spec.description.ifBlank { spec.displayName },
+                    parameters = { parsedSchema },
+                    needsApproval = { false },
+                    execute = { argsEl ->
+                        val out = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
+                            .executeJsFunctionTool(spec.name, argsEl.toString())
+                            ?: ""
+                        listOf(me.rerere.ai.ui.UIMessagePart.Text(out))
+                    },
+                )
+            )
+        }
+        val slashTools = me.rerere.rikkahub.data.st.script.StSlashExecutor.getRegisteredSlashToolNames()
+        for (toolName in slashTools) {
+            if (any { it.name.equals(toolName, ignoreCase = true) }) continue
+            add(
+                Tool(
+                    name = toolName,
+                    description = "STscript registered tool: $toolName",
+                    parameters = { me.rerere.ai.core.InputSchema.Obj(properties = kotlinx.serialization.json.JsonObject(emptyMap())) },
+                    needsApproval = { false },
+                    execute = { argsEl ->
+                        val out = me.rerere.rikkahub.data.st.script.StSlashExecutor.invokeRegisteredSlashTool(toolName, argsEl.toString())
+                        listOf(me.rerere.ai.ui.UIMessagePart.Text(out))
+                    },
+                )
+            )
+        }
+    }
+
+    internal fun parseStToolInputSchema(
+        jsonParser: Json,
+        parametersJson: String,
+    ): me.rerere.ai.core.InputSchema.Obj {
+        return runCatching {
+            val root = jsonParser.parseToJsonElement(parametersJson) as? kotlinx.serialization.json.JsonObject
+                ?: return@runCatching me.rerere.ai.core.InputSchema.Obj(properties = kotlinx.serialization.json.JsonObject(emptyMap()))
+            val props = (root["properties"] as? kotlinx.serialization.json.JsonObject)
+                ?: kotlinx.serialization.json.JsonObject(emptyMap())
+            val req = (root["required"] as? kotlinx.serialization.json.JsonArray)
+                ?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.takeIf { s -> s.isNotEmpty() } }
+            me.rerere.ai.core.InputSchema.Obj(properties = props, required = req)
+        }.getOrElse {
+            me.rerere.ai.core.InputSchema.Obj(properties = kotlinx.serialization.json.JsonObject(emptyMap()))
+        }
     }
 
     private suspend fun createWorkspaceToolsIfReady(workspaceId: String?, cwd: String?): List<Tool> {

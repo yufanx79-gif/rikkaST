@@ -305,57 +305,67 @@ object ImageUtils {
     fun getTavernCharacterMeta(context: Context, uri: Uri): Result<String> = runCatching {
         val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             ?: error("无法读取图片文件")
+        extractTavernCharacterMetaFromPngBytes(bytes)
+            ?: error("未找到有效的角色卡数据，请确认图片是酒馆角色卡PNG")
+    }
 
-        // PNG 签名(8 bytes)后开始 chunk
+    /**
+     * 从 PNG 字节数组中提取 `ccv3` / `chara` 的 Base64 角色卡元数据（纯函数，支持 `tEXt` 与 zlib 压缩的 `zTXt` 块）。
+     */
+    internal fun extractTavernCharacterMetaFromPngBytes(bytes: ByteArray): String? {
         var offset = 8
         var charaResult: String? = null
         while (offset + 8 <= bytes.size) {
             val length = readInt32BE(bytes, offset)
+            if (length < 0) break
             val type = String(bytes, offset + 4, 4, StandardCharsets.US_ASCII)
             val dataStart = offset + 8
             val dataEnd = dataStart + length
             if (dataEnd > bytes.size) break
 
             if (type == "tEXt" || type == "zTXt") {
-                // tEXt chunk data: keyword\0text
-                // 找 null 分隔符
                 val nullPos = bytes.copyOfRange(dataStart, dataEnd).indexOf(0.toByte())
                 if (nullPos >= 0) {
                     val absNull = dataStart + nullPos
                     val keyword = String(bytes, dataStart, nullPos, StandardCharsets.ISO_8859_1)
                     if (keyword.equals("chara", ignoreCase = true) || keyword.equals("ccv3", ignoreCase = true)) {
-                        val rawText = String(bytes, absNull + 1, dataEnd - absNull - 1, StandardCharsets.ISO_8859_1)
-
-                        // 去掉 base64 前面的任何垃圾字节（SilveryTavern 也这样做）
-                        val cleanB64 = rawText.trim()
-                        val jsonBytes = Base64.decode(cleanB64, Base64.DEFAULT)
-                        val jsonStr = String(jsonBytes, StandardCharsets.UTF_8)
-
-                        // 找到第一个 { 跳过前导垃圾（兼容性保护）
-                        val braceStart = jsonStr.indexOf('{')
-                        if (braceStart >= 0 && jsonStr.contains("\"spec\"")) {
-                            // ccv3 优先，但如果已经找到 chara 且现在又找到 ccv3，覆盖
-                            // ccv3 在 chunk 顺序中通常在 chara 之后
-                            if (keyword.equals("ccv3", ignoreCase = true)) {
-                                return Result.success(cleanB64)
+                        val rawText = if (type == "zTXt") {
+                            // zTXt chunk: keyword\0 + compression_method(1 byte, 0=deflate) + zlib stream
+                            val compStart = absNull + 2
+                            if (compStart <= dataEnd) {
+                                runCatching {
+                                    java.util.zip.InflaterInputStream(
+                                        java.io.ByteArrayInputStream(bytes, compStart, dataEnd - compStart)
+                                    ).use { it.readBytes() }.toString(StandardCharsets.ISO_8859_1)
+                                }.getOrNull()
+                            } else {
+                                null
                             }
-                            // chara 暂存，继续找 ccv3
-                            charaResult = cleanB64
+                        } else {
+                            String(bytes, absNull + 1, dataEnd - absNull - 1, StandardCharsets.ISO_8859_1)
+                        }
+                        if (!rawText.isNullOrBlank()) {
+                            val cleanB64 = rawText.trim()
+                            val jsonStr = runCatching {
+                                val decoded = java.util.Base64.getMimeDecoder().decode(cleanB64)
+                                String(decoded, StandardCharsets.UTF_8)
+                            }.getOrNull()
+                            if (jsonStr != null) {
+                                val braceStart = jsonStr.indexOf('{')
+                                if (braceStart >= 0 && (jsonStr.contains("\"spec\"") || jsonStr.contains("\"name\""))) {
+                                    if (keyword.equals("ccv3", ignoreCase = true)) {
+                                        return cleanB64
+                                    }
+                                    charaResult = cleanB64
+                                }
+                            }
                         }
                     }
                 }
             }
-
-            // zTXt chunk data 是压缩的，跳过（后续可加 inflate 支持）
             offset += 12 + length
         }
-
-        // 没找到 ccv3，用 chara
-        if (charaResult != null) {
-            return Result.success(charaResult)
-        }
-
-        error("未找到有效的角色卡数据，请确认图片是酒馆角色卡PNG")
+        return charaResult
     }
 
     /** 读取4字节大端整数（PNG chunk length） */

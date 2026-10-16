@@ -46,6 +46,20 @@ object TavernVariableStore {
     private val chats = linkedMapOf<String, LinkedHashMap<String, JsonElement>>()
     private val global = linkedMapOf<String, JsonElement>()
 
+    /** 记录已在运行时同步/初始化过的会话与全局标志，以及显式删除墓碑，防止从旧 Settings 快照复活已删除变量 */
+    private val initializedChats = linkedSetOf<String>()
+    @Volatile private var globalInitialized = false
+    private val deletedChatKeys = linkedMapOf<String, LinkedHashSet<String>>()
+    private val deletedGlobalKeys = linkedSetOf<String>()
+
+    /** 变量变更原子递增版本号（供 StRegexTextCache 等显示层感知变量变化自动刷新缓存） */
+    private val _mutationVersion = java.util.concurrent.atomic.AtomicLong(0L)
+    val mutationVersion: Long
+        get() = _mutationVersion.get()
+
+    /** 扩展作用域变量树（`char:<id>` / `preset:<name>` / `script:<id>` 等独立隔离存储）。 */
+    private val scoped = linkedMapOf<String, LinkedHashMap<String, JsonElement>>()
+
     /** conversationId → 消息级变量（`chat[i].variables[swipe]` 数组套数组，JSON 原样透传）。 */
     private val messageVars = linkedMapOf<String, JsonElement>()
 
@@ -76,6 +90,12 @@ object TavernVariableStore {
             obj.forEach { (k, v) -> map[k] = v }
             chats[chatKey] = map
         }
+        (root["scoped"] as? JsonObject)?.forEach { (scopeKey, tree) ->
+            val obj = tree as? JsonObject ?: return@forEach
+            val map = linkedMapOf<String, JsonElement>()
+            obj.forEach { (k, v) -> map[k] = v }
+            scoped[scopeKey] = map
+        }
         (root["messageVars"] as? JsonObject)?.forEach { (chatKey, tree) ->
             messageVars[chatKey] = tree
         }
@@ -105,6 +125,13 @@ object TavernVariableStore {
         JsonObject(chats[chatKey]?.toMap() ?: emptyMap())
     }
 
+    /** 读取独立作用域变量（`char:<id>` / `preset:<name>` / `script:<id>`）。 */
+    fun getScoped(scopeKey: String): JsonObject = synchronized(lock) {
+        val normKey = scopeKey.trim()
+        if (normKey.isEmpty()) return@synchronized JsonObject(emptyMap())
+        JsonObject(scoped[normKey]?.toMap() ?: emptyMap())
+    }
+
     /** 消息级变量（JSR `chat[i].variables[swipe]` 原样 JSON，数组套数组）。 */
     fun getMessageVars(chatKey: String): JsonElement = synchronized(lock) {
         messageVars[chatKey] ?: JsonArray(emptyList())
@@ -120,33 +147,79 @@ object TavernVariableStore {
         chats[chatKey]?.mapValues { (_, v) -> stringify(v) } ?: emptyMap()
     }
 
+    fun isGlobalInitialized(): Boolean = synchronized(lock) { globalInitialized }
+
+    fun isChatInitialized(chatKey: String): Boolean = synchronized(lock) { chatKey in initializedChats }
+
+    fun isDeleted(chatKey: String?, name: String): Boolean = synchronized(lock) {
+        if (chatKey == null) name in deletedGlobalKeys else deletedChatKeys[chatKey]?.contains(name) == true
+    }
+
+    fun clearForTest() = synchronized(lock) {
+        chats.clear()
+        global.clear()
+        scoped.clear()
+        messageVars.clear()
+        initializedChats.clear()
+        globalInitialized = false
+        deletedChatKeys.clear()
+        deletedGlobalKeys.clear()
+        _mutationVersion.incrementAndGet()
+    }
+
     // ==================== 写 ====================
 
     fun replaceGlobal(obj: JsonObject) = synchronized(lock) {
+        globalInitialized = true
         global.clear()
-        obj.forEach { (k, v) -> if (global.size < MAX_KEYS_PER_SCOPE) global[k] = v }
+        obj.forEach { (k, v) ->
+            if (global.size < MAX_KEYS_PER_SCOPE) {
+                global[k] = v
+                deletedGlobalKeys.remove(k)
+            }
+        }
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
     }
 
     fun replaceChat(chatKey: String, obj: JsonObject) = synchronized(lock) {
+        initializedChats.add(chatKey)
         val map = linkedMapOf<String, JsonElement>()
         obj.forEach { (k, v) -> if (map.size < MAX_KEYS_PER_SCOPE) map[k] = v }
         chats[chatKey] = map
+        deletedChatKeys[chatKey]?.removeAll(map.keys)
+        _mutationVersion.incrementAndGet()
+        markDirtyLocked()
+    }
+
+    /** 替换独立作用域变量（`char:<id>` / `preset:<name>` / `script:<id>`）。 */
+    fun replaceScoped(scopeKey: String, obj: JsonObject) = synchronized(lock) {
+        val normKey = scopeKey.trim()
+        if (normKey.isEmpty()) return@synchronized
+        val map = linkedMapOf<String, JsonElement>()
+        obj.forEach { (k, v) -> if (map.size < MAX_KEYS_PER_SCOPE) map[k] = v }
+        scoped[normKey] = map
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
     }
 
     fun mutateChat(chatKey: String, block: (MutableMap<String, JsonElement>) -> Unit) = synchronized(lock) {
+        initializedChats.add(chatKey)
         val map = chats.getOrPut(chatKey) { linkedMapOf() }
         block(map)
         while (map.size > MAX_KEYS_PER_SCOPE) {
             map.remove(map.keys.first())
         }
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
     }
 
     fun removeChat(chatKey: String) = synchronized(lock) {
+        initializedChats.remove(chatKey)
+        deletedChatKeys.remove(chatKey)
         if (chats.remove(chatKey) != null) markDirtyLocked()
         messageVars.remove(chatKey)
+        _mutationVersion.incrementAndGet()
     }
 
     // ==================== 宏适配（String 语义，对齐 ST variables.js） ====================
@@ -170,14 +243,26 @@ object TavernVariableStore {
     }
 
     fun macroSet(chatKey: String?, name: String, value: String) = synchronized(lock) {
+        if (chatKey == null) {
+            deletedGlobalKeys.remove(name)
+        } else {
+            deletedChatKeys[chatKey]?.remove(name)
+        }
         val map = if (chatKey == null) global else chats.getOrPut(chatKey) { linkedMapOf() }
         map[name] = JsonPrimitive(value)
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
     }
 
     fun macroDelete(chatKey: String?, name: String) = synchronized(lock) {
-        val map = if (chatKey == null) global else chats[chatKey] ?: return
-        map.remove(name)
+        if (chatKey == null) {
+            deletedGlobalKeys.add(name)
+            global.remove(name)
+        } else {
+            deletedChatKeys.getOrPut(chatKey) { linkedSetOf() }.add(name)
+            chats[chatKey]?.remove(name)
+        }
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
     }
 
@@ -187,9 +272,15 @@ object TavernVariableStore {
 
     /** 对齐 ST add（与 InMemoryMacroVariableStore.addImpl 完全一致）：数组 push；纯数字相加；否则字符串拼接。 */
     fun macroAdd(chatKey: String?, name: String, value: String): String = synchronized(lock) {
+        if (chatKey == null) {
+            deletedGlobalKeys.remove(name)
+        } else {
+            deletedChatKeys[chatKey]?.remove(name)
+        }
         val map = if (chatKey == null) global else chats.getOrPut(chatKey) { linkedMapOf() }
         val result = computeAdd(map[name], value)
         map[name] = result
+        _mutationVersion.incrementAndGet()
         markDirtyLocked()
         stringify(result)
     }
@@ -266,6 +357,7 @@ object TavernVariableStore {
                     "version" to JsonPrimitive(1),
                     "global" to JsonObject(global.toMap()),
                     "chats" to JsonObject(chats.mapValues { (_, v) -> JsonObject(v.toMap()) }),
+                    "scoped" to JsonObject(scoped.mapValues { (_, v) -> JsonObject(v.toMap()) }),
                     "messageVars" to JsonObject(messageVars.toMap()),
                 )
             )

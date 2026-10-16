@@ -136,4 +136,51 @@ class RealCardImportAuditTest {
         assertEquals(2, listCardScripts(assistant).size)
         assertTrue(tav.extensionsRaw.contains("odysseia_trace"))
     }
+
+    @Test
+    fun `d13 v1 card json without spec and png ztxt chunk import`() {
+        // 1. V1 JSON 角色卡（无 spec 字段）自动升级为 V2 导入
+        val v1Raw = """
+            {
+              "name": "LegacyTavernChar",
+              "description": "A classic V1 character.",
+              "personality": "Cheerful",
+              "scenario": "Tavern",
+              "first_mes": "Greetings traveler!",
+              "mes_example": "<START>"
+            }
+        """.trimIndent()
+        val v1Obj = json.parseToJsonElement(v1Raw).jsonObject
+        val (v1Assistant, _) = parseCardJson(v1Obj)
+        assertEquals("LegacyTavernChar", v1Assistant.name)
+        assertEquals("A classic V1 character.", v1Assistant.tavernData?.description)
+        assertEquals("Greetings traveler!", v1Assistant.tavernData?.firstMessage)
+
+        // 2. PNG zTXt (zlib 压缩文本块) 解压提取角色卡 JSON
+        val cardB64 = java.util.Base64.getEncoder().encodeToString(v1Raw.toByteArray(Charsets.UTF_8))
+        val keywordBytes = "chara".toByteArray(Charsets.ISO_8859_1)
+        val compressedBytes = java.io.ByteArrayOutputStream().use { baos ->
+            java.util.zip.DeflaterOutputStream(baos).use { dos ->
+                dos.write(cardB64.toByteArray(Charsets.ISO_8859_1))
+            }
+            baos.toByteArray()
+        }
+        val chunkData = java.io.ByteArrayOutputStream().apply {
+            write(keywordBytes)
+            write(0) // null separator
+            write(0) // compression method 0 (deflate/zlib)
+            write(compressedBytes)
+        }.toByteArray()
+        val pngBytes = java.io.ByteArrayOutputStream().apply {
+            write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+            val len = chunkData.size
+            write(byteArrayOf(((len shr 24) and 0xFF).toByte(), ((len shr 16) and 0xFF).toByte(), ((len shr 8) and 0xFF).toByte(), (len and 0xFF).toByte()))
+            write("zTXt".toByteArray(Charsets.US_ASCII))
+            write(chunkData)
+            write(byteArrayOf(0, 0, 0, 0)) // dummy CRC
+        }.toByteArray()
+
+        val extractedB64 = me.rerere.rikkahub.utils.ImageUtils.extractTavernCharacterMetaFromPngBytes(pngBytes)
+        assertEquals(cardB64, extractedB64)
+    }
 }

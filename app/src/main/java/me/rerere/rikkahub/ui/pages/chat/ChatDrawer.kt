@@ -433,7 +433,23 @@ fun ChatDrawerContent(
                     },
                     label = { Text(stringResource(R.string.settings)) },
                     onClick = {
-                        navController.navigate(Screen.Setting)
+                        // [v244 BUGFIX B6-revert] 撤销 v243 在这里加的「主动收起抽屉」。
+                        //
+                        // v243 的推理是「抽屉保持打开 → ChatPage 的 BackHandler(enabled = drawerState.isOpen)
+                        // 会吃掉第一次边缘返回手势，所以要滑两次」。该推理**不成立**：
+                        // NavDisplay 的 SinglePaneSceneStrategy 只组合栈顶 entry，设置页在栈顶时
+                        // ChatPage 根本没进组合，它的 BackHandler 也就没注册。
+                        //
+                        // 而「主动收起抽屉」会**真的造成 bug**（v244 真机反馈）：
+                        // rememberDrawerState 是 rememberSaveable，NavDisplay 又用 saveable-state
+                        // decorator 保存 entry 状态 → 被强制写入的 Closed 会持久化，从设置返回时
+                        // 抽屉是关的，用户感知为「没有返回到有侧边栏的那一层，直接跳到了聊天页」。
+                        //
+                        // 对齐上游（D:\rikkahub\rikkahub-2.5.6\...\ChatDrawer.kt:419 只 navigate、不收抽屉）：
+                        // **不再收抽屉**。launchSingleTop 保留（防重复压栈；上游没有，但无害）。
+                        navController.navigate(Screen.Setting) {
+                            launchSingleTop = true
+                        }
                     },
                 )
             }

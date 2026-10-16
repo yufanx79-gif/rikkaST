@@ -1,3 +1,4 @@
+import * as shimInject from '../shims/inject-shims.js';
 /**
  * rikkaST st-compat: script.js
  * ============================================================
@@ -108,14 +109,38 @@ export const saveChatConditional = () => {
 export const cancelDebouncedChatSave = () => {};
 export const generate = fwd('generate', () => Promise.resolve(''));
 export const generateRaw = fwd('generateRaw', () => Promise.resolve(''));
+export const generateQuietPrompt = fwd('generateQuietPrompt', () => Promise.resolve(''));
 export const Generate = generate;
 export const stopGeneration = fwd('stopGeneration', () => {});
 export const clearChat = fwd('clearChat', () => {});
 
-// ---------------------------------------------------------------- 扩展提示（P0 本地记录）
-export function setExtensionPrompt(key, value, position, depth, scan, role) {
+// ---------------------------------------------------------------- 扩展提示（同步写本地表并转发至宿主/shimInject）
+export function setExtensionPrompt(key, value, position, depth, scan, role, filter) {
     try {
-        extension_prompts[String(key || '')] = { value, position, depth, scan, role };
+        const k = String(key || '');
+        extension_prompts[k] = { value, position, depth, scan, role, filter };
+        const c = st();
+        if (c && typeof c.setExtensionPrompt === 'function') {
+            c.setExtensionPrompt(k, value, position, depth, scan, role, filter);
+            return;
+        }
+        const posStr = position === extension_prompt_types.BEFORE_PROMPT ? 'before_prompt'
+            : (position === extension_prompt_types.IN_PROMPT ? 'in_prompt' : 'in_chat');
+        const roleStr = (role === extension_prompt_roles.USER || role === 'user') ? 'user'
+            : ((role === extension_prompt_roles.ASSISTANT || role === 'assistant') ? 'assistant' : 'system');
+        if (!value || String(value).length === 0) {
+            shimInject.uninjectPrompts([k]);
+        } else {
+            shimInject.injectPrompts([{
+                id: k,
+                content: String(value),
+                position: posStr,
+                depth: typeof depth === 'number' ? depth : 4,
+                role: roleStr,
+                should_scan: !!scan,
+                filter,
+            }]);
+        }
     } catch (_e) { /* noop */ }
 }
 export function getExtensionPromptByName(name) {
@@ -153,7 +178,17 @@ export const addOneMessage = () => {};
 export const printMessages = () => {};
 export const printCharacters = () => {};
 export const scrollChatToBottom = () => {};
-export const deleteLastMessage = () => {};
+export const deleteLastMessage = async () => {
+    try {
+        const c = st();
+        if (c && typeof c.deleteLastMessage === 'function') {
+            return await c.deleteLastMessage();
+        }
+        if (window.RikkaBridge && typeof window.RikkaBridge.triggerSlash === 'function') {
+            return window.RikkaBridge.triggerSlash('/del 1');
+        }
+    } catch (_e) { /* noop */ }
+};
 export const syncMesToSwipe = () => {};
 export const activateSendButtons = () => {};
 export const deactivateSendButtons = () => {};
@@ -192,3 +227,122 @@ export function getSlideToggleOptions() {
     } catch (err) { /* noop */ }
     return {};
 }
+
+// ================================================================
+// [v243 BUGFIX C3] SillyTavern 1.18.0 原生面补齐（第一批：会话/消息/元数据）
+//
+// 依据：把 D:\SillyTavern-1.18.0.zip 的 public/script.js 导出面（249 个）与
+// rikkaST 本文件（91 个）做集合差，挑出**卡脚本/扩展真的会调用、且能在现有宿主能力上
+// 真实实现**的那批补上。其余（swipe 导航 / 删除楼层 / quiet 生成 / 角色卡编辑）
+// 需要新增宿主桥，登记在 docs/ST-FEATURE-MATRIX.md，本轮不伪造。
+// ================================================================
+
+/** ST `CLIENT_VERSION`。rikkaST 的 RikkaBridge.getVersion() 就是 "1.18.0"，保持一致。 */
+export const CLIENT_VERSION = '1.18.0';
+
+/** ST `settingsReady`：ST 里是「设置加载完成」的 Promise；rikkaST 启动即已就绪。 */
+export const settingsReady = Promise.resolve();
+
+/** ST `getChat()`：返回聊天数组（最常用的原生读取入口之一）。 */
+export function getChat() {
+    try { return st().chat || chat || []; } catch (_e) { return chat || []; }
+}
+
+/** ST `getNextMessageId()`：下一条消息的 id（= 当前条数）。 */
+export function getNextMessageId() {
+    try { return (st().chat || chat || []).length; } catch (_e) { return 0; }
+}
+
+/**
+ * ST `updateChatMetadata(metadata, save)`：合并写入 `chat_metadata`，默认触发保存。
+ * 对齐 ST 语义：只做浅合并（调用方传什么字段就覆盖什么字段）。
+ */
+export function updateChatMetadata(metadata, save = true) {
+    try {
+        if (metadata && typeof metadata === 'object') {
+            Object.assign(chat_metadata, metadata);
+            const c = st();
+            if (c.chatMetadata && typeof c.chatMetadata === 'object') {
+                Object.assign(c.chatMetadata, metadata);
+            }
+        }
+        if (save) saveMetadataDebounced();
+    } catch (_e) { /* noop */ }
+}
+
+/** ST `getCurrentChatDetails()`：当前会话的标识信息（rikkaST 用 conversationId 作为 id/file_name）。 */
+export function getCurrentChatDetails() {
+    try {
+        const id = String(st().chatId || '');
+        return { id, file_name: id, chat_metadata: chat_metadata };
+    } catch (_e) {
+        return { id: '', file_name: '', chat_metadata: {} };
+    }
+}
+
+/** ST `redisplayChat()`：整聊天重新渲染。rikkaST 的等价动作是 reloadCurrentChat()。 */
+export function redisplayChat() {
+    try {
+        const f = st().reloadCurrentChat;
+        if (typeof f === 'function') return Promise.resolve(f());
+    } catch (_e) { /* noop */ }
+    return Promise.resolve();
+}
+
+/** ST `saveChatDebounced()`（= saveChat 的去抖版）。 */
+export const saveChatDebounced = saveChat;
+
+/** ST `substituteParamsLegacy()`：旧签名版本，rikkaST 与 substituteParams 同实现。 */
+export const substituteParamsLegacy = substituteParams;
+
+/** ST `getStoppingStrings()`：rikkaST 目前无自定义停止串。 */
+export const getStoppingStrings = () => [];
+
+/** ST `isStreamingEnabled()`。 */
+export const isStreamingEnabled = () => true;
+
+/** ST 上下文长度便捷函数（rikkaST 用 live 变量 max_context）。 */
+export const getMaxContextTokens = () => max_context;
+export const getMaxPromptTokens = () => max_context;
+export const getMaxResponseTokens = () => amount_gen;
+
+/**
+ * ST `ensureSwipes(message)`：保证 message.swipes 是「字符串数组」且与 variables 对齐。
+ * 与 runtime.js pullChat() 的归一化规则保持一致（MVU 会对 swipe 条目调用 matchAll，
+ * 严禁对象占位 —— 这是真机上炸过的点）。
+ */
+export function ensureSwipes(message) {
+    try {
+        if (!message || typeof message !== 'object') return message;
+        const mesText = String(message.mes == null ? '' : message.mes);
+        const vars = Array.isArray(message.variables) ? message.variables : [{}];
+        if (!Array.isArray(message.swipes) || message.swipes.length === 0) {
+            message.swipes = new Array(Math.max(1, vars.length)).fill(mesText);
+        } else {
+            message.swipes = message.swipes.map((s) => (typeof s === 'string' ? s : mesText));
+        }
+        if (typeof message.swipe_id !== 'number') message.swipe_id = 0;
+        return message;
+    } catch (_e) { return message; }
+}
+
+/** ST `syncSwipeToMes(message)`：把当前 swipe 的文本同步回 mes。 */
+export function syncSwipeToMes(message) {
+    try {
+        if (!message || !Array.isArray(message.swipes)) return message;
+        const idx = (typeof message.swipe_id === 'number' && message.swipe_id >= 0) ? message.swipe_id : 0;
+        message.mes = String(message.swipes[idx] == null ? '' : message.swipes[idx]);
+        return message;
+    } catch (_e) { return message; }
+}
+
+// ---- 纯 UI 类：rikkaST 的滑动/消息节点由宿主 Compose 原生渲染，这些调用保持 no-op（不抛错）
+export const refreshSwipeButtons = () => {};
+export const updateSwipeCounter = () => {};
+export const updateViewMessageIds = () => {};
+export const printCharactersDebounced = () => {};
+export const hideSwipeButtons = () => {};
+export const updateEditArrowClasses = () => {};
+export const scrollOnMediaLoad = () => {};
+export const isMessageSwipeable = () => true;
+export const isSwipingAllowed = () => true;

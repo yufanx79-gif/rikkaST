@@ -27,7 +27,9 @@ import me.rerere.rikkahub.ui.components.ai.ModeInjectionsContent
 import me.rerere.rikkahub.ui.components.ai.QuickMessagesContent
 import me.rerere.rikkahub.ui.components.ai.SkillsContent
 import me.rerere.rikkahub.ui.components.ai.EmbeddedRegexSection
-import me.rerere.rikkahub.ui.components.ai.TavernPresetsSection
+import me.rerere.rikkahub.ui.components.ai.PresetManagementSection
+import me.rerere.rikkahub.ui.components.ai.togglePresetEntryForAssistant
+import me.rerere.rikkahub.ui.components.ai.togglePresetGroupForAssistant
 import me.rerere.rikkahub.ui.components.ai.TavernScriptsSection
 import me.rerere.rikkahub.ui.components.ai.ThirdPartyExtensionsSection
 import me.rerere.rikkahub.ui.context.LocalNavController
@@ -105,7 +107,8 @@ fun AssistantExtensionsPage(id: String) {
                 Tab(
                     selected = pagerState.currentPage == 1,
                     onClick = { scope.launch { pagerState.animateScrollToPage(1) } },
-                    text = { Text(stringResource(R.string.assistant_extensions_page_tab_mode_injections)) }
+                    // [第6轮 D1] 「模式注入」→「提示词注入」（这个 tab 现在展示的是新通道）
+                    text = { Text(stringResource(R.string.assistant_extensions_page_tab_prompt_injections)) }
                 )
                 Tab(
                     selected = pagerState.currentPage == 2,
@@ -178,7 +181,9 @@ fun AssistantExtensionsPage(id: String) {
                     }
 
                     1 -> {
-                        if (settings.modeInjections.isEmpty()) {
+                        // [第6轮 D1 方案 A] 助手编辑页的「模式注入」同样改走**新通道**
+                        // settings.promptInjections（与全局页、聊天页三处一致）。
+                        if (settings.promptInjections.isEmpty()) {
                             ExtensionEmptyState(
                                 message = stringResource(R.string.assistant_extensions_page_empty_mode_injections),
                                 buttonText = stringResource(R.string.assistant_extensions_page_goto_prompts),
@@ -188,7 +193,7 @@ fun AssistantExtensionsPage(id: String) {
                             Column {
                                 ModeInjectionsContent(
                                     modifier = Modifier.weight(1f),
-                                    modeInjections = settings.modeInjections,
+                                    modeInjections = settings.promptInjections,
                                     selectedIds = assistant.modeInjectionIds,
                                     onToggle = { injId, checked ->
                                         val newIds = if (checked) assistant.modeInjectionIds + injId
@@ -272,10 +277,40 @@ fun AssistantExtensionsPage(id: String) {
                         )
                     }
                     5 -> {
-                        TavernPresetsSection(
+                        // [第6轮 D2~D5] 「预设」→「预设管理」：一行 = 一个预设，
+                        // Switch（本助手是否启用该预设）+ ▾ 内联展开（D5），展开后每条可单独开关 / 点开编辑。
+                        // 编辑界面 = 全局的 ModeInjectionEditSheet，逐字一致（用户要求「和全局保持一致」）。
+                        PresetManagementSection(
                             modeInjections = settings.modeInjections,
-                            selectedIds = assistant.modeInjectionIds,
-                            onChangeSelectedIds = { newIds -> vm.update(assistant.copy(modeInjectionIds = newIds)) },
+                            entryChecked = { assistant.modeInjectionIds.contains(it.id) },
+                            onToggleEntry = { entry, checked ->
+                                vm.patchSettings { current ->
+                                    togglePresetEntryForAssistant(current, assistant.id, entry.id, checked)
+                                }
+                            },
+                            onToggleGroup = { entries, checked ->
+                                val groupName = entries.firstOrNull()?.presetGroup.orEmpty()
+                                if (groupName.isNotEmpty()) {
+                                    vm.patchSettings { current ->
+                                        togglePresetGroupForAssistant(current, assistant.id, groupName, checked)
+                                    }
+                                } else {
+                                    val ids = entries.map { it.id }.toSet()
+                                    vm.patchSettings { current ->
+                                        current.copy(
+                                            assistants = current.assistants.map { a ->
+                                                if (a.id == assistant.id) {
+                                                    val newIds = if (checked) a.modeInjectionIds + ids else a.modeInjectionIds - ids
+                                                    a.copy(modeInjectionIds = newIds)
+                                                } else {
+                                                    a
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
+                            },
+                            onUpdateEntries = { newList -> vm.patchSettings { current -> current.copy(modeInjections = newList) } },
                             onNavigateToPrompts = { navController.navigate(Screen.Prompts) },
                             modifier = Modifier.fillMaxSize(),
                         )

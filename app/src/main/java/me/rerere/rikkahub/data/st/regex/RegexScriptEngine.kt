@@ -293,8 +293,8 @@ object RegexScriptEngine {
         return slashForm.groupValues[2].contains('g', ignoreCase = true)
     }
 
-    /** 替换串引用 token：`{{match}}` / `$1` / `$<name>`（对齐 ST replaceAll 正则） */
-    private val REPLACEMENT_TOKEN = Regex("\\{\\{match\\}\\}|\\$(\\d+)|\\$<([^>]+)>", RegexOption.IGNORE_CASE)
+    /** 替换串引用 token：`{{match}}` / `$$` / `$&` / `$1` / `$<name>`（对齐 ST replaceAll + JS 原生 $&/$$ 语义） */
+    private val REPLACEMENT_TOKEN = Regex("\\{\\{match\\}\\}|\\$\\$|\\$&|\\$(\\d+)|\\$<([^>]+)>", RegexOption.IGNORE_CASE)
 
     /**
      * 对单个脚本执行替换（对齐 ST runRegexScript）。
@@ -356,7 +356,8 @@ object RegexScriptEngine {
             val num = token.groupValues[1]
             val name = token.groupValues[2]
             when {
-                token.value.equals("{{match}}", ignoreCase = true) -> filtered(match.value)
+                token.value == "$$" -> "$"
+                token.value == "$&" || token.value.equals("{{match}}", ignoreCase = true) -> filtered(match.value)
                 num.isNotEmpty() -> filtered(match.groupValues.getOrNull(num.toIntOrNull() ?: -1))
                 name.isNotEmpty() -> filtered((match.groups as? MatchNamedGroupCollection)?.get(name)?.value)
                 else -> filtered(match.value)

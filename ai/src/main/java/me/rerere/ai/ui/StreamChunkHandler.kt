@@ -64,12 +64,16 @@ class StreamChunkHandler(private val model: Model? = null) {
     /**
      * 将一个 [chunk] 合并进消息列表末尾的助手消息，并返回新的消息列表。
      *
-     * @throws IllegalArgumentException 当 [messages] 为空时抛出
+     * [v243 BUGFIX B1] [messages] 允许为空（空列表 = 无上下文生成，结果就是一条新助手消息）。
+     *
+     * 旧实现在这里 `require(messages.isNotEmpty())`。重新生成会话里第 0 条助手消息
+     * （也就是助手预设开场白）时，ChatService.regenerateAtMessage 传的 messageRange 是 `0..<0`，
+     * Kotlin 求值为空区间 IntRange(0, -1)，切片结果为空列表 —— 预设开场白必然在 index 0，
+     * 所以这是**必现**的：旧行为在这里抛 IllegalArgumentException，生成链中断，
+     * UI 已经把该楼层换成空的流式气泡，表现为「点重新生成：原内容闪一下，立刻变成空白小条」。
      */
     fun handle(messages: List<UIMessage>, chunk: StreamChunk): List<UIMessage> {
-        require(messages.isNotEmpty()) { "messages must not be empty" }
-
-        val targetMessages = if (messages.last().role != MessageRole.ASSISTANT) {
+        val targetMessages = if (messages.isEmpty() || messages.last().role != MessageRole.ASSISTANT) {
             messages + UIMessage(modelId = model?.id, role = MessageRole.ASSISTANT, parts = emptyList())
         } else {
             messages
@@ -324,7 +328,16 @@ fun List<UIMessage>.handleTextGenerationResult(
     result: TextGenerationResult,
     model: Model? = null,
 ): List<UIMessage> {
-    require(isNotEmpty()) { "messages must not be empty" }
+    // [v243 BUGFIX B1] 同 handle()：空列表是合法的「无上下文生成」，不应抛异常。
+    if (isEmpty()) {
+        return listOf(
+            result.message.copy(
+                modelId = model?.id,
+                usage = result.usage,
+                finishedAt = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()),
+            ).finishReasoning(),
+        )
+    }
     val incoming = result.message.copy(
         modelId = model?.id,
         usage = result.usage,

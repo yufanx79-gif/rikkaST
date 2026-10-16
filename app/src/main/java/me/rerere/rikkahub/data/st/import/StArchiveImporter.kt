@@ -41,7 +41,7 @@ internal fun classifyStArchiveEntry(path: String): StArchiveEntryKind {
     val lower = name.lowercase()
     fun inDir(dir: String) = p.contains("/$dir/") || p.startsWith("$dir/")
     return when {
-        inDir("characters") && (lower.endsWith(".png") || lower.endsWith(".json")) -> StArchiveEntryKind.CHARACTER
+        inDir("characters") && (lower.endsWith(".png") || lower.endsWith(".json") || lower.endsWith(".charx") || lower.endsWith(".byaf")) -> StArchiveEntryKind.CHARACTER
         inDir("worlds") && lower.endsWith(".json") -> StArchiveEntryKind.WORLD
         inDir("OpenAI Settings") && lower.endsWith(".json") -> StArchiveEntryKind.PRESET
         inDir("QuickReplies") && lower.endsWith(".json") -> StArchiveEntryKind.QUICK_REPLIES
@@ -72,15 +72,42 @@ internal fun parseStQuickReplies(json: String): List<QuickMessage> {
     return runCatching {
         val root = ExportSerializer.DefaultJson.parseToJsonElement(json) as? JsonObject
             ?: return@runCatching emptyList()
+        val setName = root["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: "Default"
+        val setDisable = root["disable"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
         val arr = root["qrList"] as? JsonArray ?: return@runCatching emptyList()
         arr.mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
-            val label = o["label"]?.jsonPrimitive?.contentOrNull.orEmpty()
-            val value = o["value"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val label = o["label"]?.jsonPrimitive?.contentOrNull
+                ?: o["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val value = o["message"]?.jsonPrimitive?.contentOrNull
+                ?: o["value"]?.jsonPrimitive?.contentOrNull.orEmpty()
             if (label.isBlank() && value.isBlank()) {
                 null
             } else {
-                QuickMessage(title = label, content = value)
+                val onStartup = o["executeOnStartup"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val onUser = o["executeOnUser"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val onAi = o["executeOnAi"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val onChatChange = o["executeOnChatChange"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val onGroup = o["executeOnGroupMemberDraft"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val autoId = o["automationId"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val isHidden = o["isHidden"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                    ?: o["hidden"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                val ctxMenu = !o["contextList"]?.let { it as? JsonArray }.isNullOrEmpty()
+                QuickMessage(
+                    title = label,
+                    content = value,
+                    autoExecute = onStartup || onUser || onAi,
+                    setName = setName,
+                    setEnabled = !setDisable,
+                    automationId = autoId,
+                    executeOnStartup = onStartup,
+                    executeOnUser = onUser,
+                    executeOnAi = onAi,
+                    executeOnChatChange = onChatChange,
+                    executeOnGroupMemberDraft = onGroup,
+                    contextMenu = ctxMenu,
+                    hidden = isHidden,
+                )
             }
         }
     }.getOrDefault(emptyList())
@@ -115,6 +142,7 @@ class StArchiveImporter(
         val newAssistants = mutableListOf<me.rerere.rikkahub.data.model.Assistant>()
         val newLorebooks = mutableListOf<Lorebook>()
         val newInjections = mutableListOf<PromptInjection.ModeInjection>()
+        val newPresetBundles = mutableListOf<me.rerere.rikkahub.data.export.PresetImportBundle>()
         val newQuickMessages = mutableListOf<QuickMessage>()
         var settingsRegexCount = 0
         var worldCount = 0
@@ -136,7 +164,13 @@ class StArchiveImporter(
                         try {
                             when (kind) {
                                 StArchiveEntryKind.CHARACTER -> {
-                                    val ext = if (entry.name.lowercase().endsWith(".png")) "png" else "json"
+                                    val lowerEntryName = entry.name.lowercase()
+                                    val ext = when {
+                                        lowerEntryName.endsWith(".png") -> "png"
+                                        lowerEntryName.endsWith(".charx") -> "charx"
+                                        lowerEntryName.endsWith(".byaf") -> "byaf"
+                                        else -> "json"
+                                    }
                                     val tmp = File(tmpDir, "card_${cardIndex++}.$ext")
                                     tmp.outputStream().use { out -> zin.copyTo(out) }
                                     runCatching {
@@ -173,10 +207,11 @@ class StArchiveImporter(
 
                                 StArchiveEntryKind.PRESET -> {
                                     val text = zin.readBytes().toString(Charsets.UTF_8)
-                                    val injections =
-                                        ModeInjectionSerializer.tryImportSillyTavernPreset(text, baseName)
-                                    if (injections != null) {
-                                        newInjections += injections
+                                    val bundle =
+                                        ModeInjectionSerializer.importPresetBundleFromString(text, baseName).getOrNull()
+                                    if (bundle != null && bundle.injections.isNotEmpty()) {
+                                        newPresetBundles += bundle
+                                        newInjections += bundle.injections
                                         presetCount++
                                     } else {
                                         errors++
@@ -213,15 +248,19 @@ class StArchiveImporter(
 
         // 一次性写入设置（快速回复按内容去重，避免重复导入产生副本）。
         // 正则脚本已由 StSettingsImporter 在 SETTINGS 分支写入（权威导入），此处不再二次合并。
-        val s = settingsStore.settingsFlow.value
-        settingsStore.update(
-            s.copy(
+        settingsStore.update { s ->
+            var next = s.copy(
                 assistants = s.assistants + newAssistants,
                 lorebooks = s.lorebooks + newLorebooks,
-                modeInjections = s.modeInjections + newInjections,
                 quickMessages = (s.quickMessages + newQuickMessages).distinctBy { it.title to it.content },
             )
-        )
+            for (bundle in newPresetBundles) {
+                val (afterBundle, addedRx) = me.rerere.rikkahub.ui.components.ai.applyPresetBundleToSettings(next, bundle)
+                next = afterBundle
+                settingsRegexCount += addedRx
+            }
+            next
+        }
 
         Summary(
             characters = newAssistants.size,

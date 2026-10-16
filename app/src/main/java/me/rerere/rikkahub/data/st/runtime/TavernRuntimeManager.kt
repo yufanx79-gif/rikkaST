@@ -11,6 +11,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.annotation.Keep
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
@@ -66,6 +67,44 @@ data class TavernScriptButton(
     val name: String,
     val event: String = "",
 )
+
+/** 第三方扩展或卡脚本通过 `registerFunctionTool` 注册的 LLM 函数工具描述。 */
+data class JsFunctionToolSpec(
+    val name: String,
+    val displayName: String = name,
+    val description: String = "",
+    val parametersJson: String = "{}",
+    val stealth: Boolean = false,
+)
+
+/** STscript `/popup`、`/input`、`/buttons` 交互弹窗请求（后台协程挂起等待 UI 响应）。 */
+sealed class SlashModalRequest {
+    abstract val deferred: CompletableDeferred<String>
+
+    data class Popup(
+        val text: String,
+        val title: String?,
+        val expectResult: Boolean,
+        val okButton: String?,
+        val cancelButton: String?,
+        override val deferred: CompletableDeferred<String> = CompletableDeferred(),
+    ) : SlashModalRequest()
+
+    data class Input(
+        val prompt: String,
+        val title: String?,
+        val defaultValue: String,
+        override val deferred: CompletableDeferred<String> = CompletableDeferred(),
+    ) : SlashModalRequest()
+
+    data class Buttons(
+        val prompt: String,
+        val labels: List<String>,
+        val multiple: Boolean,
+        override val deferred: CompletableDeferred<String> = CompletableDeferred(),
+    ) : SlashModalRequest()
+}
+
 object TavernRuntimeManager {
     private const val TAG = "TavernRuntime"
     private const val HOST = "appassets.androidplatform.net"
@@ -113,7 +152,9 @@ object TavernRuntimeManager {
         "gcore.jsdelivr.net",
     )
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    // 延迟创建：JVM 单元测试（android.jar 桩）下 Looper.getMainLooper() 会抛 "not mocked"，
+    // 静态初始化失败会导致整个类不可用；改为首次 post 时再创建。
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     val json = Json { ignoreUnknownKeys = true }
     private val logs = ConcurrentLinkedQueue<String>()
     /** 日志文件写入锁（append 可能由主线程 / JavaBridge 线程并发触发）。 */
@@ -128,6 +169,89 @@ object TavernRuntimeManager {
 
     /** [v234 S2] MacrosParser JS 注册表快照（JS 'macros_updated' 推送；key = 宏名 → (type, value)）。 */
     val macrosRegistry = AtomicReference<Map<String, Pair<String, String>>>(emptyMap())
+
+    /** JS 侧通过 SlashCommandParser.addCommandObject / addCommand 注册的扩展斜杠命令名集合（小写）。 */
+    private val jsSlashCommandNames: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** 标记当前线程或当前同步桥调用栈是否正在阻塞等待 WebView JavaBridge 返回，防止向同一 WebView 发起重入 evaluateJavascript 造成 V8 死锁。 */
+    private val inJavaBridgeCall = object : ThreadLocal<Boolean>() {
+        override fun initialValue(): Boolean = false
+    }
+    private val activeJavaBridgeBlockingCalls = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private val filterEvalSeqCounter = AtomicLong(0)
+    private val pendingFilterEvals = ConcurrentHashMap<Long, CompletableDeferred<Unit>>()
+
+    /** 判断当前是否处于 WebView @JavascriptInterface 同步调用栈内（含内部启动的 runBlocking 子协程）。 */
+    fun isInJavaBridgeCall(): Boolean = (inJavaBridgeCall.get() == true) || activeJavaBridgeBlockingCalls.get() > 0
+
+    /** 判断指定命令名是否已在 JS 侧注册（O(1) 无锁查询）。 */
+    fun hasJsSlashCommand(name: String): Boolean = name.trim().lowercase() in jsSlashCommandNames
+
+    /** 供测试或宿主同步更新已注册的 JS 斜杠命令名集合。 */
+    fun updateRegisteredJsSlashCommands(names: Collection<String>) {
+        jsSlashCommandNames.clear()
+        names.forEach { n ->
+            val trimmed = n.trim().lowercase()
+            if (trimmed.isNotEmpty()) jsSlashCommandNames.add(trimmed)
+        }
+    }
+
+    /** JS 侧通过 `registerFunctionTool` 注册的 LLM 函数工具规格列表。 */
+    private val jsFunctionToolsRef = AtomicReference<List<JsFunctionToolSpec>>(emptyList())
+    val pendingFunctionTools = ConcurrentHashMap<Long, CompletableDeferred<String>>()
+    private val functionToolSeqCounter = AtomicLong(0)
+
+    fun updateRegisteredJsFunctionTools(specs: List<JsFunctionToolSpec>) {
+        jsFunctionToolsRef.set(specs.filter { it.name.isNotBlank() })
+    }
+
+    fun getRegisteredJsFunctionTools(): List<JsFunctionToolSpec> = jsFunctionToolsRef.get()
+
+    fun listJsFunctionTools(): List<JsFunctionToolSpec> = jsFunctionToolsRef.get()
+
+    fun registerJsFunctionTool(spec: JsFunctionToolSpec): Boolean {
+        val cleanName = spec.name.trim()
+        if (cleanName.isEmpty()) return false
+        val current = jsFunctionToolsRef.get().filterNot { it.name.equals(cleanName, ignoreCase = true) }
+        jsFunctionToolsRef.set(current + spec.copy(name = cleanName))
+        return true
+    }
+
+    fun unregisterJsFunctionTool(name: String): Boolean {
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) return false
+        val before = jsFunctionToolsRef.get()
+        val after = before.filterNot { it.name.equals(cleanName, ignoreCase = true) }
+        jsFunctionToolsRef.set(after)
+        return after.size < before.size
+    }
+
+    fun hasJsFunctionTool(name: String): Boolean =
+        jsFunctionToolsRef.get().any { it.name.equals(name.trim(), ignoreCase = true) }
+
+    /** 进程内 `executeOnStartup` Quick Reply 是否已触发过（避免每次切换会话重复跑 startup 钩子）。 */
+    private val startupQrExecuted = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun markStartupQrExecuted(): Boolean = startupQrExecuted.compareAndSet(false, true)
+
+    /** STscript `/popup`、`/input`、`/buttons` 模态弹窗状态流与 UI 挂载计数。 */
+    val pendingSlashModal = MutableStateFlow<SlashModalRequest?>(null)
+    @Volatile var isSlashModalUiAttached: Boolean = false
+
+    fun awaitSlashModal(request: SlashModalRequest, timeoutMs: Long = 120_000L): String? {
+        if (!isSlashModalUiAttached) return null
+        if (Looper.myLooper() == Looper.getMainLooper()) return null
+        pendingSlashModal.value = request
+        return try {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(timeoutMs) { request.deferred.await() }
+            }
+        } finally {
+            if (pendingSlashModal.value === request) {
+                pendingSlashModal.value = null
+            }
+        }
+    }
 
     /** [v234 S2] 函数宏批量执行等待槽（seq → deferred）。 */
     val pendingMacros = ConcurrentHashMap<Long, CompletableDeferred<String>>()
@@ -167,13 +291,141 @@ object TavernRuntimeManager {
     // 脚本按钮可能注册在任意一个页面里，而 eval() 只打主页面 —— 这就是「按钮点了没反应」的原因。
     private val auxWebViews = java.util.Collections.synchronizedMap(java.util.WeakHashMap<WebView, String>())
 
+    /**
+     * [P0-1 / P0-2] 主运行时渲染进程代数：
+     * - 采用 1500ms 合并窗口（coalesce window），避免同一次共享渲染进程崩溃引发多个 WebView
+     *   连续回调时反复递增代数导致级联重建风暴；
+     * - 单个面板的局部崩溃走 [onPanelRendererGone]，仅重建失效面板自身，不强制销毁其他健康面板。
+     */
+    private val _rendererGeneration = MutableStateFlow(0)
+    val rendererGeneration: StateFlow<Int> get() = _rendererGeneration
+    private val rendererBumpLock = Any()
+    @Volatile private var lastRendererBumpAtMs: Long = 0L
+    private const val RENDERER_BUMP_COALESCE_MS = 1500L
+
+    fun bumpRendererGeneration(nowMs: Long = System.currentTimeMillis()): Int = synchronized(rendererBumpLock) {
+        if (lastRendererBumpAtMs > 0L && (nowMs - lastRendererBumpAtMs) in 0 until RENDERER_BUMP_COALESCE_MS) {
+            appendLog("debug", "[webview] coalesced duplicate bumpRendererGeneration within ${nowMs - lastRendererBumpAtMs}ms (gen=${_rendererGeneration.value})")
+            return _rendererGeneration.value
+        }
+        lastRendererBumpAtMs = nowMs
+        val next = _rendererGeneration.value + 1
+        _rendererGeneration.value = next
+        return next
+    }
+
+    /**
+     * 面板 WebView 发生 `onRenderProcessGone` 时的协调入口：
+     * 1) 立即注销失效面板辅助视图；
+     * 2) 探测主运行时 WebView 是否仍然存活（若共享同一渲染进程但主 WebView 回调尚未到达或已失效，则触发主运行时自愈）；
+     * 3) 不无条件递增全局代数，防止其他未崩溃面板丢失输入与 DOM 状态。
+     */
+    fun onPanelRendererGone(
+        panelView: WebView,
+        messageKey: String?,
+        didCrash: Boolean,
+        priority: Int,
+    ) {
+        unregisterAuxWebView(panelView)
+        appendLog(
+            "error",
+            "[webview] renderer gone (panel key=$messageKey) didCrash=$didCrash priority=$priority",
+        )
+        mainHandler.post {
+            val hostWv = webView ?: return@post
+            runCatching {
+                hostWv.evaluateJavascript("1") { res ->
+                    if (res == null) {
+                        appendLog("warn", "[webview] host runtime unresponsive after panel renderer gone -> recovering host")
+                        val gen = bumpRendererGeneration()
+                        if (webView === hostWv) {
+                            webView = null
+                            pageReady = false
+                            isMvuActive = false
+                        }
+                        runCatching {
+                            hostWv.stopLoading()
+                            hostWv.destroy()
+                        }
+                        appContext?.let { ctx ->
+                            runCatching { createWebView(ctx) }
+                                .onFailure { appendLog("error", "[webview] host recovery failed (gen=$gen): ${it.message}") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 在提示词组装前异步求值当前会话所有带动态 JS `filter` 的注入提示词（带超时保护，绝不永久阻塞生成管线）。
+     */
+    suspend fun evaluateActiveInjectFilters(conversationId: String?, timeoutMs: Long = 1200L) {
+        if (conversationId.isNullOrBlank()) return
+        if (isInJavaBridgeCall()) return
+        val rawList = InjectedPromptStore.rawSnapshot(conversationId)
+        if (rawList.none { it.hasFilter }) return
+        val wv = webView ?: return
+        if (!pageReady) return
+        val seq = filterEvalSeqCounter.incrementAndGet()
+        val deferred = CompletableDeferred<Unit>()
+        pendingFilterEvals[seq] = deferred
+        mainHandler.post {
+            val currentWv = webView
+            if (currentWv == null || !pageReady) {
+                pendingFilterEvals.remove(seq)?.complete(Unit)
+                return@post
+            }
+            runCatching {
+                currentWv.evaluateJavascript(
+                    "(async function(){try{if(window.__rikkaEvaluateAllInjectFilters){await window.__rikkaEvaluateAllInjectFilters($seq);}else if(window.RikkaBridge&&window.RikkaBridge.onInjectFiltersEvaluated){window.RikkaBridge.onInjectFiltersEvaluated($seq);}}catch(e){if(window.RikkaBridge&&window.RikkaBridge.onInjectFiltersEvaluated){window.RikkaBridge.onInjectFiltersEvaluated($seq);}}})()",
+                    null,
+                )
+            }.onFailure {
+                pendingFilterEvals.remove(seq)?.complete(Unit)
+            }
+        }
+        try {
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
+        } finally {
+            pendingFilterEvals.remove(seq)
+        }
+    }
+
+    @Volatile private var exitInfoLogged = false
+
+    /** [P0-2] Android 11+ 启动时自取证：读取上一次进程退出的内核级原因（Native abort / LMKD / OOM / ANR 及 PSS/RSS）写入日志。 */
+    private fun logLastProcessExitInfo(context: Context) {
+        if (exitInfoLogged) return
+        exitInfoLogged = true
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            runCatching {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+                val exits = am?.getHistoricalProcessExitReasons(context.packageName, 0, 3).orEmpty()
+                for ((idx, info) in exits.withIndex()) {
+                    appendLog(
+                        "warn",
+                        "[exit-info] prev_exit[$idx]: reason=${info.reason} status=${info.status} " +
+                            "importance=${info.importance} pss=${info.pss}kB rss=${info.rss}kB " +
+                            "ts=${info.timestamp} desc=${info.description}",
+                    )
+                }
+            }.onFailure { t ->
+                appendLog("warn", "[exit-info] query failed: ${t.message}")
+            }
+        }
+    }
+
     fun registerAuxWebView(wv: WebView, tag: String) {
         auxWebViews[wv] = tag
         appendLog("debug", "[webview] aux registered: $tag (total=${auxWebViews.size})")
     }
 
     fun unregisterAuxWebView(wv: WebView) {
-        auxWebViews.remove(wv)
+        val removed = auxWebViews.remove(wv)
+        if (removed != null) {
+            appendLog("debug", "[webview] aux unregistered: $removed (total=${auxWebViews.size})")
+        }
     }
 
     /** 在主运行时 + 所有辅助 WebView 里执行同一段 JS（按钮派发用）。 */
@@ -235,6 +487,9 @@ object TavernRuntimeManager {
     /** 由 UI 层注入：STscript 执行入口（JS `triggerSlash` / 快速回复共用；返回管道值）。 */
     @Volatile var slashRunner: ((String) -> String)? = null
 
+    /** 由 UI 层注入：静默生成直连通道（prompt, raw, systemPrompt -> 生成文本），不受管道符 `|` 切分干扰。 */
+    @Volatile var quietGenerator: ((String, Boolean, String) -> String)? = null
+
     /**
      * [v229 A1] 由 ChatService 注入：跑一次「JSR 生成的回复」。
      * 入参 = JSR `/generate` 的请求体（OpenAI 形状），返回宿主 Provider 归一化后的流。
@@ -253,6 +508,38 @@ object TavernRuntimeManager {
 
     /** [v214] 由 UI 层注入：面板表单发送用户消息（text → 是否受理）。 */
     @Volatile var userMessageSender: ((String) -> Boolean)? = null
+
+    /**
+     * [v243 BUGFIX A2] 由 UI 层注入：JS `createChatMessages` 的宿主落点
+     * （jsonText = [{role,name,message,data}] → 是否受理）。
+     *
+     * ⚠️ 必须**同步**完成会话状态更新（见 ChatVM.insertRuntimeChatMessages 的注释）：
+     * 卡脚本的典型序列是 `await createChatMessages(...); await triggerSlash('/trigger')`，
+     * 而 ChatService 每个入口都会 cancel 上一个 job —— 排队的异步插入会被 /trigger 直接取消。
+     */
+    @Volatile var chatInserter: ((String) -> Boolean)? = null
+
+    /** JS `deleteChatMessages` 的宿主落点（idsJson = [0, 1, ...] → 是否受理）。 */
+    @Volatile var chatDeleter: ((String) -> Boolean)? = null
+
+    /**
+     * [v243 BUGFIX A3] 由 UI 层注入：JSR 世界书条目写入
+     * （bookName, payloadJson = {upsert:[...],delete:[uid],replaceAll:bool} → 是否受理）。
+     */
+    @Volatile var lorebookUpserter: ((String, String) -> Boolean)? = null
+
+    /** JSR `createOrReplaceWorldbook` / `createWorldbook` 整书创建或替换回调（bookName, entriesJson, replaceIfExists）。 */
+    @Volatile var lorebookCreator: ((String, String, Boolean) -> Boolean)? = null
+
+    /** JSR `deleteWorldbook` 整书删除回调（bookName）。 */
+    @Volatile var lorebookDeleter: ((String) -> Boolean)? = null
+
+    /** JSR `setChatLorebook` / `rebindCharWorldbooks` / `rebindGlobalWorldbooks` 绑定回调（scope, namesJson）。 */
+    @Volatile var lorebookRebinder: ((String, String) -> Boolean)? = null
+
+    /** JS 自定义斜杠命令异步等待槽（seq → deferred）。 */
+    val pendingSlash = ConcurrentHashMap<Long, CompletableDeferred<String>>()
+    private val slashSeqCounter = AtomicLong(0)
 
     /** MVU bundle 是否已就绪（由 JS 侧 mvu_ready / mvu_error 事件维护）。 */
     @Volatile var isMvuActive: Boolean = false
@@ -300,14 +587,41 @@ object TavernRuntimeManager {
 
     /** 只设置资产拦截器上下文，不创建主运行时 WebView（扩展设置等辅助 WebView 用）。 */
     fun ensureContext(context: Context) {
-        appContext = context.applicationContext
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        logLastProcessExitInfo(appCtx)
     }
 
+    /**
+     * 启动主运行时 WebView。
+     *
+     * ⚠️⚠️ [第6轮 P0-1 · 白条根因] `appContext` 必须**同步**赋值，绝不能放进 `mainHandler.post`。
+     *
+     * 真机铁证（2026-10-14 14:48:42.638 ~ 14:48:43.199）：
+     *   · `MessageHtmlBlock` 的面板 WebView 在 `factory` 里先调 `ensureStarted(context)`，
+     *     紧接着**同一帧内**就 `loadUrl(BASE_URL + "panel.html")`；
+     *   · 旧实现里 `appContext` 是在 `post` 出去的 `createWebView()` 内部才赋值的，
+     *     于是这段窗口里 `interceptAsset()` 走到 `openAsset()` 的
+     *     `val ctx = appContext ?: return null` 直接返回 null；
+     *   · `shouldInterceptRequest` 返回 null ⇒ WebView 真的去访问
+     *     `appassets.androidplatform.net` ⇒ 加载失败（空白错误页）；
+     *   · 页面里没有 runtime.js ⇒ `window.__rikkaPanelMount` 不存在
+     *     ⇒ HTML 被暂存进 `__rikkaPanelPendingHtml` 后**永远挂不上**；
+     *   · 面板于是停在 `MessageHtmlBlock.minHeightDp = 48`
+     *     ⇒ 用户看到的「**白色的条**」（同卡的「主角图不显示 / 可修改处点不动」是同一个原因）。
+     *   · 「用久了就好」= 主运行时 WebView 起来之后 / 面板被 LazyColumn 销毁重建时，
+     *     `appContext` 已经有值了。
+     *
+     * 同步赋值后，`ensureStarted()` 一返回资产拦截器就可用（`createWebView` 内重复赋值无害）。
+     */
     fun ensureStarted(context: Context) {
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        logLastProcessExitInfo(appCtx)
         if (webView != null) return
         mainHandler.post {
             if (webView != null) return@post
-            runCatching { createWebView(context.applicationContext) }
+            runCatching { createWebView(appCtx) }
                 .onFailure { appendLog("error", "WebView 初始化失败: ${it.message}") }
         }
     }
@@ -316,6 +630,9 @@ object TavernRuntimeManager {
     private fun createWebView(context: Context) {
         appContext = context
         val wv = WebView(context)
+        // [P1-2] 离屏主运行时 WebView 永不需要输入焦点，禁止其抢夺软键盘焦点
+        wv.isFocusable = false
+        wv.isFocusableInTouchMode = false
         wv.settings.javaScriptEnabled = true
         wv.settings.domStorageEnabled = true
         wv.settings.allowFileAccess = false
@@ -334,6 +651,49 @@ object TavernRuntimeManager {
                 pageReady = true
                 appendLog("info", "运行时页面就绪: $url")
                 fireEvent("app_ready", "{}")
+                // 若是渲染器崩溃后的自愈重建，补发一次 active_conversation_changed 恢复当前会话脚本与 MVU
+                val activeConv = activeConversationId
+                if (_rendererGeneration.value > 0 && !activeConv.isNullOrBlank()) {
+                    fireEvent(
+                        "active_conversation_changed",
+                        buildJsonObject { put("conversation_id", activeConv) }.toString(),
+                    )
+                }
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: android.webkit.RenderProcessGoneDetail?,
+            ): Boolean {
+                val didCrash = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    detail?.didCrash() == true
+                } else false
+                val priority = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    detail?.rendererPriorityAtExit() ?: -1
+                } else -1
+                val gen = bumpRendererGeneration()
+                appendLog(
+                    "error",
+                    "[webview] renderer gone (host) didCrash=$didCrash priority=$priority gen=$gen -> rebuilding runtime WebView",
+                )
+                mainHandler.post {
+                    if (webView === view) {
+                        webView = null
+                        pageReady = false
+                        isMvuActive = false
+                    }
+                    runCatching {
+                        view.stopLoading()
+                        view.destroy()
+                    }
+                    val ctx = appContext
+                    if (ctx != null && webView == null) {
+                        runCatching { createWebView(ctx) }
+                            .onFailure { appendLog("error", "[webview] host rebuild failed: ${it.message}") }
+                    }
+                }
+                // 必须返回 true，阻止 Chromium 调 abort() 连带强杀整个 App 进程
+                return true
             }
         }
         wv.addJavascriptInterface(TavernJsBridge(), "RikkaBridge")
@@ -343,7 +703,7 @@ object TavernRuntimeManager {
 
     /** 资产拦截：/st-runtime/... → assets/st-runtime/...（含 ES module MIME）；CDN 请求 → 本地 vendor。 */
     internal fun interceptAsset(uri: Uri): WebResourceResponse? {
-        if (uri.host != HOST) return interceptCdn(uri)
+        if (uri.host != HOST && uri.host != "st.rikka.local") return interceptCdn(uri)
         val path = uri.path ?: return notFound()
         // 0) 第三方扩展资源（真实文件端点）：
         //    /scripts/extensions/third-party/<folder>/<path> → filesDir/tavern-extensions/third-party/...
@@ -357,6 +717,23 @@ object TavernRuntimeManager {
         // 为兼容这个 ST 常见相对路径，映射到真实的 /scripts/extensions/third-party/**。
         if (path.startsWith("/third-party/")) {
             return openThirdPartyAsset("/scripts/extensions$path")
+        }
+        // 0.2) 本地角色资产（.charx 解压资产与表情立绘）：/charx_assets/<id>/<rel> 或 /sprites/<id>/<file>
+        if (path.startsWith("/charx_assets/") || path.startsWith("/sprites/")) {
+            val ctx = appContext ?: return notFound()
+            val rel = path.removePrefix("/")
+            val topDir = rel.substringBefore('/')
+            if (topDir == "charx_assets" || topDir == "sprites") {
+                val allowedRoot = runCatching { File(ctx.filesDir, topDir).canonicalFile }.getOrNull()
+                val targetFile = runCatching { File(ctx.filesDir, rel).canonicalFile }.getOrNull()
+                if (allowedRoot != null && targetFile != null &&
+                    targetFile.path.startsWith(allowedRoot.path + File.separator) &&
+                    targetFile.isFile
+                ) {
+                    return openFileResponse(targetFile) ?: notFound()
+                }
+            }
+            return notFound()
         }
         // 0.5) [v228 S1] ST `/version` 端点（**能力闸门**，不是 rikkaST 自身版本）。
         //    JSR `src/util/tavern.ts:24-27`：await fetch('/version').then(r => r.json()).then(d => d.pkgVersion)
@@ -526,16 +903,35 @@ object TavernRuntimeManager {
         )
     }
 
-    private fun mimeOf(path: String): String = when {
-        path.endsWith(".html") -> "text/html"
-        path.endsWith(".js") || path.endsWith(".mjs") || path.endsWith("+esm") -> "application/javascript"
-        path.endsWith(".css") -> "text/css"
-        path.endsWith(".json") || path.endsWith(".map") -> "application/json"
-        path.endsWith(".wasm") -> "application/wasm"
-        path.endsWith(".png") -> "image/png"
-        path.endsWith(".svg") -> "image/svg+xml"
-        path.endsWith(".woff2") -> "font/woff2"
-        else -> "application/octet-stream"
+    internal fun mimeOf(path: String): String {
+        val clean = path.substringBefore('?').substringBefore('#').trim().lowercase(Locale.ROOT)
+        return when {
+            clean.endsWith(".html") || clean.endsWith(".htm") -> "text/html"
+            clean.endsWith(".js") || clean.endsWith(".mjs") || clean.endsWith("+esm") -> "application/javascript"
+            clean.endsWith(".css") -> "text/css"
+            clean.endsWith(".json") || clean.endsWith(".map") -> "application/json"
+            clean.endsWith(".wasm") -> "application/wasm"
+            clean.endsWith(".png") -> "image/png"
+            clean.endsWith(".jpg") || clean.endsWith(".jpeg") -> "image/jpeg"
+            clean.endsWith(".webp") -> "image/webp"
+            clean.endsWith(".gif") -> "image/gif"
+            clean.endsWith(".svg") -> "image/svg+xml"
+            clean.endsWith(".avif") -> "image/avif"
+            clean.endsWith(".bmp") -> "image/bmp"
+            clean.endsWith(".ico") -> "image/x-icon"
+            clean.endsWith(".woff2") -> "font/woff2"
+            clean.endsWith(".woff") -> "font/woff"
+            clean.endsWith(".ttf") -> "font/ttf"
+            clean.endsWith(".otf") -> "font/otf"
+            clean.endsWith(".mp3") -> "audio/mpeg"
+            clean.endsWith(".wav") -> "audio/wav"
+            clean.endsWith(".ogg") -> "audio/ogg"
+            clean.endsWith(".mp4") -> "video/mp4"
+            clean.endsWith(".webm") -> "video/webm"
+            clean.endsWith(".xml") -> "application/xml"
+            clean.endsWith(".txt") -> "text/plain"
+            else -> "application/octet-stream"
+        }
     }
 
     /**
@@ -610,6 +1006,7 @@ object TavernRuntimeManager {
      * JS 侧调 MacrosParser 函数宏并经 onMacrosResult 回传 [{id, value}, ...]；超时/未就绪返回 null。
      */
     suspend fun runMacrosBatch(requestsJson: String, timeoutMs: Long = 10_000): List<Pair<Int, String>>? {
+        if (isInJavaBridgeCall()) return null
         val wv = webView ?: return null
         val seq = macrosSeqCounter.incrementAndGet()
         val deferred = CompletableDeferred<String>()
@@ -644,6 +1041,7 @@ object TavernRuntimeManager {
 
     suspend fun renderEjsBatch(texts: List<String>, timeoutMs: Long = 10_000): List<String>? {
         if (texts.isEmpty()) return texts
+        if (isInJavaBridgeCall()) return null
         val wv = webView ?: return null
         val seq = ejsSeqCounter.incrementAndGet()
         val textsArray = org.json.JSONArray()
@@ -681,6 +1079,7 @@ object TavernRuntimeManager {
      * 回调：RikkaBridge.onGenerationHooksResult(seq, json)
      */
     suspend fun runGenerationHooks(messagesJson: String, timeoutMs: Long = 15_000): String? {
+        if (isInJavaBridgeCall()) return null
         val wv = webView ?: return null
         if (!pageReady) return null
         val seq = genHookSeqCounter.incrementAndGet()
@@ -726,6 +1125,127 @@ object TavernRuntimeManager {
     // ==================== [v214] JS 写回桥（世界书 / 面板表单发送） ====================
 
     /** [v214] JS `RikkaBridge.updateLorebookEntries`：整本书条目 disable 补丁 → 宿主持久化。 */
+    fun dispatchLorebookCreate(bookName: String, entriesJson: String, replaceIfExists: Boolean): Boolean {
+        val creator = lorebookCreator ?: run {
+            appendLog("warn", "[lorebook] createOrReplaceLorebook: creator not wired (name='$bookName')")
+            return false
+        }
+        val ok = runCatching { creator(bookName, entriesJson, replaceIfExists) }.getOrDefault(false)
+        appendLog("info", "[lorebook] createOrReplaceLorebook name='$bookName' replace=$replaceIfExists ok=$ok")
+        return ok
+    }
+
+    fun dispatchLorebookDelete(bookName: String): Boolean {
+        val deleter = lorebookDeleter ?: run {
+            appendLog("warn", "[lorebook] deleteLorebook: deleter not wired (name='$bookName')")
+            return false
+        }
+        val ok = runCatching { deleter(bookName) }.getOrDefault(false)
+        appendLog("info", "[lorebook] deleteLorebook name='$bookName' ok=$ok")
+        return ok
+    }
+
+    fun dispatchLorebookRebind(scope: String, namesJson: String): Boolean {
+        val rebinder = lorebookRebinder ?: run {
+            appendLog("warn", "[lorebook] rebindLorebooks: rebinder not wired (scope='$scope')")
+            return false
+        }
+        val ok = runCatching { rebinder(scope, namesJson) }.getOrDefault(false)
+        appendLog("info", "[lorebook] rebindLorebooks scope='$scope' names=$namesJson ok=$ok")
+        return ok
+    }
+
+    /**
+     * 调用 WebView `window.__rikkaExecuteJsSlashCommand` 执行通过 `SlashCommandParser.addCommandObject` 注册的 JS 扩展斜杠命令。
+     * @return 若 JS 侧已注册该命令则返回执行结果字符串；若未注册或 WebView 未就绪则返回 `null`。
+     */
+    suspend fun executeJsSlashCommand(
+        name: String,
+        namedArgs: Map<String, String>,
+        unnamedArgs: String,
+        pipe: String = "",
+        timeoutMs: Long = 5_000L,
+    ): String? {
+        if (isInJavaBridgeCall()) return null
+        if (name.trim().lowercase() !in jsSlashCommandNames) return null
+        val wv = webView ?: return null
+        if (!pageReady) return null
+        val seq = slashSeqCounter.incrementAndGet()
+        val deferred = CompletableDeferred<String>()
+        pendingSlash[seq] = deferred
+        val namedObj = JSONObject()
+        namedArgs.forEach { (k, v) -> namedObj.put(k, v) }
+        val namedJsonQuoted = JSONObject.quote(namedObj.toString())
+        val nameQuoted = JSONObject.quote(name)
+        val unnamedQuoted = JSONObject.quote(unnamedArgs)
+        val pipeQuoted = JSONObject.quote(pipe)
+        mainHandler.post {
+            runCatching {
+                wv.evaluateJavascript(
+                    "if (window.__rikkaExecuteJsSlashCommand) { window.__rikkaExecuteJsSlashCommand($nameQuoted, $namedJsonQuoted, $unnamedQuoted, $pipeQuoted, $seq); } else if (window.RikkaBridge && window.RikkaBridge.onSlashResult) { window.RikkaBridge.onSlashResult($seq, '{\"found\":false}'); }",
+                    null,
+                )
+            }.onFailure {
+                pendingSlash.remove(seq)?.complete("{\"found\":false}")
+            }
+        }
+        return try {
+            val raw = withTimeoutOrNull(timeoutMs) { deferred.await() } ?: return null
+            val obj = JSONObject(raw)
+            if (obj.optBoolean("found", false)) {
+                obj.optString("value", "")
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            pendingSlash.remove(seq)
+        }
+    }
+
+    /**
+     * 调用 WebView `window.__rikkaInvokeJsFunctionTool` 执行通过 `registerFunctionTool` 注册的 JS 扩展函数工具。
+     */
+    suspend fun executeJsFunctionTool(
+        name: String,
+        argsJson: String,
+        timeoutMs: Long = 15_000L,
+    ): String? {
+        if (isInJavaBridgeCall()) return null
+        if (!hasJsFunctionTool(name)) return null
+        val wv = webView ?: return null
+        if (!pageReady) return null
+        val seq = functionToolSeqCounter.incrementAndGet()
+        val deferred = CompletableDeferred<String>()
+        pendingFunctionTools[seq] = deferred
+        val nameQuoted = JSONObject.quote(name)
+        val argsQuoted = JSONObject.quote(argsJson.ifBlank { "{}" })
+        mainHandler.post {
+            runCatching {
+                wv.evaluateJavascript(
+                    "if (window.__rikkaInvokeJsFunctionTool) { window.__rikkaInvokeJsFunctionTool($nameQuoted, $argsQuoted, $seq); } else if (window.RikkaBridge && window.RikkaBridge.onFunctionToolResult) { window.RikkaBridge.onFunctionToolResult($seq, '{\"ok\":false,\"error\":\"bridge missing\"}'); }",
+                    null,
+                )
+            }.onFailure {
+                pendingFunctionTools.remove(seq)?.complete("{\"ok\":false,\"error\":\"eval failed\"}")
+            }
+        }
+        return try {
+            val raw = withTimeoutOrNull(timeoutMs) { deferred.await() } ?: return null
+            val obj = JSONObject(raw)
+            if (obj.optBoolean("ok", false)) {
+                obj.optString("value", "")
+            } else {
+                "Error: ${obj.optString("error", "tool execution failed")}"
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            pendingFunctionTools.remove(seq)
+        }
+    }
+
     fun dispatchLorebookUpdate(bookName: String, entriesJson: String): Boolean {
         val updater = lorebookUpdater ?: run {
             appendLog("warn", "[lorebook] updateLorebookEntries: updater not wired (name='$bookName')")
@@ -788,6 +1308,7 @@ object TavernRuntimeManager {
      * JS → Kotlin 同步桥。方法均在 JavaBridge 线程调用（不阻塞主线程），
      * 对内存态变量存储进行同步读写。
      */
+    @Keep
     class TavernJsBridge {
         @JavascriptInterface
         fun getVersion(): String = "1.18.0"
@@ -880,11 +1401,123 @@ object TavernRuntimeManager {
          */
         @JavascriptInterface
         fun triggerSlash(script: String): String {
+            // [v244 BUGFIX D2] 旧实现用 `slashRunner?.invoke(script) ?: "(slash runner not ready)"`，
+            // slashRunner 为空时**静默**返回一个字符串。而 JS 侧 st-compat/slash-commands.js 的
+            // toExecutionResult 把 "(slash runner not ready)" 判成 isError=true →
+            // 第三方扩展（JSR）的 triggerSlash 会 `throw Error(...)` → 卡片 `await triggerSlash('/trigger')`
+            // 整条开局链路断掉，日志里却一条都不打。这里必须留痕，否则真机无法定位。
+            val runner = slashRunner
+            if (runner == null) {
+                appendLog(
+                    "error",
+                    // [v245] 措辞订正：ChatPage 的 onDispose 已经**不再**置空 slashRunner（见 ChatPage.kt 的 E1），
+                    // 所以这里的可能原因只剩「本次进程里还没有任何 ChatPage 绑定过」。
+                    "[slash] triggerSlash: slashRunner 未接线（本进程内还没有 ChatPage 绑定过 / 从未接线）script='" +
+                        script.take(80) + "'",
+                )
+                return "(slash runner not ready)"
+            }
+            val prevInBridge = inJavaBridgeCall.get() == true
+            inJavaBridgeCall.set(true)
+            activeJavaBridgeBlockingCalls.incrementAndGet()
             return try {
-                slashRunner?.invoke(script) ?: "(slash runner not ready)"
+                runner.invoke(script)
             } catch (e: Exception) {
                 appendLog("error", "[slash] triggerSlash failed: ${e.message}")
                 "(slash error: ${e.message})"
+            } finally {
+                activeJavaBridgeBlockingCalls.decrementAndGet()
+                inJavaBridgeCall.set(prevInBridge)
+            }
+        }
+
+        /**
+         * 静默生成专用桥：直接传递 prompt、raw（是否不含聊天历史）与可选 systemPrompt，
+         * 避免通过 `triggerSlash('/gen ' + prompt)` 拼接导致 prompt 含 `|` 时被误切分为多段命令。
+         */
+        @JavascriptInterface
+        fun generateQuiet(prompt: String, raw: Boolean, systemPrompt: String): String {
+            if (prompt.isBlank()) return ""
+            val qg = quietGenerator
+            if (qg != null) {
+                val prevInBridge = inJavaBridgeCall.get() == true
+                inJavaBridgeCall.set(true)
+                activeJavaBridgeBlockingCalls.incrementAndGet()
+                return try {
+                    runCatching { qg.invoke(prompt, raw, systemPrompt) }.getOrDefault("")
+                } finally {
+                    activeJavaBridgeBlockingCalls.decrementAndGet()
+                    inJavaBridgeCall.set(prevInBridge)
+                }
+            }
+            val escapedPrompt = prompt.replace("\\", "\\\\").replace("\"", "\\\"")
+            val cmd = if (raw) {
+                val sysPart = if (systemPrompt.isNotBlank()) {
+                    val escapedSys = systemPrompt.replace("\\", "\\\\").replace("\"", "\\\"")
+                    "system=\"$escapedSys\" "
+                } else ""
+                "/genraw ${sysPart}\"$escapedPrompt\""
+            } else {
+                "/gen \"$escapedPrompt\""
+            }
+            return triggerSlash(cmd)
+        }
+
+        /** 读取 `character` / `preset` / `script` 等独立作用域变量 JSON。 */
+        @JavascriptInterface
+        fun getScopedVariablesJson(scopeKey: String): String {
+            if (scopeKey.isBlank()) return "{}"
+            return TavernVariableStore.getScoped(scopeKey).toString()
+        }
+
+        /** 写入 `character` / `preset` / `script` 等独立作用域变量 JSON。 */
+        @JavascriptInterface
+        fun replaceScopedVariables(scopeKey: String, data: String): Boolean {
+            if (scopeKey.isBlank()) return false
+            return runCatching {
+                val obj = json.decodeFromString(JsonObject.serializer(), data)
+                TavernVariableStore.replaceScoped(scopeKey, obj)
+                true
+            }.getOrDefault(false)
+        }
+
+        /** JSR `createOrReplaceWorldbook(name, entries)` 宿主桥。 */
+        @JavascriptInterface
+        fun createOrReplaceLorebook(bookName: String, entriesJson: String): Boolean =
+            dispatchLorebookCreate(bookName, entriesJson, replaceIfExists = true)
+
+        /** JSR `createWorldbook(name, entries)` / `createLorebook(name, entries)` 宿主桥。 */
+        @JavascriptInterface
+        fun createLorebook(bookName: String, entriesJson: String): Boolean =
+            dispatchLorebookCreate(bookName, entriesJson, replaceIfExists = false)
+
+        /** JSR `deleteWorldbook(name)` / `deleteLorebook(name)` 宿主桥。 */
+        @JavascriptInterface
+        fun deleteLorebook(bookName: String): Boolean =
+            dispatchLorebookDelete(bookName)
+
+        /** JSR `setChatLorebook` / `rebindCharWorldbooks` / `rebindGlobalWorldbooks` 宿主桥。 */
+        @JavascriptInterface
+        fun rebindLorebooks(scope: String, namesJson: String): Boolean =
+            dispatchLorebookRebind(scope, namesJson)
+
+        /** JS `SlashCommandParser` 自定义命令执行结果回传（JS → Kotlin）。 */
+        @JavascriptInterface
+        fun onSlashResult(seq: Long, jsonRes: String) {
+            try {
+                pendingSlash.remove(seq)?.complete(jsonRes)
+            } catch (e: Exception) {
+                appendLog("error", "[slash-js] onSlashResult failed: ${e.message}")
+            }
+        }
+
+        /** JS `registerFunctionTool` 函数工具执行结果回传（JS → Kotlin）。 */
+        @JavascriptInterface
+        fun onFunctionToolResult(seq: Long, jsonRes: String) {
+            try {
+                pendingFunctionTools.remove(seq)?.complete(jsonRes)
+            } catch (e: Exception) {
+                appendLog("error", "[tools-js] onFunctionToolResult failed: ${e.message}")
             }
         }
 
@@ -915,10 +1548,32 @@ object TavernRuntimeManager {
                             ?.equals("true", ignoreCase = true) == true,
                         once = obj["once"]?.jsonPrimitive?.contentOrNull?.trim()
                             ?.equals("true", ignoreCase = true) == true,
+                        hasFilter = obj["hasFilter"]?.jsonPrimitive?.contentOrNull?.trim()
+                            ?.equals("true", ignoreCase = true) == true,
+                        filterPassed = obj["filterPassed"]?.jsonPrimitive?.contentOrNull?.trim()
+                            ?.let { !it.equals("false", ignoreCase = true) } ?: true,
                     )
                 }
                 InjectedPromptStore.inject(conversationId, prompts)
                 appendLog("info", "[jsr] injectPrompts n=${prompts.size}")
+                true
+            }.getOrDefault(false)
+        }
+
+        /**
+         * JSR `injectPrompts` 动态 `filter` 回调求值结果同步：`{"id1": true, "id2": false}`。
+         */
+        @JavascriptInterface
+        fun updateInjectFilterResults(resultsJson: String): Boolean {
+            val conversationId = activeConversationId ?: return false
+            return runCatching {
+                val obj = json.parseToJsonElement(resultsJson) as? JsonObject ?: return false
+                val map = mutableMapOf<String, Boolean>()
+                obj.forEach { (k, v) ->
+                    val b = (v as? JsonPrimitive)?.contentOrNull?.trim()?.equals("true", ignoreCase = true) == true
+                    map[k] = b
+                }
+                InjectedPromptStore.updateFilterResults(conversationId, map)
                 true
             }.getOrDefault(false)
         }
@@ -963,6 +1618,66 @@ object TavernRuntimeManager {
         /** [v214] 面板表单发送：把文本作为普通用户消息发送。 */
         @JavascriptInterface
         fun sendUserMessage(text: String): Boolean = dispatchUserMessage(text)
+
+        /**
+         * [v243 BUGFIX A2] JS `createChatMessages` 的宿主桥：把楼层**插入**当前会话（不触发生成）。
+         *
+         * 真机取证（tavern-runtime.log 2026-10-13 10:00:59）：
+         *   [error] [百合花期] opening submit failed ReferenceError: createChatMessages is not defined
+         * 卡脚本 `createChatMessages([{role:'user',name,message}])` 是 JSR 裸全局 API；
+         * rikkaST 从来没提供过它 —— 这一步抛异常后整条开局链路（含随后的 /trigger）中断。
+         */
+        @JavascriptInterface
+        fun insertChatMessages(jsonText: String): Boolean {
+            val inserter = chatInserter ?: run {
+                appendLog("warn", "[chat] insertChatMessages: inserter not wired")
+                return false
+            }
+            return try {
+                inserter(jsonText)
+            } catch (e: Exception) {
+                appendLog("error", "[chat] insertChatMessages failed: ${e.message}")
+                false
+            }
+        }
+
+        /** JSR `deleteChatMessages(messageIds)` 的宿主桥：按 0 基楼层下标数组同步删除。 */
+        @JavascriptInterface
+        fun deleteChatMessages(idsJson: String): Boolean {
+            val deleter = chatDeleter ?: run {
+                appendLog("warn", "[chat] deleteChatMessages: deleter not wired")
+                return false
+            }
+            return try {
+                deleter(idsJson)
+            } catch (e: Exception) {
+                appendLog("error", "[chat] deleteChatMessages failed: ${e.message}")
+                false
+            }
+        }
+
+        /**
+         * [v243 BUGFIX A3] JS `createWorldbookEntries` 等 JSR 世界书写入 API 的宿主桥。
+         *
+         * 真机取证（tavern-runtime.log 2026-10-13 10:00:59）：
+         *   toast "用户设定未能写入世界书：当前酒馆助手不支持世界书接口"
+         * 该卡的能力探测要求 `createWorldbookEntries` 存在 —— 此前缺失 → 探测直接失败。
+         */
+        @JavascriptInterface
+        fun upsertLorebookEntries(bookName: String, payloadJson: String): Boolean {
+            val upserter = lorebookUpserter ?: run {
+                appendLog("warn", "[lorebook] upsertLorebookEntries: upserter not wired (name='$bookName')")
+                return false
+            }
+            val ok = try {
+                upserter(bookName, payloadJson)
+            } catch (e: Exception) {
+                appendLog("error", "[lorebook] upsertLorebookEntries failed: ${e.message}")
+                false
+            }
+            appendLog("info", "[lorebook] upsertLorebookEntries name='$bookName' ok=$ok")
+            return ok
+        }
 
         @JavascriptInterface
         fun saveMetadataDebounced() = saveChat()
@@ -1009,6 +1724,39 @@ object TavernRuntimeManager {
                     macrosRegistry.set(out)
                 } catch (e: Exception) {
                     appendLog("error", "[macros] snapshot parse failed: ${e.message}")
+                }
+            } else if (name == "js_slash_commands_updated") {
+                try {
+                    val arr = org.json.JSONArray(payloadJson)
+                    val names = mutableListOf<String>()
+                    for (i in 0 until arr.length()) {
+                        val cmdName = arr.optString(i, "").trim().lowercase()
+                        if (cmdName.isNotEmpty()) names.add(cmdName)
+                    }
+                    updateRegisteredJsSlashCommands(names)
+                } catch (e: Exception) {
+                    appendLog("error", "[slash] js_slash_commands_updated parse failed: ${e.message}")
+                }
+            } else if (name == "js_function_tools_updated") {
+                try {
+                    val arr = org.json.JSONArray(payloadJson)
+                    val specs = mutableListOf<JsFunctionToolSpec>()
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val toolName = o.optString("name", "").trim()
+                        if (toolName.isEmpty()) continue
+                        specs += JsFunctionToolSpec(
+                            name = toolName,
+                            displayName = o.optString("displayName", toolName).ifBlank { toolName },
+                            description = o.optString("description", ""),
+                            parametersJson = o.optJSONObject("parameters")?.toString()
+                                ?: o.optString("parameters", "{}").ifBlank { "{}" },
+                            stealth = o.optBoolean("stealth", false),
+                        )
+                    }
+                    updateRegisteredJsFunctionTools(specs)
+                } catch (e: Exception) {
+                    appendLog("error", "[tools] js_function_tools_updated parse failed: ${e.message}")
                 }
             }
             appendLog("js-event", "$name $payloadJson")
@@ -1081,6 +1829,15 @@ object TavernRuntimeManager {
                 pendingGenHooks.remove(seq)?.complete(jsonRes)
             } catch (e: Exception) {
                 appendLog("error", "[gen-hooks] onGenerationHooksResult failed: ${e.message}")
+            }
+        }
+
+        /** 动态注入提示词异步 filter 求值完成回调（JS → Kotlin）。 */
+        @JavascriptInterface
+        fun onInjectFiltersEvaluated(seq: Long) {
+            try {
+                pendingFilterEvals.remove(seq)?.complete(Unit)
+            } catch (_: Exception) {
             }
         }
 

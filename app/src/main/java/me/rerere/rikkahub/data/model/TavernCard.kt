@@ -115,4 +115,9 @@ data class TavernBookEntry(
     val ignoreBudget: Boolean = false,               // extensions.ignore_budget（跳过预算上限）
     // 官方 extensions.outlet_name：position=7（outlet）条目的出口名（被 {{outlet::name}} 宏引用时展开）
     val outletName: String = "",
+    val characterFilterNames: List<String> = emptyList(),
+    val characterFilterTags: List<String> = emptyList(),
+    val characterFilterIsExclude: Boolean = false,
+    val vectorized: Boolean = false,
+    val addMemo: Boolean = true,
 )

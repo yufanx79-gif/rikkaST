@@ -103,12 +103,9 @@ import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspacePage
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceDetailPage
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceFileEditorPage
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceTerminalPage
-import me.rerere.rikkahub.ui.pages.extensions.ExtensionsPage
 import me.rerere.rikkahub.ui.pages.extensions.RegexScriptsPage
 import me.rerere.rikkahub.ui.pages.extensions.TavernExtensionSettingsPage
 import me.rerere.rikkahub.ui.pages.extensions.TavernExtensionsPage
-import me.rerere.rikkahub.ui.pages.extensions.PromptPage
-import me.rerere.rikkahub.ui.pages.extensions.QuickMessagesPage
 import me.rerere.rikkahub.ui.pages.extensions.SkillDetailPage
 import me.rerere.rikkahub.ui.pages.extensions.SkillsPage
 import me.rerere.workspace.WorkspaceStorageArea
@@ -378,7 +375,11 @@ class RouteActivity : ComponentActivity() {
                                     id = Uuid.parse(key.id),
                                     text = key.text,
                                     files = key.files.map { it.toUri() },
-                                    nodeId = key.nodeId?.let { Uuid.parse(it) }
+                                    nodeId = key.nodeId?.let { Uuid.parse(it) },
+                                    // [v245 BUGFIX H1] 本 entry 是否是当前栈顶。
+                                    // backStack 是 rememberNavBackStack(...) 返回的 SnapshotStateList，
+                                    // 所以这里读 lastOrNull() 会随导航自动重组。
+                                    isOnTop = backStack.lastOrNull() == key,
                                 )
                             }
 

@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
@@ -85,7 +86,9 @@ import me.rerere.rikkahub.data.model.isHidden
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.st.regex.RegexPlacement
 import me.rerere.rikkahub.data.st.regex.getStRegexed
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.regex.mergeRegexScripts
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
 import me.rerere.rikkahub.ui.components.richtext.buildMarkdownPreviewHtml
@@ -104,6 +107,7 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.data.datastore.MessageBubbleStyle
 import me.rerere.rikkahub.data.datastore.splitAssistantSegments
 import me.rerere.rikkahub.ui.components.frosted.MessageBubbleContainer
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.utils.navigateToChatPage
 import me.rerere.rikkahub.utils.openUrl
 import me.rerere.rikkahub.utils.toMessageTimeString
@@ -113,6 +117,15 @@ import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.Uuid
 
+/**
+ * [v245 DIAG A0] 「中间格式标签」清单（用户实测里泄漏到正文的那批）。
+ * 只用于诊断日志，**不参与任何渲染/裁剪决策** —— 是否该剥离由卡自己的显示正则决定。
+ */
+private val INTERMEDIATE_TAG_RE = Regex(
+    "<(TASK_CHECK_PASS|TASK_FINAL|Interleaving|thinking|SUOT|UpdateVariable|Analysis|JSONPatch|scene|details)\\b",
+    RegexOption.IGNORE_CASE,
+)
+
 @Composable
 fun ChatMessage(
     node: MessageNode,
@@ -121,6 +134,7 @@ fun ChatMessage(
     model: Model? = null,
     assistant: Assistant? = null,
     lastMessage: Boolean = false,
+    messageDepth: Int? = null,
     onFork: () -> Unit,
     onRegenerate: () -> Unit,
     onImpersonate: (() -> Unit)? = null,
@@ -193,6 +207,7 @@ fun ChatMessage(
                 onToolApproval = onToolApproval,
                 onToolAnswer = onToolAnswer,
                 onUserMessageClick = if (message.role == MessageRole.USER) onEdit else null,
+                messageDepth = messageDepth ?: if (lastMessage) 0 else null,
             )
 
             message.translation?.let { translation ->
@@ -313,6 +328,7 @@ private fun MessagePartsBlock(
     onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
     onUserMessageClick: (() -> Unit)? = null,
     messageKey: String,
+    messageDepth: Int? = null,
 ) {
     val context = LocalContext.current
     val contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
@@ -320,7 +336,7 @@ private fun MessagePartsBlock(
     // 消息输出HapticFeedback
     val hapticFeedback = LocalHapticFeedback.current
     val settings = LocalSettings.current
-    val stRegexScripts = remember(settings.regexScripts, assistant) { mergeRegexScripts(settings.regexScripts, assistant) }
+    val stRegexScripts = remember(settings.regexScripts, settings.modeInjections, settings.tavernPresets, assistant) { mergeActiveRegexScripts(settings, assistant) }
     val partsState by rememberUpdatedState(parts)
 
     val handleClickCitation: (String) -> Unit = remember {
@@ -446,15 +462,44 @@ private fun MessagePartsBlock(
                                     // 当显示正则把预设开场白替换成 HTML 面板时，气泡仍走收缩路径，而面板是
                                     // AndroidView（intrinsics 恒为 0）→ width(IntrinsicSize.Max) 把气泡压成
                                     // 0 宽，面板又是「整高渲染」→ 真机表现为「很细很长的一条竖线」。
-                                    val segRendered = rememberStRegexedText(
-                                        segText,
-                                        stRegexScripts,
-                                        assistant,
-                                        if (role == MessageRole.USER) AssistantAffectScope.USER else AssistantAffectScope.ASSISTANT,
-                                        if (role == MessageRole.USER) RegexPlacement.USER_INPUT else RegexPlacement.AI_OUTPUT,
+                                    val activeUserName = remember(settings.personas, settings.activePersonaId, settings.displaySetting.userNickname) {
+                                        settings.personas.firstOrNull { it.id == settings.activePersonaId }?.name
+                                            ?: settings.displaySetting.userNickname.ifBlank { "User" }
+                                    }
+                                    val regexResult = rememberStRegexedTextWithStatus(
+                                        text = segText,
+                                        scripts = stRegexScripts,
+                                        assistant = assistant,
+                                        scope = if (role == MessageRole.USER) AssistantAffectScope.USER else AssistantAffectScope.ASSISTANT,
+                                        placement = if (role == MessageRole.USER) RegexPlacement.USER_INPUT else RegexPlacement.AI_OUTPUT,
+                                        depth = messageDepth,
+                                        userName = activeUserName,
+                                        conversationId = TavernRuntimeManager.activeConversationId,
                                     )
+                                    val segRendered = regexResult.text
                                     val segIsPanelHtml = remember(segRendered) {
                                         looksLikeInteractiveHtml(segRendered)
+                                    }
+                                    // [v245 DIAG A0] 中间格式标签泄漏取证（用户反馈：「大小姐」卡
+                                    // 「助手输出的消息有大量代码内容」）。
+                                    //
+                                    // 关键区分：这段文本是**显示正则已经应用过**的结果
+                                    //（rememberStRegexedText → RegexPlacement.AI_OUTPUT）。
+                                    //   · 这里**还有**标签 ⇒ 卡的 15 条显示正则里根本没有针对这些标签的规则
+                                    //     （实测：卡只覆盖 UpdateVariable / Analysis / 对白美化 / 状态栏 / 世界风云）；
+                                    //   · 这里**没有**标签 ⇒ 泄漏发生在渲染之前（流式中间态 / 分段），是另一条链路。
+                                    // 下一轮真机日志一次可判，不再靠猜。
+                                    LaunchedEffect(segKey, segRendered) {
+                                        if (segRendered.length < 24) return@LaunchedEffect
+                                        val hit = INTERMEDIATE_TAG_RE.find(segRendered)?.value
+                                        if (hit != null) {
+                                            TavernRuntimeManager.appendLog(
+                                                "warn",
+                                                "[render] 渲染文本仍含中间格式标签 tag=$hit key=$segKey " +
+                                                    "isPanel=$segIsPanelHtml len=${segRendered.length} " +
+                                                    "head=" + segRendered.take(120).replace('\n', ' '),
+                                            )
+                                        }
                                     }
                                     // [v229b 主人反馈] 有时多出一条「空白的小气泡」：显示正则把某段内容清空，
                                     // 或分段切出了纯空白段 —— 渲染后为 blank 的段仍然画了带背景的气泡。
@@ -468,6 +513,25 @@ private fun MessagePartsBlock(
                                     //   任何「测量 -> Modifier.width -> 再测量」都是闭环反馈，结构上不可能稳定。
                                     val segBubble: @Composable () -> Unit = {
                                         Column(modifier = Modifier.padding(8.dp)) {
+                                            if (regexResult.isComputing) {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(bottom = 6.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                ) {
+                                                    CircularProgressIndicator(
+                                                        modifier = Modifier.size(12.dp),
+                                                        strokeWidth = 1.5.dp,
+                                                    )
+                                                    Text(
+                                                        text = "正在应用显示正则与预设排版规则…",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    )
+                                                }
+                                            }
                                             StTextContent(
                                                 messageKey = segKey,
                                                 content = segRendered,
@@ -476,18 +540,13 @@ private fun MessagePartsBlock(
                                             )
                                         }
                                     }
-                                    // [v227 D5] 气泡容器唯一化：聊天页与消息样式预览区共用
-                                    // MessageBubbleContainer（判据 bubbleContainerKind 同源），
-                                    // 消除「预览与真实气泡不一致」的结构性来源。
-                                    // [v229 P0-1] 面板气泡宽度不再由任何测量结果决定 -> 恒定满宽（红线 3）。
                                     val bubbleModifier = Modifier
                                     if (!segIsEmpty) MessageBubbleContainer(
                                         setting = msgStyle,
                                         isUser = role == MessageRole.USER,
                                         bubbleOpacity = settings.displaySetting.bubbleOpacity,
                                         showAssistantBubble = settings.displaySetting.showAssistantBubble,
-                                        modifier = bubbleModifier.animateContentSize(),
-                                        // 面板消息（WebView）不实现 intrinsics，禁止走收缩路径
+                                        modifier = if (segIsPanelHtml) bubbleModifier else bubbleModifier.animateContentSize(),
                                         wrapContent = msgStyle.assistantBubbleWrapContent && !segIsPanelHtml,
                                         onClick = if (role == MessageRole.USER) {
                                             { onUserMessageClick?.invoke() }
@@ -496,14 +555,35 @@ private fun MessagePartsBlock(
                                         },
                                         bubbleContent = segBubble,
                                         bareContent = {
-                                            StTextContent(
-                                                messageKey = segKey,
-                                                content = segRendered,
-                                                loading = loading,
-                                                onClickCitation = handleClickCitation,
-                                                modifier = Modifier
-                                                    .animateContentSize()
-                                            )
+                                            Column(
+                                                modifier = if (segIsPanelHtml) Modifier else Modifier.animateContentSize()
+                                            ) {
+                                                if (regexResult.isComputing) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(bottom = 6.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    ) {
+                                                        CircularProgressIndicator(
+                                                            modifier = Modifier.size(12.dp),
+                                                            strokeWidth = 1.5.dp,
+                                                        )
+                                                        Text(
+                                                            text = "正在应用显示正则与预设排版规则…",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        )
+                                                    }
+                                                }
+                                                StTextContent(
+                                                    messageKey = segKey,
+                                                    content = segRendered,
+                                                    loading = loading,
+                                                    onClickCitation = handleClickCitation,
+                                                )
+                                            }
                                         },
                                     )
                                 } // key(segKey)

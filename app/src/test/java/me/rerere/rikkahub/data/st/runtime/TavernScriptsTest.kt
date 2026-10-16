@@ -597,4 +597,35 @@ class TavernScriptsTest {
             assertTrue("getter 下发的名字必须可解析: $n", buildLorebookJson(assistant, n, settings) != "null")
         }
     }
+
+    @Test
+    fun task09ScopedVariablesIsolationAndWholeBookBuilder() {
+        TavernVariableStore.replaceScoped(
+            "char:alice",
+            buildJsonObject { put("affection", JsonPrimitive(80)) },
+        )
+        TavernVariableStore.replaceScoped(
+            "preset:default",
+            buildJsonObject { put("mode", JsonPrimitive("story")) },
+        )
+        TavernVariableStore.replaceScoped(
+            "script:mvu",
+            buildJsonObject { put("initialized", JsonPrimitive(true)) },
+        )
+        assertEquals(80, TavernVariableStore.getScoped("char:alice")["affection"]?.jsonPrimitive?.int)
+        assertNull(TavernVariableStore.getScoped("preset:default")["affection"])
+        assertEquals("story", TavernVariableStore.getScoped("preset:default")["mode"]?.jsonPrimitive?.content)
+        assertEquals("true", TavernVariableStore.getScoped("script:mvu")["initialized"]?.jsonPrimitive?.content)
+
+        val entriesJson = """[{"name":"设定1","content":"世界背景","enabled":true,"strategy":{"type":"constant","keys":["k1"]},"position":{"type":"after_character_definition","order":25}}]"""
+        val book = buildLorebookFromJsrEntries("新世界书", entriesJson)
+        assertEquals("新世界书", book.name)
+        assertEquals(1, book.entries.size)
+        assertEquals("设定1", book.entries[0].name)
+        assertEquals("世界背景", book.entries[0].content)
+        assertTrue(book.entries[0].constantActive)
+
+        val updatedExt = updateWorldNameInExtensionsRaw("""{"foo":1}""", "新世界书")
+        assertEquals("新世界书", extractWorldName(updatedExt))
+    }
 }

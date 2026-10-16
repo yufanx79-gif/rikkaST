@@ -284,9 +284,15 @@ private fun GreetingSelectorCard(
         tav.alternateGreetings.filter { it.isNotBlank() }
     if (allGreetings.isEmpty()) return
 
-    val currentGreeting = assistant.presetMessages
+    val rawGreeting = assistant.presetMessages
         .firstOrNull { it.role == me.rerere.ai.core.MessageRole.ASSISTANT }
         ?.toText() ?: ""
+    val currentGreeting = remember(rawGreeting) {
+        if (rawGreeting.isBlank()) ""
+        else me.rerere.rikkahub.ui.components.message.extractQuickPlainPreview(rawGreeting)
+            .take(300)
+            .ifBlank { rawGreeting.take(300).trim() }
+    }
 
     var showSheet by remember { mutableStateOf(false) }
 
@@ -442,9 +448,14 @@ private fun GreetingPickerSheet(
                                 .width(28.dp),
                         )
 
-                        // 开场白内容
+                        // 开场白内容（剥离 <style>/<script> 等代码块后预览，防止 218KB 裸 CSS 渲染卡死）
+                        val previewText = remember(greeting) {
+                            me.rerere.rikkahub.ui.components.message.extractQuickPlainPreview(greeting)
+                                .take(300)
+                                .ifBlank { greeting.take(300).trim() }
+                        }
                         Text(
-                            text = greeting,
+                            text = previewText,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (isSelected)
                                 MaterialTheme.colorScheme.onPrimaryContainer

@@ -61,7 +61,7 @@ class AssistantDetailVM(
     }
 
     val settings: StateFlow<Settings> =
-        settingsStore.settingsFlow.stateIn(viewModelScope, SharingStarted.Eagerly, Settings.dummy())
+        settingsStore.settingsFlow.stateIn(viewModelScope, SharingStarted.Eagerly, settingsStore.settingsFlow.value)
 
     val mcpServerConfigs = settingsStore
         .settingsFlow.map { settings ->
@@ -108,17 +108,14 @@ class AssistantDetailVM(
 
     fun updateTags(tagIds: List<Uuid>, tags: List<Tag>) {
         viewModelScope.launch {
-            val settings = settings.value
-            settingsStore.update(
-                settings = settings.copy(
-                    assistantTags = tags
+            settingsStore.patch { current ->
+                current.copy(
+                    assistantTags = tags,
+                    assistants = current.assistants.map { a ->
+                        if (a.id == assistantId) a.copy(tags = tagIds.toList()) else a
+                    },
                 )
-            )
-            update(
-                assistant.value.copy(
-                    tags = tagIds.toList()
-                )
-            )
+            }
             Log.d(TAG, "updateTags: ${tagIds.joinToString(",")}")
             cleanupUnusedTags()
         }
@@ -126,52 +123,35 @@ class AssistantDetailVM(
 
     fun cleanupUnusedTags() {
         viewModelScope.launch {
-            val settings = settings.value
-            val validTagIds = settings.assistantTags.map { it.id }.toSet()
-
-            // 清理 assistant 中的无效 tag id
-            val cleanedAssistants = settings.assistants.map { assistant ->
-                val validTags = assistant.tags.filter { tagId ->
-                    validTagIds.contains(tagId)
+            settingsStore.patch { current ->
+                val validTagIds = current.assistantTags.map { it.id }.toSet()
+                val cleanedAssistants = current.assistants.map { a ->
+                    val validTags = a.tags.filter { tagId -> validTagIds.contains(tagId) }
+                    if (validTags.size != a.tags.size) a.copy(tags = validTags) else a
                 }
-                if (validTags.size != assistant.tags.size) {
-                    assistant.copy(tags = validTags)
-                } else {
-                    assistant
-                }
-            }
-
-            // 获取清理后的 assistant 中使用的 tag id
-            val usedTagIds = cleanedAssistants.flatMap { it.tags }.toSet()
-
-            // 清理未使用的 tags
-            val cleanedTags = settings.assistantTags.filter { tag ->
-                usedTagIds.contains(tag.id)
-            }
-
-            // 检查是否需要更新
-            val needUpdateAssistants = cleanedAssistants != settings.assistants
-            val needUpdateTags = cleanedTags.size != settings.assistantTags.size
-
-            if (needUpdateAssistants || needUpdateTags) {
-                settingsStore.update(
-                    settings = settings.copy(
+                val usedTagIds = cleanedAssistants.flatMap { it.tags }.toSet()
+                val cleanedTags = current.assistantTags.filter { tag -> usedTagIds.contains(tag.id) }
+                val needUpdateAssistants = cleanedAssistants != current.assistants
+                val needUpdateTags = cleanedTags.size != current.assistantTags.size
+                if (needUpdateAssistants || needUpdateTags) {
+                    current.copy(
                         assistants = cleanedAssistants,
-                        assistantTags = cleanedTags
+                        assistantTags = cleanedTags,
                     )
-                )
+                } else {
+                    current
+                }
             }
         }
     }
 
     fun update(assistant: Assistant) {
         viewModelScope.launch {
-            val settings = settings.value
-            val updatedLorebooks = syncEmbeddedToExternal(assistant, settings.lorebooks)
-            settingsStore.update(
-                settings = settings.copy(
+            settingsStore.patch { current ->
+                val updatedLorebooks = syncEmbeddedToExternal(assistant, current.lorebooks)
+                current.copy(
                     lorebooks = updatedLorebooks,
-                    assistants = settings.assistants.map {
+                    assistants = current.assistants.map {
                         if (it.id == assistant.id) {
                             checkAvatarDelete(old = it, new = assistant)
                             checkBackgroundDelete(old = it, new = assistant)
@@ -179,8 +159,9 @@ class AssistantDetailVM(
                         } else {
                             it
                         }
-                    })
-            )
+                    },
+                )
+            }
         }
     }
 
@@ -188,6 +169,12 @@ class AssistantDetailVM(
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
             settingsStore.update(settings)
+        }
+    }
+
+    fun patchSettings(transform: (Settings) -> Settings) {
+        viewModelScope.launch {
+            settingsStore.patch(transform)
         }
     }
 

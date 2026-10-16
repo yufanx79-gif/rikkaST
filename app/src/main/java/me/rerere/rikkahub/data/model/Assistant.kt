@@ -94,6 +94,28 @@ data class QuickMessage(
     val content: String = "",
     /** 快速回复自动执行（对齐酒馆 QR）：点击时直接运行——`/`开头按 STscript 执行，否则直接发送消息。 */
     val autoExecute: Boolean = false,
+    /** Quick Reply v2 所属集合名称（默认 "Default"） */
+    val setName: String = "Default",
+    /** 所属集合是否启用 */
+    val setEnabled: Boolean = true,
+    /** 绑定作用域："global" | "character" | "chat" */
+    val scope: String = "global",
+    /** 世界书条目或自动触发器关联的 automationId */
+    val automationId: String = "",
+    /** 打开会话/应用启动时自动执行（对齐 QR v2 executeOnStartup） */
+    val executeOnStartup: Boolean = false,
+    /** 用户发送消息时自动执行（对齐 QR v2 executeOnUser） */
+    val executeOnUser: Boolean = false,
+    /** AI 回复完成时自动执行（对齐 QR v2 executeOnAi） */
+    val executeOnAi: Boolean = false,
+    /** 切换会话时自动执行（对齐 QR v2 executeOnChatChange） */
+    val executeOnChatChange: Boolean = false,
+    /** 群聊成员点名生成前自动执行（对齐 QR v2 executeOnGroupMemberDraft） */
+    val executeOnGroupMemberDraft: Boolean = false,
+    /** 是否显示在右键/上下文菜单 */
+    val contextMenu: Boolean = false,
+    /** 是否在快捷栏隐藏按钮（仅通过 /qr 或钩子调用） */
+    val hidden: Boolean = false,
 )
 
 @Serializable
@@ -388,7 +410,13 @@ enum class InjectionPosition {
     AT_DEPTH,               // 在指定深度位置插入（从最新消息往前数）
 
     @SerialName("author_note")
-    AUTHOR_NOTE,            // Author's Note 位置（由用户设置决定，不固定）
+    AUTHOR_NOTE,            // Author's Note 位置（兼容旧值，同 BEFORE_AUTHOR_NOTE）
+
+    @SerialName("before_author_note")
+    BEFORE_AUTHOR_NOTE,     // 官方 ANTop (position=2)：Author's Note 之前
+
+    @SerialName("after_author_note")
+    AFTER_AUTHOR_NOTE,      // 官方 ANBottom (position=3)：Author's Note 之后
 
     @SerialName("em_top")
     EM_TOP,                 // 官方 EMTop：示例消息之前
@@ -432,6 +460,15 @@ sealed class PromptInjection {
         override val injectDepth: Int = 4,
         override val role: MessageRole = MessageRole.USER,
         val presetGroup: String? = null,                 // 预设来源分组（酒馆预设文件名；null=未分组）
+        // ===== [第6轮 D3] 酒馆预设字段补齐：以下 4 个字段 ST 预设里**大量存在**，
+        // 而旧解析器一个都不读 ⇒ 用户实测「预设导进来字段丢了」。这里先做到「一行都不丢」，
+        // 执行语义按 App 现状保守处理，不擅自替卡改行为。
+        // 实测（用户给的 3 个预设）：system_prompt 118/66/144 条、forbid_overrides 118/66/142、
+        // injection_order 112/66/80、injection_trigger 3/66/79。
+        val presetSystemPrompt: Boolean = false,         // ST prompts[].system_prompt（role=system 的 relative 块标记）
+        val injectionOrder: Int = 0,                     // ST prompts[].injection_order（absolute 注入的同深度排序）
+        val triggers: List<String> = emptyList(),        // ST prompts[].injection_trigger（生成类型过滤；在 PromptInjectionTransformer 中按 generationType 过滤）
+        val forbidOverrides: Boolean = false,            // ST prompts[].forbid_overrides（暂只存，本 App 无 override 机制）
     ) : PromptInjection()
 
     /**
@@ -478,7 +515,7 @@ sealed class PromptInjection {
         val automationId: String = "",                   // 酒馆 extensions.automation_id（本App暂不执行，仅保留）
         val displayIndex: Int = 0,                       // 酒馆 display_index（展示顺序）
         val displayPosition: Int = 0,                    // 酒馆 display_position（展示位置）
-        val triggers: List<String> = emptyList(),        // 酒馆 triggers（生成类型过滤，本App暂不执行）
+        val triggers: List<String> = emptyList(),        // 酒馆 triggers（生成类型过滤；在 PromptInjectionTransformer 中按 generationType 过滤）
         val matchPersonaDescription: Boolean = false,    // 酒馆 extensions.match_persona_description
         val matchCharacterDescription: Boolean = false,  // 酒馆 extensions.match_character_description
         val matchCharacterPersonality: Boolean = false,  // 酒馆 extensions.match_character_personality
@@ -486,7 +523,31 @@ sealed class PromptInjection {
         val matchScenario: Boolean = false,              // 酒馆 extensions.match_scenario
         val matchCreatorNotes: Boolean = false,          // 酒馆 extensions.match_creator_notes
         val ignoreBudget: Boolean = false,               // 酒馆 extensions.ignore_budget
-    ) : PromptInjection()
+        val excludeKeys: List<String> = emptyList(),     // CCv3 @@exclude_keys 独立排除关键词（不污染正向 secondaryKeys）
+        val characterFilterNames: List<String> = emptyList(), // 酒馆 characterFilter.names
+        val characterFilterTags: List<String> = emptyList(),  // 酒馆 characterFilter.tags
+        val characterFilterIsExclude: Boolean = false,        // 酒馆 characterFilter.isExclude（true=排除匹配角色，false=仅限匹配角色）
+        val vectorized: Boolean = false,                      // 酒馆 vectorized（无关键词命中时允许向量语义相似度激活）
+        val addMemo: Boolean = true,                          // 酒馆 addMemo（显示备注标题）
+    ) : PromptInjection() {
+        /**
+         * 校验当前角色是否满足世界书条目的 characterFilter 过滤条件（对齐官方 world-info.js checkWorldInfo）。
+         * 当 names 与 tags 均为空时不做限制（返回 true）。
+         */
+        fun matchesCharacterFilter(assistant: Assistant): Boolean {
+            if (characterFilterNames.isEmpty() && characterFilterTags.isEmpty()) return true
+            val charNames = buildSet {
+                if (assistant.name.isNotBlank()) add(assistant.name.trim().lowercase())
+                assistant.tavernData?.name?.takeIf { it.isNotBlank() }?.let { add(it.trim().lowercase()) }
+                assistant.tavernData?.nickname?.takeIf { it.isNotBlank() }?.let { add(it.trim().lowercase()) }
+            }
+            val charTags = assistant.tavernData?.tags.orEmpty().map { it.trim().lowercase() }.toSet()
+            val nameHit = characterFilterNames.any { it.trim().lowercase() in charNames }
+            val tagHit = characterFilterTags.any { it.trim().lowercase() in charTags }
+            val anyHit = nameHit || tagHit
+            return if (characterFilterIsExclude) !anyHit else anyHit
+        }
+    }
 }
 
 /**
@@ -566,6 +627,10 @@ fun PromptInjection.RegexInjection.isTriggered(
         if (effectiveProb < 100 && kotlin.random.Random.nextInt(100) >= effectiveProb) return false
     }
 
+    // @@exclude_keys 独立排除判定（对普通条目与 constantActive 常驻条目均生效）
+    val effectiveExcludeKeys = if (excludeKeys.isNotEmpty()) excludeKeys else parseWorldInfoDecorators(content).excludeKeys
+    if (effectiveExcludeKeys.isNotEmpty() && matchesAnyKey(effectiveExcludeKeys, context)) return false
+
     // 官方：constant 条目无需关键词即可激活（概率已参与）
     if (constantActive) return true
 
@@ -622,8 +687,13 @@ fun PromptInjection.RegexInjection.matchedKeyScore(context: String): Int {
     }
 }
 
+internal fun PromptInjection.RegexInjection.matchesAnyKey(
+    keys: List<String>,
+    context: String,
+): Boolean = keys.any { keyMatches(it, context, useRegex, caseSensitive, matchWholeWords) }
+
 /** 单个关键词匹配 */
-private fun keyMatches(
+internal fun keyMatches(
     key: String,
     context: String,
     useRegex: Boolean,
@@ -753,47 +823,100 @@ fun Assistant.assembleContext(
 }
 
 /**
- * 官方 Chat Completion 结构拆分 — 主提示消息（对应官方 main prompt / system_prompt）
+ * 官方 Chat Completion 结构拆分 — 主提示消息（对应官方 main prompt / system_prompt）。
+ *
+ * 对齐官方 SillyTavern `public/scripts/openai.js`：
+ * - 当激活预设提供 `presetMainPrompt` 时，以此作为基础 `main`；
+ * - 若 `forbidOverrides == true`，忽略角色卡的 `tavernData.systemPrompt`，仅使用基础 `main`（或非酒馆助手自身的 `systemPrompt`）；
+ * - 若 `forbidOverrides == false` 且角色卡 `tavernData.systemPrompt` 非空：
+ *   若其中含 `{{original}}` 则将其展开为基础 `main`，否则用角色卡 `tavernData.systemPrompt` 覆盖基础 `main`。
  */
-fun Assistant.assembleMainPrompt(): String {
-    return tavernData?.systemPrompt?.takeIf { it.isNotBlank() } ?: systemPrompt
+fun Assistant.assembleMainPrompt(
+    forbidOverrides: Boolean = false,
+    presetMainPrompt: String? = null,
+): String {
+    val cardSys = tavernData?.systemPrompt?.trim().orEmpty()
+    val baseMain = presetMainPrompt?.trim()?.takeIf { it.isNotEmpty() }
+        ?: if (tavernData != null && systemPrompt.trim() == cardSys) "" else systemPrompt.trim()
+    if (forbidOverrides) return baseMain
+    if (cardSys.isNotEmpty()) {
+        return if (cardSys.contains("{{original}}", ignoreCase = true)) {
+            cardSys.replace(Regex("\\{\\{\\s*original\\s*\\}\\}", RegexOption.IGNORE_CASE), baseMain)
+        } else {
+            cardSys
+        }
+    }
+    return baseMain
 }
 
 /**
  * 官方 Chat Completion 结构拆分 — 角色卡字段消息（对应官方 charDescription/charPersonality/scenario 独立 system 消息，
  * promptManagerDefaultPromptOrder 顺序：描述 → 性格 → 场景）。
  * 每字段独立一条消息，世界书 before/after_char 锚点（CharacterCardData 标记）才能精确落在官方位置。
- * 性格内容对齐官方默认 personality_format = {{personality}}（纯文本，无前缀）。
+ * 支持预设级 personality_format / scenario_format 模板（默认 {{personality}} / {{scenario}}）。
  */
-fun Assistant.assembleCharacterCardMessages(): List<UIMessage> {
+fun Assistant.assembleCharacterCardMessages(
+    personalityFormat: String? = null,
+    scenarioFormat: String? = null,
+    orderedMarkers: List<String> = emptyList(),
+    disabledMarkers: Set<String> = emptySet(),
+): List<UIMessage> {
     val tav = this.tavernData ?: return emptyList()
+    val defaultSlotOrder = listOf("charDescription", "charPersonality", "scenario")
+    val charSlots = orderedMarkers.filter { it in defaultSlotOrder }
+        .ifEmpty { defaultSlotOrder }
+        .filterNot { it in disabledMarkers }
     return buildList {
-        tav.description.takeIf { it.isNotBlank() }?.let {
-            add(
-                UIMessage(
-                    role = MessageRole.SYSTEM,
-                    parts = listOf(UIMessagePart.Text(it)),
-                    annotations = listOf(UIMessageAnnotation.CharacterCardData),
-                )
-            )
-        }
-        tav.personality.takeIf { it.isNotBlank() }?.let {
-            add(
-                UIMessage(
-                    role = MessageRole.SYSTEM,
-                    parts = listOf(UIMessagePart.Text(it)),
-                    annotations = listOf(UIMessageAnnotation.CharacterCardData),
-                )
-            )
-        }
-        tav.scenario.takeIf { it.isNotBlank() }?.let {
-            add(
-                UIMessage(
-                    role = MessageRole.SYSTEM,
-                    parts = listOf(UIMessagePart.Text(it)),
-                    annotations = listOf(UIMessageAnnotation.CharacterCardData),
-                )
-            )
+        for (slot in charSlots) {
+            when (slot) {
+                "charDescription" -> {
+                    tav.description.takeIf { it.isNotBlank() }?.let {
+                        add(
+                            UIMessage(
+                                role = MessageRole.SYSTEM,
+                                parts = listOf(UIMessagePart.Text(it)),
+                                annotations = listOf(UIMessageAnnotation.CharacterCardData),
+                            )
+                        )
+                    }
+                }
+                "charPersonality" -> {
+                    tav.personality.takeIf { it.isNotBlank() }?.let { rawPersonality ->
+                        val formatted = if (!personalityFormat.isNullOrBlank()) {
+                            personalityFormat
+                                .replace("{{personality}}", rawPersonality, ignoreCase = true)
+                                .replace("{personality}", rawPersonality, ignoreCase = true)
+                        } else {
+                            rawPersonality
+                        }
+                        add(
+                            UIMessage(
+                                role = MessageRole.SYSTEM,
+                                parts = listOf(UIMessagePart.Text(formatted)),
+                                annotations = listOf(UIMessageAnnotation.CharacterCardData),
+                            )
+                        )
+                    }
+                }
+                "scenario" -> {
+                    tav.scenario.takeIf { it.isNotBlank() }?.let { rawScenario ->
+                        val formatted = if (!scenarioFormat.isNullOrBlank()) {
+                            scenarioFormat
+                                .replace("{{scenario}}", rawScenario, ignoreCase = true)
+                                .replace("{scenario}", rawScenario, ignoreCase = true)
+                        } else {
+                            rawScenario
+                        }
+                        add(
+                            UIMessage(
+                                role = MessageRole.SYSTEM,
+                                parts = listOf(UIMessagePart.Text(formatted)),
+                                annotations = listOf(UIMessageAnnotation.CharacterCardData),
+                            )
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -801,10 +924,13 @@ fun Assistant.assembleCharacterCardMessages(): List<UIMessage> {
 /**
  * 解析角色卡 mes_example 为示例消息（对齐官方 parseMesExamples + parseExampleIntoIndividual）：
  * - 按 <START> 分块
- * - 块内按 "{{user}}:" / "{{char}}:" 前缀行切分 user/assistant 消息
- * - 官方跳过块首的 "This is how X should talk" 说明行
+ * - 块内按 "{{user}}:" / "<USER>:" / "$userName:" 与 "{{char}}:" / "<BOT>:" / "$charName:" 前缀行切分
+ * - 支持预设级 new_example_chat_prompt 块头提示词
  */
-fun Assistant.buildExampleMessages(userName: String): List<UIMessage> {
+fun Assistant.buildExampleMessages(
+    userName: String,
+    newExampleChatPrompt: String? = null,
+): List<UIMessage> {
     val raw = this.tavernData?.mesExample ?: return emptyList()
     if (raw.isBlank() || raw.trim().equals("<START>", ignoreCase = true)) return emptyList()
 
@@ -816,7 +942,18 @@ fun Assistant.buildExampleMessages(userName: String): List<UIMessage> {
     val blocks = Regex("<START>", RegexOption.IGNORE_CASE).split(text).drop(1)
 
     return blocks.flatMap { block ->
-        parseExampleBlock(block, charName = this.name, userName = userName)
+        val parsed = parseExampleBlock(block, charName = this.name, userName = userName)
+        if (parsed.isNotEmpty() && !newExampleChatPrompt.isNullOrBlank()) {
+            listOf(
+                UIMessage(
+                    role = MessageRole.SYSTEM,
+                    parts = listOf(UIMessagePart.Text(newExampleChatPrompt)),
+                    annotations = listOf(UIMessageAnnotation.ExampleMessage),
+                )
+            ) + parsed
+        } else {
+            parsed
+        }
     }
 }
 
@@ -847,8 +984,12 @@ private fun parseExampleBlock(block: String, charName: String, userName: String)
 
     for (i in startIndex until lines.size) {
         val line = lines[i]
-        val isUserLine = line.startsWith("$userName:")
-        val isCharLine = line.startsWith("$charName:")
+        val isUserLine = (userName.isNotBlank() && line.startsWith("$userName:", ignoreCase = true)) ||
+            line.startsWith("{{user}}:", ignoreCase = true) ||
+            line.startsWith("<USER>:", ignoreCase = true)
+        val isCharLine = (charName.isNotBlank() && line.startsWith("$charName:", ignoreCase = true)) ||
+            line.startsWith("{{char}}:", ignoreCase = true) ||
+            line.startsWith("<BOT>:", ignoreCase = true)
         if (isUserLine || isCharLine) {
             flush()
             currentRole = if (isUserLine) MessageRole.USER else MessageRole.ASSISTANT

@@ -3,8 +3,11 @@ package me.rerere.rikkahub.ui.pages.extensions
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.graphics.Color
+import android.os.Build
+import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -24,6 +27,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -73,6 +78,7 @@ fun TavernExtensionSettingsPage(folder: String) {
     var extension by remember(folder) { mutableStateOf<TavernExtensionInfo?>(null) }
     var runtimeExtensionsJson by remember(folder) { mutableStateOf<String?>(null) }
     val webViewHolder = remember(folder) { arrayOfNulls<WebView>(1) }
+    var crashRebuildCount by remember(folder) { mutableIntStateOf(0) }
 
     LaunchedEffect(folder, settings.tavernThirdPartyDisabled) {
         val list = withContext(Dispatchers.IO) { listExtensions(context) }
@@ -92,7 +98,7 @@ fun TavernExtensionSettingsPage(folder: String) {
         TavernRuntimeManager.thirdPartySettingsSupplier = { latestSettings.value.tavernExtensionSettings }
         TavernRuntimeManager.thirdPartySettingsSaver = { json ->
             scope.launch {
-                settingsStore.update(latestSettings.value.copy(tavernExtensionSettings = json))
+                settingsStore.update { current -> current.copy(tavernExtensionSettings = json) }
             }
         }
 
@@ -131,98 +137,125 @@ fun TavernExtensionSettingsPage(folder: String) {
                 CircularProgressIndicator()
             }
         } else {
-            AndroidView(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-                factory = { ctx ->
-                    // 只用 ensureContext 设置资产拦截上下文，不启动聊天主运行时 WebView。
-                    TavernRuntimeManager.ensureContext(ctx)
-                    WebView(ctx).apply {
-                        setBackgroundColor(Color.TRANSPARENT)
-                        this.settings.javaScriptEnabled = true
-                        this.settings.domStorageEnabled = true
-                        this.settings.allowFileAccess = false
-                        this.settings.allowContentAccess = false
-                        this.settings.mediaPlaybackRequiresUserGesture = false
-                        this.settings.blockNetworkImage = false
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): WebResourceResponse? = TavernRuntimeManager.interceptAsset(request.url)
+            key(folder, crashRebuildCount) {
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                    factory = { ctx ->
+                        // 只用 ensureContext 设置资产拦截上下文，不启动聊天主运行时 WebView。
+                        TavernRuntimeManager.ensureContext(ctx)
+                        WebView(ctx).apply {
+                            setBackgroundColor(Color.TRANSPARENT)
+                            this.settings.javaScriptEnabled = true
+                            this.settings.domStorageEnabled = true
+                            this.settings.allowFileAccess = false
+                            this.settings.allowContentAccess = false
+                            this.settings.mediaPlaybackRequiresUserGesture = false
+                            this.settings.blockNetworkImage = false
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldInterceptRequest(
+                                    view: WebView,
+                                    request: WebResourceRequest,
+                                ): WebResourceResponse? = TavernRuntimeManager.interceptAsset(request.url)
 
-                            override fun onPageFinished(view: WebView, url: String) {
-                                TavernRuntimeManager.appendLog(
-                                    "info",
-                                    "[ext-settings] page ready folder=$folder url=$url",
-                                )
+                                override fun onPageFinished(view: WebView, url: String) {
+                                    TavernRuntimeManager.appendLog(
+                                        "info",
+                                        "[ext-settings] page ready folder=$folder url=$url",
+                                    )
+                                }
+
+                                override fun onRenderProcessGone(
+                                    view: WebView,
+                                    detail: RenderProcessGoneDetail?,
+                                ): Boolean {
+                                    val didCrash = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        detail?.didCrash() == true
+                                    } else false
+                                    val priority = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        detail?.rendererPriorityAtExit() ?: -1
+                                    } else -1
+                                    TavernRuntimeManager.appendLog(
+                                        "error",
+                                        "[webview] renderer gone (ext-settings:$folder) didCrash=$didCrash priority=$priority -> recreating WebView",
+                                    )
+                                    if (webViewHolder[0] === view) webViewHolder[0] = null
+                                    TavernRuntimeManager.unregisterAuxWebView(view)
+                                    runCatching {
+                                        (view.parent as? ViewGroup)?.removeView(view)
+                                        view.destroy()
+                                    }
+                                    TavernRuntimeManager.bumpRendererGeneration()
+                                    crashRebuildCount += 1
+                                    return true
+                                }
                             }
+                            // 设置页里的扩展也可能使用 confirm/alert；给一个最小 WebChromeClient，避免静默失败。
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                                    TavernRuntimeManager.appendLog(
+                                        "debug",
+                                        "[ext-settings][console] ${consoleMessage.message()} " +
+                                            "@${consoleMessage.sourceId()}:${consoleMessage.lineNumber()}",
+                                    )
+                                    return true
+                                }
+
+                                override fun onJsAlert(
+                                    view: WebView,
+                                    url: String,
+                                    message: String,
+                                    result: JsResult,
+                                ): Boolean {
+                                    runCatching {
+                                        AlertDialog.Builder(view.context)
+                                            .setMessage(message)
+                                            .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                                            .setOnCancelListener { result.cancel() }
+                                            .show()
+                                    }.onFailure { result.cancel() }
+                                    return true
+                                }
+
+                                override fun onJsConfirm(
+                                    view: WebView,
+                                    url: String,
+                                    message: String,
+                                    result: JsResult,
+                                ): Boolean {
+                                    runCatching {
+                                        AlertDialog.Builder(view.context)
+                                            .setMessage(message)
+                                            .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                                            .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
+                                            .setOnCancelListener { result.cancel() }
+                                            .show()
+                                    }.onFailure { result.cancel() }
+                                    return true
+                                }
+                            }
+                            addJavascriptInterface(TavernRuntimeManager.TavernJsBridge(), "RikkaBridge")
+                            TavernRuntimeManager.registerAuxWebView(this, "ext-settings:$folder")
+                            webViewHolder[0] = this
+                            loadUrl(
+                                TavernRuntimeManager.BASE_URL +
+                                    "extension-settings.html?ext=" +
+                                    android.net.Uri.encode(folder),
+                            )
                         }
-                        // 设置页里的扩展也可能使用 confirm/alert；给一个最小 WebChromeClient，避免静默失败。
-                        webChromeClient = object : WebChromeClient() {
-                            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-                                TavernRuntimeManager.appendLog(
-                                    "debug",
-                                    "[ext-settings][console] ${consoleMessage.message()} " +
-                                        "@${consoleMessage.sourceId()}:${consoleMessage.lineNumber()}",
-                                )
-                                return true
-                            }
-
-                            override fun onJsAlert(
-                                view: WebView,
-                                url: String,
-                                message: String,
-                                result: JsResult,
-                            ): Boolean {
-                                runCatching {
-                                    AlertDialog.Builder(view.context)
-                                        .setMessage(message)
-                                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
-                                        .setOnCancelListener { result.cancel() }
-                                        .show()
-                                }.onFailure { result.cancel() }
-                                return true
-                            }
-
-                            override fun onJsConfirm(
-                                view: WebView,
-                                url: String,
-                                message: String,
-                                result: JsResult,
-                            ): Boolean {
-                                runCatching {
-                                    AlertDialog.Builder(view.context)
-                                        .setMessage(message)
-                                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
-                                        .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
-                                        .setOnCancelListener { result.cancel() }
-                                        .show()
-                                }.onFailure { result.cancel() }
-                                return true
-                            }
+                    },
+                    onRelease = { released ->
+                        if (webViewHolder[0] === released) webViewHolder[0] = null
+                        TavernRuntimeManager.unregisterAuxWebView(released)
+                        runCatching {
+                            released.stopLoading()
+                            released.loadUrl("about:blank")
+                            released.destroy()
                         }
-                        addJavascriptInterface(TavernRuntimeManager.TavernJsBridge(), "RikkaBridge")
-                        TavernRuntimeManager.registerAuxWebView(this, "ext-settings:$folder")
-                        webViewHolder[0] = this
-                        loadUrl(
-                            TavernRuntimeManager.BASE_URL +
-                                "extension-settings.html?ext=" +
-                                android.net.Uri.encode(folder),
-                        )
-                    }
-                },
-                onRelease = { released ->
-                    if (webViewHolder[0] === released) webViewHolder[0] = null
-                    TavernRuntimeManager.unregisterAuxWebView(released)
-                    runCatching {
-                        released.stopLoading()
-                        released.loadUrl("about:blank")
-                        released.destroy()
-                    }
-                },
-            )
+                    },
+                )
+            }
         }
     }
 }

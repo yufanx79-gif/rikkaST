@@ -30,17 +30,17 @@ keyPassword=...
 ## Common commands
 
 ```bash
-# Compile debug Kotlin
-./gradlew :app:compileDebugKotlin -x :app:installDebugPythonRequirements
+# Compile release Kotlin
+./gradlew :app:compileReleaseKotlin --console=plain
 
 # Run JVM unit tests
-./gradlew :app:testDebugUnitTest -x :app:installDebugPythonRequirements
+./gradlew :app:testDebugUnitTest
 
 # Build a debug APK
-./gradlew :app:assembleDebug -x :app:installDebugPythonRequirements
+./gradlew :app:assembleDebug
 
 # Build a release APK (requires signing config)
-./gradlew :app:assembleRelease -x :app:installDebugPythonRequirements
+./gradlew :app:assembleRelease --console=plain
 ```
 
 On Windows, use `gradlew.bat` instead of `./gradlew`.

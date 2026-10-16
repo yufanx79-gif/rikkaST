@@ -1,0 +1,25 @@
+ app/src/main/assets/st-runtime/panel.html          |   1 +
+ app/src/main/assets/st-runtime/runtime.js          |  89 +++++++-
+ .../me/rerere/rikkahub/data/ai/GenerationLoop.kt   | 155 +++++++++++++-
+ .../rikkahub/data/ai/tools/ChatToolFactory.kt      |  55 +++++
+ .../ai/transformers/PromptInjectionTransformer.kt  |   5 +-
+ .../rikkahub/data/export/ExportSerializer.kt       |  46 +++-
+ .../rikkahub/data/model/WorldInfoDecorators.kt     |   1 +
+ .../rikkahub/data/st/import/StArchiveImporter.kt   |   8 +-
+ .../data/st/runtime/TavernRuntimeManager.kt        | 204 +++++++++++++++++-
+ .../rikkahub/data/st/script/StSlashExecutor.kt     |  95 +++++++--
+ .../java/me/rerere/rikkahub/service/ChatService.kt |   2 +-
+ .../ui/components/message/MessageHtmlBlock.kt      |  79 +++++--
+ .../ui/pages/assistant/detail/AssistantImporter.kt |  80 ++++++-
+ .../me/rerere/rikkahub/ui/pages/chat/ChatList.kt   |   1 -
+ .../me/rerere/rikkahub/ui/pages/chat/ChatPage.kt   | 128 +++++++++++-
+ .../rerere/rikkahub/ui/pages/chat/ChatSlashHost.kt | 232 ++++++++++++++++++++-
+ .../rikkahub/ui/pages/chat/ConversationExport.kt   |  60 ++++++
+ .../rikkahub/ui/pages/extensions/PromptPage.kt     |  14 ++
+ .../ui/pages/extensions/QuickMessagesPage.kt       | 111 ++++++++--
+ .../ui/pages/extensions/QuickMessagesVM.kt         |   4 +
+ .../data/ai/transformers/WorldInfoDecoratorTest.kt |  69 ++++++
+ .../data/export/SillyTavernPresetImportTest.kt     |  63 ++++++
+ .../rikkahub/data/st/script/StSlashExecutorTest.kt |  45 ++++
+ .../components/message/MessageHtmlDetectionTest.kt |  53 +++++
+ 24 files changed, 1497 insertions(+), 103 deletions(-)

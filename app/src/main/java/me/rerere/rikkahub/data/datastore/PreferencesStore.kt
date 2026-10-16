@@ -126,6 +126,7 @@ class SettingsStore(
 
         // UI设置
         val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
+        val ENABLE_WEB_SEARCH = booleanPreferencesKey("enable_web_search")
         val THEME_ID = stringPreferencesKey("theme_id")
         val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
@@ -152,6 +153,8 @@ class SettingsStore(
         val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
         val COMPRESS_MODEL = stringPreferencesKey("compress_model")
         val COMPRESS_PROMPT = stringPreferencesKey("compress_prompt")
+        val EMBEDDING_MODEL = stringPreferencesKey("embedding_model")
+        val KB_INJECTION_SETTINGS = stringPreferencesKey("kb_injection_settings")
 
         // 提供商
         val PROVIDERS = stringPreferencesKey("providers")
@@ -193,6 +196,15 @@ class SettingsStore(
 
         // 提示词注入
         val MODE_INJECTIONS = stringPreferencesKey("mode_injections")
+        // [第6轮 D1 方案 A] 「提示词注入」独立通道的存储键（与 mode_injections 完全隔离）
+        val PROMPT_INJECTIONS = stringPreferencesKey("prompt_injections")
+        // [第6轮 D3] 酒馆预设原始 JSON 无损透传：{"预设名": <原始 root JSON>}
+        val TAVERN_PRESETS = stringPreferencesKey("tavern_presets")
+        val TAVERN_GLOBAL_SCRIPTS = stringPreferencesKey("tavern_global_scripts")
+        val TAVERN_GLOBAL_SCRIPTS_ENABLED = booleanPreferencesKey("tavern_global_scripts_enabled")
+        val TAVERN_PRESET_SCRIPTS = stringPreferencesKey("tavern_preset_scripts")
+        val TAVERN_THIRD_PARTY_DISABLED = stringPreferencesKey("tavern_third_party_disabled")
+        val TAVERN_EXTENSION_SETTINGS = stringPreferencesKey("tavern_extension_settings")
 val LOREBOOKS = stringPreferencesKey("lorebooks")
         // ST 正则脚本（全字段对齐酒馆 RegexScriptData，可直接导入/导出 ST JSON）
         val REGEX_SCRIPTS = stringPreferencesKey("regex_scripts")
@@ -257,6 +269,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         private suspend fun persistSettings(dataStore: DataStore<Preferences>, settings: Settings) {
         dataStore.edit { preferences ->
             preferences[DYNAMIC_COLOR] = settings.dynamicColor
+            preferences[ENABLE_WEB_SEARCH] = settings.enableWebSearch
             preferences[THEME_ID] = settings.themeId
             preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
             preferences[DEVELOPER_MODE] = settings.developerMode
@@ -266,6 +279,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
             preferences[SELECT_MODEL] = settings.chatModelId.toString()
             preferences[FAST_MODEL] = settings.fastModelId.toString()
+            preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
             settings.titleModelId?.let {
                 preferences[TITLE_MODEL] = it.toString()
             } ?: preferences.remove(TITLE_MODEL)
@@ -285,6 +299,10 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             preferences[OCR_PROMPT] = settings.ocrPrompt
             preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
             preferences[COMPRESS_PROMPT] = settings.compressPrompt
+            settings.embeddingModelId?.let {
+                preferences[EMBEDDING_MODEL] = it.toString()
+            } ?: preferences.remove(EMBEDDING_MODEL)
+            preferences[KB_INJECTION_SETTINGS] = JsonInstant.encodeToString(settings.kbInjectionSettings)
 
             preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
 
@@ -309,6 +327,13 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 preferences[SELECTED_ASR_PROVIDER] = it.toString()
             } ?: preferences.remove(SELECTED_ASR_PROVIDER)
             preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+            preferences[PROMPT_INJECTIONS] = JsonInstant.encodeToString(settings.promptInjections)
+            preferences[TAVERN_PRESETS] = settings.tavernPresets
+            preferences[TAVERN_GLOBAL_SCRIPTS] = settings.tavernGlobalScripts
+            preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] = settings.tavernGlobalScriptsEnabled
+            preferences[TAVERN_PRESET_SCRIPTS] = settings.tavernPresetScripts
+            preferences[TAVERN_THIRD_PARTY_DISABLED] = JsonInstant.encodeToString(settings.tavernThirdPartyDisabled)
+            preferences[TAVERN_EXTENSION_SETTINGS] = settings.tavernExtensionSettings
             preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
             preferences[REGEX_SCRIPTS] = JsonInstant.encodeToString(settings.regexScripts)
             preferences[WORLD_INFO_BUDGET] = settings.worldInfoBudget
@@ -380,6 +405,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 fastModelReasoningLevel = preferences[FAST_MODEL_REASONING_LEVEL]
                     ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
                     ?: ReasoningLevel.AUTO,
+                titleModelId = preferences[TITLE_MODEL]?.let { runCatching { Uuid.parse(it) }.getOrNull() },
                 translateModeId = preferences[TRANSLATE_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
                 enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
@@ -395,6 +421,10 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
                 compressModelId = preferences[COMPRESS_MODEL]?.let { Uuid.parse(it) } ?: DEFAULT_AUTO_MODEL_ID,
                 compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
+                embeddingModelId = preferences[EMBEDDING_MODEL]?.let { runCatching { Uuid.parse(it) }.getOrNull() },
+                kbInjectionSettings = preferences[KB_INJECTION_SETTINGS]?.let {
+                    runCatching { JsonInstant.decodeFromString<KbInjectionSettings>(it) }.getOrDefault(KbInjectionSettings())
+                } ?: KbInjectionSettings(),
                 assistantId = preferences[SELECT_ASSISTANT]?.let { Uuid.parse(it) }
                     ?: DEFAULT_ASSISTANT_ID,
                 assistantTags = preferences[ASSISTANT_TAGS]?.let {
@@ -403,6 +433,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 providers = JsonInstant.decodeFromString(preferences[PROVIDERS] ?: "[]"),
                 assistants = JsonInstant.decodeFromString(preferences[ASSISTANTS] ?: "[]"),
                 dynamicColor = preferences[DYNAMIC_COLOR] != false,
+                enableWebSearch = preferences[ENABLE_WEB_SEARCH] != false,
                 themeId = preferences[THEME_ID] ?: PresetThemes[0].id,
                 customThemes = preferences[CUSTOM_THEMES]?.let {
                     JsonInstant.decodeFromString(it)
@@ -440,6 +471,17 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 modeInjections = preferences[MODE_INJECTIONS]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: emptyList(),
+                promptInjections = preferences[PROMPT_INJECTIONS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                tavernPresets = preferences[TAVERN_PRESETS] ?: "{}",
+                tavernGlobalScripts = preferences[TAVERN_GLOBAL_SCRIPTS] ?: "[]",
+                tavernGlobalScriptsEnabled = preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] ?: true,
+                tavernPresetScripts = preferences[TAVERN_PRESET_SCRIPTS] ?: "{}",
+                tavernThirdPartyDisabled = preferences[TAVERN_THIRD_PARTY_DISABLED]?.let {
+                    runCatching { JsonInstant.decodeFromString<Set<String>>(it) }.getOrDefault(emptySet())
+                } ?: emptySet(),
+                tavernExtensionSettings = preferences[TAVERN_EXTENSION_SETTINGS] ?: "{}",
                 lorebooks = preferences[LOREBOOKS]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: emptyList(),
@@ -533,7 +575,10 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         .map { settings ->
             // 去重并清理无效引用
             val validMcpServerIds = settings.mcpServers.map { it.id }.toSet()
-            val validModeInjectionIds = settings.modeInjections.map { it.id }.toSet()
+            // [第6轮 D1] 两通道共用一套 modeInjectionIds ⇒ 校验集合必须是并集，
+            // 否则新通道的条目会被当成「悬空引用」在启动时被静默清掉。
+            val validModeInjectionIds =
+                (settings.modeInjections + settings.promptInjections).map { it.id }.toSet()
             val validLorebookIds = settings.lorebooks.map { it.id }.toSet()
             val validQuickMessageIds = settings.quickMessages.map { it.id }.toSet()
             val asrProviders = settings.asrProviders.distinctBy { it.id }
@@ -582,6 +627,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                     settings.providers.flatMap { it.models }.any { it.id == uuid }
                 },
                 modeInjections = settings.modeInjections.distinctBy { it.id },
+                promptInjections = settings.promptInjections.distinctBy { it.id },
                 lorebooks = settings.lorebooks.distinctBy { it.id },
                 regexScripts = settings.regexScripts.distinctBy { it.id },
                 quickMessages = settings.quickMessages.distinctBy { it.id },
@@ -648,6 +694,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
     suspend fun update(settings: Settings) {
         if(settings.init) {
             Log.w(TAG, "Cannot update dummy settings")
+            TavernRuntimeManager.appendLog("warn", "[settings] update rejected: dummy (init=true)")
             return
         }
         val previous = settingsFlow.value
@@ -660,6 +707,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         fireSettingsEvents(previous, settings)
         dataStore.edit { preferences ->
             preferences[DYNAMIC_COLOR] = settings.dynamicColor
+            preferences[ENABLE_WEB_SEARCH] = settings.enableWebSearch
             preferences[THEME_ID] = settings.themeId
             preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
             preferences[DEVELOPER_MODE] = settings.developerMode
@@ -669,6 +717,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
             preferences[SELECT_MODEL] = settings.chatModelId.toString()
             preferences[FAST_MODEL] = settings.fastModelId.toString()
+            preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
             settings.titleModelId?.let {
                 preferences[TITLE_MODEL] = it.toString()
             } ?: preferences.remove(TITLE_MODEL)
@@ -688,6 +737,10 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             preferences[OCR_PROMPT] = settings.ocrPrompt
             preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
             preferences[COMPRESS_PROMPT] = settings.compressPrompt
+            settings.embeddingModelId?.let {
+                preferences[EMBEDDING_MODEL] = it.toString()
+            } ?: preferences.remove(EMBEDDING_MODEL)
+            preferences[KB_INJECTION_SETTINGS] = JsonInstant.encodeToString(settings.kbInjectionSettings)
 
             preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
 
@@ -712,6 +765,13 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 preferences[SELECTED_ASR_PROVIDER] = it.toString()
             } ?: preferences.remove(SELECTED_ASR_PROVIDER)
             preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+            preferences[PROMPT_INJECTIONS] = JsonInstant.encodeToString(settings.promptInjections)
+            preferences[TAVERN_PRESETS] = settings.tavernPresets
+            preferences[TAVERN_GLOBAL_SCRIPTS] = settings.tavernGlobalScripts
+            preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] = settings.tavernGlobalScriptsEnabled
+            preferences[TAVERN_PRESET_SCRIPTS] = settings.tavernPresetScripts
+            preferences[TAVERN_THIRD_PARTY_DISABLED] = JsonInstant.encodeToString(settings.tavernThirdPartyDisabled)
+            preferences[TAVERN_EXTENSION_SETTINGS] = settings.tavernExtensionSettings
             preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
             preferences[REGEX_SCRIPTS] = JsonInstant.encodeToString(settings.regexScripts)
             preferences[WORLD_INFO_BUDGET] = settings.worldInfoBudget
@@ -762,6 +822,11 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         update(fn(settingsFlow.value))
     }
 
+    /** CAS 原子更新当前 Settings（基于最新 settingsFlow.value）。 */
+    suspend fun patch(fn: (Settings) -> Settings) {
+        update(fn(settingsFlow.value))
+    }
+
     /**
      * [v227 D4] 窄写回：只改一个 key，且把变换作用在 settingsFlow 的**当前**值上。
      *
@@ -783,6 +848,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         val current = settingsFlow.value
         if (current.init) {
             Log.w(TAG, "Cannot update dummy settings")
+            TavernRuntimeManager.appendLog("warn", "[settings] patchKey rejected: dummy (init=true) key=${key.name}")
             return false
         }
         val next = transform(current)
@@ -974,6 +1040,18 @@ data class Settings(
     val asrProviders: List<ASRProviderSetting> = emptyList(),
     val selectedASRProviderId: Uuid? = null,
     val modeInjections: List<PromptInjection.ModeInjection> = DEFAULT_MODE_INJECTIONS,
+    // [第6轮 D1 方案 A] 「提示词注入」独立通道。
+    //   老 settings.modeInjections 语义**不变** = 「预设仓」（带 presetGroup 的预设条目 +
+    //   历史未分组条目，老数据一行都不动）；这里是新通道自己的存储，只放 presetGroup == null 的条目。
+    //   启用集**不新增字段**：Assistant.modeInjectionIds / Conversation.modeInjectionIds 继续共用
+    //   （UUID 天然唯一，两通道混装安全）—— 见 PromptInjectionTransformer 的并集。
+    val promptInjections: List<PromptInjection.ModeInjection> = emptyList(),
+    // [第6轮 D3] 酒馆预设原始 JSON 无损透传：{"预设名": <原始 root JSON>}。
+    //   动机：实测 ST 预设 root 还有 44 个字段（temperature / new_chat_prompt / scenario_format /
+    //   personality_format / wi_format / impersonation_prompt / continue_nudge_prompt …）以及
+    //   extensions.SPreset（第三方扩展配置）；本轮不逐个映射，但**一行都不许丢**，
+    //   以后想补解析可以直接从这里取。范式对齐既有 tavernGlobalScripts / tavernPresetScripts。
+    val tavernPresets: String = "{}",
     val lorebooks: List<Lorebook> = emptyList(),
     val regexScripts: List<RegexScript> = emptyList(),   // ST 正则脚本（酒馆导出 JSON 兼容）
     // B6: JSR 酒馆助手脚本源（global / preset；character 来自角色卡 extensionsRaw，无需存储）

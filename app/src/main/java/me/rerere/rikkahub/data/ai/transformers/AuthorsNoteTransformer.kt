@@ -35,6 +35,14 @@ object AuthorsNoteTransformer : InputMessageTransformer {
             else -> userCount >= interval && userCount % interval == 0
         }
         if (!shouldInject) return messages
+        if (messages.any { m ->
+                m.parts.filterIsInstance<me.rerere.ai.ui.UIMessagePart.Text>()
+                    .joinToString("") { it.text }
+                    .startsWith("[Author's Note]")
+            }
+        ) {
+            return messages
+        }
 
         val noteText = when {
             personaTop -> "$personaDesc\n${settings.authorNote}"

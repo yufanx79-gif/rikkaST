@@ -3,33 +3,15 @@ package me.rerere.rikkahub.data.st.script
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * STscript 闭包字面量 `{: ... :}`（对齐官方 `slash-commands/SlashCommandClosure.js`
+ * STscript 闭包字面量 `{: ... :}` 与 `{| ... |}`（对齐官方 `slash-commands/SlashCommandClosure.js`
  * 与 `SlashCommandParser.js:743-820` 的语法子集）。
- *
- * ## 官方语义（1.18 源码核实）
- * - 闭包字面量以 `{:` 开始、`:}` 结束，内部是一段完整 STscript（`|` 管道可用）；
- * - 闭包体**开头**的 `key=value` 序列是「闭包命名参数声明」（parser 的
- *   `while (testNamedArgument())`），可在体里用 `{{arg::key}}` 引用（官方文档：
- *   "Named arguments can be referenced in a QR with `{{arg::key}}`"）；
- * - `/run`（别名 `/call` `/exec`）执行闭包：直接给字面量，或给「存了闭包的变量名」；
- *   `/run fn key=value` 会把命名参数提供给闭包（官方 runCallback:4214-4259）；
- * - 官方 QuickReply 用 `scope.setMacro('arg::*', '')` 定义通配兜底，因此**未提供的
- *   `{{arg::key}}` 展开成空串**、`{{arg::*}}` 是通配默认值（QuickReplySet.js:123、
- *   SlashCommandHandler.js:654）。
- *
- * ## rikkaST 本批子集（与官方的差异，已登记 DIVERGENCE.md）
- * - 不实现闭包的执行期 debug/breakpoint 机制；
- * - `{{arg::key}}` 在闭包体进入执行前做一次文本替换（官方走宏引擎动态宏，
- *   效果等价：闭包体内任何位置都可见）；
- * - 变量里的闭包存在进程内存表 [StClosureStore]（现有变量只存字符串），
- *   按 `host.chatKey` 分作用域，不持久化到磁盘（官方同样只在会话内存里）。
  */
 data class StClosure(
-    /** 闭包体脚本（不含 `{: :}`，已剥离头部命名参数声明） */
+    /** 闭包体脚本（不含 `{: :}` 或 `{| |}`，已剥离头部命名参数声明） */
     val body: String,
     /** 头部命名参数声明（官方 closure.argumentList） */
     val argumentList: List<StClosureArg> = emptyList(),
-    /** 原始字面量（含 `{: :}`，日志/调试用） */
+    /** 原始字面量（含定界符，日志/调试用） */
     val raw: String = body,
 )
 
@@ -40,6 +22,8 @@ object StClosureSyntax {
 
     const val OPEN = "{:"
     const val CLOSE = ":}"
+    const val ALT_OPEN = "{|"
+    const val ALT_CLOSE = "|}"
 
     /** 头部命名参数声明的匹配（官方 testNamedArgument：标识符 + `=` + 单 token/引号值） */
     private val HEAD_NAMED_ARG = Regex("""^\s*([A-Za-z0-9_]+)\s*=\s*("[^"]*"|'[^']*'|[^\s]+)""")
@@ -47,60 +31,107 @@ object StClosureSyntax {
     /** `{{arg::key}}`（官方宏引擎动态宏；大小写不敏感） */
     private val ARG_MACRO = Regex("""\{\{\s*arg::([^}]*?)\s*\}\}""", RegexOption.IGNORE_CASE)
 
-    /** 解析整段 `{: ... :}`（前后允许空白）；不是闭包字面量返回 null */
+    /** 解析整段 `{: ... :}` 或 `{| ... |}`（前后允许空白）；不是合法同种闭合字面量返回 null */
     fun parse(text: String): StClosure? {
         val trimmed = text.trim()
-        if (!trimmed.startsWith(OPEN) || !trimmed.endsWith(CLOSE)) return null
-        if (trimmed.length < OPEN.length + CLOSE.length) return null
-        val inner = trimmed.substring(OPEN.length, trimmed.length - CLOSE.length)
+        val (openTok, closeTok) = when {
+            trimmed.startsWith(OPEN) && trimmed.endsWith(CLOSE) -> OPEN to CLOSE
+            trimmed.startsWith(ALT_OPEN) && trimmed.endsWith(ALT_CLOSE) -> ALT_OPEN to ALT_CLOSE
+            else -> return null
+        }
+        if (trimmed.length < openTok.length + closeTok.length) return null
+        // 确保外层定界符真正闭合于末尾（拒绝如 "{: a :} {: b :}" 或定界符错配）
+        if (findClosureEnd(trimmed, 0) != trimmed.length) return null
+        val inner = trimmed.substring(openTok.length, trimmed.length - closeTok.length)
         val (args, body) = splitLeadingNamedArgs(inner)
         return StClosure(body = body, argumentList = args, raw = trimmed)
     }
 
+    /** 判断单个 token 是否为合法闭合的闭包字面量 */
+    fun isClosureLiteral(token: String): Boolean = parse(token) != null
+
     /**
-     * 从任意文本中取出**第一个**闭包字面量，返回 (闭包, 去掉该闭包后的文本)。
-     * 找不到返回 null。用于 `/run {: ... :} key=value`、`/setvar fn={: ... :}`。
+     * 从 [from] 起寻找下一个合法闭合的闭包跨度，返回 `Pair(startIndex, endIndexExclusive)`
+     *（左闭右开 `[start, end)`，可直接供 `text.substring(span.first, span.second)` 使用）。
+     * 若遇到未闭合定界符则跳过继续向后查找，找不到返回 null。
      */
-    fun takeFirstClosure(text: String): Pair<StClosure, String>? {
-        var from = 0
-        while (true) {
-            val start = text.indexOf(OPEN, from)
-            if (start < 0) return null
-            val end = findClosureEnd(text, start)
-            if (end < 0) {
-                from = start + OPEN.length
+    fun findClosureSpan(text: String, from: Int = 0): Pair<Int, Int>? {
+        var i = from.coerceAtLeast(0)
+        while (i < text.length - 1) {
+            if (text.startsWith(OPEN, i) || text.startsWith(ALT_OPEN, i)) {
+                val end = findClosureEnd(text, i)
+                if (end > i) {
+                    return i to end
+                }
+                i += 2
                 continue
             }
-            val closure = parse(text.substring(start, end)) ?: return null
-            val rest = text.substring(0, start) + text.substring(end)
-            return closure to rest
+            i++
         }
+        return null
     }
 
-    /** 从 [start]（必须指向 `{:`）开始匹配 `:}`，返回结束位置之后的下标；未闭合返回 -1。 */
+    /**
+     * 从任意文本中取出**第一个**闭包字面量（支持 `{: ... :}` 与 `{| ... |}`），
+     * 返回 (闭包, 去掉该闭包后的文本)。找不到返回 null。
+     */
+    fun takeFirstClosure(text: String): Pair<StClosure, String>? {
+        val span = findClosureSpan(text, 0) ?: return null
+        val closure = parse(text.substring(span.first, span.second)) ?: return null
+        val rest = text.substring(0, span.first) + text.substring(span.second)
+        return closure to rest
+    }
+
+    /**
+     * 从 [start]（指向 `{:` 或 `{|`）开始栈式匹配对应的 `:}` 或 `|}`（支持嵌套与反斜杠转义跳过），
+     * 返回闭合定界符之后的下标；未闭合或首尾定界符混用返回 -1。
+     */
     fun findClosureEnd(text: String, start: Int): Int {
-        var depth = 0
+        if (start < 0 || start >= text.length - 1) return -1
+        if (!text.startsWith(OPEN, start) && !text.startsWith(ALT_OPEN, start)) return -1
+        val stack = ArrayDeque<String>()
         var i = start
-        while (i < text.length - 1) {
-            when {
-                text.startsWith(OPEN, i) -> {
-                    depth++
-                    i += OPEN.length
-                }
-                text.startsWith(CLOSE, i) -> {
-                    depth--
-                    i += CLOSE.length
-                    if (depth == 0) return i
-                }
-                else -> i++
+        while (i < text.length) {
+            if (text[i] == '\\' && i + 1 < text.length) {
+                i += 2
+                continue
             }
+            if (i < text.length - 1) {
+                when {
+                    text.startsWith(OPEN, i) -> {
+                        stack.addLast(CLOSE)
+                        i += OPEN.length
+                        continue
+                    }
+                    text.startsWith(ALT_OPEN, i) -> {
+                        stack.addLast(ALT_CLOSE)
+                        i += ALT_OPEN.length
+                        continue
+                    }
+                    text.startsWith(CLOSE, i) -> {
+                        if (stack.isEmpty() || stack.last() != CLOSE) return -1
+                        stack.removeLast()
+                        i += CLOSE.length
+                        if (stack.isEmpty()) return i
+                        continue
+                    }
+                    text.startsWith(ALT_CLOSE, i) -> {
+                        if (stack.isEmpty() || stack.last() != ALT_CLOSE) return -1
+                        stack.removeLast()
+                        i += ALT_CLOSE.length
+                        if (stack.isEmpty()) return i
+                        continue
+                    }
+                }
+            }
+            i++
         }
         return -1
     }
 
     /**
      * 参数分词（闭包字面量保持为**一个** token；引号内空白不切分）。
-     * 供 `/switch value key={: ... :}` 这类「命名参数值是闭包」的命令使用。
+     * 供 `/switch`、`/if`、`/while` 等命令使用。
      */
     fun tokenizeArgs(args: String): List<String> {
         val out = mutableListOf<String>()
@@ -116,7 +147,7 @@ object StClosureSyntax {
                     }
                     i++
                 }
-                c == '{' && i + 1 < args.length && args[i + 1] == ':' -> {
+                c == '{' && i + 1 < args.length && (args[i + 1] == ':' || args[i + 1] == '|') -> {
                     val end = findClosureEnd(args, i)
                     if (end > i) {
                         sb.append(args, i, end)
@@ -131,8 +162,13 @@ object StClosureSyntax {
                     sb.append(c)
                     i++
                     while (i < args.length && args[i] != quote) {
-                        sb.append(args[i])
-                        i++
+                        if (args[i] == '\\' && i + 1 < args.length) {
+                            sb.append(args[i]).append(args[i + 1])
+                            i += 2
+                        } else {
+                            sb.append(args[i])
+                            i++
+                        }
                     }
                     if (i < args.length) {
                         sb.append(args[i])
@@ -192,10 +228,6 @@ object StClosureSyntax {
 
 /**
  * 闭包表：把「闭包」作为值存进变量作用域（现有变量只存字符串，故单开一张内存表）。
- *
- * - 作用域键 = `host.chatKey`（每个对话一套；无会话时用 [GLOBAL_SCOPE]）；
- * - 进程内存、不持久化（官方 SlashCommandScope 同样是会话内存）；
- * - 供 `/setvar fn={: ... :}` 写入、`/run fn` 读取，支持闭包内再 `/run` 自己（递归）。
  */
 object StClosureStore {
 

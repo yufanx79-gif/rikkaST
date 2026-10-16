@@ -11,6 +11,63 @@
 import { deepClone } from './clone-util.js';
 import { getCurrentMessageId } from './util-shims.js';
 
+
+const _scopedVarMemory = {};
+
+function resolveScopeKey(option) {
+    const t = String((option && option.type) || 'chat');
+    const ctx = getCtx() || {};
+    if (t === 'character') {
+        const cid = option.character_id ?? option.character ?? ctx.characterId ?? ctx.name2 ?? 'default';
+        return 'char:' + String(cid);
+    }
+    if (t === 'preset') {
+        const pid = option.preset_id ?? option.preset_name ?? option.preset ?? 'default';
+        return 'preset:' + String(pid);
+    }
+    if (t === 'script') {
+        let sid = option.script_id;
+        if (!sid && typeof window.getScriptId === 'function') {
+            try { sid = window.getScriptId(); } catch (_e) { /* noop */ }
+        }
+        return 'script:' + String(sid || 'default');
+    }
+    return t + ':default';
+}
+
+function getScopedVariablesMap(option) {
+    const key = resolveScopeKey(option);
+    try {
+        const b = window.RikkaBridge || (window.parent && window.parent.RikkaBridge);
+        if (b && typeof b.getScopedVariablesJson === 'function') {
+            const raw = b.getScopedVariablesJson(key);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    _scopedVarMemory[key] = parsed;
+                    return parsed;
+                }
+            }
+        }
+    } catch (_e) { /* noop */ }
+    if (!_scopedVarMemory[key] || typeof _scopedVarMemory[key] !== 'object') {
+        _scopedVarMemory[key] = {};
+    }
+    return _scopedVarMemory[key];
+}
+
+function setScopedVariablesMap(option, variables) {
+    const key = resolveScopeKey(option);
+    const clean = (variables && typeof variables === 'object' && !Array.isArray(variables)) ? deepClone(variables) : {};
+    _scopedVarMemory[key] = clean;
+    try {
+        const b = window.RikkaBridge || (window.parent && window.parent.RikkaBridge);
+        if (b && typeof b.replaceScopedVariables === 'function') {
+            b.replaceScopedVariables(key, JSON.stringify(clean));
+        }
+    } catch (_e) { /* noop */ }
+}
+
 function getCtx() {
     return window.SillyTavern.getContext();
 }
@@ -49,8 +106,10 @@ function get_variables_without_clone(option) {
         case 'global': {
             return _.get(ctx.extensionSettings, 'variables.global', {});
         }
+        case 'character':
+        case 'preset':
         case 'script': {
-            return {};
+            return getScopedVariablesMap(option);
         }
         case 'extension': {
             return _.get(ctx.extensionSettings, option.extension_id, {});
@@ -122,6 +181,12 @@ export function replaceVariables(variables, option = { type: 'chat' }) {
             }
             _.set(ctx.extensionSettings.variables, 'global', variables);
             if (ctx.saveSettingsDebounced) ctx.saveSettingsDebounced();
+            break;
+        }
+        case 'character':
+        case 'preset':
+        case 'script': {
+            setScopedVariablesMap(option, variables);
             break;
         }
         case 'extension': {

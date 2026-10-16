@@ -1,19 +1,32 @@
 /**
  * rikkaST st-compat: authors-note.js
  * ============================================================
- * 模拟 SillyTavern `public/scripts/authors-note.js` 的最小导出面（P0）。
+ * 对齐 SillyTavern `public/scripts/authors-note.js`。
  */
+
+const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
 export const NOTE_MODULE_NAME = 'authorsNote';
 
-export const metadata_keys = [
-    'note_prompt',
-    'note_interval',
-    'note_position',
-    'note_depth',
-    'note_role',
-];
+export const metadata_keys = {
+    prompt: 'note_prompt',
+    interval: 'note_interval',
+    position: 'note_position',
+    depth: 'note_depth',
+    role: 'note_role',
+};
 
 export function shouldWIAddPrompt() {
-    return false;
+    try {
+        const ctx = st();
+        const meta = (ctx && ctx.chatMetadata) || {};
+        const prompt = meta.note_prompt || '';
+        const interval = Number(meta.note_interval ?? 1);
+        if (!prompt || interval <= 0) return false;
+        const chat = Array.isArray(ctx && ctx.chat) ? ctx.chat : [];
+        const userCount = chat.filter((m) => m && m.is_user).length;
+        return userCount > 0 && (userCount % interval === 0);
+    } catch (_e) {
+        return false;
+    }
 }

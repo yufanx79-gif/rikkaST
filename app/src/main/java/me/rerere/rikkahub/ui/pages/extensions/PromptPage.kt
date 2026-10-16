@@ -114,6 +114,7 @@ import kotlinx.coroutines.withContext
 import me.rerere.ai.core.MessageRole
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.export.LorebookSerializer
+import me.rerere.rikkahub.data.export.SillyTavernLorebookSerializer
 import kotlinx.serialization.json.JsonElement
 import me.rerere.rikkahub.data.export.ModeInjectionSerializer
 import me.rerere.rikkahub.data.st.runtime.mergePresetScripts
@@ -123,6 +124,8 @@ import me.rerere.rikkahub.data.export.rememberImporter
 import me.rerere.rikkahub.data.model.InjectionPosition
 import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.ui.pages.assistant.detail.syncExternalToEmbedded
+import me.rerere.rikkahub.ui.components.ai.PresetManagementTab
+import me.rerere.rikkahub.ui.components.ai.mergeRawPreset
 import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.SelectiveLogic
 import me.rerere.rikkahub.ui.components.nav.BackButton
@@ -151,7 +154,8 @@ import sh.calvin.reorderable.rememberReorderableLazyListState
 @Composable
 fun PromptPage(vm: PromptVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
-    val pagerState = rememberPagerState { 2 }
+    // [第6轮 D1~D5] 2 → 3 个 tab：预设管理 / 提示词注入 / 世界书
+    val pagerState = rememberPagerState { 3 }
     val scope = rememberCoroutineScope()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -166,20 +170,31 @@ fun PromptPage(vm: PromptVM = koinViewModel()) {
         },
         bottomBar = {
             NavigationBar {
+                // [第6轮 D1~D5] 底部由「模式注入 / 世界书」改为
+                // 「预设管理 / 提示词注入 / 世界书」——预设管理占原来的 0 号位，
+                // 新的「提示词注入」插在中间（用户原话：在中间加一个）。
                 NavigationBarItem(
                     selected = pagerState.currentPage == 0,
                     label = { Text(stringResource(R.string.prompt_page_mode_injection_tab)) },
-                    icon = { Icon(HugeIcons.MagicWand01, null) },
+                    icon = { Icon(HugeIcons.Folder01, null) },
                     onClick = {
                         scope.launch { pagerState.animateScrollToPage(0) }
                     }
                 )
                 NavigationBarItem(
                     selected = pagerState.currentPage == 1,
+                    label = { Text(stringResource(R.string.prompt_page_prompt_injection_tab)) },
+                    icon = { Icon(HugeIcons.MagicWand01, null) },
+                    onClick = {
+                        scope.launch { pagerState.animateScrollToPage(1) }
+                    }
+                )
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 2,
                     label = { Text(stringResource(R.string.prompt_page_lorebook_tab)) },
                     icon = { Icon(HugeIcons.Book01, null) },
                     onClick = {
-                        scope.launch { pagerState.animateScrollToPage(1) }
+                        scope.launch { pagerState.animateScrollToPage(2) }
                     }
                 )
             }
@@ -194,30 +209,80 @@ fun PromptPage(vm: PromptVM = koinViewModel()) {
                 .fillMaxSize()
         ) { page ->
             when (page) {
-                0 -> ModeInjectionTab(
+                // ===== [第6轮 D1~D5] Page 0 = 「预设管理」=====
+                // 老「模式注入」的**同一份数据**（settings.modeInjections，语义不变 = 预设仓），
+                // 改成按 presetGroup 分组渲染：导入 2 个预设 → 就出现 2 行。
+                // 「未分组条目」（presetGroup == null，含历史手写注入与默认 Learning Mode）单独一行，
+                // 保证老数据一条都看不到丢（用户 D4 明确要求）。
+                0 -> PresetManagementTab(
                     modeInjections = settings.modeInjections,
-                    onUpdate = { vm.updateSettings(settings.copy(modeInjections = it)) },
+                    onUpdate = { newList ->
+                        vm.patchSettings { current -> current.copy(modeInjections = newList) }
+                    },
                     onPresetScripts = { label, scripts ->
-                        // B6：导入的酒馆预设若含「酒馆助手」脚本，按预设组名保存；
-                        // 助手启用该预设（modeInjectionIds 含该组条目）后自动装载。
-                        vm.updateSettings(
-                            settings.copy(
-                                tavernPresetScripts = mergePresetScripts(settings.tavernPresetScripts, label, scripts)
+                        vm.patchSettings { current ->
+                            current.copy(
+                                tavernPresetScripts = mergePresetScripts(current.tavernPresetScripts, label, scripts)
                             )
-                        )
-                    }
+                        }
+                    },
+                    onStoreRawPreset = { label, raw ->
+                        vm.patchSettings { current ->
+                            current.copy(tavernPresets = mergeRawPreset(current.tavernPresets, label, raw))
+                        }
+                    },
+                    onImportBundle = { bundle ->
+                        vm.patchSettings { current ->
+                            val beforeGroups = current.modeInjections.mapNotNull { it.presetGroup }.distinct()
+                            me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+                                "info",
+                                "[preset] before update: modeInjections=${current.modeInjections.size} " +
+                                    "groups=$beforeGroups regex=${current.regexScripts.size} init=${current.init}",
+                            )
+                            val (next, addedRegex) = me.rerere.rikkahub.ui.components.ai.applyPresetBundleToSettings(current, bundle)
+                            val afterGroups = next.modeInjections.mapNotNull { it.presetGroup }.distinct()
+                            me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+                                "info",
+                                "[preset] after update: modeInjections=${next.modeInjections.size} " +
+                                    "groups=$afterGroups regex=${next.regexScripts.size} (+$addedRegex)",
+                            )
+                            next
+                        }
+                    },
+                    onRenameOrDeletePresetGroup = { oldName, newName, updatedList ->
+                        vm.patchSettings { current ->
+                            me.rerere.rikkahub.ui.components.ai.applyPresetGroupLifecycleChange(
+                                current = current,
+                                oldName = oldName,
+                                newName = newName,
+                                updatedModeInjections = updatedList,
+                            )
+                        }
+                    },
                 )
 
-                1 -> LorebookTab(
+                // ===== [第6轮 D1 方案 A] Page 1 = 「提示词注入」= **新通道** =====
+                // 复用老 ModeInjectionTab 的全部能力（导入 / 多选 / 新增 / 拖拽排序 / 单条编辑 / 删除），
+                // 但数据源换成独立的 settings.promptInjections（偏好键 prompt_injections）。
+                // ⇒ 用户重点强调的「提示词注入里不能显示预设管理里的那些东西」是**数据层保证**，不是 UI 过滤。
+                1 -> ModeInjectionTab(
+                    modeInjections = settings.promptInjections,
+                    onUpdate = { newList ->
+                        vm.patchSettings { current -> current.copy(promptInjections = newList) }
+                    },
+                )
+
+                // ===== 世界书：与原实现逐字一致，本轮未做任何改动 =====
+                2 -> LorebookTab(
                     lorebooks = settings.lorebooks,
                     onUpdate = { newLorebooks ->
                         // 外置世界书更新时，同步回写绑定它的角色卡内嵌世界书
-                        vm.updateSettings(
-                            settings.copy(
+                        vm.patchSettings { current ->
+                            current.copy(
                                 lorebooks = newLorebooks,
-                                assistants = syncExternalToEmbedded(settings.assistants, newLorebooks),
+                                assistants = syncExternalToEmbedded(current.assistants, newLorebooks),
                             )
-                        )
+                        }
                     },
                     settings = settings,
                     onSettingsUpdate = { vm.updateSettings(it) }
@@ -274,9 +339,9 @@ private fun ModeInjectionTab(
             }
             result.onSuccess { importedList ->
                 if (importedList.isNotEmpty()) {
-                    // 导入后全部启用（不做自动绑定；为助手开启请到「助手 → 扩展 → 预设」）
-                    val enabledList = importedList.map { it.copy(enabled = true) }
-                    onUpdate(currentModeInjections + enabledList)
+                    // 保留来源定义的 enabled 状态（不做强制篡改）
+                    val enabledCount = importedList.count { it.enabled }
+                    onUpdate(currentModeInjections + importedList)
                     // B6：提取预设内嵌的「酒馆助手」脚本（若有）
                     val presetScripts = withContext(Dispatchers.IO) {
                         ModeInjectionSerializer.importPresetScripts(context, uri)
@@ -284,11 +349,11 @@ private fun ModeInjectionTab(
                     if (presetScripts != null) {
                         onPresetScripts(presetScripts.first, presetScripts.second)
                         toaster.show(
-                            "$importSuccessMsg（${enabledList.size} 条已全部启用，含 ${presetScripts.second.size} 个预设脚本）"
+                            "$importSuccessMsg（共 ${importedList.size} 条，启用 $enabledCount 条，含 ${presetScripts.second.size} 个预设脚本）"
                         )
                     } else {
                         toaster.show(
-                            "$importSuccessMsg（${enabledList.size} 条已全部启用；可在助手→扩展→预设中为助手开启）"
+                            "$importSuccessMsg（共 ${importedList.size} 条，启用 $enabledCount 条；可在助手→扩展→预设中为助手开启）"
                         )
                     }
                 }
@@ -562,7 +627,7 @@ private fun ModeInjectionCard(
 }
 
 @Composable
-private fun ModeInjectionEditSheet(
+internal fun ModeInjectionEditSheet(
     injection: PromptInjection.ModeInjection,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
@@ -716,6 +781,8 @@ private fun InjectionPosition.usesStandaloneMessage(): Boolean = when (this) {
     InjectionPosition.AFTER_DIALOG,
     InjectionPosition.AT_DEPTH,
     InjectionPosition.AUTHOR_NOTE,
+    InjectionPosition.BEFORE_AUTHOR_NOTE,
+    InjectionPosition.AFTER_AUTHOR_NOTE,
     InjectionPosition.EM_TOP,
     InjectionPosition.EM_BOTTOM -> true
 }
@@ -732,6 +799,8 @@ private fun getPositionLabel(position: InjectionPosition): String = when (positi
     InjectionPosition.AFTER_DIALOG -> stringResource(R.string.prompt_page_position_after_dialog)
     InjectionPosition.AT_DEPTH -> stringResource(R.string.prompt_page_position_at_depth)
     InjectionPosition.AUTHOR_NOTE -> stringResource(R.string.prompt_page_position_author_note)
+    InjectionPosition.BEFORE_AUTHOR_NOTE -> stringResource(R.string.prompt_page_position_before_author_note)
+    InjectionPosition.AFTER_AUTHOR_NOTE -> stringResource(R.string.prompt_page_position_after_author_note)
     InjectionPosition.EM_TOP -> stringResource(R.string.prompt_page_pos_em_top)
     InjectionPosition.EM_BOTTOM -> stringResource(R.string.prompt_page_pos_em_bottom)
     InjectionPosition.OUTLET -> stringResource(R.string.prompt_page_pos_outlet)
@@ -1264,8 +1333,10 @@ private fun LorebookCard(
     onDelete: () -> Unit
 ) {
     var showExportDialog by remember { mutableStateOf(false) }
+    var showStExportDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     val exporter = rememberExporter(book, LorebookSerializer)
+    val stExporter = rememberExporter(book, SillyTavernLorebookSerializer)
 
     Card(
         onClick = if (selectMode) onToggleSelect else onEdit,
@@ -1339,6 +1410,11 @@ private fun LorebookCard(
                         onClick = { showExportDialog = true },
                     ),
                     ItemAction(
+                        text = "导出酒馆世界书 (ST JSON)",
+                        icon = HugeIcons.Share03,
+                        onClick = { showStExportDialog = true },
+                    ),
+                    ItemAction(
                         text = stringResource(R.string.prompt_page_delete),
                         icon = HugeIcons.Delete01,
                         destructive = true,
@@ -1369,6 +1445,12 @@ private fun LorebookCard(
             onDismiss = { showExportDialog = false }
         )
     }
+    if (showStExportDialog) {
+        ExportDialog(
+            exporter = stExporter,
+            onDismiss = { showStExportDialog = false }
+        )
+    }
 }
 
 @Composable
@@ -1390,33 +1472,12 @@ private fun LorebookEditSheet(
     }
     val groupEditState = useEditState<Pair<String, List<PromptInjection.RegexInjection>>> { pair ->
         val (newGroupName, updatedEntries) = pair
-        val oldGroupName = book.entries.firstOrNull { it.id == updatedEntries.firstOrNull()?.id }?.group ?: return@useEditState
+        val updatedById = updatedEntries.associateBy { it.id }
+        val oldGroupName = book.entries.firstOrNull { it.id in updatedById }?.group ?: return@useEditState
+        val template = updatedEntries.firstOrNull() ?: return@useEditState
         val newEntries = book.entries.map { entry ->
             if (entry.group == oldGroupName) {
-                val base = updatedEntries.first()
-                entry.copy(
-                    name = base.name,
-                    enabled = base.enabled,
-                    priority = base.priority,
-                    position = base.position,
-                    content = base.content,
-                    injectDepth = base.injectDepth,
-                    role = base.role,
-                    keywords = base.keywords,
-                    secondaryKeys = base.secondaryKeys,
-                    useRegex = base.useRegex,
-                    caseSensitive = base.caseSensitive,
-                    scanDepth = base.scanDepth,
-                    constantActive = base.constantActive,
-                    selective = base.selective,
-                    selectiveLogic = base.selectiveLogic,
-                    probability = base.probability,
-                    sticky = base.sticky,
-                    cooldown = base.cooldown,
-                    group = newGroupName,
-                    groupWeight = base.groupWeight,
-                    groupOverride = base.groupOverride,
-                )
+                applyLorebookGroupBatchToEntry(entry, newGroupName, template)
             } else entry
         }
         onEdit(book.copy(entries = newEntries))
@@ -1595,46 +1656,10 @@ private fun LorebookEditSheet(
                 entries = entries,
                 onDismiss = { groupEditState.dismiss() },
                 onConfirm = { newGroupName, template ->
-                    groupEditState.currentState = Pair(newGroupName, entries.map { it.copy(
-                        name = template.name,
-                        enabled = template.enabled,
-                        priority = template.priority,
-                        position = template.position,
-                        content = template.content,
-                        injectDepth = template.injectDepth,
-                        role = template.role,
-                        useRegex = template.useRegex,
-                        caseSensitive = template.caseSensitive,
-                        scanDepth = template.scanDepth,
-                        constantActive = template.constantActive,
-                        selective = template.selective,
-                        selectiveLogic = template.selectiveLogic,
-                        probability = template.probability,
-                        sticky = template.sticky,
-                        cooldown = template.cooldown,
-                        delay = template.delay,
-                        groupWeight = template.groupWeight,
-                        groupOverride = template.groupOverride,
-                        matchWholeWords = template.matchWholeWords,
-                        excludeRecursion = template.excludeRecursion,
-                        preventRecursion = template.preventRecursion,
-                        delayUntilRecursion = template.delayUntilRecursion,
-                        useProbability = template.useProbability,
-                        inclusionGroup = template.inclusionGroup,
-                        useGroupScoring = template.useGroupScoring,
-                        groupPriority = template.groupPriority,
-                        automationId = template.automationId,
-                        displayIndex = template.displayIndex,
-                        displayPosition = template.displayPosition,
-                        triggers = template.triggers,
-                        matchPersonaDescription = template.matchPersonaDescription,
-                        matchCharacterDescription = template.matchCharacterDescription,
-                        matchCharacterPersonality = template.matchCharacterPersonality,
-                        matchCharacterDepthPrompt = template.matchCharacterDepthPrompt,
-                        matchScenario = template.matchScenario,
-                        matchCreatorNotes = template.matchCreatorNotes,
-                        ignoreBudget = template.ignoreBudget,
-                    ) })
+                    groupEditState.currentState = Pair(
+                        newGroupName,
+                        applyLorebookGroupBatchSettings(entries, newGroupName, template),
+                    )
                     groupEditState.confirm()
                 },
             )
@@ -1950,6 +1975,67 @@ private fun LorebookGroupSection(
     }
 }
 
+/**
+ * 世界书分组批量修改：仅更新组名与扫描/注入控制属性，严禁覆盖各条目的独立 `name`、`content`、`keywords`、`secondaryKeys`。
+ */
+internal fun applyLorebookGroupBatchToEntry(
+    entry: PromptInjection.RegexInjection,
+    newGroupName: String,
+    template: PromptInjection.RegexInjection,
+): PromptInjection.RegexInjection = entry.copy(
+    // 显式保留单条目私有标识、标题、正文与正副关键词
+    name = entry.name,
+    content = entry.content,
+    keywords = entry.keywords,
+    secondaryKeys = entry.secondaryKeys,
+    // 批量更新分组与扫描注入控制属性
+    group = newGroupName,
+    enabled = template.enabled,
+    priority = template.priority,
+    position = template.position,
+    injectDepth = template.injectDepth,
+    role = template.role,
+    useRegex = template.useRegex,
+    caseSensitive = template.caseSensitive,
+    scanDepth = template.scanDepth,
+    constantActive = template.constantActive,
+    selective = template.selective,
+    selectiveLogic = template.selectiveLogic,
+    probability = template.probability,
+    sticky = template.sticky,
+    cooldown = template.cooldown,
+    delay = template.delay,
+    groupWeight = template.groupWeight,
+    groupOverride = template.groupOverride,
+    matchWholeWords = template.matchWholeWords,
+    excludeRecursion = template.excludeRecursion,
+    preventRecursion = template.preventRecursion,
+    delayUntilRecursion = template.delayUntilRecursion,
+    useProbability = template.useProbability,
+    inclusionGroup = template.inclusionGroup,
+    useGroupScoring = template.useGroupScoring,
+    groupPriority = template.groupPriority,
+    automationId = template.automationId,
+    displayIndex = template.displayIndex,
+    displayPosition = template.displayPosition,
+    triggers = template.triggers,
+    matchPersonaDescription = template.matchPersonaDescription,
+    matchCharacterDescription = template.matchCharacterDescription,
+    matchCharacterPersonality = template.matchCharacterPersonality,
+    matchCharacterDepthPrompt = template.matchCharacterDepthPrompt,
+    matchScenario = template.matchScenario,
+    matchCreatorNotes = template.matchCreatorNotes,
+    ignoreBudget = template.ignoreBudget,
+)
+
+internal fun applyLorebookGroupBatchSettings(
+    entries: List<PromptInjection.RegexInjection>,
+    newGroupName: String,
+    template: PromptInjection.RegexInjection,
+): List<PromptInjection.RegexInjection> = entries.map { entry ->
+    applyLorebookGroupBatchToEntry(entry, newGroupName, template)
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GroupSettingsDialog(
@@ -2223,16 +2309,7 @@ private fun GroupSettingsDialog(
                     }
                 }
 
-                // 注入内容
-                OutlinedTextField(
-                    value = edited.content,
-                    onValueChange = { edited = edited.copy(content = it) },
-                    label = { Text(stringResource(R.string.prompt_page_injection_content)) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(120.dp),
-                    minLines = 3,
-                )
+
 
                 // 组权重 + 覆盖
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

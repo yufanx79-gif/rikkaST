@@ -82,7 +82,7 @@ object MacroDefinitions {
         reg("else") { MacroEngine.ELSE_MARKER }
 
         // {{input}} -> ''（PORT NOTE：无 send_textarea 访问；生成期输入框为空）
-        reg("input") { "" }
+        reg("input") { ctx -> ctx.env.system.input }
 
         reg("maxPrompt", minArgs = 0, maxArgs = 0, aliases = listOf("maxPromptTokens")) { ctx ->
             val context = ctx.env.system.maxContextTokens
@@ -156,10 +156,19 @@ object MacroDefinitions {
         }
 
         // {{banned::word}} -> ''（PORT NOTE：无 textgen 后端；对齐 chat-completion 模式下的空行为）
-        reg("banned", minArgs = 1, maxArgs = 1, argDefs = listOf(MacroArgDef("word"))) { "" }
+        reg("banned", minArgs = 1, maxArgs = 1, argDefs = listOf(MacroArgDef("word"))) { ctx ->
+            val word = ctx.unnamedArgs.getOrNull(0)?.trim().orEmpty()
+            if (word.isNotEmpty()) ctx.env.system.bannedWords.add(word)
+            ""
+        }
 
         // {{outlet::key}} -> outlet 内容。官方 getOutletPrompt：读取扩展注入槽 CUSTOM_WI_OUTLET(key)，
         // 未激活/未配置时为空串。key 先原文匹配、失败再 trim 兜底（对齐酒馆宽松读取）。
+        reg("summary") { ctx ->
+            ctx.env.variables.local.get("__st_memory_summary")?.takeIf { it.isNotEmpty() }
+                ?: ctx.env.variables.local.get("summary").orEmpty()
+        }
+
         reg("outlet", minArgs = 1, maxArgs = 1, argDefs = listOf(MacroArgDef("key"))) { ctx ->
             val key = ctx.unnamedArgs.getOrNull(0) ?: ""
             ctx.env.outlets[key] ?: ctx.env.outlets[key.trim()] ?: ""

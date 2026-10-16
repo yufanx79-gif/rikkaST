@@ -100,7 +100,9 @@ fun Route.settingsRoutes(
                 throw NotFoundException("Assistant not found")
             }
 
-            val validModeInjectionIds = settings.modeInjections.map { it.id }.toSet()
+            // [第6轮 D1] 两通道并集（否则 Web API 传新通道的 id 会被判成 unknown injection id）
+            val validModeInjectionIds =
+                (settings.modeInjections + settings.promptInjections).map { it.id }.toSet()
             val requestedModeInjectionIds =
                 request.modeInjectionIds.map { it.toUuid("modeInjectionIds") }.toSet()
             if (!validModeInjectionIds.containsAll(requestedModeInjectionIds)) {

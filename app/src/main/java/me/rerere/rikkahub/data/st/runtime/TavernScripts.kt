@@ -81,11 +81,19 @@ fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
 }
 
 /** 当前助手已启用的预设组集合（来自 modeInjectionIds → presetGroup 推导）。 */
-fun enabledPresetGroups(assistant: Assistant?, settings: Settings?): Set<String> {
+fun enabledPresetGroups(
+    assistant: Assistant?,
+    settings: Settings?,
+    extraModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
+): Set<String> {
     if (assistant == null || settings == null) return emptySet()
-    val ids = assistant.modeInjectionIds
+    val ids = if (assistant.allowConversationPromptInjection && extraModeInjectionIds.isNotEmpty()) {
+        extraModeInjectionIds
+    } else {
+        assistant.modeInjectionIds + extraModeInjectionIds
+    }
     return settings.modeInjections
-        .filter { it.id in ids && !it.presetGroup.isNullOrBlank() }
+        .filter { it.id in ids && it.enabled && !it.presetGroup.isNullOrBlank() }
         .mapNotNull { it.presetGroup }
         .toSet()
 }
@@ -180,15 +188,48 @@ fun removeGlobalScript(globalJson: String?, scriptId: String): String? {
     return JsonArray(newList).toString()
 }
 
-/** 合并一个预设组下的脚本（同名组整体替换，重复导入即更新）。 */
-fun mergePresetScripts(presetJson: String?, group: String, scripts: List<JsonElement>): String {
+/** 合并一个预设组下的脚本（同名组整体替换；当 scripts 为空且 removeWhenEmpty=true 时清除该预设组的旧脚本残留）。 */
+fun mergePresetScripts(
+    presetJson: String?,
+    group: String,
+    scripts: List<JsonElement>,
+    removeWhenEmpty: Boolean = true,
+): String {
+    if (group.isBlank()) return presetJson ?: "{}"
     val root = try {
         (presetJson?.takeIf { it.isNotBlank() }?.let { Json.parseToJsonElement(it) } as? JsonObject)
             ?: JsonObject(emptyMap())
     } catch (_: Exception) {
         JsonObject(emptyMap())
     }
+    if (scripts.isEmpty() && removeWhenEmpty) {
+        val mutable = root.toMutableMap()
+        mutable.remove(group)
+        return JsonObject(mutable).toString()
+    }
     return root.withField(group, JsonArray(scripts)).toString()
+}
+
+/** 预设重命名或删除时，同步迁移或清理 `tavernPresetScripts` 中的分组键。 */
+fun renameOrRemovePresetScriptsGroup(
+    presetJson: String?,
+    oldGroup: String,
+    newGroup: String?,
+): String {
+    if (oldGroup.isBlank()) return presetJson ?: "{}"
+    val root = try {
+        (presetJson?.takeIf { it.isNotBlank() }?.let { Json.parseToJsonElement(it) } as? JsonObject)
+            ?: return presetJson ?: "{}"
+    } catch (_: Exception) {
+        return presetJson ?: "{}"
+    }
+    if (!root.containsKey(oldGroup)) return presetJson ?: "{}"
+    val mutable = root.toMutableMap()
+    val existing = mutable.remove(oldGroup)
+    if (!newGroup.isNullOrBlank() && existing != null) {
+        mutable[newGroup] = existing
+    }
+    return JsonObject(mutable).toString()
 }
 
 /**
@@ -540,7 +581,8 @@ private fun injectionPositionToStNumber(pos: InjectionPosition): Int = when (pos
     InjectionPosition.TOP_OF_CHAT -> 2
     InjectionPosition.BOTTOM_OF_CHAT -> 3
     InjectionPosition.AT_DEPTH -> 4
-    InjectionPosition.AUTHOR_NOTE -> 2
+    InjectionPosition.AUTHOR_NOTE, InjectionPosition.BEFORE_AUTHOR_NOTE -> 2
+    InjectionPosition.AFTER_AUTHOR_NOTE -> 3
     InjectionPosition.ANTAGONIZE, InjectionPosition.AFTER_DIALOG -> 7
     InjectionPosition.EM_TOP -> 5
     InjectionPosition.EM_BOTTOM -> 6
@@ -604,6 +646,386 @@ fun applyLorebookDisablePatch(book: Lorebook, patchJson: String): Lorebook? {
         e.copy(enabled = enabled)
     }
     return if (changed) book.copy(entries = entries) else null
+}
+
+/**
+ * [v243 BUGFIX A3] JSR 世界书写入载荷：`{ upsert:[WorldbookEntry...], delete:[uid...], replaceAll:boolean }`。
+ */
+data class LorebookUpsertPayload(
+    val upsert: List<JsonObject>,
+    val delete: List<Int>,
+    val replaceAll: Boolean,
+)
+
+/** 解析 JS `RikkaBridge.upsertLorebookEntries` 的载荷；空/非法返回 null。 */
+fun parseLorebookUpsertPayload(json: String): LorebookUpsertPayload? {
+    if (json.isBlank()) return null
+    return try {
+        val obj = Json.parseToJsonElement(json) as? JsonObject ?: return null
+        val upsert = (obj["upsert"] as? JsonArray)?.mapNotNull { it as? JsonObject } ?: emptyList()
+        val delete = (obj["delete"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.intOrNull } ?: emptyList()
+        val replaceAll = (obj["replaceAll"] as? JsonPrimitive)?.booleanOrNull == true
+        if (upsert.isEmpty() && delete.isEmpty() && !replaceAll) return null
+        LorebookUpsertPayload(upsert, delete, replaceAll)
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** JSR `position.type` → 官方 world_info_position 数值。 */
+private fun jsrPositionTypeToStNumber(type: String?): Int = when ((type ?: "").lowercase()) {
+    "before_character_definition" -> 0
+    "after_character_definition" -> 1
+    "before_authors_note" -> 2
+    "after_authors_note" -> 3
+    "at_depth" -> 4
+    "before_example_messages" -> 5
+    "after_example_messages" -> 6
+    "outlet" -> 7
+    else -> 1
+}
+
+/** JSR `strategy.keys_secondary.logic` → 官方 world_info_logic 数值。 */
+private fun jsrLogicToStNumber(logic: String?): Int = when ((logic ?: "").lowercase()) {
+    "not_all" -> 1
+    "not_any" -> 2
+    "and_all" -> 3
+    else -> 0
+}
+
+/** JSR 字符串数组（元素可能是 `/regex/` 串）→ 普通字符串列表。 */
+private fun jsrKeyList(el: JsonElement?): List<String> {
+    val arr = el as? JsonArray ?: return emptyList()
+    return arr.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.takeIf { k -> k.isNotEmpty() } }
+}
+
+/**
+ * [v243 BUGFIX A3] JSR `WorldbookEntry` → [TavernBookEntry]（ST 扁平条目）。
+ *
+ * 只映射「卡脚本真的会写、且 `lorebook-shims.js:toLorebookEntry` 会回读校验」的字段：
+ * name / content / enabled / strategy(type, keys, keys_secondary, scan_depth) /
+ * position(type, role, depth, order) / probability。
+ *
+ * 为什么必须能回读一致：卡写完会立刻 `getWorldbook()` 再比对
+ *   `strategy.type === 'constant' && position.type === 'after_character_definition' && position.order === 25`
+ * 不一致就报「写入后回读的条目设置与预期不一致」。所以这几个键的往返必须无损。
+ *
+ * @param fallbackId 未带 uid 时使用的 id（由调用方分配 max+1）
+ */
+private fun jsrEntryToTavernBookEntry(obj: JsonObject, fallbackId: Int): TavernBookEntry? {
+    val name = (obj["name"] as? JsonPrimitive)?.contentOrNull ?: ""
+    val content = (obj["content"] as? JsonPrimitive)?.contentOrNull
+    if (content == null && name.isEmpty()) return null
+
+    val strategy = obj["strategy"] as? JsonObject
+    val strategyType = ((strategy?.get("type") as? JsonPrimitive)?.contentOrNull ?: "selective").lowercase()
+    val secondary = strategy?.get("keys_secondary") as? JsonObject
+    val position = obj["position"] as? JsonObject
+    val rawScanDepth = strategy?.get("scan_depth")
+    val scanDepth = if (rawScanDepth is JsonPrimitive) rawScanDepth.intOrNull else null
+    val rawUid = (obj["uid"] as? JsonPrimitive)?.intOrNull ?: -1
+    val enabled = (obj["enabled"] as? JsonPrimitive)?.booleanOrNull ?: true
+
+    return TavernBookEntry(
+        id = if (rawUid >= 0) rawUid else fallbackId,
+        keys = jsrKeyList(strategy?.get("keys")),
+        secondaryKeys = jsrKeyList(secondary?.get("keys")),
+        comment = name,
+        content = content ?: "",
+        // JSR strategy.type：constant / selective / vectorized
+        constant = strategyType == "constant",
+        selective = strategyType != "constant",
+        selectiveLogic = jsrLogicToStNumber((secondary?.get("logic") as? JsonPrimitive)?.contentOrNull),
+        position = jsrPositionTypeToStNumber((position?.get("type") as? JsonPrimitive)?.contentOrNull),
+        priority = (position?.get("order") as? JsonPrimitive)?.intOrNull ?: 100,
+        disable = !enabled,
+        depth = (position?.get("depth") as? JsonPrimitive)?.intOrNull ?: 4,
+        scanDepth = scanDepth,
+        role = ((position?.get("role") as? JsonPrimitive)?.contentOrNull ?: "system").lowercase(),
+        probability = (obj["probability"] as? JsonPrimitive)?.intOrNull ?: 100,
+        useProbability = true,
+    )
+}
+
+/** JSR `position.type` → [InjectionPosition]（必须是 [injectionPositionToStNumber] 的逆，保证回读一致）。 */
+private fun jsrPositionTypeToInjectionPosition(type: String?): InjectionPosition = when ((type ?: "").lowercase()) {
+    "before_character_definition" -> InjectionPosition.BEFORE_CHARACTER
+    "after_character_definition" -> InjectionPosition.AFTER_CHARACTER
+    "before_authors_note" -> InjectionPosition.BEFORE_AUTHOR_NOTE
+    "after_authors_note" -> InjectionPosition.AFTER_AUTHOR_NOTE
+    "at_depth" -> InjectionPosition.AT_DEPTH
+    "before_example_messages" -> InjectionPosition.EM_TOP
+    "after_example_messages" -> InjectionPosition.EM_BOTTOM
+    "outlet" -> InjectionPosition.OUTLET
+    else -> InjectionPosition.AFTER_CHARACTER
+}
+
+/** JSR `strategy.keys_secondary.logic` → [SelectiveLogic]。 */
+private fun jsrLogicToSelectiveLogic(logic: String?): SelectiveLogic = when ((logic ?: "").lowercase()) {
+    "not_all" -> SelectiveLogic.NOT_ALL
+    "not_any" -> SelectiveLogic.NOT_ANY
+    "and_all" -> SelectiveLogic.AND_ALL
+    else -> SelectiveLogic.AND_ANY
+}
+
+/** JSR `position.role` → [MessageRole]。 */
+private fun jsrRoleToMessageRole(role: String?): MessageRole = when ((role ?: "system").lowercase()) {
+    "user" -> MessageRole.USER
+    "assistant" -> MessageRole.ASSISTANT
+    else -> MessageRole.SYSTEM
+}
+
+/**
+ * [v243 BUGFIX A3b] JSR `WorldbookEntry` → [PromptInjection.RegexInjection]（宿主全局世界书库的条目形态）。
+ *
+ * 字段选择与 [jsrEntryToTavernBookEntry] 完全一致，保证「写进去 → getWorldbook 回读」无损
+ * （回读路径 = globalInjectionToTavernEntry → entryToStJson → JS toLorebookEntry）。
+ */
+private fun jsrEntryToRegexInjection(obj: JsonObject): PromptInjection.RegexInjection? {
+    val name = (obj["name"] as? JsonPrimitive)?.contentOrNull ?: ""
+    val content = (obj["content"] as? JsonPrimitive)?.contentOrNull
+    if (content == null && name.isEmpty()) return null
+
+    val strategy = obj["strategy"] as? JsonObject
+    val strategyType = ((strategy?.get("type") as? JsonPrimitive)?.contentOrNull ?: "selective").lowercase()
+    val secondary = strategy?.get("keys_secondary") as? JsonObject
+    val position = obj["position"] as? JsonObject
+    val rawScanDepth = strategy?.get("scan_depth")
+    val scanDepth = if (rawScanDepth is JsonPrimitive) rawScanDepth.intOrNull else null
+    val enabled = (obj["enabled"] as? JsonPrimitive)?.booleanOrNull ?: true
+
+    return PromptInjection.RegexInjection(
+        name = name,
+        enabled = enabled,
+        content = content ?: "",
+        priority = (position?.get("order") as? JsonPrimitive)?.intOrNull ?: 100,
+        position = jsrPositionTypeToInjectionPosition((position?.get("type") as? JsonPrimitive)?.contentOrNull),
+        injectDepth = (position?.get("depth") as? JsonPrimitive)?.intOrNull ?: 4,
+        role = jsrRoleToMessageRole((position?.get("role") as? JsonPrimitive)?.contentOrNull),
+        keywords = jsrKeyList(strategy?.get("keys")),
+        secondaryKeys = jsrKeyList(secondary?.get("keys")),
+        constantActive = strategyType == "constant",
+        selective = strategyType != "constant",
+        selectiveLogic = jsrLogicToSelectiveLogic((secondary?.get("logic") as? JsonPrimitive)?.contentOrNull),
+        scanDepth = scanDepth,
+        probability = (obj["probability"] as? JsonPrimitive)?.intOrNull ?: 100,
+        useProbability = true,
+    )
+}
+
+/**
+ * [v243 BUGFIX A3b] **全局世界书库**（[Settings.lorebooks]）条目 upsert。
+ *
+ * uid 契约：全局书的 uid 就是条目**下标**（见 [lorebookToStJson] / [applyLorebookDisablePatch]）。
+ * 因此这里的语义是：
+ * - `replaceAll` → 整本替换；
+ * - 带 `uid`（合法下标）→ 替换该下标；否则**追加**到末尾；
+ * - `delete` → 按下标删除（从大到小删，避免下标漂移）。
+ *
+ * @return 有实际变更的新书；无变更返回 null。
+ */
+fun applyLorebookUpsertPatch(book: Lorebook, payloadJson: String): Lorebook? {
+    val payload = parseLorebookUpsertPayload(payloadJson) ?: return null
+
+    val entries = if (payload.replaceAll) mutableListOf() else book.entries.toMutableList()
+    payload.upsert.forEach { obj ->
+        val converted = jsrEntryToRegexInjection(obj) ?: return@forEach
+        val uid = (obj["uid"] as? JsonPrimitive)?.intOrNull ?: -1
+        if (uid in entries.indices) {
+            // [v245 BUGFIX G1-KT] 更新既有条目：保留 JSR 投影读不到、也写不回的那批字段。
+            // [v245 BUGFIX G3] 再按 presence 覆盖 effect / recursion 里真的带了的键。
+            entries[uid] = converted.keepingUnmappedFrom(entries[uid]).withJsrEffectAndRecursion(obj)
+        } else {
+            entries.add(converted)
+        }
+    }
+    payload.delete
+        .filter { it in entries.indices }
+        .sortedDescending()
+        .forEach { entries.removeAt(it) }
+
+    if (entries == book.entries) return null
+    return book.copy(entries = entries)
+}
+
+/**
+ * [v243 BUGFIX A3] 卡内嵌世界书条目 upsert（新增/覆盖/删除）。
+ *
+ * - `replaceAll = true` → 整本替换（JSR `replaceLorebookEntries` / `replaceWorldbook`）；
+ * - 否则按 `uid` 合并：同 id 覆盖、新 id 追加；`delete` 里的 uid 删除。
+ *
+ * @return 有实际变更的新书；无变更返回 null。
+ */
+fun applyLorebookUpsertPatch(book: TavernEmbeddedBook, payloadJson: String): TavernEmbeddedBook? {
+    val payload = parseLorebookUpsertPayload(payloadJson) ?: return null
+
+    val map = LinkedHashMap<Int, TavernBookEntry>()
+    if (!payload.replaceAll) book.entries.forEach { map[it.id] = it }
+    var nextId = (map.keys.maxOrNull() ?: -1) + 1
+    payload.upsert.forEach { obj ->
+        val rawUid = (obj["uid"] as? JsonPrimitive)?.intOrNull ?: -1
+        val target = if (rawUid >= 0) rawUid else nextId++
+        // [v245 BUGFIX G1-KT] 更新既有条目：保留 JSR 投影读不到、也写不回的那批字段。
+        jsrEntryToTavernBookEntry(obj, target)?.let {
+            // [v245 BUGFIX G3] 先保未映射字段，再按 presence 覆盖 effect / recursion 里**真的带了**的键。
+            map[target] = it.keepingUnmappedFrom(map[target]).withJsrEffectAndRecursion(obj)
+        }
+    }
+    payload.delete.forEach { map.remove(it) }
+
+    val result = map.values.toList()
+    if (result == book.entries) return null
+    return book.copy(entries = result)
+}
+
+/**
+ * [v245 BUGFIX G1-KT] 保留「JSR 投影读不到、也写不回」的那批字段。
+ *
+ * 背景：`lorebook-shims.js` 的 `getWorldbook` 是**有损投影**——`toLorebookEntry` 只产出
+ * name / content / enabled / strategy / position / probability / recursion / effect 这几个键。
+ * 卡走 `updateWorldbookWith` 时会把读到的条目原样回传，宿主侧若**整条目替换**，
+ * 下面这批字段就会被静默打回默认值（对 357 条的大卡是数据损毁级）：
+ *   group / caseSensitive / matchWholeWords / useRegex / sticky / cooldown / groupWeight /
+ *   groupOverride / delay / excludeRecursion / preventRecursion / delayUntilRecursion /
+ *   inclusionGroup / useGroupScoring / groupPriority / automationId / displayIndex /
+ *   displayPosition / triggers / extensionsRaw / match* / ignoreBudget / outletName
+ *
+ * 修法：更新既有条目时**以上字段沿用旧值**，只覆盖 `jsrEntryToTavernBookEntry` 真正映射的那批。
+ * 已知局限（保守取向，宁可少写不可错写）：卡若通过 `updateWorldbookWith` 修改
+ * `effect.sticky` / `recursion.*` 这类「投影能读、但本次不覆盖」的字段，改动不会落盘，
+ * 但旧值不会被破坏。要放开需先把这批字段纳入映射并做「presence 感知」解析。
+ */
+internal fun TavernBookEntry.keepingUnmappedFrom(old: TavernBookEntry?): TavernBookEntry {
+    if (old == null) return this
+    return copy(
+        group = old.group,
+        caseSensitive = old.caseSensitive,
+        matchWholeWords = old.matchWholeWords,
+        useRegex = old.useRegex,
+        sticky = old.sticky,
+        cooldown = old.cooldown,
+        groupWeight = old.groupWeight,
+        groupOverride = old.groupOverride,
+        delay = old.delay,
+        excludeRecursion = old.excludeRecursion,
+        preventRecursion = old.preventRecursion,
+        delayUntilRecursion = old.delayUntilRecursion,
+        inclusionGroup = old.inclusionGroup,
+        useGroupScoring = old.useGroupScoring,
+        groupPriority = old.groupPriority,
+        automationId = old.automationId,
+        displayIndex = old.displayIndex,
+        displayPosition = old.displayPosition,
+        triggers = old.triggers,
+        extensionsRaw = old.extensionsRaw,
+        matchPersonaDescription = old.matchPersonaDescription,
+        matchCharacterDescription = old.matchCharacterDescription,
+        matchCharacterPersonality = old.matchCharacterPersonality,
+        matchCharacterDepthPrompt = old.matchCharacterDepthPrompt,
+        matchScenario = old.matchScenario,
+        matchCreatorNotes = old.matchCreatorNotes,
+        ignoreBudget = old.ignoreBudget,
+        outletName = old.outletName,
+    )
+}
+
+/**
+ * [v245 BUGFIX G3] JSR `effect` / `recursion` 的 **presence 感知**写回（[TavernBookEntry]）。
+ *
+ * 为什么要单独一步：`lorebook-shims.js:toLorebookEntry` **会读**这两个对象
+ *   effect   → sticky / cooldown / delay
+ *   recursion→ excludeRecursion(prev_incoming) / preventRecursion(prev_outgoing) / delayUntilRecursion(delay_until)
+ * 但 `jsrEntryToTavernBookEntry` **不写**它们 ⇒ 卡通过 `updateWorldbookWith` 改这几个字段会静默丢失。
+ *
+ * 为什么必须 presence 感知而不是无条件覆盖：卡也常手工构造**局部**条目
+ * （例如只给 `{uid, content}`），无条件覆盖会把没提到的子键打成默认值（= 数据损毁）。
+ * 所以规则是：**只有 JSON 里真的出现的子键才覆盖**，其余沿用（此时已由
+ * [keepingUnmappedFrom] 保留成旧值）。
+ *
+ * 上游语义出处：JSR `WorldbookEntry` 的 `effect` / `recursion`（JS-Slash-Runner worldbook 类型），
+ * 与 ST 扁平条目的 extensions.sticky / cooldown / delay / exclude_recursion / prevent_recursion /
+ * delay_until_recursion 一一对应。
+ */
+internal fun TavernBookEntry.withJsrEffectAndRecursion(obj: kotlinx.serialization.json.JsonObject): TavernBookEntry {
+    var out = this
+    (obj["effect"] as? kotlinx.serialization.json.JsonObject)?.let { eff ->
+        out = out.copy(
+            sticky = (eff["sticky"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.sticky,
+            cooldown = (eff["cooldown"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.cooldown,
+            delay = (eff["delay"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.delay,
+        )
+    }
+    (obj["recursion"] as? kotlinx.serialization.json.JsonObject)?.let { rec ->
+        out = out.copy(
+            excludeRecursion = (rec["prevent_incoming"] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: out.excludeRecursion,
+            preventRecursion = (rec["prevent_outgoing"] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: out.preventRecursion,
+            delayUntilRecursion = (rec["delay_until"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.delayUntilRecursion,
+        )
+    }
+    return out
+}
+
+/** [v245 BUGFIX G3] 同 [TavernBookEntry.withJsrEffectAndRecursion]（全局世界书库条目）。 */
+internal fun PromptInjection.RegexInjection.withJsrEffectAndRecursion(obj: kotlinx.serialization.json.JsonObject): PromptInjection.RegexInjection {
+    var out = this
+    (obj["effect"] as? kotlinx.serialization.json.JsonObject)?.let { eff ->
+        out = out.copy(
+            sticky = (eff["sticky"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.sticky,
+            cooldown = (eff["cooldown"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.cooldown,
+            delay = (eff["delay"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.delay,
+        )
+    }
+    (obj["recursion"] as? kotlinx.serialization.json.JsonObject)?.let { rec ->
+        out = out.copy(
+            excludeRecursion = (rec["prevent_incoming"] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: out.excludeRecursion,
+            preventRecursion = (rec["prevent_outgoing"] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: out.preventRecursion,
+            delayUntilRecursion = (rec["delay_until"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: out.delayUntilRecursion,
+        )
+    }
+    return out
+}
+
+/**
+ * [v245 BUGFIX G1-KT] 同 [TavernBookEntry.keepingUnmappedFrom]（全局世界书库条目）。
+ *
+ * 额外保留 `id`：`jsrEntryToRegexInjection` 不解析 uid，默认走 `Uuid.random()`，
+ * 整条目替换会让同一个条目每次都换主键（引用它的地方会错位）。
+ */
+internal fun PromptInjection.RegexInjection.keepingUnmappedFrom(
+    old: PromptInjection.RegexInjection?,
+): PromptInjection.RegexInjection {
+    if (old == null) return this
+    return copy(
+        id = old.id,
+        useRegex = old.useRegex,
+        caseSensitive = old.caseSensitive,
+        matchWholeWords = old.matchWholeWords,
+        group = old.group,
+        groupWeight = old.groupWeight,
+        groupOverride = old.groupOverride,
+        sticky = old.sticky,
+        cooldown = old.cooldown,
+        delay = old.delay,
+        excludeRecursion = old.excludeRecursion,
+        preventRecursion = old.preventRecursion,
+        delayUntilRecursion = old.delayUntilRecursion,
+        inclusionGroup = old.inclusionGroup,
+        useGroupScoring = old.useGroupScoring,
+        groupPriority = old.groupPriority,
+        automationId = old.automationId,
+        displayIndex = old.displayIndex,
+        displayPosition = old.displayPosition,
+        triggers = old.triggers,
+        outletName = old.outletName,
+        matchPersonaDescription = old.matchPersonaDescription,
+        matchCharacterDescription = old.matchCharacterDescription,
+        matchCharacterPersonality = old.matchCharacterPersonality,
+        matchCharacterDepthPrompt = old.matchCharacterDepthPrompt,
+        matchScenario = old.matchScenario,
+        matchCreatorNotes = old.matchCreatorNotes,
+        ignoreBudget = old.ignoreBudget,
+    )
 }
 
 /** [TavernBookEntry] → ST 扁平条目的字段名（与 JSR lorebook-shims `toLorebookEntry` 读取的字段对齐）。 */
@@ -836,4 +1258,47 @@ fun buildCharacterJson(assistant: Assistant?): String {
         put("spec_version", tav.specVersion)
         put("data", data)
     }.toString()
+}
+
+
+/**
+ * 将 JSR `createOrReplaceWorldbook(name, entries)` / `createWorldbook(name, entries)` 传入的条目数组 JSON
+ * 转换为宿主 [Lorebook]。若传入 `existing` 则保留其 id 与 enabled 状态。
+ */
+fun buildLorebookFromJsrEntries(
+    name: String,
+    entriesJson: String,
+    existing: Lorebook? = null,
+): Lorebook {
+    val parsedEntries: List<PromptInjection.RegexInjection> = runCatching {
+        if (entriesJson.isBlank()) {
+            emptyList()
+        } else {
+            when (val el = Json.parseToJsonElement(entriesJson)) {
+                is JsonArray -> el.mapNotNull { (it as? JsonObject)?.let(::jsrEntryToRegexInjection) }
+                is JsonObject -> {
+                    val arr = (el["upsert"] as? JsonArray) ?: (el["entries"] as? JsonArray)
+                    arr?.mapNotNull { (it as? JsonObject)?.let(::jsrEntryToRegexInjection) }.orEmpty()
+                }
+                else -> emptyList()
+            }
+        }
+    }.getOrDefault(emptyList())
+    return existing?.copy(name = name.trim(), entries = parsedEntries)
+        ?: Lorebook(
+            name = name.trim(),
+            enabled = true,
+            entries = parsedEntries,
+        )
+}
+
+/** 更新角色卡 `extensionsRaw` JSON 中的 `world` 字段（绑定主世界书名）。 */
+fun updateWorldNameInExtensionsRaw(extensionsRaw: String?, worldName: String?): String {
+    val map = parseExtensionsObject(extensionsRaw).toMutableMap()
+    if (worldName.isNullOrBlank()) {
+        map.remove("world")
+    } else {
+        map["world"] = JsonPrimitive(worldName.trim())
+    }
+    return JsonObject(map).toString()
 }

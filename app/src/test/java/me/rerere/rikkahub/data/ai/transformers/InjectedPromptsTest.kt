@@ -175,6 +175,47 @@ class InjectedPromptsTest {
         assertTrue(InjectedPromptStore.snapshot("c1").isEmpty())
     }
 
+
+    @Test
+    fun `dynamic filter excludes false prompts and includes true prompts after update`() {
+        InjectedPromptStore.inject(
+            "c1",
+            listOf(
+                InjectedPromptStore.InjectedPrompt(
+                    id = "f_pass",
+                    position = "in_chat",
+                    depth = 0,
+                    role = "system",
+                    content = "PASS_CONTENT",
+                    shouldScan = false,
+                    once = false,
+                    hasFilter = true,
+                    filterPassed = true,
+                ),
+                InjectedPromptStore.InjectedPrompt(
+                    id = "f_block",
+                    position = "in_chat",
+                    depth = 0,
+                    role = "system",
+                    content = "BLOCK_CONTENT",
+                    shouldScan = false,
+                    once = false,
+                    hasFilter = true,
+                    filterPassed = false,
+                ),
+            ),
+        )
+        val firstOut = InjectedPromptsTransformer.applyInjectedPrompts("c1", listOf(UIMessage.user("hi")))
+        assertEquals(2, firstOut.size)
+        assertTrue(textOf(firstOut.last()).contains("PASS_CONTENT"))
+
+        // 动态更新 filter 结果：f_pass -> false, f_block -> true
+        InjectedPromptStore.updateFilterResults("c1", mapOf("f_pass" to false, "f_block" to true))
+        val secondOut = InjectedPromptsTransformer.applyInjectedPrompts("c1", listOf(UIMessage.user("hi")))
+        assertEquals(2, secondOut.size)
+        assertTrue(textOf(secondOut.last()).contains("BLOCK_CONTENT"))
+    }
+
     private fun prompt(
         id: String,
         position: String = "in_chat",

@@ -273,6 +273,14 @@ fun ChatInput(
         val text = state.textContent.text.toString().trimStart()
         if (text.startsWith("/")) {
             val cmd = matchSlashCommand(text, slashCommands)
+            if (shouldRouteToStSlashExecutor(text, cmd) && onSlashScript != null) {
+                state.clearInput()
+                val result = onSlashScript(text)
+                if (!result.isNullOrBlank()) {
+                    toaster.show(result)
+                }
+                return
+            }
             if (cmd != null) {
                 val args = text.substringAfter(" ", "").trim()
                 if (cmd.builtinKind != null) {
@@ -1042,7 +1050,13 @@ private fun TextInputRow(
                 .testTag("chat_input")
                 .contentReceiver(receiveContentListener)
                 .onFocusChanged {
-                    isFocused = it.isFocused
+                    if (isFocused != it.isFocused) {
+                        isFocused = it.isFocused
+                        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+                            "debug",
+                            "[input] focus changed: enabled=true focused=${it.isFocused} hasFocus=${it.hasFocus}",
+                        )
+                    }
                 },
             shape = MaterialTheme.shapes.largeIncreased,
             placeholder = {
@@ -1551,7 +1565,8 @@ private fun handleBuiltinSlash(
         BuiltinSlashKind.CHECKPOINT_PARENT,
         BuiltinSlashKind.CHECKPOINT_GET,
         BuiltinSlashKind.CHECKPOINT_LIST,
-        BuiltinSlashKind.BRANCH_CREATE -> {
+        BuiltinSlashKind.BRANCH_CREATE,
+        BuiltinSlashKind.STSCRIPT -> {
             if (onSlashScript == null) {
                 toaster.show(context.getString(R.string.slash_toast_not_supported))
             } else {

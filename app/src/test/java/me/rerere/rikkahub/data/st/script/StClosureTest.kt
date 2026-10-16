@@ -79,7 +79,10 @@ class StClosureTest {
         val closure = StClosureSyntax.parse("{: name=rikka age=\"18 years\" /echo {{arg::name}} :}")
         assertTrue(closure != null)
         assertEquals(
-            listOf(StClosureArg("name", "rikka"), StClosureArg("age", "18 years")),
+            listOf(
+                StClosureArg(name = "name", value = "rikka"),
+                StClosureArg(name = "age", value = "18 years"),
+            ),
             closure!!.argumentList,
         )
         assertEquals("/echo {{arg::name}}", closure.body)
@@ -301,5 +304,16 @@ class StClosureTest {
         val host = FakeHost()
         // {{pipe}} 在命令执行时被替换成上一条命令的输出（官方管道语义）
         assertEquals("A", StSlashExecutor.execute("/pass a | /switch {{pipe}} a={: /echo A :}", host))
+    }
+
+    @Test
+    fun `alt delimiter and nested mixed closures and negative cases`() {
+        val host = FakeHost()
+        assertTrue(StClosureSyntax.isClosureLiteral("{| /echo ok |}"))
+        assertFalse(StClosureSyntax.isClosureLiteral("{| /echo unclosed"))
+        assertFalse(StClosureSyntax.isClosureLiteral("{: /echo mismatched |}"))
+        assertFalse(StClosureSyntax.isClosureLiteral("{| /echo mismatched :}"))
+        assertEquals("ok", StSlashExecutor.execute("/run {: /if (1 == 1) {| /echo ok |} :}", host))
+        assertEquals("a-", StSlashExecutor.execute("/times 3 {| /echo a-{{pipe}} |}", host))
     }
 }

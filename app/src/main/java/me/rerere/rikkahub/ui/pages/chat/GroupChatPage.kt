@@ -93,12 +93,46 @@ private fun getSpeakerHistory(
     return result
 }
 
+private val GROUP_CHAR_MACRO_REGEX = Regex("\\{\\{\\s*char\\s*\\}\\}", RegexOption.IGNORE_CASE)
+
+/**
+ * 选取群聊成员开场白候选池（对齐官方 SillyTavern group-chats.js）：
+ * 若角色卡配置了非空的 `groupOnlyGreetings`，优先从中选取；否则从 `firstMessage` + `alternateGreetings` 中选取。
+ */
+internal fun selectGroupGreetingPool(tav: TavernCharacterData): List<String> {
+    val groupOnly = tav.groupOnlyGreetings.filter { it.isNotBlank() }
+    if (groupOnly.isNotEmpty()) return groupOnly
+    return listOfNotNull(tav.firstMessage.takeIf { it.isNotBlank() }) +
+        tav.alternateGreetings.filter { it.isNotBlank() }
+}
+
+/**
+ * 准备群聊生成的 `(history, prompt)`：
+ * - 当最后一条历史消息是 `USER`（本轮首个发言角色）时，拆出最后一条作为 `prompt`；
+ * - 当最后一条历史消息已是本轮前序群成员的 `ASSISTANT` 回复（或系统消息）时，
+ *   保持真实历史顺序不变（绝不抽走中间的用户消息放到末尾造成时序倒置，也不把上一条 `ASSISTANT` 回复误作 `USER` prompt），
+ *   并将 `prompt` 置空由 `generateForAssistant` 原序发送 `history`。
+ */
+internal fun prepareGroupGenerationHistoryAndPrompt(
+    history: List<UIMessage>,
+    fallbackUserText: String = "",
+): Pair<List<UIMessage>, String> {
+    if (history.isEmpty()) return emptyList<UIMessage>() to fallbackUserText
+    val lastMsg = history.last()
+    return if (lastMsg.role == MessageRole.USER) {
+        history.dropLast(1) to lastMsg.toText().ifBlank { fallbackUserText }
+    } else {
+        history to ""
+    }
+}
+
 /**
  * 按生成模式构造本次生成使用的助手（对齐酒馆）：
  * SWAP = 只用当前发言成员自己的角色卡；
- * APPEND / APPEND_DISABLED = 合并全体成员角色卡（禁言成员仅 APPEND_DISABLED 时包含）。
+ * APPEND / APPEND_DISABLED = 合并全体成员角色卡（禁言成员仅 APPEND_DISABLED 时包含），
+ * 且在拼接前先将每个成员字段中的 `{{char}}` 替换为该成员自己的名字，防止被后续统一替换成当前发言者名字。
  */
-private fun buildGenerationSpeaker(
+internal fun buildGenerationSpeaker(
     gc: GroupChat,
     members: List<Assistant>,
     speaker: Assistant,
@@ -111,9 +145,11 @@ private fun buildGenerationSpeaker(
     if (pool.size <= 1) return base
 
     fun join(getter: (TavernCharacterData) -> String): String =
-        pool.mapNotNull { m -> m.tavernData?.let(getter) }
-            .filter { it.isNotBlank() }
-            .joinToString("\n")
+        pool.mapNotNull { m ->
+            val raw = m.tavernData?.let(getter)?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val memberName = m.tavernData?.nickname?.takeIf { it.isNotBlank() } ?: m.name
+            GROUP_CHAR_MACRO_REGEX.replace(raw, memberName)
+        }.joinToString("\n")
 
     return base.copy(
         tavernData = tav.copy(
@@ -126,7 +162,7 @@ private fun buildGenerationSpeaker(
 }
 
 /**
- * 群聊内重新生成某条消息：按该消息的发言人重新生成（避免串成第一个成员）
+ * 群聊内重新生成某条消息：按该消息的发言人重新生成，并正确区分前序消息是 USER 还是 ASSISTANT。
  */
 private suspend fun regenerateGroupMessage(
     convId: Uuid,
@@ -149,13 +185,12 @@ private suspend fun regenerateGroupMessage(
         )
     }
 
-    // 2. 用该发言人重新生成（历史 = 截断后的消息，prompt = 最后一条）
+    // 2. 用该发言人重新生成（正确区分最后一条是 USER 还是 ASSISTANT 接力，绝不把 ASSISTANT 消息当成 USER prompt）
     val effectiveSpeaker = buildGenerationSpeaker(gc, members, speaker)
     val conv = chatService.getConversationFlow(convId).value
     val history = buildHistoryWithNames(conv.messageNodes, conv.speakerMap, members)
     if (history.isEmpty()) return
-    val prompt = history.last().toText()
-    val historyWithoutLast = history.dropLast(1)
+    val (historyWithoutLast, prompt) = prepareGroupGenerationHistoryAndPrompt(history)
 
     val placeholderNode = UIMessage.assistant("").toMessageNode()
     chatService.updateConversationState(convId) { c ->
@@ -297,8 +332,7 @@ fun GroupChatPage(groupId: String) {
             // 对齐酒馆：新群聊先加入每个成员的开场白（first_mes 或随机备选开场白）
             val greetingPairs = members.mapNotNull { m ->
                 val tav = m.tavernData ?: return@mapNotNull null
-                val texts = listOfNotNull(tav.firstMessage.takeIf { it.isNotBlank() }) +
-                    tav.alternateGreetings.filter { it.isNotBlank() }
+                val texts = selectGroupGreetingPool(tav)
                 val chosen = texts.randomOrNull() ?: return@mapNotNull null
                 val node = UIMessage.assistant(chosen).toMessageNode()
                 node to m.id
@@ -600,19 +634,17 @@ fun GroupChatPage(groupId: String) {
                                             val currentConv = chatService.getConversationFlow(currentConvId).value
                                             val historyNodes = currentConv.messageNodes.dropLast(1) // 去掉占位
 
-                                            // 构建带角色名前缀的历史
+                                            // 构建带角色名前缀的历史：
+                                            // 第 1 个发言人时 history 末尾为本轮用户消息（拆出作为 prompt）；
+                                            // 第 2+ 个发言人时 history 末尾已是前序角色回复，保持真实顺序不抽走中间的用户消息
                                             val history = buildHistoryWithNames(historyNodes, currentConv.speakerMap, members)
-                                            // 去掉最后一条用户消息（prompt里已经有了），保留其他上下文
-                                            val lastUserIdx = history.indexOfLast { it.role == MessageRole.USER }
-                                            val historyWithoutLastUser = if (lastUserIdx >= 0) {
-                                                history.filterIndexed { idx, _ -> idx != lastUserIdx }
-                                            } else history
+                                            val (historyWithoutLastUser, effectivePrompt) = prepareGroupGenerationHistoryAndPrompt(history, text)
 
                                             try {
                                                 val response = chatService.generateForAssistant(
                                                     assistant = effectiveSpeaker,
                                                     settings = settings,
-                                                    prompt = text,
+                                                    prompt = effectivePrompt,
                                                     history = historyWithoutLastUser,
                                                     conversationId = currentConvId,
                                                     onChunk = { partialText, parts ->
@@ -772,6 +804,7 @@ fun GroupChatPage(groupId: String) {
                     model = null,
                     loading = (isGenerating || queueStatus.contains("正在")) && index >= messageNodes.lastIndex - 2,
                     lastMessage = index == messageNodes.lastIndex,
+                    messageDepth = (messageNodes.lastIndex - index).coerceAtLeast(0),
                     onRegenerate = {
                         val target = node.messages[node.selectIndex]
                         val sid = speakerMap[node.id]

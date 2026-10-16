@@ -25,6 +25,8 @@ import * as shimInject from './shims/inject-shims.js';
 import * as ejsRender from './shims/ejs-render.js';
 import * as mathRender from './shims/math-render.js';
 import { deepClone } from './shims/clone-util.js';
+// [v243 BUGFIX C3] SillyTavern public/script.js 的原生导出面（裸全局挂载用）
+import * as stCompatScript from './st-compat/script.js';
 import { normalizeStCharacter } from './character-shape.js';
 // [v214] ST ctx.powerUserSettings（recon §2.9：ST-PT persona 域）——零依赖模块，直接复用 st-compat 导出。
 import { power_user as stCompatPowerUser } from './st-compat/power-user.js';
@@ -255,13 +257,27 @@ const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 // 聊天内容指纹（diff 出被 JS 侧修改过的楼层；JSR setChatMessages / MVU saveChat 写路径）
 let chatFingerprintParts = [];
+let lastPullChatAt = 0;
 
-function pullChat() {
-    let raw = null;
-    try { raw = callBridge('getChatJson'); } catch (_e) { /* noop */ }
-    let chat = [];
-    try { chat = raw ? JSON.parse(raw) : []; } catch (_e) { chat = []; }
-    if (!Array.isArray(chat)) chat = [];
+function invalidateChatCache() {
+    lastPullChatAt = 0;
+}
+
+function pullChat(force) {
+    const now = Date.now();
+    // [P0-2 内存风暴修复] 面板 varsWait 每 400ms 调一次 readMvuVars() -> pullChat()。
+    // 若距离上次全量拉取不足 1500ms 且非强制刷新，跳过 218KB 全量消息文本序列化（getChatJson），
+    // 仅拉取轻量级的 getMessageVariablesJson 原地更新变量，既保证变量 0 延迟可见，又消除 V8 堆内存风暴。
+    let chat = null;
+    if (!force && Array.isArray(state.chat) && state.chat.length > 0 && (now - lastPullChatAt) < 1500) {
+        chat = state.chat;
+    } else {
+        let raw = null;
+        try { raw = callBridge('getChatJson'); } catch (_e) { /* noop */ }
+        try { chat = raw ? JSON.parse(raw) : []; } catch (_e) { chat = []; }
+        if (!Array.isArray(chat)) chat = [];
+        lastPullChatAt = now;
+    }
 
     let mv = null;
     try { mv = JSON.parse(callBridge('getMessageVariablesJson') || '[]'); } catch (_e) { mv = null; }
@@ -298,9 +314,14 @@ function pullSettings() {
     let obj = null;
     try { obj = JSON.parse(callBridge('getSettingsJson') || '{}'); } catch (_e) { obj = null; }
     if (!obj || typeof obj !== 'object') obj = {};
-    if (!obj.variables || typeof obj.variables !== 'object') obj.variables = {};
-    if (!obj.variables.global || typeof obj.variables.global !== 'object') obj.variables.global = {};
+    if (!obj.variables || typeof obj.variables !== 'object' || Array.isArray(obj.variables)) obj.variables = {};
+    if (!obj.variables.global || typeof obj.variables.global !== 'object' || Array.isArray(obj.variables.global)) obj.variables.global = {};
     state.extensionSettings = obj;
+    if (!state.thirdPartySettings || typeof state.thirdPartySettings !== 'object' || Array.isArray(state.thirdPartySettings)) {
+        state.thirdPartySettings = {};
+    }
+    // 绑定 state.thirdPartySettings.variables 与 state.extensionSettings.variables 为同一引用，消除全局变量双轨分裂
+    state.thirdPartySettings.variables = state.extensionSettings.variables;
 }
 
 // 第三方扩展设置（extension_settings 语义：按扩展名分键）。补充 ST 内置键的安全默认，
@@ -308,21 +329,30 @@ function pullSettings() {
 let thirdPartySettingsDirty = false;
 
 /**
- * [v215] ST 契约形状保证：`extension_settings.variables.global` 必须存在。
- * 真机取证：ST-Prompt-Template `src/function/variables.ts:54` 直接读
- * `extension_settings.variables.global`（不做空值保护）—— 我们的
- * `ctx.extensionSettings` 默认 `{}` 时就是 `TypeError: Cannot read properties of undefined (reading 'global')`
- * （真机日志 18:30/19:27 成片出现，栈顶 = ST-PT dist/index.js）。
- * 同时这也是 JSR `type:'global'` 变量的存储位置（variable-shims.js:49-51）。
+ * [v215] ST 契约形状保证：`extension_settings.variables.global` 必须存在，
+ * 且 `state.thirdPartySettings.variables` 与 `state.extensionSettings.variables` 始终指向同一容器对象。
  */
 function ensureStStateShapes() {
     try {
+        if (!state.extensionSettings || typeof state.extensionSettings !== 'object' || Array.isArray(state.extensionSettings)) {
+            state.extensionSettings = { variables: { global: {} } };
+        }
+        if (!state.extensionSettings.variables || typeof state.extensionSettings.variables !== 'object' || Array.isArray(state.extensionSettings.variables)) {
+            state.extensionSettings.variables = { global: {} };
+        }
+        if (!state.extensionSettings.variables.global || typeof state.extensionSettings.variables.global !== 'object' || Array.isArray(state.extensionSettings.variables.global)) {
+            state.extensionSettings.variables.global = {};
+        }
         if (!state.thirdPartySettings || typeof state.thirdPartySettings !== 'object' || Array.isArray(state.thirdPartySettings)) {
             state.thirdPartySettings = {};
         }
         const es = state.thirdPartySettings;
-        if (!es.variables || typeof es.variables !== 'object' || Array.isArray(es.variables)) es.variables = { global: {} };
-        if (!es.variables.global || typeof es.variables.global !== 'object' || Array.isArray(es.variables.global)) es.variables.global = {};
+        if (es.variables && es.variables !== state.extensionSettings.variables && typeof es.variables === 'object' && !Array.isArray(es.variables)) {
+            if (es.variables.global && typeof es.variables.global === 'object' && !Array.isArray(es.variables.global)) {
+                state.extensionSettings.variables.global = es.variables.global;
+            }
+        }
+        es.variables = state.extensionSettings.variables;
         if (!state.chatMetadata || typeof state.chatMetadata !== 'object' || Array.isArray(state.chatMetadata)) state.chatMetadata = { variables: {} };
         if (!state.chatMetadata.variables || typeof state.chatMetadata.variables !== 'object' || Array.isArray(state.chatMetadata.variables)) {
             state.chatMetadata.variables = {};
@@ -339,10 +369,12 @@ function pullThirdPartySettings(force) {
     if (!Array.isArray(obj.regex)) obj.regex = [];
     if (!Array.isArray(obj.regex_presets)) obj.regex_presets = [];
     if (!Array.isArray(obj.character_allowed_regex)) obj.character_allowed_regex = [];
-    if (!obj.preset_allowed_regex || typeof obj.preset_allowed_regex !== 'object' || Array.isArray(obj.preset_allowed_regex)) obj.preset_allowed_regex = {}
-    // [v215] 世界书之外的 ST 契约形状：全局变量存放在 extension_settings.variables.global
-    if (!obj.variables || typeof obj.variables !== 'object' || Array.isArray(obj.variables)) obj.variables = { global: {} }
-    if (!obj.variables.global || typeof obj.variables.global !== 'object' || Array.isArray(obj.variables.global)) obj.variables.global = {};
+    if (!obj.preset_allowed_regex || typeof obj.preset_allowed_regex !== 'object' || Array.isArray(obj.preset_allowed_regex)) obj.preset_allowed_regex = {};
+    ensureStStateShapes();
+    if (obj.variables && obj.variables.global && typeof obj.variables.global === 'object' && !Array.isArray(obj.variables.global)) {
+        Object.assign(state.extensionSettings.variables.global, obj.variables.global);
+    }
+    obj.variables = state.extensionSettings.variables;
     if (!obj.note || typeof obj.note !== 'object' || Array.isArray(obj.note)) {
         obj.note = {
             default: '',
@@ -395,8 +427,47 @@ function pullCharacter() {
     } catch (_e) { /* noop */ }
 }
 
+function syncMessageVariablesOnly() {
+    try {
+        const mvRaw = callBridge('getMessageVariablesJson', '') || '[]';
+        const mv = JSON.parse(mvRaw);
+        if (!Array.isArray(mv)) return;
+        if (!Array.isArray(state.chat) || state.chat.length === 0) {
+            state.chat = mv.map((vs, idx) => ({
+                name: idx === 0 ? state.name2 : 'Message',
+                is_user: false,
+                is_system: false,
+                mes: '',
+                swipe_id: 0,
+                swipes: [''],
+                variables: (Array.isArray(vs) && vs.length > 0) ? vs : [{}],
+                __lightweightPlaceholder: true,
+            }));
+        } else {
+            mv.forEach((vs, i) => {
+                if (state.chat[i] && typeof state.chat[i] === 'object') {
+                    state.chat[i].variables = (Array.isArray(vs) && vs.length > 0) ? vs : [{}];
+                }
+            });
+        }
+    } catch (_e) { /* noop */ }
+}
+
+function refreshForPanelMode() {
+    pullMetadata();
+    pullSettings();
+    pullThirdPartySettings(false);
+    pullCharacter();
+    const cid = callBridge('getActiveConversationId');
+    if (typeof cid === 'string') state.chatId = cid;
+    syncMessageVariablesOnly();
+    ensureStStateShapes();
+    try { window.dispatchEvent(new Event('rikka-st-refresh')); } catch (_e) { /* noop */ }
+}
+
 function refreshAll() {
-    pullChat();
+    invalidateChatCache();
+    pullChat(true);
     pullMetadata();
     pullSettings();
     pullThirdPartySettings(false);
@@ -424,8 +495,15 @@ function pushChatVars() {
 }
 
 function pushGlobalVars() {
-    try { callBridge('replaceGlobalVariables', JSON.stringify((state.extensionSettings.variables || {}).global || {})); }
-    catch (e) { safeWarn('pushGlobalVars failed', e); }
+    try {
+        ensureStStateShapes();
+        const globalObj = (state.thirdPartySettings && state.thirdPartySettings.variables && state.thirdPartySettings.variables.global)
+            || (state.extensionSettings && state.extensionSettings.variables && state.extensionSettings.variables.global)
+            || {};
+        state.extensionSettings.variables.global = globalObj;
+        state.thirdPartySettings.variables = state.extensionSettings.variables;
+        callBridge('replaceGlobalVariables', JSON.stringify(globalObj));
+    } catch (e) { safeWarn('pushGlobalVars failed', e); }
 }
 
 function pushThirdPartySettingsNow() {
@@ -498,11 +576,84 @@ const POPUP_RESULT = {
     CUSTOM6: 1006, CUSTOM7: 1007, CUSTOM8: 1008, CUSTOM9: 1009,
 };
 
+const stFunctionToolRegistry = new Map();
+let stFunctionToolSyncTimer = null;
+function syncJsFunctionToolsToHost() {
+    if (window.__RIKKA_PANEL_MODE__ || window.__RIKKA_EXT_SETTINGS_MODE__) return;
+    if (stFunctionToolSyncTimer) clearTimeout(stFunctionToolSyncTimer);
+    stFunctionToolSyncTimer = setTimeout(() => {
+        stFunctionToolSyncTimer = null;
+        try {
+            const list = [];
+            stFunctionToolRegistry.forEach((def, name) => {
+                try {
+                    if (typeof def.shouldRegister === 'function' && !def.shouldRegister()) return;
+                } catch (_e) { /* ignore shouldRegister error */ }
+                list.push({
+                    name: String(name),
+                    displayName: String(def.displayName || name),
+                    description: String(def.description || ''),
+                    parameters: (def.parameters && typeof def.parameters === 'object') ? def.parameters : {},
+                    stealth: !!def.stealth,
+                });
+            });
+            callBridge('emitEvent', 'js_function_tools_updated', JSON.stringify(list));
+        } catch (_e) { /* noop */ }
+    }, 20);
+}
+
+function registerStFunctionTool(toolDef) {
+    if (!toolDef || typeof toolDef !== 'object') return false;
+    const name = String(toolDef.name || '').trim();
+    if (!name || typeof toolDef.action !== 'function') return false;
+    stFunctionToolRegistry.set(name, toolDef);
+    syncJsFunctionToolsToHost();
+    return true;
+}
+
+function unregisterStFunctionTool(name) {
+    const key = String(name || '').trim();
+    if (!key) return false;
+    const existed = stFunctionToolRegistry.delete(key);
+    syncJsFunctionToolsToHost();
+    return existed;
+}
+
+window.__rikkaInvokeJsFunctionTool = async (name, argsJson, seq) => {
+    const finish = (payload) => {
+        try {
+            if (window.RikkaBridge && typeof window.RikkaBridge.onFunctionToolResult === 'function') {
+                window.RikkaBridge.onFunctionToolResult(seq, JSON.stringify(payload));
+            }
+        } catch (_e) { /* noop */ }
+    };
+    try {
+        const key = String(name || '').trim();
+        let entry = stFunctionToolRegistry.get(key);
+        if (!entry) {
+            for (const [k, v] of stFunctionToolRegistry.entries()) {
+                if (k.toLowerCase() === key.toLowerCase()) { entry = v; break; }
+            }
+        }
+        if (!entry || typeof entry.action !== 'function') {
+            finish({ ok: false, error: `Tool not registered: ${key}` });
+            return;
+        }
+        let parsedArgs = {};
+        try { parsedArgs = argsJson ? JSON.parse(argsJson) : {}; } catch (_e) { parsedArgs = {}; }
+        const rawOut = await Promise.resolve(entry.action(parsedArgs));
+        const valueStr = (typeof rawOut === 'string') ? rawOut : JSON.stringify(rawOut ?? '');
+        finish({ ok: true, value: valueStr });
+    } catch (err) {
+        finish({ ok: false, error: String((err && err.message) || err) });
+    }
+};
+
 const toolManagerStub = {
-    isToolCallingSupported: () => false,
-    canPerformToolCalls: () => false,
-    registerFunctionTool: () => {},
-    unregisterFunctionTool: () => {},
+    isToolCallingSupported: () => true,
+    canPerformToolCalls: () => true,
+    registerFunctionTool: registerStFunctionTool,
+    unregisterFunctionTool: unregisterStFunctionTool,
 };
 
 const chatCompletionSettingsStub = {
@@ -525,43 +676,123 @@ async function callGenericPopupStub(content, type, defaultResult /*, options */)
 // st-memory-enhancement 走 `ctx.macros.registry.registerMacro`（新版）与 `ctx.registerMacro`（旧版）双路径；
 // 这里给一个真实注册表（可查询、可展开），避免 TypeError。
 const stMacroRegistry = new Map();
+let stMacroSyncTimer = null;
+function syncStMacrosToHost() {
+    if (stMacroSyncTimer) clearTimeout(stMacroSyncTimer);
+    stMacroSyncTimer = setTimeout(() => {
+        stMacroSyncTimer = null;
+        try {
+            const out = {};
+            if (typeof MacrosParserModule !== 'undefined' && MacrosParserModule.MacrosParser && MacrosParserModule.MacrosParser.macros instanceof Map) {
+                for (const [k, v] of MacrosParserModule.MacrosParser.macros.entries()) {
+                    out[k] = { type: typeof v === 'function' ? 'function' : 'string', value: typeof v === 'function' ? null : String(v) };
+                }
+            }
+            for (const [k, v] of stMacroRegistry.entries()) {
+                out[k] = { type: typeof v === 'function' ? 'function' : 'string', value: typeof v === 'function' ? null : String(v) };
+            }
+            callBridge('emitEvent', 'macros_updated', JSON.stringify(out));
+        } catch (_e) { /* noop */ }
+    }, 30);
+}
+function registerStMacroUnified(name, value) {
+    try {
+        const key = String(name);
+        stMacroRegistry.set(key, value);
+        if (typeof MacrosParserModule !== 'undefined' && MacrosParserModule.MacrosParser && typeof MacrosParserModule.MacrosParser.registerMacro === 'function') {
+            MacrosParserModule.MacrosParser.registerMacro(key, value);
+        }
+        syncStMacrosToHost();
+    } catch (_e) { /* noop */ }
+    return value;
+}
+function unregisterStMacroUnified(name) {
+    try {
+        const key = String(name);
+        stMacroRegistry.delete(key);
+        if (typeof MacrosParserModule !== 'undefined' && MacrosParserModule.MacrosParser && typeof MacrosParserModule.MacrosParser.unregisterMacro === 'function') {
+            MacrosParserModule.MacrosParser.unregisterMacro(key);
+        }
+        syncStMacrosToHost();
+    } catch (_e) { /* noop */ }
+}
 const stMacrosFacade = {
     macros: stMacroRegistry,
     registry: {
-        registerMacro: (name, value) => { try { stMacroRegistry.set(String(name), value); } catch (_e) { /* noop */ } },
-        unregisterMacro: (name) => { try { stMacroRegistry.delete(String(name)); } catch (_e) { /* noop */ } },
+        registerMacro: (name, value) => registerStMacroUnified(name, value),
+        unregisterMacro: (name) => unregisterStMacroUnified(name),
         getMacro: (name) => stMacroRegistry.get(String(name)) ?? null,
         hasMacro: (name) => stMacroRegistry.has(String(name)),
-        clear: () => { try { stMacroRegistry.clear(); } catch (_e) { /* noop */ } },
+        clear: () => {
+            try {
+                stMacroRegistry.clear();
+                if (typeof MacrosParserModule !== 'undefined' && MacrosParserModule.MacrosParser && MacrosParserModule.MacrosParser.macros instanceof Map) {
+                    MacrosParserModule.MacrosParser.macros.clear();
+                }
+                syncStMacrosToHost();
+            } catch (_e) { /* noop */ }
+        },
     },
-    registerMacro: (name, value) => { try { stMacroRegistry.set(String(name), value); } catch (_e) { /* noop */ } },
-    unregisterMacro: (name) => { try { stMacroRegistry.delete(String(name)); } catch (_e) { /* noop */ } },
+    register: (name, value) => registerStMacroUnified(name, value),
+    unregister: (name) => unregisterStMacroUnified(name),
+    registerMacro: (name, value) => registerStMacroUnified(name, value),
+    unregisterMacro: (name) => unregisterStMacroUnified(name),
     getMacro: (name) => stMacroRegistry.get(String(name)) ?? null,
 };
 
-/** ST ctx.substituteParams：先展开已注册宏，未命中保持原样（宿主宏由生成管线处理）。 */
+/** ST ctx.substituteParams：展开内置消息索引/角色宏与已注册宏，未命中保持原样。 */
 function substituteParamsWithMacros(text) {
     let out = String(text == null ? '' : text);
-    if (stMacroRegistry.size === 0) return out;
+    if (!out.includes('{{')) return out;
     try {
         out = out.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, name) => {
-            if (!stMacroRegistry.has(name)) return m;
-            try {
-                const v = stMacroRegistry.get(name);
-                return typeof v === 'function' ? String(v()) : String(v);
-            } catch (_e) { return m; }
+            const lower = String(name).toLowerCase();
+            if (lower === 'lastmessageid') {
+                return String(Math.max(0, (state.chat || []).length - 1));
+            }
+            if (lower === 'firstmessageid') {
+                return '0';
+            }
+            if (lower === 'lastusermessageid') {
+                const chat = state.chat || [];
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i] && chat[i].is_user) return String(i);
+                }
+                return '-1';
+            }
+            if (lower === 'lastcharmessageid') {
+                const chat = state.chat || [];
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i] && !chat[i].is_user && !chat[i].is_system) return String(i);
+                }
+                return '-1';
+            }
+            if (lower === 'char') return String(state.name2 || '');
+            if (lower === 'user') return String(state.name1 || '');
+            if (stMacroRegistry.has(name) || stMacroRegistry.has(lower)) {
+                try {
+                    const entry = stMacroRegistry.get(name) ?? stMacroRegistry.get(lower);
+                    const fn = (entry && typeof entry === 'object' && 'fn' in entry) ? entry.fn : entry;
+                    return typeof fn === 'function' ? String(fn()) : String(fn ?? '');
+                } catch (_e) { return m; }
+            }
+            return m;
         });
     } catch (_e) { /* noop */ }
     return out;
 }
 
-/** ST ctx.variables.local / global（st-context.js:288-303），底层复用 variable-shims 存储布局。 */
+/** ST ctx.variables.local / global（st-context.js:288-303），增量合并写回，严禁抹掉其它已有键。 */
 function makeStVariableScope(type) {
     const readAll = () => {
         try { return shimVariable.getVariables({ type }) || {}; } catch (_e) { return {}; }
     };
     const write = (name, value) => {
-        try { shimVariable.replaceVariables({ [String(name)]: value }, { type }); } catch (_e) { /* noop */ }
+        try {
+            const current = readAll();
+            current[String(name)] = value;
+            shimVariable.replaceVariables(current, { type });
+        } catch (_e) { /* noop */ }
     };
     return {
         get: (name) => { const v = readAll(); return name == null ? v : v[name]; },
@@ -708,7 +939,12 @@ function stMessageFormatting(text, ch_name, isSystem, isUser, messageId, sanitiz
 const TAVERN_ST_COMPAT_VERSION = '1.13.5';
 
 const stCtx = {
-    get chat() { return state.chat; },
+    get chat() {
+        if (window.__RIKKA_PANEL_MODE__ && (!Array.isArray(state.chat) || state.chat.length === 0 || (state.chat[0] && state.chat[0].__lightweightPlaceholder))) {
+            try { pullChat(false); } catch (_e) { /* noop */ }
+        }
+        return state.chat;
+    },
     get chatMetadata() { ensureStStateShapes(); return state.chatMetadata; },
     get extensionSettings() { ensureStStateShapes(); return state.thirdPartySettings; },
     get characters() { return state.characters; },
@@ -751,14 +987,62 @@ const stCtx = {
     getChatCompletionModel: () => state.modelName || 'unknown',
     getCharacterCardFields: () => ({ name: state.name2 || '', description: '', personality: '', scenario: '', first_mes: '', mes_example: '' }),
     callGenericPopup: callGenericPopupStub,
-    registerFunctionTool: () => {},
-    unregisterFunctionTool: () => {},
+    registerFunctionTool: registerStFunctionTool,
+    unregisterFunctionTool: unregisterStFunctionTool,
     registerMacro: stMacrosFacade.registerMacro,
     unregisterMacro: stMacrosFacade.unregisterMacro,
     extensionPrompts: {},
-    generate: async () => '',
-    generateRaw: async () => '',
-    generateQuietPrompt: async () => '',
+    get extension_prompts() { return stCtx.extensionPrompts; },
+    executeSlashCommandsWithOptions: async (text, _options) => {
+        try {
+            const raw = callBridge('triggerSlash', String(text == null ? '' : text));
+            const pipe = raw == null ? '' : String(raw);
+            const isErr = pipe.startsWith('(slash error:') || pipe === '(slash runner not ready)';
+            return {
+                pipe: isErr ? '' : pipe,
+                isError: isErr,
+                errorMessage: isErr ? pipe : '',
+                isAbort: false,
+                isIdle: false,
+                hasBackpipe: false,
+            };
+        } catch (_e) {
+            return { pipe: '', isError: true, errorMessage: String(_e), isAbort: false, isIdle: false, hasBackpipe: false };
+        }
+    },
+    executeSlashCommands: async (text) => {
+        const r = await stCtx.executeSlashCommandsWithOptions(text);
+        return r && typeof r === 'object' ? r.pipe : r;
+    },
+    generate: async () => {
+        try { return String(callBridge('triggerSlash', '/trigger') || ''); } catch (_e) { return ''; }
+    },
+    generateRaw: async (opts) => {
+        try {
+            const prompt = typeof opts === 'string' ? opts : (opts && (opts.prompt || opts.quietPrompt) ? String(opts.prompt || opts.quietPrompt) : '');
+            const systemPrompt = (opts && typeof opts === 'object' && (opts.systemPrompt || opts.system)) ? String(opts.systemPrompt || opts.system) : '';
+            if (!prompt) return '';
+            if (window.RikkaBridge && typeof window.RikkaBridge.generateQuiet === 'function') {
+                return String(callBridge('generateQuiet', prompt, true, systemPrompt) || '');
+            }
+            const quotedPrompt = '"' + prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+            const sysArg = systemPrompt ? ('system="' + systemPrompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '" ') : '';
+            return String(callBridge('triggerSlash', '/genraw ' + sysArg + quotedPrompt) || '');
+        } catch (_e) { return ''; }
+    },
+    generateQuietPrompt: async (quietPrompt) => {
+        try {
+            const prompt = typeof quietPrompt === 'string'
+                ? quietPrompt
+                : (quietPrompt && (quietPrompt.quietPrompt || quietPrompt.prompt) ? String(quietPrompt.quietPrompt || quietPrompt.prompt) : '');
+            if (!prompt) return '';
+            if (window.RikkaBridge && typeof window.RikkaBridge.generateQuiet === 'function') {
+                return String(callBridge('generateQuiet', prompt, false, '') || '');
+            }
+            const quotedPrompt = '"' + prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+            return String(callBridge('triggerSlash', '/gen ' + quotedPrompt) || '');
+        } catch (_e) { return ''; }
+    },
     generateRawData: async () => ({}),
     sendStreamingRequest: async () => {},
     sendGenerationRequest: async () => {},
@@ -792,8 +1076,29 @@ const stCtx = {
     t: (text) => String(text == null ? '' : text),
     translate: (text) => String(text == null ? '' : text),
     addLocaleData: () => {},
-    setExtensionPrompt: (key, value, position, depth) => {
-        try { stCtx.extensionPrompts[String(key)] = { value: value, position: position, depth: depth }; } catch (_e) { /* noop */ }
+    setExtensionPrompt: (key, value, position, depth, scan = false, role = 0) => {
+        try {
+            const k = String(key == null ? '' : key).trim();
+            if (!k) return;
+            const val = value == null ? '' : String(value);
+            stCtx.extensionPrompts[k] = { value: val, position: position, depth: depth, scan: !!scan, role: role };
+            if (!val) {
+                shimInject.uninjectPrompts([k]);
+            } else {
+                const roleStr = (role === 1 || role === 'user') ? 'user'
+                    : ((role === 2 || role === 'assistant') ? 'assistant' : 'system');
+                const posStr = (position === -1 || position === 'none') ? 'none' : 'in_chat';
+                const depthNum = Number.isFinite(Number(depth)) ? Number(depth) : 4;
+                shimInject.injectPrompts([{
+                    id: k,
+                    content: val,
+                    position: posStr,
+                    depth: depthNum,
+                    role: roleStr,
+                    should_scan: !!scan,
+                }]);
+            }
+        } catch (_e) { /* noop */ }
     },
     updateChatMetadata: (patch) => {
         try {
@@ -832,8 +1137,17 @@ const stCtx = {
     unshallowCharacter: async () => {},
     unshallowGroupMembers: async () => {},
     addOneMessage: () => {},
-    deleteLastMessage: async () => {},
-    deleteMessage: async () => {},
+    deleteLastMessage: async () => {
+        try {
+            const n = state.chat ? state.chat.length : 0;
+            if (n > 0) await shimChat.deleteChatMessages([n - 1]);
+        } catch (_e) { /* noop */ }
+    },
+    deleteMessage: async (index) => {
+        try {
+            if (index !== undefined && index !== null) await shimChat.deleteChatMessages([Number(index)]);
+        } catch (_e) { /* noop */ }
+    },
     saveReply: async () => {},
     sendSystemMessage: () => {},
     activateSendButtons: () => {},
@@ -902,10 +1216,10 @@ const SillyTavern = {
     getCurrentLocale: () => 'zh-cn',
     getChatCompletionModel: () => state.modelName || 'unknown',
     getCharacterCardFields: () => stCtx.getCharacterCardFields(),
-    registerFunctionTool: () => {},
-    unregisterFunctionTool: () => {},
-    registerMacro: () => {},
-    unregisterMacro: () => {},
+    registerFunctionTool: registerStFunctionTool,
+    unregisterFunctionTool: unregisterStFunctionTool,
+    registerMacro: stMacrosFacade.registerMacro,
+    unregisterMacro: stMacrosFacade.unregisterMacro,
     loadWorldInfo: async (name) => {
         try {
             const raw = callBridge('getLorebookJson', String(name == null ? '' : name));
@@ -969,6 +1283,32 @@ try {
     for (const k of Object.keys(mounts)) {
         try { if (!(k in window)) window[k] = mounts[k]; } catch (_e) { /* noop */ }
     }
+    // [v243 BUGFIX C3] 把 st-compat/script.js 的**整个原生导出面**挂成裸全局。
+    // 依据：SillyTavern 的 public/script.js 导出（249 个）里绝大多数在酒馆里同时是裸全局，
+    // 卡脚本按标识符直接调用（`getChat()` / `updateChatMetadata()` / `ensureSwipes()` …）。
+    // rikkaST 原来只挂了 8 个，其余全部 ReferenceError。
+    // 只挂**函数**与**稳定常量**；live 标量（chat / characters / name1 …）跳过 ——
+    // 它们的值是每次 refreshAll 才更新的，拷贝一份到 window 会读到过期快照。
+    const LIVE_SCALARS = new Set([
+        'chat', 'characters', 'name1', 'name2', 'this_chid', 'chat_metadata', 'extension_settings',
+        'settings', 'amount_gen', 'max_context', 'selected_group', 'groups', 'user_avatar',
+        'online_status', 'is_send_press', 'isChatSaving', 'main_api', 'extension_prompts',
+        'nai_settings', 'GenerateOptions',
+    ]);
+    let mounted = 0;
+    const sources = [stCtx, stCompatScript];
+    for (const src of sources) for (const k of Object.keys(src)) {
+        try {
+            if (LIVE_SCALARS.has(k) || (k in window)) continue;
+            const v = src[k];
+            if (typeof v === 'function' || (v && typeof v === 'object') || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+                window[k] = v;
+                mounted++;
+            }
+        } catch (_e) { /* noop */ }
+    }
+    try { if (typeof RikkaPanel !== 'undefined' && RikkaPanel.log) RikkaPanel.log('debug', '[boot] ST native bare globals mounted: ' + mounted); } catch (_e) { /* noop */ }
+    try { console.log('[RikkaTavern] ST native bare globals mounted: ' + mounted); } catch (_e) { /* noop */ }
 })();
 
 // [v236 R1] 楼层 DOM 桩接线：渲染器 = stMessageFormatting；chat_changed / chat_id_changed → 重建楼层。
@@ -1006,6 +1346,9 @@ const TavernHelper = {
     getChatMessages: shimChat.getChatMessages,
     setChatMessages: shimChat.setChatMessages,
     setChatMessage: shimChat.setChatMessage,
+    // [v243 BUGFIX A2] JSR 聊天消息写入面（此前缺失 -> 卡脚本 ReferenceError: createChatMessages is not defined）
+    createChatMessages: shimChat.createChatMessages,
+    deleteChatMessages: shimChat.deleteChatMessages,
     // 世界书
     getLorebookEntries: shimLorebook.getLorebookEntries,
     getCurrentCharPrimaryLorebook: shimLorebook.getCurrentCharPrimaryLorebook,
@@ -1019,6 +1362,30 @@ const TavernHelper = {
     getWorldbookNames: shimLorebook.getWorldbookNames,
     getChatWorldbookName: shimLorebook.getChatWorldbookName,
     getGlobalWorldbookNames: shimLorebook.getGlobalWorldbookNames,
+    // [v243 BUGFIX A3] JSR 世界书写入面（此前缺失 -> 卡片能力探测报「当前酒馆助手不支持世界书接口」）
+    createWorldbookEntries: shimLorebook.createWorldbookEntries,
+    createLorebookEntry: shimLorebook.createLorebookEntry,
+    createLorebookEntries: shimLorebook.createLorebookEntries,
+    setLorebookEntries: shimLorebook.setLorebookEntries,
+    replaceLorebookEntries: shimLorebook.replaceLorebookEntries,
+    replaceWorldbook: shimLorebook.replaceWorldbook,
+    updateLorebookEntriesWith: shimLorebook.updateLorebookEntriesWith,
+    deleteWorldbookEntries: shimLorebook.deleteWorldbookEntries,
+    deleteLorebookEntries: shimLorebook.deleteLorebookEntries,
+    deleteLorebookEntry: shimLorebook.deleteLorebookEntry,
+    getLorebooks: shimLorebook.getLorebooks,
+    createLorebook: shimLorebook.createLorebook,
+    createWorldbook: shimLorebook.createWorldbook,
+    createOrReplaceWorldbook: shimLorebook.createOrReplaceWorldbook,
+    deleteLorebook: shimLorebook.deleteLorebook,
+    deleteWorldbook: shimLorebook.deleteWorldbook,
+    getChatLorebook: shimLorebook.getChatLorebook,
+    setChatLorebook: shimLorebook.setChatLorebook,
+    getOrCreateChatWorldbook: shimLorebook.getOrCreateChatWorldbook,
+    setCurrentCharLorebooks: shimLorebook.setCurrentCharLorebooks,
+    rebindCharWorldbooks: shimLorebook.rebindCharWorldbooks,
+    rebindChatWorldbook: shimLorebook.rebindChatWorldbook,
+    rebindGlobalWorldbooks: shimLorebook.rebindGlobalWorldbooks,
     // 按钮
     getScriptButtons: shimButton.getScriptButtons,
     replaceScriptButtons: shimButton.replaceScriptButtons,
@@ -1042,6 +1409,29 @@ const TavernHelper = {
     initializeGlobal: shimUtil.initializeGlobal,
     waitGlobalInitialized: shimUtil.waitGlobalInitialized,
     registerMacroLike: shimUtil.registerMacroLike,
+    unregisterMacroLike: shimUtil.unregisterMacroLike,
+    registerVariableSchema: shimUtil.registerVariableSchema,
+    // [v243 BUGFIX C2] 扩展安装状态（卡脚本判断「酒馆助手装没装」的第二种常用方式）
+    isInstalledExtension: shimUtil.isInstalledExtension,
+    getExtensionType: shimUtil.getExtensionType,
+    getExtensionStatus: shimUtil.getExtensionStatus,
+    getTavernHelperExtensionId: shimUtil.getTavernHelperExtensionId,
+    isAdmin: shimUtil.isAdmin,
+    installExtension: shimUtil.installExtension,
+    uninstallExtension: shimUtil.uninstallExtension,
+    reinstallExtension: shimUtil.reinstallExtension,
+    updateExtension: shimUtil.updateExtension,
+    // [v243 BUGFIX C2] 角色信息 + 常用别名（JSR 同义）
+    getCurrentCharacterName: shimUtil.getCurrentCharacterName,
+    getCurrentCharacterId: shimUtil.getCurrentCharacterId,
+    getCharacterNames: shimUtil.getCharacterNames,
+    getCharacterIds: shimUtil.getCharacterIds,
+    getCharData: shimUtil.getCharData,
+    getMessageId: shimUtil.getMessageId,
+    triggerSlashWithResult: shimUtil.triggerSlashWithResult,
+    getFrontendVersion: shimUtil.getFrontendVersion,
+    updateFrontendVersion: shimUtil.updateFrontendVersion,
+    updateTavernHelper: shimUtil.updateTavernHelper,
     // [v241] JSR 注入提示词（酒馆助手）：injectPrompts / uninjectPrompts
     // 语义与差异见 shims/inject-shims.js 头部注释（filter 不支持，已在 DIVERGENCE §H.4 登记）
     injectPrompts: shimInject.injectPrompts,
@@ -1073,6 +1463,21 @@ const CORE_BARE_GLOBALS = [
     'getVariables', 'getAllVariables', 'replaceVariables', 'updateVariablesWith',
     'deleteVariable', 'insertOrAssignVariables', 'insertVariables',
     'triggerSlash', 'substitudeMacros', 'getLastMessageId', 'getCurrentMessageId',
+    // [v243 BUGFIX A2/A3] 卡脚本按裸全局调用的写入面（JSR predefine 会把 TavernHelper 顶层键全装成裸全局）
+    'createChatMessages', 'deleteChatMessages', 'getChatMessages', 'setChatMessages', 'setChatMessage',
+    'createWorldbookEntries', 'createLorebookEntry', 'createLorebookEntries', 'setLorebookEntries',
+    'replaceLorebookEntries', 'replaceWorldbook', 'updateLorebookEntriesWith', 'deleteWorldbookEntries',
+    'deleteLorebookEntries', 'deleteLorebookEntry', 'getLorebooks', 'getWorldbook', 'getWorldbookNames',
+    'getCharWorldbookNames', 'getChatWorldbookName', 'getGlobalWorldbookNames', 'getLorebookEntries',
+    'updateWorldbookWith', 'getCurrentCharPrimaryLorebook',
+    // [v243 BUGFIX C2] 扩展安装状态 / 角色信息 / 别名（卡脚本按裸全局调用）
+    'isInstalledExtension', 'getExtensionType', 'getExtensionStatus', 'getTavernHelperExtensionId',
+    'getCurrentCharacterName', 'getCurrentCharacterId', 'getCharacterNames', 'getCharacterIds',
+    'getCharData', 'getMessageId', 'triggerSlashWithResult',
+    'injectPrompts', 'uninjectPrompts',
+    'createOrReplaceWorldbook', 'createWorldbook', 'createLorebook',
+    'deleteWorldbook', 'deleteLorebook', 'setChatLorebook',
+    'rebindCharWorldbooks', 'rebindChatWorldbook', 'rebindGlobalWorldbooks',
 ];
 
 // 把 JSR predefine 语义的裸全局装进一个子窗口（脚本 iframe / MVU iframe 共用）。
@@ -1178,8 +1583,30 @@ function pushRuntimeGlobals(w) {
     if (!w) return;
     const src = richestTavernHelper();
     installBareGlobals(w, [src, TavernHelper]);
+    // [v244 BUGFIX D1] 核心 API 必须**裸全局 + TavernHelper 两个位置都在**。
+    // 卡片 fn(name) 会依次探 window / window.TavernHelper / parent / parent.TavernHelper；
+    // 第三方扩展（JSR）把父窗口 TavernHelper 换成它自己那份后，子窗口复制到的对象可能缺键
+    // （或键在、值不是函数）→ 卡片判「未检测到 createChatMessages / triggerSlash 接口」。
+    // 这里用宿主自带实现（模块内建的 TavernHelper）补齐**两个位置**；需要补键时先脱钩，
+    // 绝不就地改父窗口那份共享对象。
     for (const name of CORE_BARE_GLOBALS) {
-        try { if (typeof w[name] !== 'function' && typeof TavernHelper[name] === 'function') w[name] = TavernHelper[name]; } catch (_e) { /* noop */ }
+        try {
+            if (typeof TavernHelper[name] !== 'function') continue;
+            if (typeof w[name] !== 'function') w[name] = TavernHelper[name];
+            let th = null;
+            try { th = w.TavernHelper; } catch (_e) { th = null; }
+            if (!th || typeof th !== 'object') continue;
+            if (typeof th[name] === 'function') continue;
+            let shared = false;
+            try { shared = (th === TavernHelper) || (th === src) || (typeof window !== 'undefined' && th === window.TavernHelper); } catch (_e) { shared = true; }
+            if (shared) {
+                const copy = {};
+                for (const k in th) { try { copy[k] = th[k]; } catch (_e) { /* noop */ } }
+                try { w.TavernHelper = copy; } catch (_e) { /* noop */ }
+                th = copy;
+            }
+            th[name] = TavernHelper[name];
+        } catch (_e) { /* noop */ }
     }
     try { if (!w.__mvu_shims__) w.__mvu_shims__ = src; } catch (_e) { /* noop */ }
     let childKeys = 0;
@@ -1596,6 +2023,9 @@ window.__rikkaEvalMacrosBatch = async function __rikkaEvalMacrosBatch(seq, reque
                 if (typeof fn !== 'function' && mod && mod.MacrosParser && mod.MacrosParser.macros instanceof Map) {
                     fn = mod.MacrosParser.macros.get(req.name);
                 }
+                if (typeof fn !== 'function' && stMacroRegistry instanceof Map) {
+                    fn = stMacroRegistry.get(req.name);
+                }
                 if (typeof fn === 'function') {
                     const raw = fn(req.nonce);
                     value = (raw == null) ? '' : (typeof raw === 'object' ? JSON.stringify(raw) : String(raw));
@@ -1724,19 +2154,53 @@ function buildScriptIframeHtml(script) {
         var existingTH = (window.TavernHelper && typeof window.TavernHelper === 'object') ? window.TavernHelper : null;
         var existingKeys = 0;
         try { existingKeys = existingTH ? Object.keys(existingTH).length : 0; } catch (e) { existingKeys = 0; }
-        var TH = parentTHKeys > 0 ? parentTH : (existingKeys > 0 ? existingTH : (parentTH || existingTH || {}));
+        // [v244 BUGFIX D1] 不再「二选一丢弃」，改成**并集合并**。
+        // 真机取证（tavern-runtime.log 2026-10-13 23:07:45 diag）：
+        //   parentTHKeys=157 / existingKeys=167 —— 旧代码 parentTHKeys > 0 ? parentTH : …
+        //   会把更丰富的 existingTH 整份丢掉；而两份的键集**并不相同**
+        //   （父窗口那份可能已被第三方扩展 JSR 换成它自己的对象，宿主那份是模块内建实现）。
+        //   后果：卡片 fn('createChatMessages'/'triggerSlash') 随机命中/落空 →
+        //   「未检测到酒馆助手的 createChatMessages / triggerSlash 接口，请确认助手扩展已开启！」。
+        // 现在：两份都装（键少的先装、键多的后装覆盖），再把宿主自带实现（p.__mvu_shims__）补缺。
+        var sources = [];
+        if (parentTH && existingTH && parentTH !== existingTH) {
+            sources = parentTHKeys >= existingKeys ? [existingTH, parentTH] : [parentTH, existingTH];
+        } else {
+            sources = [parentTH || existingTH || {}];
+        }
+        var hostShims = null;
+        try { hostShims = (p && p.__mvu_shims__) ? p.__mvu_shims__ : null; } catch (e) { hostShims = null; }
+        if (hostShims && sources.indexOf(hostShims) < 0) sources.push(hostShims);
         window.TavernHelper = {};
-        for (var key in TH) { try { window.TavernHelper[key] = TH[key]; } catch (e) { /* noop */ } }
+        for (var si = 0; si < sources.length; si++) {
+            var srcObj = sources[si];
+            if (!srcObj || typeof srcObj !== 'object') continue;
+            for (var key in srcObj) { try { window.TavernHelper[key] = srcObj[key]; } catch (e) { /* noop */ } }
+        }
         window.TavernHelper._bind = window.TavernHelper._bind || {};
-        for (var key2 in TH) {
+        for (var key2 in window.TavernHelper) {
             if (key2 === '_bind') continue;
-            try { window[key2] = TH[key2]; } catch (e) { /* noop */ }
+            try { window[key2] = window.TavernHelper[key2]; } catch (e) { /* noop */ }
+        }
+        // 宿主自带实现（模块内建那份，永远有 createChatMessages / triggerSlash / 世界书写入面）
+        // 只补**缺失或非函数**的键 —— 裸全局 + TavernHelper 两个位置都要在。
+        if (hostShims) {
+            var __core = ${JSON.stringify(CORE_BARE_GLOBALS)};
+            for (var ci = 0; ci < __core.length; ci++) {
+                var cn = __core[ci];
+                try {
+                    if (typeof hostShims[cn] !== 'function') continue;
+                    if (typeof window[cn] !== 'function') window[cn] = hostShims[cn];
+                    if (typeof window.TavernHelper[cn] !== 'function') window.TavernHelper[cn] = hostShims[cn];
+                } catch (e) { /* noop */ }
+            }
         }
         // [v221] JSR predefine 语义补全：_bind 的每个 key 去掉前导下划线后挂成裸全局，并 bind(本 iframe window)。
         // 真机根因：JSR 会把父窗口 window.TavernHelper 换成它自己的对象（顶层**没有** eventOn，
         // 只有 _bind._eventOn）→ 旧代码只遍历顶层 key，裸全局 eventOn 就丢了
         // （真机 diag：thKeys=165/parentThKeys=157 但 eventOn=undefined）。
-        var __bindSrc = (window.TavernHelper && window.TavernHelper._bind) || (TH && TH._bind) || null;
+        // [v244] 注意：TH 变量已在上面被 sources 合并逻辑取代，这里只能读合并后的 window.TavernHelper。
+        var __bindSrc = (window.TavernHelper && window.TavernHelper._bind) || (sources[0] && sources[0]._bind) || null;
         if (__bindSrc) {
             for (var bkey in __bindSrc) {
                 var bare = String(bkey).replace(/^_/, '');
@@ -1744,10 +2208,24 @@ function buildScriptIframeHtml(script) {
                 try { if (typeof window[bare] !== 'function') window[bare] = __bindSrc[bkey].bind(window); } catch (e) { /* noop */ }
             }
         }
+        // [v244] API 面探针：卡片 fn(name) 会依次探 window / window.TavernHelper / parent / parent.TavernHelper。
+        // 四个位置全部打出来 —— 一次真机复现即可判定「未检测到 createChatMessages / triggerSlash」缺在哪一层。
+        var __probeOf = function (o, k) { try { return typeof (o && o[k]); } catch (e) { return 'ERR'; } };
         window.__rikkaPredefineInfo = {
             parentTHKeys: parentTHKeys,
             existingKeys: existingKeys,
             usedKeys: Object.keys(window.TavernHelper).length,
+            srcCount: sources.length,
+            hostShims: !!hostShims,
+            win_triggerSlash: __probeOf(window, 'triggerSlash'),
+            win_createChatMessages: __probeOf(window, 'createChatMessages'),
+            win_createWorldbookEntries: __probeOf(window, 'createWorldbookEntries'),
+            th_triggerSlash: __probeOf(window.TavernHelper, 'triggerSlash'),
+            th_createChatMessages: __probeOf(window.TavernHelper, 'createChatMessages'),
+            th_createWorldbookEntries: __probeOf(window.TavernHelper, 'createWorldbookEntries'),
+            p_triggerSlash: __probeOf(p, 'triggerSlash'),
+            pTh_triggerSlash: __probeOf(p && p.TavernHelper, 'triggerSlash'),
+            pTh_createChatMessages: __probeOf(p && p.TavernHelper, 'createChatMessages'),
         };
         // 2.5) 脚本按钮 / 脚本身份：per-iframe 包装（对齐 JSR 语义）
         var sid = ${JSON.stringify(scriptId)};
@@ -1838,10 +2316,31 @@ ${content}
 </html>`;
 }
 
+// [v245 BUGFIX F1] iframe 拆除统一入口。
+// 真机取证（round-4 tavern-runtime.log，6 个脚本 iframe 全部报）：
+//   [10-14 00:49:40.590][error] [TH-script] host-verify FAILED: TH-script--fb4825fd-… eventOn missing; {"eventOn":"object"}
+// 而同一个 iframe 在 2500ms 前的 predefine-ok diag 里明明写着 "eventOn":"function"。
+//
+// 根因（先证伪了「eventOn 在 predefine 之后被 JSR 覆盖成 object」这条假设）：
+//   ① loadTavernScripts(force) / mountScriptIframe 重建脚本 iframe 时直接 frame.remove()，
+//      **没有取消**该 iframe 自己的 2500ms host-verify 定时器；
+//   ② 定时器到点时 iframe 早已被摘出 DOM → `iframe.contentWindow` 返回 **null**；
+//   ③ 原诊断的回退分支写的是 `{ eventOn: typeof (w && w.eventOn) }`，而 JS 里
+//      **`typeof null === 'object'`** → 于是打出 `{"eventOn":"object"}` 这个假告警。
+//   判据：真正走 __rikkaDiag('host-verify') 的那条路会带上 tag / thKeys / name 等字段；
+//   日志里只有孤零零一个 eventOn 键 → 必然走的是 null 回退分支。
+// 修法：拆除时统一清定时器；host-verify 自己再区分「iframe 还在 DOM 但窗口为空」与「已拆除」。
+function teardownScriptIframe(frame) {
+    if (!frame) return;
+    try { if (frame.__rikkaHostVerifyTimer) clearTimeout(frame.__rikkaHostVerifyTimer); } catch (_e) { /* noop */ }
+    try { if (frame.__rikkaGuardTimer) clearInterval(frame.__rikkaGuardTimer); } catch (_e) { /* noop */ }
+    try { frame.remove(); } catch (_e) { /* noop */ }
+}
+
 function mountScriptIframe(script) {
     const id = String(script.id == null || script.id === '' ? (script.name == null ? 'script' : script.name) : script.id);
     if (scriptIframes.has(id)) {
-        try { scriptIframes.get(id).remove(); } catch (_e) { /* noop */ }
+        teardownScriptIframe(scriptIframes.get(id));
         scriptIframes.delete(id);
     }
     const html = buildScriptIframeHtml(script);
@@ -1864,13 +2363,20 @@ function mountScriptIframe(script) {
     pushShims();
     iframe.addEventListener('load', pushShims);
     [50, 250, 800].forEach((ms) => setTimeout(pushShims, ms));
-    guardChildGlobals(iframe.contentWindow);
-    setTimeout(() => {
+    iframe.__rikkaGuardTimer = guardChildGlobals(iframe.contentWindow);
+    // [v245 BUGFIX F1] 定时器句柄挂在 iframe 上，拆除时由 teardownScriptIframe 取消。
+    iframe.__rikkaHostVerifyTimer = setTimeout(() => {
         try {
+            // 已从 DOM 摘掉（重建 / 切会话）→ 这不是失败，别刷假告警。
+            if (!iframe.isConnected) return;
             const w = iframe.contentWindow;
-            if (w && typeof w.eventOn === 'function') return;
+            if (!w) {
+                callBridge('log', 'error', `[TH-script] host-verify: ${iframe.id} iframe 仍在 DOM 但 contentWindow 为空`);
+                return;
+            }
+            if (typeof w.eventOn === 'function') return;
             let diag = 'n/a';
-            try { diag = JSON.stringify(w && w.__rikkaDiag ? w.__rikkaDiag('host-verify') : { eventOn: typeof (w && w.eventOn) }); } catch (_e) { diag = 'diag-failed'; }
+            try { diag = JSON.stringify(w.__rikkaDiag ? w.__rikkaDiag('host-verify') : { eventOn: typeof w.eventOn }); } catch (_e) { diag = 'diag-failed'; }
             callBridge('log', 'error', `[TH-script] host-verify FAILED: ${iframe.id} eventOn missing; ${diag}`);
         } catch (_e) { /* noop */ }
     }, 2500);
@@ -1878,6 +2384,8 @@ function mountScriptIframe(script) {
     scriptIframes.set(id, iframe);
     console.log(`${LOG_PREFIX} script iframe mounted: ${iframe.id} (${script.name || ''})`);
 }
+
+let scriptsLoadGen = 0;
 
 async function loadTavernScripts(force) {
     let raw = '';
@@ -1892,14 +2400,27 @@ async function loadTavernScripts(force) {
         try { callBridge('log', 'debug', `[scripts] skip (same signature, conv=${convTag}, n=${scripts.length})`); } catch (_e) { /* noop */ }
         return false;
     }
+    const myGen = ++scriptsLoadGen;
     // 集合变化：全部重建（pagehide 会自清理监听与 Mvu）
+    // [v245 BUGFIX F1] 走统一拆除入口：必须取消各自的 host-verify / guard 定时器，
+    // 否则被摘掉的 iframe 会在 2.5s 后误报 `host-verify FAILED … {"eventOn":"object"}`。
     for (const [id, frame] of scriptIframes) {
-        try { frame.remove(); } catch (_e) { /* noop */ }
+        teardownScriptIframe(frame);
         scriptIframes.delete(id);
     }
     lastScriptsSignature = signature;
-    mvuFromScripts = scripts.some((s) => /mvu_bundle_full|MVU-offline/i.test(String(s.content || '')));
-    for (const s of scripts) mountScriptIframe(s);
+    // [P0-1 根因1修复] 识别 MagVarUpdate（如大小姐 var_update 脚本），避免重复创建内置 mvuIframe 引发双份 MVU 冲突
+    mvuFromScripts = scripts.some((s) => /mvu_bundle_full|MVU-offline|MagVarUpdate/i.test(String(s.content || '')));
+    // [P0-1 根因1修复] 串行分帧挂载脚本 iframe（每两个重型 iframe 之间让出主线程 80ms），
+    // 避免 6 个 blob: iframe 在同一毫秒并发初始化冲击共享的 CrRendererMain 造成渲染线程死锁。
+    for (let i = 0; i < scripts.length; i++) {
+        if (myGen !== scriptsLoadGen) return false;
+        mountScriptIframe(scripts[i]);
+        if (i + 1 < scripts.length) {
+            await new Promise((r) => setTimeout(r, 80));
+        }
+    }
+    if (myGen !== scriptsLoadGen) return false;
     try { callBridge('log', 'info', `[scripts] loaded ${scripts.length}${scripts.length ? ': ' + scripts.map((s) => s.name).join(', ') : ''}, mvu_from_scripts=${mvuFromScripts} (conv=${convTag}, force=${!!force})`); } catch (_e) { /* noop */ }
     emitToHost('scripts_loaded', { count: scripts.length, mvu_from_scripts: mvuFromScripts });
     return true;
@@ -2294,6 +2815,8 @@ try {
 
 function createMvuIframe() {
     if (mvuIframe) {
+        // [v245 BUGFIX F1] 同款收口：清掉上一个 MVU iframe 的 guard 定时器再摘除。
+        try { if (mvuIframe.__rikkaGuardTimer) clearInterval(mvuIframe.__rikkaGuardTimer); } catch (_e) { /* noop */ }
         try { mvuIframe.remove(); } catch (_e) { /* noop */ }
         mvuIframe = null;
     }
@@ -2314,7 +2837,7 @@ function createMvuIframe() {
     pushMvuShims();
     iframe.addEventListener('load', pushMvuShims);
     [50, 250, 800].forEach((ms) => setTimeout(pushMvuShims, ms));
-    guardChildGlobals(iframe.contentWindow);
+    iframe.__rikkaGuardTimer = guardChildGlobals(iframe.contentWindow);
 
     mvuIframe = iframe;
     return iframe;
@@ -2405,7 +2928,7 @@ function waitForMvu(timeoutMs = 30000) {
                 } catch (e) { diag = 'ERR ' + ((e && e.message) || e); }
                 reject(new Error(`MVU init timeout after ${timeoutMs}ms (window.Mvu not found; iframe=${mvuIframe ? 'created' : 'none'}; diag=${diag})`));
             }
-        }, 250);
+        }, 80);
     });
 }
 
@@ -2444,7 +2967,7 @@ async function loadMvu() {
             }
         } catch (_e) { /* noop */ }
         try {
-            await waitForMvu(6000);
+            await waitForMvu(2500);
             mvuReady = true;
             console.log(`${LOG_PREFIX} MVU ready (card scripts)`);
             emitToHost('mvu_ready', { source: 'script', version: String(window.Mvu?.version || '') });
@@ -2536,20 +3059,171 @@ function ensurePanelChatDomStubs() {
     } catch (_e) { /* noop */ }
 }
 
+
+// ---------------------------------------------------------------- [v243 BUGFIX D1] 面板 vh 转换
+/**
+ * 把面板 HTML 里的 `min-height: <n>vh` 换算成 `--rikka-panel-vh`（固定 px），
+ * 打断「面板越高 -> vh 越大 -> 内容越高 -> 面板越高」的自激回路。
+ *
+ * 真机取证（tavern-runtime.log 10:00:59.082 起，每 ~15ms 一跳、每跳 +64px，6 秒涨到 21389 才停）：
+ *   [panel] height=1475 -> 1539 -> 1603 -> ... -> 21379 -> 21389
+ * 卡的面板 CSS 含 `min-height: 100vh`；面板 WebView 的高度由 ResizeObserver 上报，
+ * 而 vh 又是相对**面板自身**的高度计算的 -> 结构上不可能收敛。
+ *
+ * 酒馆助手（JS-Slash-Runner/src/panel/render/iframe.ts:5-79）就是这么做的：
+ * 把所有 min-height 里的 vh 换成 `var(--TH-viewport-height)`，
+ * 而该变量由 adjust_viewport.js 固定为 **父窗口** 的 innerHeight（一个不随面板高度变化的值）。
+ * rikkaST 的面板没有父窗口，改用宿主注入的稳定视口高度（见 installPanelMode 开头）。
+ */
+function convertPanelVh(content) {
+    if (typeof content !== 'string' || content.indexOf('vh') < 0) return content;
+    const hasCss = /min-height\s*:\s*[^;{}]*\d+(?:\.\d+)?vh/i.test(content);
+    const hasInline = /style\s*=\s*(["'])[\s\S]*?min-height\s*:\s*[^;]*?\d+(?:\.\d+)?vh[\s\S]*?\1/i.test(content);
+    const hasJs = /(\.style\.minHeight\s*=\s*(["']))([\s\S]*?vh)(\2)/i.test(content)
+        || /(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?vh)(\3\s*\))/i.test(content);
+    if (!hasCss && !hasInline && !hasJs) return content;
+
+    const toVar = (value) => String(value).replace(/(\d+(?:\.\d+)?)vh\b/gi, (match, num) => {
+        const parsed = parseFloat(num);
+        if (!isFinite(parsed)) return match;
+        const expr = 'var(--rikka-panel-vh)';
+        if (parsed === 100) return expr;
+        return 'calc(' + expr + ' * ' + (parsed / 100) + ')';
+    });
+
+    // 1) CSS 声明块 / <style> / 内联样式串：min-height: ...vh
+    content = content.replace(/(min-height\s*:\s*)([^;{}]*?\d+(?:\.\d+)?vh)(?=\s*[;}])/gi,
+        (_m, prefix, value) => prefix + toVar(value));
+    // 2) 行内 style="...min-height:...vh..."
+    content = content.replace(/(style\s*=\s*(["']))([^"']*?)(\2)/gi,
+        (match, prefix, _q, styleContent, suffix) => {
+            if (!/min-height\s*:\s*[^;]*vh/i.test(styleContent)) return match;
+            const replaced = styleContent.replace(/(min-height\s*:\s*)([^;]*?\d+(?:\.\d+)?vh)/gi,
+                (_m, p1, p2) => p1 + toVar(p2));
+            return prefix + replaced + suffix;
+        });
+    // 3) JS: element.style.minHeight = "...vh"
+    content = content.replace(/(\.style\.minHeight\s*=\s*(["']))([\s\S]*?)(\2)/gi,
+        (match, prefix, _q, val, suffix) => {
+            if (!/\b\d+(?:\.\d+)?vh\b/i.test(val)) return match;
+            return prefix + toVar(val) + suffix;
+        });
+    // 4) JS: element.style.setProperty('min-height', "...vh")
+    content = content.replace(/(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?)(\3\s*\))/gi,
+        (match, prefix, _q1, _q2, val, suffix) => {
+            if (!/\b\d+(?:\.\d+)?vh\b/i.test(val)) return match;
+            return prefix + toVar(val) + suffix;
+        });
+    return content;
+}
+
+/**
+ * [v243 BUGFIX C1] 把已安装第三方扩展的**元数据**同步进当前 realm。
+ * 面板是独立 WebView，主运行时的 window.__rikkaSt.extensions 不会同步过来，
+ * 于是卡脚本的「插件是否已安装」探测（getExtensionManifest 等）永远查不到 →
+ * 用户明明装了酒馆助手/提示词模板也被判为未安装。
+ * 只同步元数据，不重新执行插件模块（避免重复注册全局事件/计时器）。
+ */
+function syncThirdPartyExtensionMetadata() {
+    try {
+        const raw = callBridge('getThirdPartyExtensionsJson');
+        const list = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(list)) return;
+        window.__rikkaSt = window.__rikkaSt || {};
+        window.__rikkaSt.extensions = list;
+        // [v243 BUGFIX C2] 广播刷新：st-compat/extensions.js 的 extensionTypes（live 快照）
+        // 与各 shim 的 live binding 都靠这个事件重新取数。
+        try { window.dispatchEvent(new Event('rikka-st-refresh')); } catch (_e2) { /* noop */ }
+    } catch (_e) { /* noop */ }
+}
+
 function installPanelMode() {
     const root = document.getElementById('rikka-panel-root') || document.body;
+    // [v243 BUGFIX D1] 稳定视口高度：绝不能用 window.innerHeight（那就是被 ResizeObserver
+    // 反复改写的面板自身高度，用它做 vh 基准 = 自激回路）。优先用宿主注入值，其次屏幕高度。
+    try {
+        let vhPx = 0;
+        if (typeof window.__rikkaViewportHeightPx === 'number' && window.__rikkaViewportHeightPx > 0) {
+            vhPx = window.__rikkaViewportHeightPx;
+        } else if (window.screen && window.screen.height > 0) {
+            vhPx = Math.round(window.screen.height);
+        }
+        if (vhPx > 0) {
+            document.documentElement.style.setProperty('--rikka-panel-vh', vhPx + 'px');
+        }
+    } catch (_e) { /* noop */ }
+    // [v243 BUGFIX C1] 面板独立 realm：同步已安装扩展元数据（不重新执行插件模块）
+    syncThirdPartyExtensionMetadata();
+    // ---------------------------------------------------------------- [v243 BUGFIX A4] 面板自识别
+    /**
+     * 面板是「某条消息」的渲染宿主：本条消息 id 由 Kotlin 侧注入
+     * （MessageHtmlBlock 在挂 HTML 前 evaluateJavascript 写 window.__rikkaPanelMessageKey）。
+     * 用它把 chat 数组里对应的那条消息找出来；写死 message_id: -1 永远只指向最后一条消息。
+     *
+     * ⚠️ [v243 BUGFIX A4] 这个函数原来被误插在 `probe` 的**函数体内部**，
+     * 于是 installPanelMode 作用域里的三处调用全部 ReferenceError（都被 catch 吞掉）：
+     *   · readMvuVars()  → 永远返回 null → varsWait 永远超时 → 面板脚本永远拿不到变量、写不回变量；
+     *   · emitRenderedEvent() → 永远不派发 panel_rendered → 扩展视图（记忆表格等）不刷新；
+     *   · wrapPanelVarApi().note() → `[panel] varreq …` 诊断日志一条都不打。
+     * 真机取证：tavern-runtime.log / MiniMax 版日志里
+     * `[panel] varreq` / `[panel] rendered id=` **一条都没有**（而 `vars wait: timeout` 出现 3 次），
+     * 正是这三处全部抛 ReferenceError 的特征。
+     * 另外 `vars wait: timeout` 里打印的 `selfId=-1` 也是同一个原因（`typeof panelSelfId` 拿到 'undefined'），
+     * 属于**假象**，不代表真的没匹配上楼层。
+     */
+    function panelSelfId() {
+        try {
+            const key = window.__rikkaPanelMessageKey;
+            if (key) {
+                const chat = (window.SillyTavern.getContext().chat) || [];
+                for (let i = 0; i < chat.length; i++) {
+                    if (chat[i] && String(chat[i].id) === String(key)) {
+                        window.__rikkaPanelMessageKeyIndex = i;
+                        return i;
+                    }
+                }
+                if (typeof window.__rikkaPanelMessageKeyIndex === 'number') return window.__rikkaPanelMessageKeyIndex;
+            }
+        } catch (_e) { /* noop */ }
+        return -1;
+    }
+
     ensurePanelChatDomStubs();
-    // 高度上报（v183 强化：多基准测量 + 变化去重 + 面板日志）
+    // 高度上报（以 #rikka-panel-root 真实内容几何为准，避免 documentElement.scrollHeight 被旧视口高度锁死导致折叠后无法收缩）
     let lastReportedHeight = -1;
     const measure = () => {
-        const de = document.documentElement, b = document.body;
-        const parts = [
-            de ? de.scrollHeight : 0,
-            b ? b.scrollHeight : 0,
-            root.scrollHeight,
-            Math.ceil(root.getBoundingClientRect().height || 0),
-        ].filter((v) => typeof v === 'number' && isFinite(v) && v >= 0);
-        return parts.length ? Math.max.apply(null, parts) : 0;
+        if (!root) return 0;
+        let maxChildBottom = 0;
+        let maxDescendantBottom = 0;
+        try {
+            const rootRect = root.getBoundingClientRect();
+            const rootTop = rootRect ? rootRect.top : 0;
+            const children = Array.from(root.children || []);
+            for (let i = 0; i < children.length; i++) {
+                const c = children[i];
+                if (!c) continue;
+                const style = window.getComputedStyle ? window.getComputedStyle(c) : null;
+                if (style && style.display === 'none') continue;
+                const marginBottom = style ? (parseFloat(style.marginBottom) || 0) : 0;
+                const bottom = (c.offsetTop || 0) + Math.max(c.scrollHeight || 0, c.offsetHeight || 0) + marginBottom;
+                if (bottom > maxChildBottom) maxChildBottom = bottom;
+                const cr = c.getBoundingClientRect ? c.getBoundingClientRect() : null;
+                if (cr && cr.height > 0) {
+                    const relBottom = (cr.bottom - rootTop) + marginBottom;
+                    if (relBottom > maxDescendantBottom) maxDescendantBottom = relBottom;
+                }
+            }
+        } catch (_e) { /* noop */ }
+        const rootBoxH = Math.ceil((root.getBoundingClientRect && root.getBoundingClientRect().height) || 0);
+        const rootScrollH = root.scrollHeight || 0;
+        const rootOffsetH = root.offsetHeight || 0;
+        // 若 root 有子元素，优先使用子元素包络与 root 自身盒高度，避免 body/documentElement 因 WebView 视口高度锁死在旧高值
+        const hasChildren = root.children && root.children.length > 0;
+        const parts = hasChildren
+            ? [rootBoxH, rootOffsetH, Math.ceil(maxChildBottom), Math.ceil(maxDescendantBottom), rootScrollH]
+            : [rootScrollH, rootBoxH, rootOffsetH];
+        const valid = parts.filter((v) => typeof v === 'number' && isFinite(v) && v >= 0);
+        return valid.length ? Math.max.apply(null, valid) : 0;
     };
     // [v229 P0-1] 面板宽度测量/上报**整条链路已删除**（主人已拍板：渲染/面板气泡恢复「正常气泡模式」）。
     //   v228 的实现是「测量 -> 约束 -> 再测量」的闭环：ResizeObserver 量到的是**被约束后**的宽度，
@@ -2612,10 +3286,10 @@ function installPanelMode() {
             try {
                 const doc = new DOMParser().parseFromString(unfenced, 'text/html');
                 const headBits = Array.from(doc.head.querySelectorAll('style,link[rel="stylesheet"]')).map((n) => n.outerHTML).join('\n');
-                return headBits + '\n' + doc.body.innerHTML;
+                return convertPanelVh(headBits + '\n' + doc.body.innerHTML);
             } catch (_e) { /* fallthrough */ }
         }
-        return unfenced;
+        return convertPanelVh(unfenced);
     };
     // [DIAG B] 资源加载失败捕获（capture 阶段，target 就是元素本身）：
     // 面板 HTML 常引用 cdnjs font-awesome / Google Fonts，离线或被拦时图标字体静默变空白，
@@ -2638,25 +3312,6 @@ function installPanelMode() {
     const probe = (tag) => {
         try {
             if (!window.RikkaPanel || typeof RikkaPanel.log !== 'function') return;
-    // [批次十三] 面板是「某条消息」的渲染宿主：本条消息 id 由 Kotlin 侧注入
-    // （MessageHtmlBlock 在挂 HTML 前 evaluateJavascript 写 window.__rikkaPanelMessageKey）。
-    // 用它把 chat 数组里对应的那条消息找出来；先前写死的 message_id: -1 永远只指向最后一条消息。
-    function panelSelfId() {
-        try {
-            const key = window.__rikkaPanelMessageKey;
-            if (key) {
-                const chat = (window.SillyTavern.getContext().chat) || [];
-                for (let i = 0; i < chat.length; i++) {
-                    if (chat[i] && String(chat[i].id) === String(key)) {
-                        window.__rikkaPanelMessageKeyIndex = i;
-                        return i;
-                    }
-                }
-                if (typeof window.__rikkaPanelMessageKeyIndex === 'number') return window.__rikkaPanelMessageKeyIndex;
-            }
-        } catch (_e) { /* noop */ }
-        return -1;
-    }
 
 
             const nScripts = root.querySelectorAll('script').length;
@@ -2689,6 +3344,8 @@ function installPanelMode() {
     //   ② 只重挂一次（整棵面板重新执行）—— 照顾一次性渲染的卡脚本。
     const hasMvuVars = (v) => !!v && typeof v === 'object' && (Object.keys(v).length > 0 || !!v.stat_data);
     const readMvuVars = () => {
+        // 优先通过轻量级 getMessageVariablesJson 同步变量，避免每次轮询触发 218KB 全量 getChatJson 跨桥序列化
+        try { syncMessageVariablesOnly(); } catch (_e) { /* noop */ }
         try {
             if (window.Mvu && typeof window.Mvu.getMvuData === 'function') {
                 return window.Mvu.getMvuData({ type: 'message', message_id: panelSelfId() });
@@ -2724,7 +3381,7 @@ function installPanelMode() {
                 try { if (lastPanelHtml && window.__rikkaPanelMount) window.__rikkaPanelMount(lastPanelHtml, 'remount'); } catch (_e) { /* noop */ }
                 return;
             }
-            if (ticks >= 20) {
+            if (ticks >= 30) {
                 clearInterval(varsWaitTimer); varsWaitTimer = null;
                 try {
                     if (window.RikkaPanel && RikkaPanel.log) {
@@ -2736,7 +3393,7 @@ function installPanelMode() {
                     }
                 } catch (_e) { /* noop */ }
             }
-        }, 400);
+        }, 200);
     };
         // [v218.1] 面板渲染完成后补发 ST 的 RENDERED 事件（见 __rikkaPanelMount 里的调用点）
         function emitRenderedEvent(tag) {
@@ -2755,6 +3412,12 @@ function installPanelMode() {
         }
 
     window.__rikkaPanelMount = (html, tag) => {
+        const t = tag || 'mount';
+        if (t === 'mount' && window.__rikkaPanelMountedHtml === html) {
+            report();
+            return;
+        }
+        window.__rikkaPanelMountedHtml = html;
         try {
             if (!window.__rikkaPanelHtmlDumps) window.__rikkaPanelHtmlDumps = [];
             const dus = window.__rikkaPanelHtmlDumps;
@@ -2763,7 +3426,6 @@ function installPanelMode() {
                 if (dus.indexOf(head) < 0) { dus.push(head); RikkaPanel.log('debug', '[panel] html head: ' + head); }
             }
         } catch (_e) { /* noop */ }
-        const t = tag || 'mount';
         try {
             root.innerHTML = normalizeHtml(html);
             Promise.resolve()
@@ -2824,7 +3486,40 @@ function installPanelMode() {
     }
     try { if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => report()).catch(() => {}); } catch (_e) { /* noop */ }
     window.addEventListener('load', () => { report(); setTimeout(report, 250); });
-    setInterval(report, 1500);
+    // 捕获阶段监听 details 展开/收起（toggle 不冒泡）、图片/子资源加载、CSS 过渡/动画完成与表单输入，确保高度实时双向更新
+    const scheduleDynamicReport = () => {
+        try {
+            requestAnimationFrame(() => {
+                report();
+                setTimeout(report, 80);
+            });
+        } catch (_e) { report(); }
+    };
+    document.addEventListener('toggle', scheduleDynamicReport, true);
+    document.addEventListener('load', scheduleDynamicReport, true);
+    document.addEventListener('transitionend', scheduleDynamicReport, true);
+    document.addEventListener('animationend', scheduleDynamicReport, true);
+    document.addEventListener('input', scheduleDynamicReport, true);
+    window.__rikkaSyncAfterHostRestart = () => {
+        try {
+            syncThirdPartyExtensionMetadata();
+            invalidateChatCache();
+            refreshAll();
+            report();
+        } catch (_e) { /* noop */ }
+    };
+    // [P0-2 修复] 高度稳定 6 次后自动停止 1500ms 轮询（后续由 ResizeObserver / MutationObserver 驱动），消除静置状态下永久强制重排
+    let stableReportTicks = 0;
+    const reportInterval = setInterval(() => {
+        const prev = lastReportedHeight;
+        report();
+        if (lastReportedHeight > 48 && lastReportedHeight === prev) {
+            stableReportTicks++;
+            if (stableReportTicks >= 6) clearInterval(reportInterval);
+        } else {
+            stableReportTicks = 0;
+        }
+    }, 1500);
     setTimeout(report, 100);
     // Mvu stub：与 MagVarUpdate bundle 同形（getMvuData → getVariables / events 常量表）。
     // panel 模式不加载 MVU 引擎，但面板脚本（魔法少女状态栏等）会直接引用 Mvu.*
@@ -2854,6 +3549,18 @@ function installPanelMode() {
         const pendingHtml = window.__rikkaPanelPendingHtml;
         window.__rikkaPanelPendingHtml = null;
         try { window.__rikkaPanelMount(pendingHtml); } catch (_e) { /* noop */ }
+    } else if (window.RikkaPanel && typeof window.RikkaPanel.getPendingHtml === 'function') {
+        try {
+            const pendingKey = (typeof window.RikkaPanel.getPendingKey === 'function')
+                ? String(window.RikkaPanel.getPendingKey() || '') : '';
+            if (pendingKey && !window.__rikkaPanelMessageKey) {
+                window.__rikkaPanelMessageKey = pendingKey;
+            }
+            const pendingHtml = String(window.RikkaPanel.getPendingHtml() || '');
+            if (pendingHtml) {
+                window.__rikkaPanelMount(pendingHtml);
+            }
+        } catch (_e) { /* noop */ }
     }
         // [批次十三·诊断] 卡脚本在面板里到底向变量系统要了什么、又拿到了什么。
     // 只记前 24 次，避免刷爆日志（tavern-runtime.log 上限 256KB）。
@@ -2978,11 +3685,11 @@ function installPanelMode() {
         }, 1500);
         return;
     }
-    // Panel 模式（C4）：消息内嵌渲染宿主 —— 不加载卡脚本 / MVU
+    // Panel 模式（C4）：消息内嵌渲染宿主 —— 启动时仅轻量拉取元数据与变量（refreshForPanelMode），按需惰性拉取聊天正文
     if (window.__RIKKA_PANEL_MODE__) {
         console.log(`${LOG_PREFIX} booting in PANEL mode ...`);
         if (typeof $ === 'undefined') safeWarn('jQuery missing! shims may break.');
-        refreshAll();
+        refreshForPanelMode();
         emitToHost('panel_ready', { version: '1.1.0' });
         installPanelMode();
         return;
@@ -2998,26 +3705,79 @@ function installPanelMode() {
     refreshAll();
     emitToHost('script_ready', { version: '1.1.0' });
     console.log(`${LOG_PREFIX} shims installed: ${Object.keys(TavernHelper).length} keys`);
-    // 先装载卡脚本（可能自带 MVU 加载器），再决定 MVU 来源
-    try { await loadTavernScripts(); } catch (_e) { /* noop */ }
-    console.log(`${LOG_PREFIX} card scripts mounted: mvuFromScripts=${mvuFromScripts}, window.Mvu=${!!window.Mvu}`);
-    // [BUGFIX B] MVU 装载不再排在第三方扩展装载之后。
-    // 真机证据：injectThirdPartyModule 单模块最长等 15s（setTimeout(done, 15000)），3 个扩展
-    // 最坏要 45s 才返回，而卡内 MVU 引擎脚本只重试 10×2s＝20s 就放弃并报「未检测到MVU框架」，
-    // 变量永不初始化 → 状态栏/监控面板拿不到数据只能渲染空壳。MVU 必须尽早、与扩展并行启动。
-    setTimeout(() => { loadMvu(); }, 1200);
-    // 第三方扩展（ST third-party）：与卡脚本独立，装载完成后广播 rikka-st-refresh
+    // [P0-1 根因1修复] 重排冷启动顺序，消除冷启动直落重度脚本卡（如大小姐）时的 CrRendererMain 死锁：
+    // 1) 先装载第三方扩展（ST-Prompt-Template / JS-Slash-Runner，本地实测 ~450ms），
+    //    确保 window.TavernHelper（180 keys）完整就绪后再启动角色卡脚本 iframe，避免 JSR 覆盖 TavernHelper 与 6 个 iframe 并发争抢。
     const extT0 = Date.now();
     try { await loadThirdPartyExtensions(false); } catch (_e) { /* noop */ }
+    try {
+        if (window.TavernHelper && typeof window.TavernHelper === 'object') {
+            window.TavernHelper.injectPrompts = shimInject.injectPrompts;
+            window.TavernHelper.uninjectPrompts = shimInject.uninjectPrompts;
+        }
+        window.injectPrompts = shimInject.injectPrompts;
+        window.uninjectPrompts = shimInject.uninjectPrompts;
+    } catch (_e) { /* noop */ }
     console.log(`${LOG_PREFIX} third-party extension phase done in ${Date.now() - extT0}ms (window.Mvu=${!!window.Mvu})`);
-    // 少数扩展自带 MVU：晚到时补一次 ready 广播，避免宿主一直等 mvu_ready
-    if (window.Mvu && !mvuReady) {
-        mvuReady = true;
-        console.log(`${LOG_PREFIX} MVU became available from third-party extension`);
-        emitToHost('mvu_ready', { source: 'extension', version: String(window.Mvu && window.Mvu.version || '') });
-        setTimeout(() => notifyChatReady(), 150);
+
+    // 2) 探测当前角色卡脚本是否自带 MVU（含 MagVarUpdate）：若不自带，则先启动内置 MVU，保证卡脚本启动时 window.Mvu 已就绪
+    let preHasScriptMvu = false;
+    try {
+        const rawScripts = callBridge('getTavernScriptsJson') || '{}';
+        const helper = (JSON.parse(rawScripts) || {}).tavern_helper || null;
+        const list = (helper && Array.isArray(helper.scripts)) ? helper.scripts : [];
+        preHasScriptMvu = list.some(
+            (s) => s && s.type === 'script' && scriptEnabled(s.enabled) &&
+                /mvu_bundle_full|MVU-offline|MagVarUpdate/i.test(String(s.content || ''))
+        );
+    } catch (_e) { preHasScriptMvu = false; }
+    if (!preHasScriptMvu && !window.Mvu) {
+        try { await loadMvu(); } catch (_e) { /* noop */ }
+    }
+
+    // 3) 在 TavernHelper 与 MVU 已就绪的环境下，按 80ms 间隔串行分帧挂载卡脚本 iframe
+    try { await loadTavernScripts(); } catch (_e) { /* noop */ }
+    console.log(`${LOG_PREFIX} card scripts mounted: mvuFromScripts=${mvuFromScripts}, window.Mvu=${!!window.Mvu}`);
+
+    // 4) 若卡脚本自带 MVU（如大小姐 MagVarUpdate）或 MVU 仍未就绪，走 loadMvu() 认领/兜底流程
+    if (!window.Mvu || !mvuReady) {
+        setTimeout(() => { loadMvu(); }, 300);
     }
 })();
 
 // 页面卸载前冲刷变量
 window.addEventListener('pagehide', () => { try { flushAll(); } catch (_e) { /* noop */ } });
+
+
+// JS SlashCommandParser 自定义命令回退执行桥（供宿主 StSlashExecutor 调用）
+if (typeof window.__rikkaExecuteJsSlashCommand !== 'function') {
+    window.__rikkaExecuteJsSlashCommand = async function (name, namedArgsJson, unnamedArgs, pipe, seq) {
+        const reg = window.__rikkaStSlashRegistry;
+        const cmd = reg && typeof reg.get === 'function'
+            ? (reg.get(String(name)) || reg.get(String(name).toLowerCase()) || null)
+            : null;
+        if (!cmd || typeof cmd.callback !== 'function') {
+            if (seq != null && window.RikkaBridge && typeof window.RikkaBridge.onSlashResult === 'function') {
+                try { window.RikkaBridge.onSlashResult(seq, JSON.stringify({ found: false, value: '' })); } catch (_e) { /* noop */ }
+            }
+            return null;
+        }
+        let named = {};
+        try { named = (typeof namedArgsJson === 'string' && namedArgsJson) ? JSON.parse(namedArgsJson) : (namedArgsJson && typeof namedArgsJson === 'object' ? namedArgsJson : {}); } catch (_e) { named = {}; }
+        if (pipe !== undefined && named._pipe === undefined) named._pipe = String(pipe);
+        try {
+            const r = await cmd.callback(named, String(unnamedArgs == null ? '' : unnamedArgs));
+            const val = r == null ? '' : String(r);
+            if (seq != null && window.RikkaBridge && typeof window.RikkaBridge.onSlashResult === 'function') {
+                try { window.RikkaBridge.onSlashResult(seq, JSON.stringify({ found: true, value: val })); } catch (_e) { /* noop */ }
+            }
+            return val;
+        } catch (err) {
+            const errVal = `(js slash error: ${(err && err.message) || err})`;
+            if (seq != null && window.RikkaBridge && typeof window.RikkaBridge.onSlashResult === 'function') {
+                try { window.RikkaBridge.onSlashResult(seq, JSON.stringify({ found: true, value: errVal })); } catch (_e) { /* noop */ }
+            }
+            return errVal;
+        }
+    };
+}

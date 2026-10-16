@@ -122,6 +122,9 @@ enum class BuiltinSlashKind {
 
     /** 在消息处创建分支并打开（官方 /branch-create） */
     BRANCH_CREATE,
+
+    /** 通用 STscript 命令（交由 StSlashExecutor 执行） */
+    STSCRIPT,
 }
 
 /**
@@ -477,7 +480,59 @@ fun builtinSlashCommands(context: Context): List<SlashCommand> = listOf(
             SlashExample(R.string.slash_example_branch_create_1_cmd, R.string.slash_example_branch_create_1_desc),
         ),
     ),
-) + varSlashCommands(context)
+) + varSlashCommands(context) + stScriptSlashCommands()
+
+/**
+ * 常用 STscript 扩展命令自动补全项（全部交由 StSlashExecutor 执行）。
+ */
+fun stScriptSlashCommands(): List<SlashCommand> = listOf(
+    SlashCommand(name = "echo", description = "显示提示消息并透传管道文本", argumentHint = "[文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "pass", description = "透传文本或当前管道值", argumentHint = "[文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "return", description = "返回指定值并结束当前脚本", argumentHint = "[值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "let", description = "定义当前脚本作用域局部变量", argumentHint = "[变量名] [值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "var", description = "读写当前脚本作用域变量", argumentHint = "[变量名] [值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "if", description = "条件分支执行命令或闭包", argumentHint = "left=.. rule=.. right=.. {: ... :}", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "else", description = "上一次 /if 未命中时的分支", argumentHint = "{: ... :}", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "while", description = "条件循环执行命令或闭包", argumentHint = "left=.. rule=.. right=.. {: ... :}", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "times", description = "按指定次数循环执行闭包或子命令", argumentHint = "[次数] {: ... :}", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "break", description = "跳出当前循环或闭包", argumentHint = "[返回值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "abort", description = "中止整条 STscript 脚本执行", argumentHint = "[原因]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "delay", description = "延迟等待指定毫秒数", argumentHint = "[毫秒]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "run", description = "调用闭包字面量或已保存的闭包变量", argumentHint = "[闭包名或 {: ... :}]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "genraw", description = "不带聊天历史静默生成文本并返回至管道", argumentHint = "[system=..] [提示词]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "setglobalvar", description = "设置全局宏变量", argumentHint = "[key] [value]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "getglobalvar", description = "读取全局宏变量", argumentHint = "[key]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "addglobalvar", description = "累加或拼接全局宏变量", argumentHint = "[key] [value]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "incglobalvar", description = "全局宏变量自增 1", argumentHint = "[key]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "decglobalvar", description = "全局宏变量自减 1", argumentHint = "[key]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "flushglobalvar", description = "删除指定全局宏变量", argumentHint = "[key]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "listglobalvar", description = "列出所有全局宏变量", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "del", description = "删除指定数量或范围的消息", argumentHint = "[数量或 start-end]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "cut", description = "剪切指定范围的消息并返回文本", argumentHint = "[数量或 start-end]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "inject", description = "向当前会话注入临时提示词", argumentHint = "id=.. position=.. depth=.. [内容]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "listinjects", description = "列出当前会话的临时注入提示词", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "flushinject", description = "清除指定或全部临时注入提示词", argumentHint = "[id]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "world", description = "绑定或解绑指定名称的世界书", argumentHint = "[state=on|off] [世界书名]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "getentryfield", description = "读取世界书条目字段", argumentHint = "file=.. field=.. [uid]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "setentryfield", description = "修改世界书条目字段", argumentHint = "file=.. uid=.. field=.. [值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "createentry", description = "在世界书中新建条目", argumentHint = "file=.. key=.. [内容]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "regex", description = "启用或禁用指定正则脚本", argumentHint = "[state=on|off] [名称或ID]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "setinput", description = "设置聊天输入框草稿内容", argumentHint = "[文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "messages", description = "读取指定楼层或范围的消息文本", argumentHint = "[names=on|off] [楼层或范围]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "note", description = "读取或设置作者备注（Author's Note）", argumentHint = "[文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "note-depth", description = "设置作者备注注入深度", argumentHint = "[深度]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "note-frequency", description = "设置作者备注注入间隔", argumentHint = "[间隔]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "note-position", description = "设置作者备注注入位置", argumentHint = "[chat|prompt|before]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "note-role", description = "设置作者备注注入角色", argumentHint = "[system|user|assistant]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "qr", description = "按标题触发快速回复", argumentHint = "[标题]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "qr-arg", description = "设置快速回复上下文参数", argumentHint = "[键] [值]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "translate", description = "将文本翻译为目标语言", argumentHint = "[target=语言] [文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "summarize", description = "总结当前对话剧情并保存至 {{summary}}", argumentHint = "[提示词]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "caption", description = "生成当前画面或场景的描述", argumentHint = "[提示词]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "popup", description = "显示弹窗提示", argumentHint = "[title=标题] [文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "input", description = "获取输入值（支持 default=默认值）", argumentHint = "[default=..] [提示文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+    SlashCommand(name = "buttons", description = "按钮选择命令（支持 labels=[...]）", argumentHint = "labels=[...] [提示文本]", content = "", filePath = "builtin", builtinKind = BuiltinSlashKind.STSCRIPT),
+)
 
 /**
  * 官方变量命令家族（对齐 SillyTavern variables.js，仅保留本对话级 7 个）。
@@ -625,6 +680,52 @@ fun matchSlashCommand(
 ): SlashCommand? {
     val trimmed = input.trimStart()
     if (!trimmed.startsWith("/")) return null
-    val name = trimmed.substring(1).split(" ").first().lowercase()
+    val name = trimmed.substring(1).split(Regex("\\s+")).first().lowercase()
     return commands.find { it.name.lowercase() == name }
+}
+
+/**
+ * 判断输入框中的 `/` 文本是否应直接交由 [me.rerere.rikkahub.data.st.script.StSlashExecutor] 执行：
+ * 1. 以 `//` 开头的 STscript 注释；
+ * 2. 包含管道符 `|`（引号外）、闭包字面量 `{:` / `{|`、宏 `{{...}}` 或多行脚本；
+ * 3. `matched == null`（不在旧版单命令表中，如 50+ 条 STscript 命令或 JS 扩展注册命令）；
+ * 4. 命中 `BuiltinSlashKind.STSCRIPT`、检查点族或分支创建命令。
+ */
+fun shouldRouteToStSlashExecutor(
+    text: String,
+    matched: SlashCommand? = null,
+): Boolean {
+    val trimmed = text.trimStart()
+    if (!trimmed.startsWith("/")) return false
+    if (trimmed.startsWith("//")) return true
+    if (trimmed.contains('\n') || trimmed.contains("{:") || trimmed.contains("{|") || trimmed.contains("{{")) {
+        return true
+    }
+    // 检查引号外是否包含顶层管道符 '|'
+    var inSingle = false
+    var inDouble = false
+    var i = 0
+    while (i < trimmed.length) {
+        val c = trimmed[i]
+        if (c == '\\' && i + 1 < trimmed.length) {
+            i += 2
+            continue
+        }
+        if (c == '\'' && !inDouble) inSingle = !inSingle
+        else if (c == '"' && !inSingle) inDouble = !inDouble
+        else if (c == '|' && !inSingle && !inDouble) return true
+        i++
+    }
+    if (matched == null) return true
+    return when (matched.builtinKind) {
+        BuiltinSlashKind.STSCRIPT,
+        BuiltinSlashKind.CHECKPOINT_CREATE,
+        BuiltinSlashKind.CHECKPOINT_GO,
+        BuiltinSlashKind.CHECKPOINT_EXIT,
+        BuiltinSlashKind.CHECKPOINT_PARENT,
+        BuiltinSlashKind.CHECKPOINT_GET,
+        BuiltinSlashKind.CHECKPOINT_LIST,
+        BuiltinSlashKind.BRANCH_CREATE -> true
+        else -> false
+    }
 }

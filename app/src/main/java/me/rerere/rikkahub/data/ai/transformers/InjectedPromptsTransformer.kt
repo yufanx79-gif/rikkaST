@@ -29,7 +29,11 @@ object InjectedPromptsTransformer : InputMessageTransformer {
     override suspend fun transform(
         ctx: TransformerContext,
         messages: List<UIMessage>,
-    ): List<UIMessage> = applyInjectedPrompts(ctx.conversationId?.toString(), messages)
+    ): List<UIMessage> {
+        val convId = ctx.conversationId?.toString()
+        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.evaluateActiveInjectFilters(convId)
+        return applyInjectedPrompts(convId, messages)
+    }
 
     /** 纯函数核心（无 Android 依赖，JVM 单测直接调用） */
     internal fun applyInjectedPrompts(

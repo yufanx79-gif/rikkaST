@@ -26,6 +26,10 @@ class QuickMessagesVM(
         )
     }
 
+    fun addQuickMessageItem(item: QuickMessage) {
+        updateQuickMessages(settings.value.quickMessages + item)
+    }
+
     fun updateQuickMessage(updated: QuickMessage) {
         updateQuickMessages(
             settings.value.quickMessages.map { quickMessage ->

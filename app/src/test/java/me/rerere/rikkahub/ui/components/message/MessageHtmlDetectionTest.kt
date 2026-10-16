@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.ui.components.message
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -76,5 +77,57 @@ class MessageHtmlDetectionTest {
     @Test
     fun shortTextIsNotInteractive() {
         assertFalse(looksLikeInteractiveHtml("<div>x</div>"))
+    }
+
+    @Test
+    fun cssBackgroundAndFlexGridFragmentsAreInteractiveWhileXmlFenceIsNot() {
+        val bgCard = """<div style="background-image: url('https://example.com/bg.png'); display: flex; padding: 12px;"><span>状态栏</span></div>"""
+        assertTrue(looksLikeInteractiveHtml(bgCard))
+
+        val svgPanel = """<div class="hud"><svg width="100" height="40"><rect width="100" height="40"/></svg></div>"""
+        assertTrue(looksLikeInteractiveHtml(svgPanel))
+
+        val xmlCodeFence = """
+            ```xml
+            <div class="not-html-render">
+                <span style="color:red">This is an XML code snippet</span>
+            </div>
+            ```
+        """.trimIndent()
+        assertFalse(looksLikeInteractiveHtml(xmlCodeFence))
+    }
+
+    @Test
+    fun panelMountStateUsesInPlaceRemountForScriptlessUpdatesAndReloadsForScripts() {
+        val state = PanelMountState()
+        val html1 = "<style>.card{color:blue}</style><div class=\"card\">Turn 1</div>"
+        val html2 = "<style>.card{color:blue}</style><div class=\"card\">Turn 2</div>"
+        val htmlWithScript = "<div class=\"card\">Turn 3</div><script>console.log(3)</script>"
+
+        assertEquals(PanelUpdateAction.RELOAD_DOCUMENT, state.decideUpdateAction(html1, 1))
+        assertEquals(1, state.reloadCount)
+        assertEquals(0, state.inPlaceRemountCount)
+
+        // 同一内容且同一重载代次 → NO_OP
+        assertEquals(PanelUpdateAction.NO_OP, state.decideUpdateAction(html1, 1))
+
+        // 纯 HTML/CSS 更新（无 <script>）→ 原地重挂载，不触发整页 reload
+        assertEquals(PanelUpdateAction.REMOUINT_IN_PLACE, state.decideUpdateAction(html2, 1))
+        assertEquals(1, state.reloadCount)
+        assertEquals(1, state.inPlaceRemountCount)
+
+        // 含 <script> 的更新 → 整页 reload 以隔离全局污染并重新触发 DOMContentLoaded
+        assertEquals(PanelUpdateAction.RELOAD_DOCUMENT, state.decideUpdateAction(htmlWithScript, 1))
+        assertEquals(2, state.reloadCount)
+    }
+
+    @Test
+    fun tavernRuntimeMimeOfHandlesCaseQueryFragmentsAndMediaExtensions() {
+        assertEquals("image/jpeg", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("charx_assets/id/Avatar.JPG?v=1#top"))
+        assertEquals("image/webp", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("sprites/joy.WEBP"))
+        assertEquals("image/avif", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("bg.avif"))
+        assertEquals("font/woff2", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("fonts/custom.WOFF2?ver=2.0"))
+        assertEquals("font/ttf", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("fonts/pixel.ttf"))
+        assertEquals("audio/mpeg", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("voice/line01.MP3"))
     }
 }

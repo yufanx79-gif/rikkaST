@@ -35,8 +35,21 @@ fun ZoomableAsyncImage(
     val context = LocalContext.current
     val placeholder = if(LocalDarkMode.current) R.drawable.placeholder_dark else R.drawable.placeholder
     val export = LocalExportContext.current
+    val resolvedData: Any? = remember(model, context) {
+        val m = model?.trim().orEmpty()
+        val localPrefix = listOf(
+            "https://appassets.androidplatform.net/",
+            "https://st.rikka.local/",
+        ).firstOrNull { m.startsWith(it, ignoreCase = true) }
+        if (localPrefix != null) {
+            val rel = m.substring(localPrefix.length).substringBefore('?').substringBefore('#')
+            if (rel.startsWith("charx_assets/") || rel.startsWith("sprites/")) {
+                java.io.File(context.filesDir, rel).takeIf { it.isFile } ?: model
+            } else model
+        } else model
+    }
     val coilModel = ImageRequest.Builder(context)
-        .data(model)
+        .data(resolvedData)
         .placeholder(placeholder)
         .crossfade(false)
         .allowHardware(!export)

@@ -48,7 +48,9 @@ import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.st.regex.RegexPlacement
 import me.rerere.rikkahub.data.st.regex.getStRegexed
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.regex.mergeRegexScripts
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import me.rerere.rikkahub.ui.components.ui.ChainOfThoughtScope
 import me.rerere.rikkahub.ui.context.LocalSettings
@@ -134,7 +136,7 @@ private fun ReasoningContent(
 ) {
     val isPreview = expandState == ReasoningCardState.Preview
     val settings = LocalSettings.current
-    val stRegexScripts = remember(settings.regexScripts, assistant) { mergeRegexScripts(settings.regexScripts, assistant) }
+    val stRegexScripts = remember(settings.regexScripts, settings.modeInjections, settings.tavernPresets, assistant) { mergeActiveRegexScripts(settings, assistant) }
     val reasoningTextStyle = MaterialTheme.typography.bodySmall.copy(
         fontFamily = LocalTextStyle.current.fontFamily,
     )

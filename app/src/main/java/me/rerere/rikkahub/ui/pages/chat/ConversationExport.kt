@@ -176,6 +176,32 @@ fun ChatExportSheet(
                     )
                 }
 
+                val jsonlSuccessMessage =
+                    stringResource(id = R.string.chat_page_export_success, "SillyTavern JSONL")
+                OutlinedCard(
+                    onClick = {
+                        exportToStJsonl(context, conversation, settings)
+                        toaster.show(
+                            jsonlSuccessMessage,
+                            type = ToastType.Success
+                        )
+                        onDismissRequest()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    ListItem(
+                        headlineContent = {
+                            Text("SillyTavern JSONL (.jsonl)")
+                        },
+                        supportingContent = {
+                            Text("导出为官方 SillyTavern 聊天记录格式（含多分支 Swipes 与消息变量）")
+                        },
+                        leadingContent = {
+                            Icon(HugeIcons.File02, contentDescription = null)
+                        }
+                    )
+                }
+
                 val imageSuccessMessage =
                     stringResource(id = R.string.chat_page_export_success, "Image")
                 OutlinedCard(
@@ -252,6 +278,40 @@ fun ChatExportSheet(
             }
         }
     }
+}
+
+private fun exportToStJsonl(
+    context: Context,
+    conversation: Conversation,
+    settings: Settings,
+) {
+    val filename = "chat-export-${LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))}.jsonl"
+    val assistant = settings.assistants.firstOrNull { it.id == conversation.assistantId }
+    val charName = assistant?.tavernData?.nickname?.takeIf { it.isNotBlank() }
+        ?: assistant?.name?.takeIf { it.isNotBlank() }
+        ?: "Assistant"
+    val userName = settings.personas.firstOrNull { it.id == settings.activePersonaId && it.enabled }?.name?.takeIf { it.isNotBlank() }
+        ?: settings.displaySetting.userNickname.ifBlank { "User" }
+    val jsonlContent = me.rerere.rikkahub.data.st.runtime.exportConversationToStJsonl(
+        conversation = conversation,
+        userName = userName,
+        characterName = charName,
+    )
+    val file = context.appTempFolder.resolve(filename)
+    FileOutputStream(file).use {
+        it.write(jsonlContent.toByteArray(Charsets.UTF_8))
+    }
+    val fileUri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file,
+    )
+    val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+        type = "application/jsonl"
+        putExtra(android.content.Intent.EXTRA_STREAM, fileUri)
+        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.getActivity()?.startActivity(android.content.Intent.createChooser(shareIntent, null))
 }
 
 private fun exportToMarkdown(

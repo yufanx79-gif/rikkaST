@@ -34,7 +34,9 @@ import me.rerere.rikkahub.ui.components.ai.ModeInjectionsContent
 import me.rerere.rikkahub.ui.components.ai.QuickMessagesContent
 import me.rerere.rikkahub.ui.components.ai.SkillsContent
 import me.rerere.rikkahub.ui.components.ai.EmbeddedRegexSection
-import me.rerere.rikkahub.ui.components.ai.TavernPresetsSection
+import me.rerere.rikkahub.ui.components.ai.PresetManagementSection
+import me.rerere.rikkahub.ui.components.ai.togglePresetEntryForAssistant
+import me.rerere.rikkahub.ui.components.ai.togglePresetGroupForAssistant
 import me.rerere.rikkahub.ui.components.ai.TavernScriptsSection
 import me.rerere.rikkahub.ui.components.ai.ThirdPartyExtensionsSection
 import org.koin.compose.koinInject
@@ -100,7 +102,7 @@ fun ExtensionSelector(
                 onClick = {
                     scope.launch { pagerState.animateScrollToPage(1) }
                 },
-                text = { Text(stringResource(R.string.extension_selector_tab_mode_injections)) }
+                text = { Text(stringResource(R.string.extension_selector_tab_prompt_injections)) }
             )
             Tab(
                 selected = pagerState.currentPage == 2,
@@ -178,9 +180,11 @@ fun ExtensionSelector(
                 }
 
                 1 -> {
-                    if (settings.modeInjections.isNotEmpty()) {
+                    // [第6轮 D1 方案 A] 「模式注入」tab 改走**新通道** settings.promptInjections。
+                    // 预设（presetGroup 非空）不会再出现在这里 —— 它们全部归 tab5「预设管理」。
+                    if (settings.promptInjections.isNotEmpty()) {
                         ModeInjectionsContent(
-                            modeInjections = settings.modeInjections,
+                            modeInjections = settings.promptInjections,
                             selectedIds = selectedModeInjectionIds,
                             onToggle = { id, checked ->
                                 val newIds = if (checked) {
@@ -265,15 +269,60 @@ fun ExtensionSelector(
                     )
                 }
                 5 -> {
-                    TavernPresetsSection(
+                    // [第6轮 D2~D5] 「预设」→「预设管理」：一行 = 一个预设，
+                    // 右侧 = 整组 Switch + ▾ **内联展开面板**（D5），展开后每条可单独开关 / 点开编辑，
+                    // 编辑界面 = 全局的 ModeInjectionEditSheet（注入位置·深度·角色·权重·常驻·概率·粘性·冷却…逐字一致）。
+                    // ⚠️「未分组条目」（历史手写注入 / 默认 Learning Mode）也会在这里单独一行出现（D4 用户要求）。
+                    // 用限定名避免依赖本文件是否 import 了 kotlin.uuid.Uuid
+                    val applyIds: (Set<kotlin.uuid.Uuid>) -> Unit = { newIds ->
+                        if (useConversationInjections) {
+                            onUpdateConversation(conversation.copy(modeInjectionIds = newIds))
+                        } else {
+                            onUpdate(assistant.copy(modeInjectionIds = newIds))
+                        }
+                    }
+                    PresetManagementSection(
                         modeInjections = settings.modeInjections,
-                        selectedIds = selectedModeInjectionIds,
-                        onChangeSelectedIds = { newIds ->
+                        entryChecked = { selectedModeInjectionIds.contains(it.id) },
+                        onToggleEntry = { entry, checked ->
                             if (useConversationInjections) {
-                                onUpdateConversation(conversation.copy(modeInjectionIds = newIds))
+                                if (checked && !entry.enabled) {
+                                    onUpdateSettings(
+                                        settings.copy(
+                                            modeInjections = settings.modeInjections.map { e ->
+                                                if (e.id == entry.id) e.copy(enabled = true) else e
+                                            }
+                                        )
+                                    )
+                                }
+                                applyIds(
+                                    if (checked) selectedModeInjectionIds + entry.id
+                                    else selectedModeInjectionIds - entry.id
+                                )
                             } else {
-                                onUpdate(assistant.copy(modeInjectionIds = newIds))
+                                onUpdateSettings(togglePresetEntryForAssistant(settings, assistant.id, entry.id, checked))
                             }
+                        },
+                        onToggleGroup = { entries, checked ->
+                            val groupName = entries.firstOrNull()?.presetGroup.orEmpty()
+                            if (useConversationInjections || groupName.isEmpty()) {
+                                if (checked && groupName.isNotEmpty() && entries.isNotEmpty() && entries.none { it.enabled }) {
+                                    onUpdateSettings(
+                                        settings.copy(
+                                            modeInjections = settings.modeInjections.map { e ->
+                                                if (e.presetGroup == groupName) e.copy(enabled = true) else e
+                                            }
+                                        )
+                                    )
+                                }
+                                val ids = entries.map { it.id }.toSet()
+                                applyIds(if (checked) selectedModeInjectionIds + ids else selectedModeInjectionIds - ids)
+                            } else {
+                                onUpdateSettings(togglePresetGroupForAssistant(settings, assistant.id, groupName, checked))
+                            }
+                        },
+                        onUpdateEntries = { newList ->
+                            onUpdateSettings(settings.copy(modeInjections = newList))
                         },
                         onNavigateToPrompts = onNavigateToPrompts,
                         modifier = Modifier.fillMaxSize(),

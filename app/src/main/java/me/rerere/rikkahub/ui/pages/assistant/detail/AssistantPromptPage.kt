@@ -444,6 +444,12 @@ private fun AssistantPromptContent(
                 modifier = Modifier.padding(16.dp)
             ) {
                 assistant.presetMessages.fastForEachIndexed { index, presetMessage ->
+                    // [v243 BUGFIX B3] 预设消息列表必须给 key。
+                    // 这段是**有状态**的（OutlinedTextField 内部持有 TextFieldState：文本缓冲 / 光标 / 撤销栈）。
+                    // 没有 key 时 Compose 按位置复用组合槽：删掉第 0 条后，第 1 条会复用第 0 条的槽位，
+                    // 内部状态与新 value 不同步 —— 表现为「内容闪一下 / 显示错位 / 一度空白」。
+                    // 同文件下面的正则列表用的就是 key(regex.id)，这里漏了。UIMessage 自带稳定 id。
+                    key(presetMessage.id) {
                     Column(
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
@@ -486,13 +492,27 @@ private fun AssistantPromptContent(
                             }
                         }
                         OutlinedTextField(
-                            value = presetMessage.toText(),
+                            // [v243 BUGFIX B4] 不用 UIMessage.toText()。
+                            // toText() 把**非文本 part 渲染成空字符串、却仍然占一个 "\n" 分隔位**
+                            // （ai/src/main/java/me/rerere/ai/ui/Message.kt:43）：
+                            // parts=[Text("A"), Image] → 显示成 "A\n"，纯图片的预设消息 → **完全空白**
+                            // —— 这正是用户报的「助手预设消息无法显示内容」。
+                            // toText() 全仓有 39 处调用（含 LLM 提示词拼装），改它风险太大，
+                            // 所以只在「给人看的编辑器」这一处换成只取文本 part 的写法。
+                            value = presetMessage.editableText(),
                             onValueChange = { text ->
                                 onUpdate(
                                     assistant.copy(
                                         presetMessages = assistant.presetMessages.mapIndexed { i, msg ->
                                             if (i == index) {
-                                                msg.copy(parts = listOf(UIMessagePart.Text(text)))
+                                                // [v243 BUGFIX B5] 旧写法
+                                                //   msg.copy(parts = listOf(UIMessagePart.Text(text)))
+                                                // 会把整条消息的 parts **压成一个 Text**：
+                                                // 任何 Image / Tool / Reasoning part 被静默丢弃 ——
+                                                // 用户只是改了一句话，图片就没了。
+                                                // 改成：文本 part 原地替换（多个合并进第一个，保持顺序），
+                                                // **非文本 part 原样保留**。
+                                                msg.copy(parts = msg.parts.toEditableParts(text))
                                             } else {
                                                 msg
                                             }
@@ -503,6 +523,7 @@ private fun AssistantPromptContent(
                             modifier = Modifier.fillMaxWidth(),
                             maxLines = 6
                         )
+                    }
                     }
                 }
                 Button(
@@ -812,4 +833,36 @@ private fun AssistantRegexCard(
     ) {
         Text(stringResource(R.string.common_delete_confirm_message, regex.name))
     }
+}
+
+/**
+ * [v243 BUGFIX B4] 预设消息编辑器用的「纯文本视图」。
+ *
+ * 只取 Text part 并用换行连接，**跳过**非文本 part。
+ * 与 [me.rerere.ai.ui.UIMessage.toText] 的区别：后者把非文本 part 渲染成空串但仍占分隔位，
+ * 于是 parts=[Text("A"), Image] 显示成 "A\n"、纯图片消息显示成空白。
+ */
+private fun UIMessage.editableText(): String =
+    parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+
+/**
+ * [v243 BUGFIX B5] 编辑预设消息正文后重建 parts，**保留非文本 part**。
+ *
+ * 多个 Text part 会被合并进第一个（保持原有相对顺序），非文本 part 原样留在原位。
+ * 这样「只改字」不会把图片 / 工具 / 推理 part 一起删掉。
+ */
+private fun List<UIMessagePart>.toEditableParts(text: String): List<UIMessagePart> = buildList {
+    var textReplaced = false
+    for (part in this@toEditableParts) {
+        when (part) {
+            is UIMessagePart.Text -> {
+                if (!textReplaced) {
+                    add(UIMessagePart.Text(text))
+                    textReplaced = true
+                }
+            }
+            else -> add(part)
+        }
+    }
+    if (!textReplaced) add(UIMessagePart.Text(text))
 }

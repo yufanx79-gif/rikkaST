@@ -5,8 +5,30 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.export.parseActiveStPresetConfig
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import kotlin.uuid.Uuid
+
+/**
+ * 统一合并当前生效的正则脚本（自动提取激活预设中的 `SPreset.RegexBinding` 强制启用/禁用列表）。
+ */
+fun mergeActiveRegexScripts(
+    settings: Settings,
+    assistant: Assistant?,
+    conversationModeInjectionIds: Set<Uuid> = emptySet(),
+): List<RegexScript> {
+    val activeGroups = enabledPresetGroups(assistant, settings, conversationModeInjectionIds)
+    val activePresetCfg = parseActiveStPresetConfig(settings.tavernPresets, activeGroups)
+    return mergeRegexScripts(
+        global = settings.regexScripts,
+        assistant = assistant,
+        enabledPresetGroups = activeGroups,
+        spresetEnabledIds = activePresetCfg.spresetEnabledRegexIds,
+        spresetDisabledIds = activePresetCfg.spresetDisabledRegexIds,
+    )
+}
 
 /**
  * 合并全局正则脚本与角色卡内嵌正则脚本。
@@ -14,9 +36,33 @@ import kotlin.uuid.Uuid
  * 内嵌脚本仅在该角色对话中生效（对齐 ST 语义：角色卡正则随角色激活，
  * 在酒馆中导入角色卡后即自动识别并绑定）。
  */
-fun mergeRegexScripts(global: List<RegexScript>, assistant: Assistant?): List<RegexScript> =
-    if (assistant == null) global
-    else global + (assistant.tavernData?.embeddedRegexScripts ?: emptyList())
+fun mergeRegexScripts(
+    global: List<RegexScript>,
+    assistant: Assistant?,
+    enabledPresetGroups: Set<String>? = null,
+    spresetEnabledIds: Set<String> = emptySet(),
+    spresetDisabledIds: Set<String> = emptySet(),
+): List<RegexScript> {
+    val pureGlobal = global.filter { it.sourcePresetGroup.isNullOrBlank() }
+    val presetScoped = global.filter {
+        val group = it.sourcePresetGroup
+        !group.isNullOrBlank() && (enabledPresetGroups == null || group in enabledPresetGroups)
+    }
+    val cardScoped = assistant?.tavernData?.embeddedRegexScripts ?: emptyList()
+    val combined = pureGlobal + presetScoped + cardScoped
+    val seenIds = mutableSetOf<String>()
+    val deduped = combined.filter { s ->
+        if (s.id.isBlank()) true else seenIds.add(s.id)
+    }
+    if (spresetEnabledIds.isEmpty() && spresetDisabledIds.isEmpty()) return deduped
+    return deduped.map { s ->
+        when {
+            s.id in spresetDisabledIds || s.scriptName in spresetDisabledIds -> s.copy(disabled = true)
+            s.id in spresetEnabledIds || s.scriptName in spresetEnabledIds -> s.copy(disabled = false)
+            else -> s
+        }
+    }
+}
 
 /**
  * 从角色卡 `data.extensions.regex_scripts`（酒馆 RegexScriptData 数组）解析内嵌正则。

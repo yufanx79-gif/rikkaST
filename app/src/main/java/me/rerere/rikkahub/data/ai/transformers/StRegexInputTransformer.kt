@@ -6,7 +6,9 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.st.regex.RegexPlacement
 import me.rerere.rikkahub.data.st.regex.RegexScriptEngine
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.regex.mergeRegexScripts
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 
@@ -29,7 +31,7 @@ object StRegexInputTransformer : InputMessageTransformer, KoinComponent {
         ctx: TransformerContext,
         messages: List<UIMessage>,
     ): List<UIMessage> {
-        val scripts = mergeRegexScripts(ctx.settings.regexScripts, ctx.assistant)
+        val scripts = mergeActiveRegexScripts(ctx.settings, ctx.assistant, ctx.conversationModeInjectionIds)
         if (scripts.isEmpty()) return messages
 
         val settingsStore = get<SettingsStore>()

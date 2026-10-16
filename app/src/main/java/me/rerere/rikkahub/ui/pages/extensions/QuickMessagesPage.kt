@@ -123,8 +123,8 @@ fun QuickMessagesPage(vm: QuickMessagesVM = koinViewModel()) {
             title = stringResource(R.string.quick_messages_page_add_title),
             initialQuickMessage = null,
             onDismiss = { showAddDialog = false },
-            onConfirm = { title, content, autoExecute ->
-                vm.addQuickMessage(title, content, autoExecute)
+            onConfirm = { updated ->
+                vm.addQuickMessageItem(updated)
                 showAddDialog = false
             },
         )
@@ -135,14 +135,8 @@ fun QuickMessagesPage(vm: QuickMessagesVM = koinViewModel()) {
             title = stringResource(R.string.quick_messages_page_edit_title),
             initialQuickMessage = quickMessage,
             onDismiss = { editTarget = null },
-            onConfirm = { title, content, autoExecute ->
-                vm.updateQuickMessage(
-                    quickMessage.copy(
-                        title = title,
-                        content = content,
-                        autoExecute = autoExecute,
-                    )
-                )
+            onConfirm = { updated ->
+                vm.updateQuickMessage(updated)
                 editTarget = null
             },
         )
@@ -236,7 +230,7 @@ private fun EditQuickMessageDialog(
     title: String,
     initialQuickMessage: QuickMessage?,
     onDismiss: () -> Unit,
-    onConfirm: (title: String, content: String, autoExecute: Boolean) -> Unit,
+    onConfirm: (QuickMessage) -> Unit,
 ) {
     var quickMessageTitle by rememberSaveable(initialQuickMessage?.id) {
         mutableStateOf(initialQuickMessage?.title ?: "")
@@ -247,12 +241,36 @@ private fun EditQuickMessageDialog(
     var quickMessageAutoExecute by rememberSaveable(initialQuickMessage?.id) {
         mutableStateOf(initialQuickMessage?.autoExecute ?: false)
     }
+    var setName by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.setName ?: "Default")
+    }
+    var automationId by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.automationId ?: "")
+    }
+    var executeOnStartup by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.executeOnStartup ?: false)
+    }
+    var executeOnChatChange by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.executeOnChatChange ?: false)
+    }
+    var executeOnUser by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.executeOnUser ?: false)
+    }
+    var executeOnAi by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.executeOnAi ?: false)
+    }
+    var executeOnGroup by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.executeOnGroupMemberDraft ?: false)
+    }
+    var hidden by rememberSaveable(initialQuickMessage?.id) {
+        mutableStateOf(initialQuickMessage?.hidden ?: false)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = quickMessageTitle,
                     onValueChange = { quickMessageTitle = it },
@@ -265,9 +283,25 @@ private fun EditQuickMessageDialog(
                     onValueChange = { quickMessageContent = it },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text(stringResource(R.string.assistant_page_quick_message_content)) },
-                    minLines = 4,
-                    maxLines = 8,
+                    minLines = 3,
+                    maxLines = 6,
                 )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = setName,
+                        onValueChange = { setName = it },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("QR 集合名") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = automationId,
+                        onValueChange = { automationId = it },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("Automation ID") },
+                        singleLine = true,
+                    )
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -288,11 +322,58 @@ private fun EditQuickMessageDialog(
                         onCheckedChange = { quickMessageAutoExecute = it },
                     )
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("切会话触发", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = executeOnChatChange, onCheckedChange = { executeOnChatChange = it })
+                    Text("AI回复后触发", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = executeOnAi, onCheckedChange = { executeOnAi = it })
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("启动时触发", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = executeOnStartup, onCheckedChange = { executeOnStartup = it })
+                    Text("发送时触发", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = executeOnUser, onCheckedChange = { executeOnUser = it })
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("群聊发言前", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = executeOnGroup, onCheckedChange = { executeOnGroup = it })
+                    Text("隐藏按钮", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = hidden, onCheckedChange = { hidden = it })
+                }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(quickMessageTitle.trim(), quickMessageContent.trim(), quickMessageAutoExecute) },
+                onClick = {
+                    val base = initialQuickMessage ?: QuickMessage()
+                    onConfirm(
+                        base.copy(
+                            title = quickMessageTitle.trim(),
+                            content = quickMessageContent.trim(),
+                            autoExecute = quickMessageAutoExecute,
+                            setName = setName.trim().ifEmpty { "Default" },
+                            automationId = automationId.trim(),
+                            executeOnStartup = executeOnStartup,
+                            executeOnChatChange = executeOnChatChange,
+                            executeOnUser = executeOnUser,
+                            executeOnAi = executeOnAi,
+                            executeOnGroupMemberDraft = executeOnGroup,
+                            hidden = hidden,
+                        )
+                    )
+                },
                 enabled = quickMessageTitle.isNotBlank() && quickMessageContent.isNotBlank(),
             ) {
                 Text(stringResource(R.string.assistant_page_save))

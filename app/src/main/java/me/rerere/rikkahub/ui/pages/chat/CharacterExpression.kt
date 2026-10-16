@@ -58,9 +58,24 @@ fun CharacterExpressionHost(vm: ChatVM, setting: Settings, conversation: Convers
             val s = updatedSetting
             val conv = currentConversation
             if (doneConversationId != conv.id) return@collect
-            if (!s.expressionEnabled || s.expressionClassifier == ExpressionClassifier.NONE) return@collect
-
             val assistant = s.getAssistantById(conv.assistantId) ?: s.getCurrentAssistant()
+
+            // Quick Reply v2 AI 回复完成钩子（executeOnAi）与世界书条目激活联动触发（automationId）
+            val autoIds = me.rerere.rikkahub.data.ai.transformers.PromptInjectionTransformer
+                .getLastActivatedAutomationIds("${assistant.id}:default")
+            val aiQrs = selectAutoTriggeredQuickReplies(s.quickMessages, "ai", autoIds)
+            if (aiQrs.isNotEmpty()) {
+                withContext(Dispatchers.Default) {
+                    val host = buildChatSlashHost(context, vm, null, vm.inputState, null)
+                    aiQrs.forEach { qm ->
+                        if (qm.content.trim().startsWith("/")) {
+                            me.rerere.rikkahub.data.st.script.StSlashExecutor.execute(qm.content.trim(), host)
+                        }
+                    }
+                }
+            }
+
+            if (!s.expressionEnabled || s.expressionClassifier == ExpressionClassifier.NONE) return@collect
 
             // 该角色无立绘 → 不调用、不显示（避免无意义的模型调用）
             val availableLabels = withContext(Dispatchers.IO) {

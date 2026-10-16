@@ -1,43 +1,125 @@
 package me.rerere.rikkahub.data.model
 
 /**
- * 世界书条目装饰器（`@@activate` / `@@dont_activate`）。
+ * 世界书条目装饰器（`@@activate` / `@@dont_activate` 及 CCv3 扩展装饰器）。
  *
- * 移植自 SillyTavern 1.18.0 `public/scripts/world-info.js`：
- * - [WORLD_INFO_DECORATORS] ← `KNOWN_DECORATORS`（world-info.js:100，官方**只有这 2 个**）；
- * - [parseWorldInfoDecorators] ← `parseDecorators()`（world-info.js:4538-4582）；
- * - 扫描循环里的判定顺序 ← `checkWorldInfo`（world-info.js:4763-4770）：
- *   `@@activate` 无条件激活 → `@@dont_activate` 无条件跳过，且都发生在关键词匹配之前。
- *
- * 与存储层的关系（硬约束 #1）：官方在 `getSortedEntries` 里把剥壳后的结果写进条目副本
- * （`{ ...entry, decorators, content }`），rikkaST 不改存储结构 —— [PromptInjection.RegexInjection]
- * 的持久化字段保持原样，装饰器通过下面的**派生**属性在扫描时即时解析，
- * 因此角色卡/世界书的导入导出仍然无损（`@@` 行原样保留）。
- *
- * 官方 parseDecorators 的逐字行为（含 `@@@` 转义细节，已按源码对齐）：
- * 1. content 不以 `@@` 开头 → 无装饰器、内容原样；
- * 2. 逐行扫描开头连续的 `@@` 行：
- *    - 以 `@@@` 开头且尚未 fallback → 跳过（不记录、不打断）；
- *    - 行（剥掉至多一个 `@` 后）`startsWith` 任一已知装饰器 → 记录该行（`@@@x` 记录成 `@@x`），
- *      并复位 fallback 标记；
- *    - 否则（未知装饰器）→ fallback 标记置位（后续 `@@@x` 按转义还原成 `@@x` 记录）；
- *    - 否则该行不属于装饰器 → 从该行起（含）作为内容，结束扫描；
- * 3. 若所有行都是 `@@` 行（没有触发结束分支），内容保持**原样**（官方同样如此）。
- *
- * 注意：官方判定「已知」用的是 `startsWith`，而扫描处判定激活用的是 `includes`（精确相等），
- * 因此 `@@activate_extra` 会被当作「已知装饰器」记录、但**不会**触发激活 —— 本实现保持一致。
+ * 移植自 SillyTavern 1.18.0 `public/scripts/world-info.js` (`parseDecorators`) 与 CCv3 规范。
  */
 const val WORLD_INFO_DECORATOR_ACTIVATE = "@@activate"
 const val WORLD_INFO_DECORATOR_DONT_ACTIVATE = "@@dont_activate"
+const val WORLD_INFO_DECORATOR_DEPTH = "@@depth"
+const val WORLD_INFO_DECORATOR_ROLE = "@@role"
+const val WORLD_INFO_DECORATOR_POSITION = "@@position"
+const val WORLD_INFO_DECORATOR_SCAN_DEPTH = "@@scan_depth"
+const val WORLD_INFO_DECORATOR_INSTRUCT_SCAN_DEPTH = "@@instruct_scan_depth"
+const val WORLD_INFO_DECORATOR_OUTLET = "@@outlet"
+const val WORLD_INFO_DECORATOR_IGNORE_MAX_CONTEXT = "@@ignore_on_max_context"
+const val WORLD_INFO_DECORATOR_ADDITIONAL_KEYS = "@@additional_keys"
+const val WORLD_INFO_DECORATOR_EXCLUDE_KEYS = "@@exclude_keys"
 
-/** 官方 KNOWN_DECORATORS（world-info.js:100） */
-val WORLD_INFO_DECORATORS = listOf(WORLD_INFO_DECORATOR_ACTIVATE, WORLD_INFO_DECORATOR_DONT_ACTIVATE)
+/** 官方 KNOWN_DECORATORS（world-info.js:100）+ CCv3 扩展装饰器 */
+val WORLD_INFO_DECORATORS = listOf(
+    WORLD_INFO_DECORATOR_ACTIVATE,
+    WORLD_INFO_DECORATOR_DONT_ACTIVATE,
+    WORLD_INFO_DECORATOR_DEPTH,
+    WORLD_INFO_DECORATOR_ROLE,
+    WORLD_INFO_DECORATOR_POSITION,
+    WORLD_INFO_DECORATOR_SCAN_DEPTH,
+    WORLD_INFO_DECORATOR_INSTRUCT_SCAN_DEPTH,
+    WORLD_INFO_DECORATOR_OUTLET,
+    WORLD_INFO_DECORATOR_IGNORE_MAX_CONTEXT,
+    WORLD_INFO_DECORATOR_ADDITIONAL_KEYS,
+    WORLD_INFO_DECORATOR_EXCLUDE_KEYS,
+)
 
-/** 装饰器解析结果：装饰器列表 + 剥壳后的内容（官方 parseDecorators 的返回值） */
+private fun extractDecoratorArg(line: String, prefix: String): String? {
+    val trimmed = line.trim()
+    if (!trimmed.startsWith(prefix)) return null
+    val rest = trimmed.substring(prefix.length)
+    if (rest.isEmpty() || (rest[0] != ' ' && rest[0] != '=' && rest[0] != ':')) return null
+    return rest.trimStart(' ', '=', ':').trim()
+}
+
+private fun mapDecoratorPosition(arg: String): InjectionPosition? = when (arg.lowercase()) {
+    "before_char", "before", "0" -> InjectionPosition.BEFORE_CHARACTER
+    "after_char", "after", "1" -> InjectionPosition.AFTER_CHARACTER
+    "antop", "before_an", "2" -> InjectionPosition.BEFORE_AUTHOR_NOTE
+    "anbottom", "after_an", "3" -> InjectionPosition.AFTER_AUTHOR_NOTE
+    "at_depth", "atdepth", "in_chat", "4" -> InjectionPosition.AT_DEPTH
+    "emtop", "5" -> InjectionPosition.EM_TOP
+    "embottom", "6" -> InjectionPosition.EM_BOTTOM
+    "outlet", "7" -> InjectionPosition.OUTLET
+    else -> null
+}
+
+/** 装饰器解析结果：装饰器列表 + 剥壳后的内容（官方 parseDecorators 的返回值）及 CCv3 派生覆盖属性 */
 data class ParsedWorldInfoDecorators(
     val decorators: List<String>,
     val content: String,
-)
+) {
+    val depthOverride: Int?
+        get() = decorators.mapNotNull { raw ->
+            extractDecoratorArg(raw, WORLD_INFO_DECORATOR_DEPTH)?.toIntOrNull()?.takeIf { it >= 0 }
+        }.lastOrNull()
+
+    val roleOverride: String?
+        get() = decorators.mapNotNull { raw ->
+            val arg = extractDecoratorArg(raw, WORLD_INFO_DECORATOR_ROLE)?.lowercase() ?: return@mapNotNull null
+            when (arg) {
+                "user", "1" -> "user"
+                "assistant", "2" -> "assistant"
+                "system", "0" -> "system"
+                else -> null
+            }
+        }.lastOrNull()
+
+    val positionOverride: InjectionPosition?
+        get() = decorators.mapNotNull { raw ->
+            when {
+                extractDecoratorArg(raw, WORLD_INFO_DECORATOR_DEPTH)?.toIntOrNull()?.let { it >= 0 } == true ->
+                    InjectionPosition.AT_DEPTH
+                extractDecoratorArg(raw, WORLD_INFO_DECORATOR_OUTLET)?.isNotEmpty() == true ->
+                    InjectionPosition.OUTLET
+                else -> extractDecoratorArg(raw, WORLD_INFO_DECORATOR_POSITION)?.let(::mapDecoratorPosition)
+            }
+        }.lastOrNull()
+
+    val scanDepthOverride: Int?
+        get() = decorators.mapNotNull { raw ->
+            val arg = extractDecoratorArg(raw, WORLD_INFO_DECORATOR_INSTRUCT_SCAN_DEPTH)
+                ?: extractDecoratorArg(raw, WORLD_INFO_DECORATOR_SCAN_DEPTH)
+            arg?.toIntOrNull()?.takeIf { it >= 0 }
+        }.lastOrNull()
+
+    val outletOverride: String?
+        get() = decorators.mapNotNull { raw ->
+            extractDecoratorArg(raw, WORLD_INFO_DECORATOR_OUTLET)?.takeIf { it.isNotEmpty() }
+        }.lastOrNull()
+
+    val ignoreOnMaxContext: Boolean
+        get() = decorators.any { it.trim() == WORLD_INFO_DECORATOR_IGNORE_MAX_CONTEXT }
+
+    val additionalKeys: List<String>
+        get() = decorators.flatMap { raw ->
+            extractDecoratorArg(raw, WORLD_INFO_DECORATOR_ADDITIONAL_KEYS)
+                ?.split(',')
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                .orEmpty()
+        }.distinct()
+
+    val excludeKeys: List<String>
+        get() = decorators.flatMap { raw ->
+            extractDecoratorArg(raw, WORLD_INFO_DECORATOR_EXCLUDE_KEYS)
+                ?.split(',')
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                .orEmpty()
+        }.distinct()
+
+    fun applyWorldInfoDecoratorOverrides(entry: PromptInjection.RegexInjection): PromptInjection.RegexInjection =
+        entry.applyWorldInfoDecoratorOverrides(decorators)
+}
 
 /** 官方 `isKnownDecorator`：`@@@x` 先剥一个 `@`，再按 startsWith 判定。 */
 private fun isKnownWorldInfoDecorator(data: String): Boolean {
@@ -47,7 +129,7 @@ private fun isKnownWorldInfoDecorator(data: String): Boolean {
 
 /** 官方 `parseDecorators(content)` 的逐字移植（见文件头注释）。 */
 fun parseWorldInfoDecorators(content: String): ParsedWorldInfoDecorators {
-    if (!content.startsWith("@@")) return ParsedWorldInfoDecorators(emptyList(), content)
+    if (!content.startsWith("@@")) return ParsedWorldInfoDecorators(decorators = emptyList(), content = content)
 
     var newContent = content
     val lines = content.split("\n")
@@ -69,7 +151,7 @@ fun parseWorldInfoDecorators(content: String): ParsedWorldInfoDecorators {
             break
         }
     }
-    return ParsedWorldInfoDecorators(decorators, newContent)
+    return ParsedWorldInfoDecorators(decorators = decorators, content = newContent)
 }
 
 /**
@@ -85,3 +167,75 @@ val PromptInjection.RegexInjection.worldInfoDecorators: List<String>
  */
 val PromptInjection.RegexInjection.contentWithoutDecorators: String
     get() = parseWorldInfoDecorators(content).content
+
+/**
+ * 顶层重载：满足 `me.rerere.rikkahub.data.model.applyWorldInfoDecoratorOverrides(baseEntry)` 直接调用。
+ */
+@JvmName("applyWorldInfoDecoratorOverridesTopLevel")
+fun applyWorldInfoDecoratorOverrides(
+    entry: PromptInjection.RegexInjection,
+    decorators: List<String> = entry.worldInfoDecorators,
+): PromptInjection.RegexInjection = entry.applyWorldInfoDecoratorOverrides(decorators)
+
+/**
+ * 将条目装饰器中的属性覆盖（`@@depth`、`@@role`、`@@position`、`@@scan_depth`、`@@outlet`、
+ * `@@ignore_on_max_context`、`@@additional_keys`、`@@exclude_keys`）应用到扫描副本上。
+ */
+fun PromptInjection.RegexInjection.applyWorldInfoDecoratorOverrides(
+    decorators: List<String> = worldInfoDecorators,
+): PromptInjection.RegexInjection {
+    if (decorators.isEmpty()) return this
+    var current = this
+    for (raw in decorators) {
+        val trimmed = raw.trim()
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_DEPTH)?.toIntOrNull()?.takeIf { it >= 0 }?.let { d ->
+            current = current.copy(position = InjectionPosition.AT_DEPTH, injectDepth = d)
+            continue
+        }
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_ROLE)?.lowercase()?.let { arg ->
+            val r = when (arg) {
+                "user", "1" -> me.rerere.ai.core.MessageRole.USER
+                "assistant", "2" -> me.rerere.ai.core.MessageRole.ASSISTANT
+                "system", "0" -> me.rerere.ai.core.MessageRole.SYSTEM
+                else -> null
+            }
+            if (r != null) current = current.copy(role = r)
+            continue
+        }
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_POSITION)?.let { arg ->
+            val pos = mapDecoratorPosition(arg)
+            if (pos != null) current = current.copy(position = pos)
+            continue
+        }
+        val sdArg = extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_INSTRUCT_SCAN_DEPTH)
+            ?: extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_SCAN_DEPTH)
+        if (sdArg != null) {
+            val sd = sdArg.toIntOrNull()
+            if (sd != null && sd >= 0) current = current.copy(scanDepth = sd)
+            continue
+        }
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_OUTLET)?.takeIf { it.isNotEmpty() }?.let { name ->
+            current = current.copy(position = InjectionPosition.OUTLET, outletName = name)
+            continue
+        }
+        if (trimmed == WORLD_INFO_DECORATOR_IGNORE_MAX_CONTEXT) {
+            current = current.copy(ignoreBudget = true)
+            continue
+        }
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_ADDITIONAL_KEYS)?.let { arg ->
+            val keys = arg.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            if (keys.isNotEmpty()) {
+                current = current.copy(keywords = (current.keywords + keys).distinct())
+            }
+            continue
+        }
+        extractDecoratorArg(trimmed, WORLD_INFO_DECORATOR_EXCLUDE_KEYS)?.let { arg ->
+            val keys = arg.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            if (keys.isNotEmpty()) {
+                current = current.copy(excludeKeys = (current.excludeKeys + keys).distinct())
+            }
+            continue
+        }
+    }
+    return current
+}

@@ -346,6 +346,8 @@ private fun ChatListNormal(
                             model = node.currentMessage.modelId?.let(modelById::get),
                             assistant = assistant,
                             loading = loading && index == lastMessageIndex,
+                            lastMessage = index == lastMessageIndex,
+                            messageDepth = (lastMessageIndex - index).coerceAtLeast(0),
                             onRegenerate = {
                                 onRegenerate(node.currentMessage)
                             },
@@ -381,7 +383,6 @@ private fun ChatListNormal(
                             onClearTranslation = onClearTranslation,
                             onToolApproval = onToolApproval,
                             onToolAnswer = onToolAnswer,
-                            lastMessage = index == lastMessageIndex,
                         )
                     }
                 }

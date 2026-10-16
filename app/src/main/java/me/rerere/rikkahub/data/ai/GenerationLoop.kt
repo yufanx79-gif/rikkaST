@@ -52,6 +52,8 @@ import me.rerere.rikkahub.data.model.assembleContext
 import me.rerere.rikkahub.data.model.assembleCharacterCardMessages
 import me.rerere.rikkahub.data.model.assembleMainPrompt
 import me.rerere.rikkahub.data.model.buildExampleMessages
+import me.rerere.rikkahub.data.export.parseActiveStPresetConfig
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.data.model.isHidden
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
@@ -141,12 +143,21 @@ class GenerationLoop(
                 assistant.contextTemplate.trim() == me.rerere.rikkahub.data.model.DEFAULT_CONTEXT_TEMPLATE)
         val conversationOverride = assistant.allowConversationSystemPrompt && !conversationSystemPrompt.isNullOrBlank()
 
-        val mainIdentity = if (conversationOverride) {
+        val activePresetCfg = parseActiveStPresetConfig(
+            settings.tavernPresets,
+            enabledPresetGroups(assistant, settings),
+        )
+        val mainIdentity = if ("main" in activePresetCfg.disabledMarkers && !conversationOverride) {
+            ""
+        } else if (conversationOverride) {
             conversationSystemPrompt
         } else if (useOfficialSplit) {
             // 官方默认 Main Prompt：角色卡没有 system_prompt 时必须明确"下一句由角色回复"，
             // 否则模型只能靠内容猜角色——/sendas 等插入助手消息后会把角色认反
-            assistant.assembleMainPrompt().ifBlank {
+            assistant.assembleMainPrompt(
+                forbidOverrides = activePresetCfg.forbidOverridesMain,
+                presetMainPrompt = activePresetCfg.mainPromptContent,
+            ).ifBlank {
                 "Write ${assistant.name}'s next reply in a fictional chat between ${assistant.name} and $userName."
             }
         } else if (assistant.tavernData != null) {
@@ -155,54 +166,80 @@ class GenerationLoop(
             assistant.systemPrompt
         }
 
-        val assemblerContext = me.rerere.rikkahub.data.ai.prompts.PromptContext(
-            identitySection = mainIdentity,
-            leadInInstructions = buildString {
-                appendLine("<tool_selection>")
-                appendLine("Workspace files → workspace_read/write/edit (/workspace/...)")
-                appendLine("Workspace shell → workspace_shell (git, builds, Unix tools in sandbox)")
-                appendLine("Device files → file action=\"read/write/patch/list/search/copy/move/delete\" (Download/skills dirs)")
-                appendLine("Device shell → execute_command (logcat, device info only)")
-                appendLine("Python → execute_python (data processing, API)")
-                appendLine("Math → calculator (NOT execute_python)")
-                appendLine("Web → web_search / web_fetch")
-                appendLine("Memory → memory_tool")
-                appendLine("</tool_selection>")
-                appendLine()
-                appendLine("<work_ethic>")
-                appendLine("❌ Do NOT describe what you will do — just do it")
-                appendLine("❌ Do NOT stop after writing a stub — complete then report")
-                appendLine("❌ Do NOT fabricate results — if a tool fails, say so")
-                appendLine("❌ Do NOT use shell when a dedicated tool exists")
-                appendLine("❌ Do NOT use execute_python for math (use calculator)")
-                appendLine("✅ If you need user input, use ask_user directly")
-                appendLine("</work_ethic>")
-                appendLine()
-            },
-            workspaceDescription = "Working directory: ${context.filesDir?.absolutePath ?: "."}",
-            extraInstructions = buildString {
+        // 酒馆角色卡模式（assistant.tavernData != null）下不注入 Coding Agent 的 <tool_selection> / <work_ethic> / Working directory，
+        // 避免污染角色扮演人设与文风。
+        val mainText = if (assistant.tavernData != null) {
+            buildString {
+                append(mainIdentity)
                 if (assistant.enableRecentChatsReference) {
-                    appendLine()
-                    append(buildRecentChatsPrompt(assistant, conversationRepo))
+                    val recent = buildRecentChatsPrompt(assistant, conversationRepo)
+                    if (recent.isNotBlank()) {
+                        if (isNotEmpty()) appendLine()
+                        append(recent)
+                    }
                 }
-            },
-            constraints = emptyList(),
-        )
-        val system = me.rerere.rikkahub.data.ai.prompts.SystemPromptAssembler.assemble(assemblerContext)
-        val mainText = buildString {
-            append(system)
-            tools.forEach { tool ->
-                appendLine()
-                append(tool.systemPrompt(model, messages))
+                tools.forEach { tool ->
+                    if (isNotEmpty()) appendLine()
+                    append(tool.systemPrompt(model, messages))
+                }
             }
+        } else {
+            val assemblerContext = me.rerere.rikkahub.data.ai.prompts.PromptContext(
+                identitySection = mainIdentity,
+                leadInInstructions = buildString {
+                    appendLine("<tool_selection>")
+                    appendLine("Workspace files → workspace_read/write/edit (/workspace/...)")
+                    appendLine("Workspace shell → workspace_shell (git, builds, Unix tools in sandbox)")
+                    appendLine("Device files → file action=\"read/write/patch/list/search/copy/move/delete\" (Download/skills dirs)")
+                    appendLine("Device shell → execute_command (logcat, device info only)")
+                    appendLine("Python → execute_python (data processing, API)")
+                    appendLine("Math → calculator (NOT execute_python)")
+                    appendLine("Web → web_search / web_fetch")
+                    appendLine("Memory → memory_tool")
+                    appendLine("</tool_selection>")
+                    appendLine()
+                    appendLine("<work_ethic>")
+                    appendLine("❌ Do NOT describe what you will do — just do it")
+                    appendLine("❌ Do NOT stop after writing a stub — complete then report")
+                    appendLine("❌ Do NOT fabricate results — if a tool fails, say so")
+                    appendLine("❌ Do NOT use shell when a dedicated tool exists")
+                    appendLine("❌ Do NOT use execute_python for math (use calculator)")
+                    appendLine("✅ If you need user input, use ask_user directly")
+                    appendLine("</work_ethic>")
+                    appendLine()
+                },
+                workspaceDescription = "Working directory: ${context.filesDir?.absolutePath ?: "."}",
+                extraInstructions = buildString {
+                    if (assistant.enableRecentChatsReference) {
+                        appendLine()
+                        append(buildRecentChatsPrompt(assistant, conversationRepo))
+                    }
+                },
+                constraints = emptyList(),
+            )
+            val system = me.rerere.rikkahub.data.ai.prompts.SystemPromptAssembler.assemble(assemblerContext)
+            buildString {
+                append(system)
+                tools.forEach { tool ->
+                    appendLine()
+                    append(tool.systemPrompt(model, messages))
+                }
             }
+        }
         return buildList {
             if (mainText.isNotBlank()) {
                 add(UIMessage.system(prompt = mainText))
             }
-            // 官方拆分：角色卡字段独立消息（charDescription/charPersonality/scenario，世界书 before/after char 锚点）
+            // 官方拆分：角色卡字段独立消息（按预设 prompt_order 插槽顺序与启停控制装配 charDescription/charPersonality/scenario）
             if (useOfficialSplit && !conversationOverride) {
-                addAll(assistant.assembleCharacterCardMessages())
+                addAll(
+                    assistant.assembleCharacterCardMessages(
+                        personalityFormat = activePresetCfg.personalityFormat,
+                        scenarioFormat = activePresetCfg.scenarioFormat,
+                        orderedMarkers = activePresetCfg.orderedMarkers,
+                        disabledMarkers = activePresetCfg.disabledMarkers,
+                    )
+                )
             }
         }
     }
@@ -362,6 +399,12 @@ class GenerationLoop(
                     conversationId = conversationId,
                     workspaceCwd = workspaceCwd,
                 )
+                // [v243 BUGFIX B1] 空列表防御：下面两处 last() 在空列表上会抛 NoSuchElementException。
+                // 放宽 StreamChunkHandler.handle() 的 require(messages.isNotEmpty()) 之后，
+                // 空列表可以走到这里（重新生成第 0 条助手消息就是空列表起步）；
+                // 若模型又恰好返回零个 chunk（内容过滤 / 空响应），旧代码会在这里崩。
+                // 没有助手消息可写时直接结束本轮，不要崩。
+                if (messages.isEmpty()) break
                 messages = messages.slice(0 until messages.lastIndex) + messages.last().copy(
                     finishedAt = Clock.System.now()
                         .toLocalDateTime(TimeZone.currentSystemDefault())
@@ -612,33 +655,64 @@ class GenerationLoop(
                 add(UIMessage.system(prompt = fallbackSystem))
             }
 
-            // ── 官方 mes_example：作为示例消息注入（story string 之后、聊天历史之前）──
-            if (assistant.tavernData != null) {
+            val activePresetCfg = parseActiveStPresetConfig(
+                settings.tavernPresets,
+                enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
+            )
+            // ── 官方 mes_example：作为示例消息注入（若预设 prompt_order 中显式禁用 dialogueExamples 则跳过）──
+            if (assistant.tavernData != null && "dialogueExamples" !in activePresetCfg.disabledMarkers) {
                 addAll(
                     assistant.buildExampleMessages(
-                        userName = settings.displaySetting.userNickname.ifBlank { "User" }
+                        userName = settings.displaySetting.userNickname.ifBlank { "User" },
+                        newExampleChatPrompt = activePresetCfg.newExampleChatPrompt,
                     )
                 )
             }
 
             // ── s10: getUserContext — 用户上下文通过 <system-reminder> UserMessage 注入 ──
-            // 对标 Claude Code context.ts → prependUserContext()
-            // getUserContext 返回 { claudeMd, currentDate }，此处映射为 memories + currentDate
-            val userContext = buildUserContext(memories, assistant, settings)
-            if (userContext.isNotBlank()) {
-                if (settings.deepseekCacheOptimization) {
-                    // DeepSeek 缓存优化：不在此处注入（否则日期/记忆变化会断掉其后全部历史缓存），
-                    // 改为 transforms 之后追加到请求末尾
-                    deepseekTailInjection = userContext
-                } else {
-                    add(UIMessage.user(prompt = userContext))
+            // 酒馆角色卡模式（assistant.tavernData != null）下不插入 <system-reminder> UserMessage，
+            // 避免隔断 prebuiltSystemMessages 与 new_chat_prompt 导致 squash_system_messages 失效。
+            if (assistant.tavernData == null) {
+                val userContext = buildUserContext(memories, assistant, settings)
+                if (userContext.isNotBlank()) {
+                    if (settings.deepseekCacheOptimization) {
+                        deepseekTailInjection = userContext
+                    } else {
+                        add(UIMessage.user(prompt = userContext))
+                    }
                 }
             }
 
-            addAll(limitedChat.withMessageNames())
+            val activeGroupChat = settings.groupChats.firstOrNull { gc ->
+                (conversationId != null && gc.conversationId == conversationId) || assistant.id in gc.memberIds
+            }
+            val startChatPromptRaw = if (activeGroupChat != null && !activePresetCfg.newGroupChatPrompt.isNullOrBlank()) {
+                activePresetCfg.newGroupChatPrompt
+            } else {
+                activePresetCfg.newChatPrompt
+            }
+            if ((assistant.tavernData != null || activeGroupChat != null) && !startChatPromptRaw.isNullOrBlank()) {
+                val groupNames = activeGroupChat?.memberIds?.mapNotNull { mid ->
+                    settings.assistants.firstOrNull { it.id == mid }?.name
+                }?.joinToString(", ").orEmpty().ifBlank { assistant.name }
+                val expandedStartPrompt = startChatPromptRaw
+                    .replace("{{group}}", groupNames, ignoreCase = true)
+                    .replace("{{charIfNotGroup}}", groupNames, ignoreCase = true)
+                    .replace("{{char}}", assistant.name, ignoreCase = true)
+                    .replace("{{user}}", settings.displaySetting.userNickname.ifBlank { "User" }, ignoreCase = true)
+                add(UIMessage.system(prompt = expandedStartPrompt).copy(isSynthetic = true))
+            }
+            if ("chatHistory" !in activePresetCfg.disabledMarkers) {
+                addAll(limitedChat.withMessageNames())
+            }
         }.let { base ->
+            val activePresetCfgForPersona = parseActiveStPresetConfig(
+                settings.tavernPresets,
+                enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
+            )
             val persona = settings.personas.find { it.id == settings.activePersonaId }
-            if (persona != null && persona.enabled && persona.description.isNotBlank() &&
+            if ("personaDescription" !in activePresetCfgForPersona.disabledMarkers &&
+                persona != null && persona.enabled && persona.description.isNotBlank() &&
                 (persona.lockedCharacterIds.isEmpty() || assistant.id in persona.lockedCharacterIds)
             ) {
                 val personaText = "[User Persona]\n${persona.description}"
@@ -704,10 +778,61 @@ class GenerationLoop(
         )
         // DeepSeek 缓存优化：把动态上下文（日期/记忆）追加为最后一条 user 消息，
         // 位于全部历史之后 —— 跨天/记忆更新时只有末尾新增部分失效，system+历史前缀全部命中缓存
+        val postPresetCfg = parseActiveStPresetConfig(
+            settings.tavernPresets,
+            enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
+        )
         var internalMessages = deepseekTailInjection
             ?.takeIf { settings.deepseekCacheOptimization }
             ?.let { transformedMessages + UIMessage.user(prompt = it) }
             ?: transformedMessages
+        val postGroupChat = settings.groupChats.firstOrNull { gc ->
+            (conversationId != null && gc.conversationId == conversationId) || assistant.id in gc.memberIds
+        }
+        if (postGroupChat != null && !postPresetCfg.groupNudgePrompt.isNullOrBlank() &&
+            generationType != me.rerere.rikkahub.data.model.GenerationType.IMPERSONATE
+        ) {
+            val groupNames = postGroupChat.memberIds.mapNotNull { mid ->
+                settings.assistants.firstOrNull { it.id == mid }?.name
+            }.joinToString(", ").ifBlank { assistant.name }
+            val expandedGroupNudge = postPresetCfg.groupNudgePrompt
+                .replace("{{group}}", groupNames, ignoreCase = true)
+                .replace("{{charIfNotGroup}}", groupNames, ignoreCase = true)
+                .replace("{{char}}", assistant.name, ignoreCase = true)
+                .replace("{{user}}", settings.displaySetting.userNickname.ifBlank { "User" }, ignoreCase = true)
+            internalMessages = internalMessages + UIMessage.system(prompt = expandedGroupNudge).copy(isSynthetic = true)
+        }
+        if (postPresetCfg.wrapInQuotes && internalMessages.isNotEmpty()) {
+            val lastIdx = internalMessages.indexOfLast { it.role == MessageRole.USER && !it.isSynthetic }
+            if (lastIdx >= 0) {
+                val uMsg = internalMessages[lastIdx]
+                val updatedParts = uMsg.parts.map { p ->
+                    if (p is UIMessagePart.Text) {
+                        val t = p.text.trim()
+                        if (t.isNotEmpty() && !t.startsWith("\"") && !t.endsWith("\"")) {
+                            p.copy(text = "\"$t\"")
+                        } else p
+                    } else p
+                }
+                internalMessages = internalMessages.toMutableList().apply { set(lastIdx, uMsg.copy(parts = updatedParts)) }
+            }
+        }
+        val combinedPrefill = listOfNotNull(
+            postPresetCfg.startReplyWith.takeIf { it.isNotBlank() },
+            postPresetCfg.assistantPrefill?.takeIf { it.isNotBlank() },
+        ).distinct().joinToString("")
+        if (combinedPrefill.isNotBlank() &&
+            generationType != me.rerere.rikkahub.data.model.GenerationType.IMPERSONATE
+        ) {
+            internalMessages = internalMessages + UIMessage.assistant(combinedPrefill).copy(isSynthetic = true)
+        }
+        val squashSep = postPresetCfg.spresetChatSquashSeparator.ifEmpty { "\n\n" }
+        if (postPresetCfg.squashSystemMessages && internalMessages.size > 1) {
+            internalMessages = squashAdjacentSystemMessages(internalMessages, squashSep)
+        }
+        if (postPresetCfg.promptPostProcessing.isNotBlank() && internalMessages.size > 1) {
+            internalMessages = applyPromptPostProcessing(internalMessages, postPresetCfg.promptPostProcessing, squashSep)
+        }
         // [v211] ST 生成前钩子（CHAT_COMPLETION_SETTINGS_READY）：让扩展（ST-PT 的 EJS 模板 /
         //  MVU 的 <UpdateVariable> 剥离）就地改写最终 messages。ST 契约：openai.js:1616-1623
         //   const eventData = { chat, dryRun }; await eventSource.emit(CHAT_COMPLETION_PROMPT_READY, eventData);
@@ -734,19 +859,20 @@ class GenerationLoop(
         var messages: List<UIMessage> = messages
         val params = TextGenerationParams(
             model = model,
-            temperature = assistant.temperature,
-            topP = assistant.topP,
-            maxTokens = maxTokensOverride ?: assistant.maxTokens,
+            temperature = assistant.temperature ?: postPresetCfg.temperature,
+            topP = assistant.topP ?: postPresetCfg.topP,
+            maxTokens = maxTokensOverride ?: assistant.maxTokens ?: postPresetCfg.maxTokens,
             tools = tools,
             reasoningLevel = assistant.reasoningLevel,
             customHeaders = buildList {
                 addAll(assistant.customHeaders)
                 addAll(model.customHeaders)
             },
-            customBody = buildList {
-                addAll(assistant.customBodies)
-                addAll(model.customBodies)
-            },
+            customBody = buildPresetMergedCustomBodies(
+                assistantBodies = assistant.customBodies,
+                modelBodies = model.customBodies,
+                preset = postPresetCfg,
+            ),
             sessionId = (conversationId ?: Uuid.random()).toString(),
         )
         try {
@@ -1099,6 +1225,158 @@ private fun buildUserContext(
  * SYSTEM 角色（narrator，/sys /sysgen）不拼 —— 官方 narrator 消息带独立 name 字段但不进 content，
  * 否则会泄漏 "System: " 污染提示词。
  */
+/**
+ * 合并相邻的无名称、无工具调用的 SYSTEM 消息（对齐官方 SillyTavern `squash_system_messages` 语义）。
+ */
+internal fun buildPresetMergedCustomBodies(
+    assistantBodies: List<me.rerere.ai.provider.CustomBody>,
+    preset: me.rerere.rikkahub.data.export.StActivePresetConfig,
+): List<me.rerere.ai.provider.CustomBody> =
+    buildPresetMergedCustomBodies(assistantBodies = assistantBodies, modelBodies = emptyList(), preset = preset)
+
+internal fun buildPresetMergedCustomBodies(
+    assistantBodies: List<me.rerere.ai.provider.CustomBody>,
+    modelBodies: List<me.rerere.ai.provider.CustomBody>,
+    preset: me.rerere.rikkahub.data.export.StActivePresetConfig,
+): List<me.rerere.ai.provider.CustomBody> {
+    val existingKeys = (assistantBodies.map { it.key } + modelBodies.map { it.key }).toSet()
+    val presetBodies = mutableListOf<me.rerere.ai.provider.CustomBody>()
+    fun putIfAbsent(key: String, value: kotlinx.serialization.json.JsonElement) {
+        if (key !in existingKeys) {
+            presetBodies += me.rerere.ai.provider.CustomBody(key = key, value = value)
+        }
+    }
+    if (preset.customStoppingStrings.isNotEmpty()) {
+        putIfAbsent(
+            "stop",
+            kotlinx.serialization.json.JsonArray(
+                preset.customStoppingStrings.map { kotlinx.serialization.json.JsonPrimitive(it) }
+            ),
+        )
+    }
+    if (preset.logitBias.isNotEmpty()) {
+        putIfAbsent(
+            "logit_bias",
+            kotlinx.serialization.json.buildJsonObject {
+                preset.logitBias.forEach { (k, v) -> put(k, kotlinx.serialization.json.JsonPrimitive(v)) }
+            },
+        )
+    }
+    if (preset.seed >= 0) {
+        putIfAbsent("seed", kotlinx.serialization.json.JsonPrimitive(preset.seed))
+    }
+    preset.frequencyPenalty?.takeIf { it != 0f }?.let {
+        putIfAbsent("frequency_penalty", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    preset.presencePenalty?.takeIf { it != 0f }?.let {
+        putIfAbsent("presence_penalty", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    preset.repetitionPenalty?.takeIf { it != 1f }?.let {
+        putIfAbsent("repetition_penalty", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    preset.topK?.takeIf { it > 0 }?.let {
+        putIfAbsent("top_k", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    preset.minP?.takeIf { it > 0f }?.let {
+        putIfAbsent("min_p", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    preset.topA?.takeIf { it > 0f }?.let {
+        putIfAbsent("top_a", kotlinx.serialization.json.JsonPrimitive(it))
+    }
+    if (preset.cfgScale != 1.0f && preset.cfgScale > 0f) {
+        putIfAbsent("guidance_scale", kotlinx.serialization.json.JsonPrimitive(preset.cfgScale))
+    }
+    if (preset.negativePrompt.isNotBlank()) {
+        putIfAbsent("negative_prompt", kotlinx.serialization.json.JsonPrimitive(preset.negativePrompt))
+    }
+    return buildList {
+        addAll(presetBodies)
+        addAll(assistantBodies)
+        addAll(modelBodies)
+    }
+}
+
+/**
+ * 应用 SillyTavern `prompt_post_processing` 消息合并与角色归一化策略：
+ * - `merge` / `merge_tools`：合并相邻同角色（SYSTEM/USER/ASSISTANT）纯文本消息；
+ * - `semi` / `semi_tools`：合并相邻 SYSTEM 消息；
+ * - `strict` / `strict_tools` / `single`：除首条 SYSTEM 消息外，其余 SYSTEM 消息转为 USER，并合并相邻同角色消息。
+ */
+internal fun applyPromptPostProcessing(
+    messages: List<UIMessage>,
+    mode: String,
+    separator: String = "\n\n",
+): List<UIMessage> {
+    val norm = mode.trim().lowercase()
+    if (norm.isEmpty() || norm == "none" || messages.size <= 1) return messages
+    val sep = separator.ifEmpty { "\n\n" }
+    if (norm == "semi" || norm == "semi_tools") {
+        val squashed = squashAdjacentSystemMessages(messages, sep)
+        return squashed.mapIndexed { idx, msg ->
+            if (idx > 0 && msg.role == MessageRole.SYSTEM && msg.getTools().isEmpty()) {
+                msg.copy(role = MessageRole.USER)
+            } else {
+                msg
+            }
+        }
+    }
+    val roleConverted = if (norm == "strict" || norm == "strict_tools" || norm == "single") {
+        messages.mapIndexed { idx, msg ->
+            if (idx > 0 && msg.role == MessageRole.SYSTEM && msg.getTools().isEmpty()) {
+                msg.copy(role = MessageRole.USER)
+            } else {
+                msg
+            }
+        }
+    } else {
+        messages
+    }
+    if (norm in setOf("merge", "merge_tools", "strict", "strict_tools", "single")) {
+        val merged = mutableListOf<UIMessage>()
+        for (msg in roleConverted) {
+            val prev = merged.lastOrNull()
+            if (prev != null && prev.role == msg.role &&
+                prev.name.isNullOrBlank() && msg.name.isNullOrBlank() &&
+                prev.getTools().isEmpty() && msg.getTools().isEmpty() &&
+                prev.parts.all { it is UIMessagePart.Text } && msg.parts.all { it is UIMessagePart.Text }
+            ) {
+                val prevText = prev.parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+                val curText = msg.parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+                val combined = listOf(prevText, curText).filter { it.isNotBlank() }.joinToString(sep)
+                merged[merged.lastIndex] = prev.copy(parts = listOf(UIMessagePart.Text(combined)))
+            } else {
+                merged.add(msg)
+            }
+        }
+        return merged
+    }
+    return messages
+}
+
+internal fun squashAdjacentSystemMessages(
+    messages: List<UIMessage>,
+    separator: String = "\n\n",
+): List<UIMessage> {
+    if (messages.size <= 1) return messages
+    val squashSep = separator.ifEmpty { "\n\n" }
+    val squashed = mutableListOf<UIMessage>()
+    for (msg in messages) {
+        val prev = squashed.lastOrNull()
+        if (prev != null && prev.role == MessageRole.SYSTEM && msg.role == MessageRole.SYSTEM &&
+            prev.name.isNullOrBlank() && msg.name.isNullOrBlank() &&
+            prev.getTools().isEmpty() && msg.getTools().isEmpty()
+        ) {
+            val prevText = prev.parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+            val curText = msg.parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+            val mergedText = listOf(prevText, curText).filter { it.isNotBlank() }.joinToString(squashSep)
+            squashed[squashed.lastIndex] = prev.copy(parts = listOf(UIMessagePart.Text(mergedText)))
+        } else {
+            squashed.add(msg)
+        }
+    }
+    return squashed
+}
+
 private fun List<UIMessage>.withMessageNames(): List<UIMessage> = map { message ->
     if (message.role == MessageRole.SYSTEM) return@map message
     val name = message.name?.takeIf { it.isNotBlank() } ?: return@map message

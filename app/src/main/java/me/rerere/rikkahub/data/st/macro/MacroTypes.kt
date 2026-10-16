@@ -300,6 +300,10 @@ class MacroEnv(
         var syspromptEnabled: Boolean = false,
         /** sysprompt 内容（systemPrompt 宏的兜底取值） */
         var syspromptContent: String = "",
+        /** 当前输入框文本（{{input}} 宏数据源） */
+        var input: String = "",
+        /** {{banned::word}} 宏收集的禁用词列表 */
+        val bannedWords: MutableList<String> = mutableListOf(),
     )
 
     /**

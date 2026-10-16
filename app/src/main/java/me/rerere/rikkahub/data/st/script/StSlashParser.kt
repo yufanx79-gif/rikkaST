@@ -118,6 +118,14 @@ object StSlashParser {
         while (i < n) {
             while (i < n && args[i].isWhitespace()) i++
             if (i >= n) break
+            if (i + 1 < n && args[i] == '{' && (args[i + 1] == ':' || args[i + 1] == '|')) {
+                val span = StClosureSyntax.findClosureSpan(args, i)
+                if (span != null && span.first == i) {
+                    rest.append(args, span.first, span.second).append(' ')
+                    i = span.second
+                    continue
+                }
+            }
             val start = i
             while (i < n && !args[i].isWhitespace() && args[i] != '=') i++
             if (i < n && args[i] == '=' && i > start) {
@@ -146,7 +154,13 @@ object StSlashParser {
         return t
     }
 
-    /** 裸值读取：带引号 → 读到配对引号（支持 \\ 转义）；否则读到空白。 */
+    /**
+     * 裸值读取：
+     * - 带引号 → 读到配对引号（支持 \\ 转义）；
+     * - 闭包字面量 `{: ... :}` / `{| ... |}` → 按栈式配对读完整段闭包；
+     * - 方括号数组 `[...]` → 忽略内部引号与空白，按括号深度读到配对 `]`（如 `labels=["Option A", "Option B"]`）；
+     * - 否则读到空白。
+     */
     private fun readValue(args: String, from: Int): Pair<String, Int> {
         var i = from
         if (i < args.length && (args[i] == '"' || args[i] == '\'')) {
@@ -164,6 +178,46 @@ object StSlashParser {
             }
             if (i < args.length) i++ // 跳过闭合引号
             return sb.toString() to i
+        }
+        if (i + 1 < args.length && args[i] == '{' && (args[i + 1] == ':' || args[i + 1] == '|')) {
+            val span = StClosureSyntax.findClosureSpan(args, i)
+            if (span != null && span.first == i) {
+                return args.substring(span.first, span.second) to span.second
+            }
+        }
+        if (i < args.length && args[i] == '[') {
+            val start = i
+            var depth = 0
+            var inQuote: Char? = null
+            while (i < args.length) {
+                val c = args[i]
+                if (inQuote != null) {
+                    if (c == '\\' && i + 1 < args.length) {
+                        i += 2
+                        continue
+                    }
+                    if (c == inQuote) inQuote = null
+                    i++
+                } else {
+                    when (c) {
+                        '"', '\'' -> {
+                            inQuote = c
+                            i++
+                        }
+                        '[' -> {
+                            depth++
+                            i++
+                        }
+                        ']' -> {
+                            depth--
+                            i++
+                            if (depth <= 0) break
+                        }
+                        else -> i++
+                    }
+                }
+            }
+            return args.substring(start, i) to i
         }
         val start = i
         while (i < args.length && !args[i].isWhitespace()) i++

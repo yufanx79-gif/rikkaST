@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.data.ai.python
 
 import android.content.Context
+import androidx.annotation.Keep
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import me.rerere.rikkahub.data.ai.tools.LocalToolOption
@@ -18,6 +19,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.uuid.Uuid
 
+@Keep
 class PythonBridge(
     private val context: Context,
     private val db: AppDatabase,

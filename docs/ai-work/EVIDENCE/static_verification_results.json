@@ -1,0 +1,72 @@
+{
+  "kotlin_lexer_scan": {
+    "files_scanned": 925,
+    "error_count": 0,
+    "errors": {}
+  },
+  "p0_compile_blockers": {
+    "KOT-01": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt"
+    },
+    "KOT-02": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/export/ExportSerializer.kt"
+    },
+    "KOT-03": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/service/ChatService.kt"
+    },
+    "KOT-04": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatList.kt"
+    },
+    "KOT-05": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatSlashHost.kt"
+    },
+    "KOT-06": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/model/WorldInfoDecorators.kt"
+    },
+    "KOT-07": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt"
+    },
+    "KOT-08": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/st/script/StSlashExecutor.kt"
+    },
+    "KOT-09": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/data/st/script/StSlashExecutor.kt"
+    },
+    "KOT-10": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt"
+    },
+    "KOT-11": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantImporter.kt"
+    },
+    "KOT-12": {
+      "status": "FIXED",
+      "file": "app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatSlashHost.kt"
+    }
+  },
+  "node_js_syntax_check": {
+    "files_checked": 50,
+    "error_count": 0,
+    "errors": {}
+  },
+  "json_validation": {
+    "files_checked": 11,
+    "error_count": 0,
+    "errors": {}
+  },
+  "xml_validation": {
+    "files_checked": 31,
+    "error_count": 0,
+    "errors": {}
+  }
+}

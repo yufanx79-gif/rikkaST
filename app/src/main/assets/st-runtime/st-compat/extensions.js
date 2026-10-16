@@ -18,6 +18,7 @@ try {
                 extension_settings = c.extensionSettings;
             }
         } catch (_e) { /* noop */ }
+        try { __rikkaRefreshExtensionTypes(); } catch (_e) { /* noop */ }
     });
 } catch (_e) { /* noop */ }
 
@@ -55,7 +56,26 @@ export function __rikkaEnsureTavernHelperSeed() {
 
 try { __rikkaEnsureTavernHelperSeed(); } catch (_e) { /* noop */ }
 
+/**
+ * [v243 BUGFIX C2] 扩展类型表。
+ *
+ * JSR 的 `extensionTypes` 形状是 `{ 'third-party/<folder>': 'local', ... }`
+ * （见 JS-Slash-Runner/src/function/extension.ts:26-29 `Object.keys(extensionTypes).find(k => k.endsWith(id))`），
+ * 而 rikkaST 原来只导出 `{ SYSTEM, LOCAL, GLOBAL }` —— 卡脚本按 JSR 形状查会永远 miss。
+ * 这里做成**混合表**：保留原有三个常量键（向后兼容），同时按 JSR 形状补 `third-party/<folder>`
+ * 条目，并在 `rikka-st-refresh`（宿主同步扩展清单后广播）时重新取数。
+ */
 export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global' };
+
+function __rikkaRefreshExtensionTypes() {
+    try {
+        const list = host().extensions || [];
+        for (const e of list) {
+            if (e && e.folder) extensionTypes['third-party/' + String(e.folder)] = 'local';
+        }
+    } catch (_e) { /* noop */ }
+}
+try { __rikkaRefreshExtensionTypes(); } catch (_e) { /* noop */ }
 
 export function getContext() {
     return st();
@@ -108,9 +128,22 @@ export const __setReplayContext = () => {};
 
 export function openThirdPartyExtensionMenu() {}
 
+/**
+ * [v243 BUGFIX C1] 扩展清单查询。
+ *
+ * 旧实现只比 `folder` / `name` 两个字段。宿主 buildRuntimeExtensionsJson() 下发的正式字段是
+ * `displayName`（UI 显示名，如「酒馆助手」「提示词模板」），卡脚本用显示名查就会 miss ——
+ * 表现就是「明明装了插件，卡却报未检测到」。
+ * 现在对 folder / name / displayName 三个字段做「去空格 + 不区分大小写」的精确匹配。
+ */
 export function getExtensionManifest(extensionName) {
     try {
         const list = host().extensions || [];
-        return list.find((e) => e && (e.folder === extensionName || e.name === extensionName)) || null;
+        const want = String(extensionName == null ? '' : extensionName).trim().toLowerCase();
+        if (!want) return null;
+        const norm = (v) => String(v == null ? '' : v).trim().toLowerCase();
+        return list.find((e) => e && (
+            norm(e.folder) === want || norm(e.name) === want || norm(e.displayName) === want
+        )) || null;
     } catch (_e) { return null; }
 }

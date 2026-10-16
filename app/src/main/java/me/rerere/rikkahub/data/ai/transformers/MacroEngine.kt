@@ -36,16 +36,11 @@ class MacroEngine(
     private val vars: MacroVars,
 ) {
 
-    /** 解析并求值整段文本。任何解析失败都会原样返回输入，绝不吞文本。 */
+    /** 解析并求值整段文本：统一委托至高保真 ST 宏引擎（StMacroSupport -> data.st.macro.MacroEngine），彻底消除双轨宏引擎分叉。 */
     fun substitute(text: String, ctx: PlaceholderCtx): String {
         if (!text.contains("{{")) return text
         return try {
-            // \{{ 转义：先换成哨兵，解析完再还原为字面 {{
-            val escaped = text.replace("\\{{", ESCAPE_SENTINEL)
-            val nodes = parse(escaped)
-            val seedSource = escaped
-            val out = evaluate(nodes, EvalState(ctx, seedSource), 0)
-            out.replace(ESCAPE_SENTINEL, "{{")
+            StMacroSupport.substitute(text, ctx, vars, DefaultPlaceholderProvider)
         } catch (_: Exception) {
             text
         }

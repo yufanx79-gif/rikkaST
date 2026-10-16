@@ -173,3 +173,122 @@ private fun UIMessage.withMesText(text: String): UIMessage {
         copy(parts = listOf(UIMessagePart.Text(text)) + parts)
     }
 }
+
+// ============================================================
+// [v243 BUGFIX A2] JS `RikkaBridge.insertChatMessages` 载荷解析
+// ============================================================
+
+/** `createChatMessages` 的单条插入载荷。 */
+data class RuntimeChatInsert(
+    val role: MessageRole,
+    val name: String?,
+    val message: String,
+    val data: JsonObject?,
+)
+
+/**
+ * 解析 JS 侧 `createChatMessages([...])` 归一化后的载荷：
+ * `[{"role":"user"|"assistant"|"system","name":String?,"message":String,"data":Object?}]`。
+ * 非法/空返回空列表（调用方据此返回 false，不静默吞掉）。
+ */
+fun parseRuntimeChatInserts(jsonText: String): List<RuntimeChatInsert> {
+    if (jsonText.isBlank()) return emptyList()
+    return try {
+        val arr = Json.parseToJsonElement(jsonText) as? JsonArray ?: return emptyList()
+        arr.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val role = when ((obj["role"] as? JsonPrimitive)?.contentOrNull?.lowercase()) {
+                "assistant" -> MessageRole.ASSISTANT
+                "system" -> MessageRole.SYSTEM
+                else -> MessageRole.USER
+            }
+            val text = (obj["message"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            if (text.isBlank()) return@mapNotNull null
+            RuntimeChatInsert(
+                role = role,
+                name = (obj["name"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
+                message = text,
+                data = obj["data"] as? JsonObject,
+            )
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+
+/**
+ * 将 Conversation 导出为官方 SillyTavern `.jsonl` 聊天记录格式（首行为对话元数据头，后续每行为一条消息 JSON）。
+ */
+fun exportConversationToStJsonl(
+    conversation: Conversation,
+    userName: String = "User",
+    characterName: String = "Assistant",
+    chatMetadata: JsonObject = buildJsonObject {},
+): String {
+    val lines = mutableListOf<String>()
+    val header = buildJsonObject {
+        put("user_name", JsonPrimitive(userName))
+        put("character_name", JsonPrimitive(characterName))
+        put("create_date", JsonPrimitive(conversation.createAt.toString()))
+        put("chat_metadata", chatMetadata)
+    }
+    lines += header.toString()
+    val chatArrayJson = buildTavernChatJson(conversation, TavernVariableStore.getMessageVars(conversation.id.toString()))
+    val arr = runCatching { Json.parseToJsonElement(chatArrayJson) as? JsonArray }.getOrNull() ?: JsonArray(emptyList())
+    for (el in arr) {
+        val obj = el as? JsonObject ?: continue
+        lines += obj.toString()
+    }
+    return lines.joinToString("\n")
+}
+
+/**
+ * 从官方 SillyTavern `.jsonl` 聊天记录文本无损导入为 Conversation（支持多 swipes、is_user、is_system 隐藏标志与消息级 variables）。
+ */
+fun importConversationFromStJsonl(
+    jsonl: String,
+    assistantId: kotlin.uuid.Uuid = kotlin.uuid.Uuid.random(),
+    title: String = "",
+): Conversation {
+    val rawLines = jsonl.lines().map { it.trim() }.filter { it.isNotEmpty() }
+    val nodes = mutableListOf<me.rerere.rikkahub.data.model.MessageNode>()
+    var resolvedTitle = title
+    for ((idx, line) in rawLines.withIndex()) {
+        val obj = runCatching { Json.parseToJsonElement(line) as? JsonObject }.getOrNull() ?: continue
+        // 首行若是 header（包含 user_name / character_name / chat_metadata 且无 mes 字段）则跳过消息构造
+        if (idx == 0 && !obj.containsKey("mes") && (obj.containsKey("user_name") || obj.containsKey("character_name") || obj.containsKey("chat_metadata"))) {
+            if (resolvedTitle.isBlank()) {
+                resolvedTitle = (obj["character_name"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            }
+            continue
+        }
+        val isUser = (obj["is_user"] as? JsonPrimitive)?.booleanOrNull == true
+        val isSystemHidden = (obj["is_system"] as? JsonPrimitive)?.booleanOrNull == true
+        val name = (obj["name"] as? JsonPrimitive)?.contentOrNull
+        val mes = (obj["mes"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        val swipesArr = (obj["swipes"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+        val swipeTexts = if (!swipesArr.isNullOrEmpty()) swipesArr else listOf(mes)
+        val swipeId = ((obj["swipe_id"] as? JsonPrimitive)?.intOrNull ?: 0).coerceIn(0, (swipeTexts.size - 1).coerceAtLeast(0))
+        val role = if (isUser) MessageRole.USER else MessageRole.ASSISTANT
+        val messages = swipeTexts.map { text ->
+            val base = UIMessage(
+                role = role,
+                parts = listOf(UIMessagePart.Text(text)),
+                name = name,
+            )
+            if (isSystemHidden) base.withHidden() else base.withoutHidden()
+        }
+        nodes += me.rerere.rikkahub.data.model.MessageNode(
+            id = kotlin.uuid.Uuid.random(),
+            messages = messages,
+            selectIndex = swipeId,
+        )
+    }
+    return Conversation(
+        id = kotlin.uuid.Uuid.random(),
+        assistantId = assistantId,
+        title = resolvedTitle.ifBlank { "Imported ST Chat" },
+        messageNodes = nodes,
+    )
+}

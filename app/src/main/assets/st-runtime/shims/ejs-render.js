@@ -113,16 +113,23 @@ export function createEjsApi(extras = {}) {
             try { return shimUtil.substitudeMacros ? String(shimUtil.substitudeMacros(String(s))) : String(s); }
             catch (_e) { return String(s); }
         },
-        // 斜杠命令（暂未接线；明确报错优于静默失败）
-        execute: async () => { throw new Error('[EJS] execute() is not supported in rikkaST runtime yet'); },
-        // 世界书条目读取（按标题/主键匹配，退化为内容包含搜索）
-        getwi: async (key) => {
+        // 斜杠命令（对接宿主 STscript 执行器）
+        execute: async (cmd) => {
             try {
-                const entries = await shimLorebook.getLorebookEntries(undefined, {});
+                return shimUtil.triggerSlash ? await shimUtil.triggerSlash(String(cmd == null ? '' : cmd)) : '';
+            } catch (_e) { return ''; }
+        },
+        // 世界书条目读取（兼容 getwi(key) 单参数与 ST-PT getwi(book, key) 双参数签名）
+        getwi: async (bookOrKey, maybeKey) => {
+            try {
+                const hasBook = maybeKey !== undefined;
+                const bookName = hasBook ? (bookOrKey ? String(bookOrKey) : undefined) : undefined;
+                const nameKey = String(hasBook ? maybeKey : bookOrKey);
+                const entries = await shimLorebook.getLorebookEntries(bookName, {});
                 const list = Array.isArray(entries) ? entries : [];
-                const nameKey = String(key);
                 const hit = list.find(e => e && (e.name === nameKey
-                    || (typeof (e.strategy && e.strategy.keys && e.strategy.keys[0]) === 'string' && e.strategy.keys[0] === nameKey)))
+                    || String(e.uid) === nameKey
+                    || (Array.isArray(e.strategy && e.strategy.keys) && e.strategy.keys.includes(nameKey))))
                     || list.find(e => e && typeof e.content === 'string' && e.content.includes(nameKey));
                 return hit ? hit.content : '';
             } catch (_e) { return ''; }

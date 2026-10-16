@@ -2,42 +2,89 @@
  * rikkaST st-compat: slash-commands/slash-commands.js（根入口）
  * ============================================================
  * 模拟 SillyTavern `public/scripts/slash-commands.js` 的执行入口。
- * executeSlashCommandsWithOptions 直连宿主 RikkaBridge.triggerSlash（真执行）。
- *
- * [v213] 返回形态对齐 ST 契约：ST 的 executeSlashCommandsWithOptions 返回
- * SlashCommandExecutionResult 对象 { pipe, isError, errorMessage, isAbort, isIdle, hasBackpipe }，
- * 不是字符串。JSR function/slash.ts:3-8（triggerSlash）与 ST-PT EJS 的 execute() 都读 result.pipe / result.isError。
- * 旧实现直接返回字符串 → result.pipe === undefined。
+ * 优先支持通过 `SlashCommandParser.addCommandObject` 在 JS 侧注册的扩展命令，
+ * 其余命令直连宿主 `RikkaBridge.triggerSlash`，并准确识别未知命令错误与 `/abort` 中止状态。
  */
 
-function toExecutionResult(rawValue) {
-    const text = rawValue == null ? "" : String(rawValue);
-    // 宿主桥的三类返回：真实管道值 / "(slash runner not ready)" / "(slash error: ...)"
-    const isErr = text.startsWith("(slash error:") || text === "(slash runner not ready)";
+import { __getRegistry } from './slash-commands/SlashCommand.js';
+
+function parseSimpleSlashInvocation(text) {
+    const trimmed = String(text == null ? '' : text).trim();
+    if (!trimmed.startsWith('/') || trimmed.includes('|')) return null;
+    const body = trimmed.slice(1).trimStart();
+    const sp = body.search(/\s/);
+    const name = (sp === -1 ? body : body.slice(0, sp)).toLowerCase();
+    const rawArgs = sp === -1 ? '' : body.slice(sp + 1).trim();
+    const namedArgs = {};
+    const restParts = [];
+    const tokenRe = /([a-zA-Z0-9_-]+)=("[^"]*"|'[^']*'|[^\s]+)|("[^"]*"|'[^']*'|[^\s]+)/g;
+    let m;
+    while ((m = tokenRe.exec(rawArgs)) !== null) {
+        if (m[1]) {
+            let v = m[2] || '';
+            if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+                v = v.slice(1, -1);
+            }
+            namedArgs[m[1]] = v;
+        } else if (m[3]) {
+            let v = m[3];
+            if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+                v = v.slice(1, -1);
+            }
+            restParts.push(v);
+        }
+    }
+    return { name, namedArgs, unnamedArgs: restParts.join(' ') };
+}
+
+function toExecutionResult(rawValue, commandText = '') {
+    const text = rawValue == null ? '' : String(rawValue);
+    const cmdTrim = String(commandText == null ? '' : commandText).trim().toLowerCase();
+    const isAbort = text === '已中止' || text.startsWith('(slash abort') || cmdTrim === '/abort' || cmdTrim.startsWith('/abort ');
+    const isErr = !isAbort && (
+        text.startsWith('(slash error:') ||
+        text === '(slash runner not ready)' ||
+        text.startsWith('未知命令：') ||
+        text.startsWith('命令不可用：') ||
+        text.startsWith('命令缺少')
+    );
     return {
-        pipe: isErr ? "" : text,
+        pipe: (isErr || isAbort) ? '' : text,
         isError: isErr,
-        errorMessage: isErr ? text : "",
-        isAbort: false,
+        errorMessage: isErr ? text : '',
+        isAbort: isAbort,
+        isAborted: isAbort,
         isIdle: false,
         hasBackpipe: false,
     };
 }
 
 export async function executeSlashCommandsWithOptions(text, options) {
+    const cmdStr = String(text == null ? '' : text);
     try {
-        if (window.RikkaBridge && typeof window.RikkaBridge.triggerSlash === "function") {
-            return toExecutionResult(window.RikkaBridge.triggerSlash(String(text == null ? "" : text)));
+        const parsed = parseSimpleSlashInvocation(cmdStr);
+        if (parsed) {
+            const reg = __getRegistry();
+            const jsCmd = reg.get(parsed.name) || reg.get(cmdStr.trim().slice(1).split(/\s+/)[0]);
+            if (jsCmd && typeof jsCmd.callback === 'function') {
+                const out = await jsCmd.callback(parsed.namedArgs, parsed.unnamedArgs);
+                return toExecutionResult(out == null ? '' : String(out), cmdStr);
+            }
         }
-    } catch (_e) { /* noop */ }
-    return toExecutionResult("(slash runner not ready)");
+        if (window.RikkaBridge && typeof window.RikkaBridge.triggerSlash === 'function') {
+            return toExecutionResult(window.RikkaBridge.triggerSlash(cmdStr), cmdStr);
+        }
+    } catch (e) {
+        return toExecutionResult('(slash error: ' + String((e && e.message) || e) + ')', cmdStr);
+    }
+    return toExecutionResult('(slash runner not ready)', cmdStr);
 }
 
 export async function executeSlashCommands(text) {
     const r = await executeSlashCommandsWithOptions(text);
-    return r && typeof r === "object" ? r.pipe : r;
+    return r && typeof r === 'object' ? r.pipe : r;
 }
 
 export async function executeSlashCommandsOnChatInput() {
-    return "";
+    return '';
 }

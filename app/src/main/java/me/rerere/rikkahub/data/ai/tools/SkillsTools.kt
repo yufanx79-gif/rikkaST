@@ -115,8 +115,10 @@ fun createSkillTools(
                             ?.let { SkillFrontmatterParser.extractBody(it.readText()) }
                         ?: error("Skill '${skill.name}' not found")
                     buildString {
-                        appendLine(body)
+                        // 正文本身不追加尾换行；linked_files 段落与非空场景下的历史输出保持逐字节一致
+                        append(body)
                         if (skill.linkedFiles.isNotEmpty()) {
+                            appendLine()
                             appendLine()
                             appendLine("--- linked_files ---")
                             skill.linkedFiles.forEach { (dir, files) ->

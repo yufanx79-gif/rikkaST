@@ -266,7 +266,21 @@ internal fun applyStSettingsPatch(current: Settings, patch: StSettingsPatch): Se
         worldInfoUseGroupScoring = w.useGroupScoring ?: s.worldInfoUseGroupScoring,
     )
     patch.authorNote?.let { s = s.copy(authorNote = it) }
-    patch.regexScripts?.let { s = s.copy(regexScripts = it) }
+    patch.regexScripts?.let { importedGlobal ->
+        val preservedPresetRegex = s.regexScripts.filter { it.sourcePresetGroup != null }
+        val occupiedIds = importedGlobal.map { it.id }.toMutableSet()
+        val dedupedPresetRegex = preservedPresetRegex.map { rx ->
+            if (rx.id !in occupiedIds) {
+                occupiedIds.add(rx.id)
+                rx
+            } else {
+                val scopedId = "${rx.sourcePresetGroup}::${rx.id}"
+                occupiedIds.add(scopedId)
+                rx.copy(id = scopedId)
+            }
+        }
+        s = s.copy(regexScripts = importedGlobal + dedupedPresetRegex)
+    }
     patch.enableWebSearch?.let { s = s.copy(enableWebSearch = it) }
     patch.thirdPartyDisabled?.let { s = s.copy(tavernThirdPartyDisabled = it) }
     patch.thirdPartySettingsJson?.let { s = s.copy(tavernExtensionSettings = it) }

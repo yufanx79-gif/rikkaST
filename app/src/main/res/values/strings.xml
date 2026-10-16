@@ -25,6 +25,7 @@
   <string name="assistant_extensions_page_goto_prompts">Go to Prompts</string>
   <string name="assistant_extensions_page_tab_lorebooks">Lorebooks</string>
   <string name="assistant_extensions_page_tab_mode_injections">Mode Injections</string>
+  <string name="assistant_extensions_page_tab_prompt_injections">Prompt Injections</string>
   <string name="assistant_extensions_page_tab_quick_messages">Quick Messages</string>
   <string name="assistant_extensions_page_tab_skills">Skills</string>
   <string name="assistant_extensions_page_title">Extensions</string>
@@ -374,10 +375,11 @@
   <string name="extension_selector_skills_empty">No skills available</string>
   <string name="extension_selector_tab_lorebooks">Lorebooks</string>
   <string name="extension_selector_tab_mode_injections">Mode Injections</string>
+  <string name="extension_selector_tab_prompt_injections">Prompt Injections</string>
   <string name="extension_selector_tab_quick_messages">Quick Messages</string>
   <string name="extension_selector_tab_skills">Skills</string>
     <string name="tavern_ext_tab_regex">Regex</string>
-    <string name="tavern_ext_tab_presets">Presets</string>
+    <string name="tavern_ext_tab_presets">Preset Management</string>
     <string name="tavern_ext_tab_scripts">Scripts</string>
     <string name="tavern_ext_tab_third_party">Extensions</string>
   <string name="extensions_page_agent_skills">Agent Skills</string>
@@ -538,7 +540,7 @@
   <string name="prompt_page_edit">Edit</string>
   <string name="prompt_page_edit_entry">Edit Entry</string>
   <string name="prompt_page_edit_lorebook">Edit Lorebook</string>
-  <string name="prompt_page_edit_mode_injection">Edit Mode Injection</string>
+  <string name="prompt_page_edit_mode_injection">Edit Preset</string>
   <string name="prompt_page_empty_hint">Click the button below to add</string>
   <string name="prompt_page_enabled">Enabled</string>
   <string name="prompt_page_entries_count_format">%d entries</string>
@@ -562,7 +564,8 @@
   <string name="prompt_page_world_info_recursive_desc">Scan injected lorebook content for more keywords, chaining related entries</string>
   <string name="prompt_page_world_info_recursive_title">Recursive Scanning</string>
   <string name="prompt_page_mode_injection_empty">No mode injections</string>
-  <string name="prompt_page_mode_injection_tab">Mode Injection</string>
+  <string name="prompt_page_mode_injection_tab">Preset Management</string>
+  <string name="prompt_page_prompt_injection_tab">Prompt Injections</string>
   <string name="prompt_page_name">Name</string>
   <string name="prompt_page_new_keyword">New Keyword</string>
   <string name="prompt_page_position_after_system">After System Prompt</string>
@@ -571,6 +574,8 @@
   <string name="prompt_page_position_antagonize">Antagonize (Between Card and Chat)</string>
   <string name="prompt_page_position_at_depth">At Depth</string>
   <string name="prompt_page_position_author_note">Author\'s Note (Follows Global Setting)</string>
+  <string name="prompt_page_position_before_author_note">Before Author\'s Note (ANTop)</string>
+  <string name="prompt_page_position_after_author_note">After Author\'s Note (ANBottom)</string>
   <string name="prompt_page_position_before_system">Before System Prompt</string>
   <string name="prompt_page_position_before_character">Before Character</string>
   <string name="prompt_page_position_bottom_of_chat">Before Latest Message</string>
@@ -599,7 +604,7 @@
   <string name="prompt_page_role_assistant">Assistant (prefill)</string>
   <string name="prompt_page_role_user">User</string>
   <string name="prompt_page_scan_depth">Scan Depth</string>
-  <string name="prompt_page_title">Prompt Injection</string>
+  <string name="prompt_page_title">Preset Management</string>
   <string name="prompt_page_unnamed">Unnamed</string>
   <string name="prompt_page_unnamed_entry">Unnamed Entry</string>
   <string name="prompt_page_unnamed_lorebook">Unnamed Lorebook</string>

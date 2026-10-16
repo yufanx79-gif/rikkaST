@@ -34,6 +34,8 @@ data class RegexScript(
     val minDepth: Int? = null,
     /** 最大消息深度（含）；null 或 < 0 视为不限制；对齐 ST maxDepth */
     val maxDepth: Int? = null,
+    /** [P1-3] 若来自酒馆预设内嵌正则（extensions.regex_scripts），记录所属预设组名；用户自建/全局导入为 null。 */
+    val sourcePresetGroup: String? = null,
 )
 
 /** ST regex_placement（public/scripts/extensions/regex/engine.js） */

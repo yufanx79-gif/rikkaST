@@ -134,7 +134,10 @@ import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.st.regex.RegexPlacement
 import me.rerere.rikkahub.data.st.regex.getStRegexed
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.regex.mergeRegexScripts
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
+import me.rerere.rikkahub.data.export.parseActiveStPresetConfig
 import me.rerere.rikkahub.data.model.GenerationType
 import me.rerere.rikkahub.data.st.expressions.ExpressionLabels
 import me.rerere.rikkahub.data.model.checkpointLinkAt
@@ -223,8 +226,8 @@ private val inputTransformers by lazy {
         // [v241] JSR injectPrompts：注入必须发生在世界书扫描之前（should_scan 内容要参与扫描）
         InjectedPromptsTransformer,
         TimeReminderTransformer,
-        PromptInjectionTransformer,
         AuthorsNoteTransformer,
+        PromptInjectionTransformer,
         PlaceholderTransformer,
         StRegexInputTransformer,
         EjsInputTransformer,
@@ -708,7 +711,7 @@ class ChatService(
                             part.copy(
                                             text = part.text
                                                 .replaceRegexes(assistant, scope, visual = false)
-                                                .getStRegexed(mergeRegexScripts(settings.regexScripts, assistant),
+                                                .getStRegexed(mergeActiveRegexScripts(settings, assistant),
                                                     if (role == MessageRole.USER) RegexPlacement.USER_INPUT else RegexPlacement.SLASH_COMMAND,
                                                     isPrompt = true,
                                                 )
@@ -753,6 +756,14 @@ class ChatService(
         val session = sessionManager.getOrCreate(conversationId)
         val previousJob = session.getJob()
         previousJob?.cancel()
+        // [v244 BUGFIX D2] /trigger 真机取证点：确认「命令到达宿主 → 生成任务真的被排上」。
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[trigger] triggerGeneration conv=" + conversationId +
+                " type=" + generationType +
+                " prevJob=" + (previousJob != null) +
+                " msgs=" + session.state.value.currentMessages.size,
+        )
 
         val job = appScope.launch {
             try {
@@ -829,7 +840,7 @@ class ChatService(
                 val trimmed = if (trim) trimToEndSentence(rawNarration) else rawNarration.trim()
                 val narration = trimmed
                     .replaceRegexes(assistant, AssistantAffectScope.ASSISTANT, visual = false)
-                    .getStRegexed(mergeRegexScripts(settings.regexScripts, assistant), RegexPlacement.SLASH_COMMAND, isPrompt = true)
+                    .getStRegexed(mergeActiveRegexScripts(settings, assistant), RegexPlacement.SLASH_COMMAND, isPrompt = true)
                 if (narration.isBlank()) {
                     addError(
                         IllegalStateException(context.getString(R.string.slash_error_sysgen_empty)),
@@ -1083,8 +1094,22 @@ class ChatService(
                     ?: settings.getCurrentAssistant()
                 val targetNode = nodes[lastAssistantIndex]
                 val lastText = targetNode.messages.getOrNull(targetNode.selectIndex)?.toText().orEmpty()
-                // 官方语义：把最后一条助手消息作为“预填”，模型接着它继续写。
-                // 可选参数作为预填的追加文本（quiet_prompt），由模型继续接写，而不是当作指令。
+                val activePresetCfgForCont = parseActiveStPresetConfig(
+                    settings.tavernPresets,
+                    enabledPresetGroups(assistant, settings, conversation.modeInjectionIds),
+                )
+                val userName = settings.personas.firstOrNull { it.id == settings.activePersonaId }?.name
+                    ?: settings.displaySetting.userNickname.ifBlank { "User" }
+                val continueNudgeSys = activePresetCfgForCont.continueNudgePrompt
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { rawNudge ->
+                        val expanded = rawNudge
+                            .replace("{{lastChatMessage}}", lastText, ignoreCase = true)
+                            .replace("{{lastMessage}}", lastText, ignoreCase = true)
+                            .replace("{{char}}", assistant.name, ignoreCase = true)
+                            .replace("{{user}}", userName, ignoreCase = true)
+                        listOf(UIMessage.system(expanded))
+                    }.orEmpty()
                 val prompt = buildString {
                     append(lastText)
                     extraPrompt?.trim()?.takeIf { it.isNotBlank() }?.let {
@@ -1107,6 +1132,7 @@ class ChatService(
                     },
                     conversationId = conversationId,
                     generationType = GenerationType.CONTINUE,
+                    extraSystemMessages = continueNudgeSys,
                 )
                 if (continuation.isBlank()) return@launch
 
@@ -1119,7 +1145,18 @@ class ChatService(
                             if (i != idx) n else node.copy(
                                 messages = node.messages.mapIndexed { mi, m ->
                                     if (mi == node.selectIndex) {
-                                        m.copy(parts = m.parts + UIMessagePart.Text("\n\n" + continuation))
+                                        val activePresetCfg = parseActiveStPresetConfig(
+                                            settings.tavernPresets,
+                                            enabledPresetGroups(assistant, settings, conversation.modeInjectionIds),
+                                        )
+                                        val sep = when (activePresetCfg.continuePostfix?.lowercase()) {
+                                            "", "none" -> ""
+                                            " ", "space" -> " "
+                                            "\n", "newline" -> "\n"
+                                            "\n\n", "double_newline" -> "\n\n"
+                                            else -> "\n\n"
+                                        }
+                                        m.copy(parts = m.parts + UIMessagePart.Text(sep + continuation))
                                     } else m
                                 }
                             )
@@ -1179,7 +1216,15 @@ class ChatService(
                         parts = listOf(UIMessagePart.Text("$lastText\n$instruction"))
                     )
                 }
-                val draftHistory = effectiveHistory + UIMessage(
+                val activePresetCfg = parseActiveStPresetConfig(
+                    settings.tavernPresets,
+                    enabledPresetGroups(assistant, settings, conversation.modeInjectionIds),
+                )
+                val impSystemList = activePresetCfg.impersonationPrompt
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { listOf(UIMessage.system(it.replace("{{user}}", userName).replace("{{char}}", assistant.name))) }
+                    ?: emptyList()
+                val draftHistory = effectiveHistory + impSystemList + UIMessage(
                     role = MessageRole.ASSISTANT,
                     parts = listOf(UIMessagePart.Text("$userName:")),
                 )
@@ -1234,9 +1279,99 @@ class ChatService(
     )
 
     /**
-     * 官方 /gen：安静生成（quiet generation）。
-     * 输入/输出都不写入聊天历史，结果通过 onDraft 交回（本地填入输入框，
-     * trim=true 替换、否则追加到命令文本后，对齐官方 setInputText / setInputTextAfterPrompt）。
+     * 官方 /gen（includeHistory = true）与 /genraw（includeHistory = false）：静默生成，
+     * 返回完整生成文本作为管道值，绝不向会话历史插入新消息，也不覆写用户输入框。
+     */
+    suspend fun quietGenerate(
+        conversationId: String,
+        prompt: String,
+        includeHistory: Boolean = true,
+        systemPrompt: String = "",
+        asRole: QuietPromptAs = QuietPromptAs.SYSTEM,
+        length: Int = 0,
+        name: String? = null,
+        trim: Boolean = false,
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (prompt.isBlank()) return@runCatching ""
+            val convUuid = runCatching { Uuid.parse(conversationId) }.getOrNull()
+            val settings = settingsStore.settingsFlow.first()
+            val conversation = convUuid?.let { getConversationFlow(it).value }
+            val assistant = conversation?.let { settings.getAssistantById(it.assistantId) }
+                ?: settings.getCurrentAssistant()
+
+            val rawOutput = if (!includeHistory) {
+                val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
+                    ?: settings.findModelById(settings.fastModelId)
+                    ?: error("No chat model selected")
+                val provider = model.findProvider(settings.providers)
+                    ?: error("Provider not found")
+                val providerHandler = providerManager.getProviderByType(provider)
+                val rawMessages = buildList {
+                    if (systemPrompt.isNotBlank()) add(UIMessage.system(systemPrompt))
+                    add(UIMessage.user(prompt))
+                }
+                val baseParams = backgroundTextGenerationParams(model, convUuid ?: Uuid.random())
+                val params = if (length > 0) baseParams.copy(maxTokens = length) else baseParams
+                providerHandler.generateText(
+                    providerSetting = provider,
+                    messages = rawMessages,
+                    params = params,
+                ).message.toText()
+            } else {
+                val history = conversation?.messageNodes?.map { node ->
+                    UIMessage(
+                        role = node.role,
+                        parts = listOf(UIMessagePart.Text(
+                            node.messages.getOrNull(node.selectIndex)?.toText().orEmpty()
+                        )),
+                    )
+                }.orEmpty()
+                val charName = if (asRole == QuietPromptAs.CHAR) {
+                    name?.takeIf { it.isNotBlank() }
+                        ?: (assistant.tavernData?.name?.takeIf { it.isNotBlank() } ?: assistant.name)
+                } else {
+                    null
+                }
+                val effectivePrompt = if (!charName.isNullOrBlank()) {
+                    "$charName: $prompt"
+                } else {
+                    prompt
+                }
+                val promptRole = when (asRole) {
+                    QuietPromptAs.SYSTEM -> MessageRole.SYSTEM
+                    QuietPromptAs.CHAR -> MessageRole.ASSISTANT
+                }
+                val extraSys = if (systemPrompt.isNotBlank()) {
+                    listOf(UIMessage.system(systemPrompt))
+                } else {
+                    emptyList()
+                }
+                generateForAssistant(
+                    assistant = assistant,
+                    settings = settings,
+                    prompt = effectivePrompt,
+                    promptRole = promptRole,
+                    history = history,
+                    conversationId = convUuid,
+                    generationType = GenerationType.QUIET,
+                    extraSystemMessages = extraSys,
+                    maxTokensOverride = length.takeIf { it > 0 },
+                )
+            }
+            val trimmed = if (trim) trimToEndSentence(rawOutput.trim()) else rawOutput.trim()
+            trimmed
+                .replaceRegexes(assistant, AssistantAffectScope.ASSISTANT, visual = false)
+                .getStRegexed(
+mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEmpty()),
+                    RegexPlacement.SLASH_COMMAND,
+                    isPrompt = false,
+                )
+        }
+    }
+
+    /**
+     * 兼容回调式入口（供旧调用方使用）。
      */
     fun quietGenerate(
         conversationId: Uuid,
@@ -1424,11 +1559,18 @@ class ChatService(
                 model = model,
                 generationType = generationType,
                 processingStatus = session.processingStatus,
-                messages = conversation.currentMessages.let {
+                messages = conversation.currentMessages.let { list ->
                     if (messageRange != null) {
-                        it.subList(messageRange.start, messageRange.endInclusive + 1)
+                        // [v243 BUGFIX B1] 越界防护：messageRange 是 messageNodes 的下标区间，
+                        // 而这里切的是 currentMessages；两者长度在 swipe / fork / 分支编辑后可能不一致，
+                        // 旧写法 subList(start, endInclusive + 1) 会抛 IndexOutOfBoundsException。
+                        // nodeIndex == 0（重新生成助手预设开场白）时区间是空的，切片结果就是空列表 ——
+                        // 由 StreamChunkHandler.handle() 的空列表分支兜底成「一条新助手消息」。
+                        val from = messageRange.start.coerceIn(0, list.size)
+                        val to = (messageRange.endInclusive + 1).coerceIn(from, list.size)
+                        list.subList(from, to).toList()
                     } else {
-                        it
+                        list
                     }
                 },
                 assistant = assistant,

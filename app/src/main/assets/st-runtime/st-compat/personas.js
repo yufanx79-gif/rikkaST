@@ -1,23 +1,41 @@
 /**
  * rikkaST st-compat: personas.js
  * ============================================================
- * 模拟 SillyTavern `public/scripts/personas.js` 的导出面（P0：最小实现）。
+ * 对齐 SillyTavern `public/scripts/personas.js`，桥接宿主 Persona 与Slash 命令。
  */
 
 const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
-export let user_avatar = '';
+export let user_avatar = 'user-default.png';
 
 export function getUserAvatar() {
-    return user_avatar || '';
+    const ctx = st();
+    return (ctx && ctx.userAvatar) || user_avatar || 'user-default.png';
 }
 
 export function getUserAvatars() {
-    return [];
+    const ctx = st();
+    if (ctx && Array.isArray(ctx.personas)) {
+        return ctx.personas.map((p) => (p && (p.avatar || p.name)) || '').filter(Boolean);
+    }
+    return [getUserAvatar()];
 }
 
-export async function setUserAvatar() {}
+export async function setUserAvatar(avatarOrName) {
+    if (!avatarOrName) return;
+    user_avatar = String(avatarOrName);
+    try {
+        const ctx = st();
+        if (ctx && typeof ctx.executeSlashCommandsWithOptions === 'function') {
+            await ctx.executeSlashCommandsWithOptions(`/persona ${avatarOrName}`);
+        }
+    } catch (_e) { /* noop */ }
+}
 
 export async function getUserPersona() {
+    const ctx = st();
+    if (ctx && ctx.extensionSettings && ctx.extensionSettings.persona_description) {
+        return String(ctx.extensionSettings.persona_description);
+    }
     return '';
 }

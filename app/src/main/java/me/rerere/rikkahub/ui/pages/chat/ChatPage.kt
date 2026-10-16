@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PermanentNavigationDrawer
 import androidx.compose.material3.Scaffold
@@ -141,7 +142,15 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.Uuid
 
 @Composable
-fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
+fun ChatPage(
+    id: Uuid,
+    text: String?,
+    files: List<Uri>,
+    nodeId: Uuid? = null,
+    // [v245 BUGFIX H1] 本 Screen.Chat 是否位于导航栈顶（由 RouteActivity 按 backStack 判定）。
+    // 默认 true：直接调用 ChatPage 的地方（预览 / 测试）行为不变。
+    isOnTop: Boolean = true,
+) {
     val vm: ChatVM = koinViewModel(
         parameters = {
             parametersOf(id.toString())
@@ -159,12 +168,16 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
     val enableWebSearch by vm.enableWebSearch.collectAsStateWithLifecycle()
     val errors by vm.errors.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val toaster = LocalToaster.current
+    val openConversation: (Uuid) -> Unit = { targetId ->
+        scope.launch { navigateToChatPage(navController, chatId = targetId) }
+    }
 
     // 酒馆运行时：注册当前会话上下文（变量 / MVU / 脚本宿主）
     val tavernLatestConversation = rememberUpdatedState(conversation)
     val tavernLatestSettings = rememberUpdatedState(setting)
-    // [v214] key 追加 assistantId：会话数据晚到时 assistantId 变化必须重跑，否则卡脚本永不重载（P0）
-    LaunchedEffect(conversation.id, conversation.assistantId) {
+    // [v214 / P0-1] key 追加 assistantId 与 setting.init：会话/设置数据从 dummy 切换到真实值时必须重跑
+    LaunchedEffect(conversation.id, conversation.assistantId, setting.init) {
         TavernRuntimeManager.ensureStarted(context)
         TavernRuntimeManager.chatJsonSupplier = {
             val conv = tavernLatestConversation.value
@@ -210,7 +223,10 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
             tavernLatestSettings.value.tavernExtensionSettings
         }
         TavernRuntimeManager.thirdPartySettingsSaver = { json ->
-            vm.updateSettings(tavernLatestSettings.value.copy(tavernExtensionSettings = json))
+            // [P0-3 修复] 必须走 patchSettings 基于 SettingsStore 最新权威值写回，
+            // 否则当用户切去「预设管理」页导入预设触发 settings_updated -> JS saveSettingsDebounced 时，
+            // 已离开前景的 ChatPage 持有的 tavernLatestSettings.value 是旧快照，会在 300ms 后把刚导入的预设覆盖回滚！
+            vm.patchSettings { current -> current.copy(tavernExtensionSettings = json) }
         }
         // [v214] 世界书写回桥（JS RikkaBridge.updateLorebookEntries）
         TavernRuntimeManager.lorebookUpdater = { name, json ->
@@ -221,20 +237,92 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
             vm.handleMessageSend(listOf(UIMessagePart.Text(text)))
             true
         }
-        // [v214] supplier 全部就位后再切 active conversation，消除「先切后读旧 assistant」时序竞态
-        TavernRuntimeManager.setActiveConversation(conversation.id.toString())
-        TavernRuntimeManager.appendLog(
-            "info",
-            "[route] tavern bind: conv=${conversation.id} assistant=${conversation.assistantId}",
-        )
+        // [v243 BUGFIX A2] JSR createChatMessages / deleteChatMessages 落点（同步更新，不触发生成）
+        TavernRuntimeManager.chatInserter = { jsonText -> vm.insertRuntimeChatMessages(jsonText) }
+        TavernRuntimeManager.chatDeleter = { idsJson -> vm.deleteRuntimeChatMessages(idsJson) }
+        // [v243 BUGFIX A3] JSR 世界书条目写入与整书 CRUD / 绑定落点
+        TavernRuntimeManager.lorebookUpserter = { name, json -> vm.applyLorebookUpsert(name, json) }
+        TavernRuntimeManager.lorebookCreator = { name, entriesJson, replace ->
+            vm.createOrReplaceLorebook(name, entriesJson, replace)
+        }
+        TavernRuntimeManager.lorebookDeleter = { name -> vm.deleteLorebookByName(name) }
+        TavernRuntimeManager.lorebookRebinder = { scopeName, namesJson ->
+            vm.rebindLorebooks(scopeName, namesJson)
+        }
+        // [P0-1 优化] 冷启动首帧若仍处于 Settings.dummy() (init=true) 且会话尚未从数据库加载完毕，
+        // 仅完成上方 supplier 注册，跳过第一轮针对默认占位助手 (0950e2dc) 的虚假 setActiveConversation 广播，
+        // 待 ~150ms 后真实设置/助手到位时再触发一次完整的会话绑定。
+        // Quick Reply v2 会话打开/切换时自动触发钩子（executeOnStartup / executeOnChatChange）
+        if (!setting.init) {
+            val isFirstProcessStart = TavernRuntimeManager.markStartupQrExecuted()
+            val startupList = if (isFirstProcessStart) {
+                selectAutoTriggeredQuickReplies(setting.quickMessages, "startup")
+            } else emptyList()
+            val chatChangeList = selectAutoTriggeredQuickReplies(setting.quickMessages, "chatchange")
+            val combinedQrs = (startupList + chatChangeList).distinctBy { it.id }
+            if (combinedQrs.isNotEmpty()) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    val host = buildChatSlashHost(context, vm, toaster, vm.inputState, openConversation)
+                    combinedQrs.forEach { qm ->
+                        if (qm.content.trim().startsWith("/")) {
+                            StSlashExecutor.execute(qm.content.trim(), host)
+                        }
+                    }
+                }
+            }
+        }
+        if (setting.init && conversation.messageNodes.isEmpty()) {
+            TavernRuntimeManager.appendLog(
+                "debug",
+                "[route] tavern bind deferred (dummy settings init=true): conv=${conversation.id} assistant=${conversation.assistantId}",
+            )
+        } else {
+            // [v214] supplier 全部就位后再切 active conversation，消除「先切后读旧 assistant」时序竞态
+            TavernRuntimeManager.setActiveConversation(conversation.id.toString())
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[route] tavern bind: conv=${conversation.id} assistant=${conversation.assistantId}",
+            )
+        }
     }
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val softwareKeyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
 
-    // Handle back press when drawer is open
-    BackHandler(enabled = drawerState.isOpen) {
+    // [v245 DIAG H0] ChatPage 组合进出留痕 —— 用来判定「设置页在栈顶时 ChatPage 到底还在不在组合里」。
+    // 下一轮真机复现路径：打开抽屉 → 点设置 → 返回。
+    //   若日志里在进入设置页时就出现 `ChatPage leave composition`，说明 ChatPage 已被销毁，
+    //   H1 的门槛是冗余的（但无害），两次返回的真因在别处；
+    //   若**没有**出现 leave，说明 ChatPage 一直活着、BackHandler 确实在设置页生效，H1 就是正解。
+    val drawerOpenState = rememberUpdatedState(drawerState.isOpen)
+    DisposableEffect(Unit) {
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[nav] ChatPage enter composition conv=$id isOnTop=$isOnTop drawerOpen=${drawerOpenState.value}",
+        )
+        onDispose {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[nav] ChatPage leave composition conv=$id isOnTop=$isOnTop drawerOpen=${drawerOpenState.value}",
+            )
+        }
+    }
+
+    // [v245 BUGFIX H1] 抽屉的返回手势处理。
+    //
+    // 真机实测（用户原话）：「第五设置页返回又变成了需要全面屏手势返回两次了。」
+    // 三/四轮对比（同一条路径、只差「进设置时是否主动收抽屉」）：
+    //   · 第三轮主动收抽屉 → 设置页一次返回就离开 ✅，但回到聊天页时抽屉是关的
+    //     （用户：「跳过『有侧边栏』那一层」）；
+    //   · 第四轮撤销收抽屉 → 抽屉保持打开，设置页要滑两次 ❌。
+    // ⇒ 唯一变量是 drawerState.isOpen ⇒ **只有本 BackHandler 会在设置页吃掉第一次返回**。
+    //
+    // 所以门槛必须加「本页是栈顶」：抽屉开着、但当前显示的是设置页时，这个 handler
+    // 不该拦截系统返回 —— 交给 NavDisplay 弹栈，抽屉状态由 rememberSaveable 原样保留，
+    // 回到聊天页时侧边栏那一层还在（用户要的语义）。
+    BackHandler(enabled = isOnTop && drawerState.isOpen) {
+        TavernRuntimeManager.appendLog("info", "[nav] ChatPage BackHandler 吃掉了返回（收起抽屉）conv=${id}")
         scope.launch {
             drawerState.close()
         }
@@ -449,11 +537,115 @@ private fun ChatPageContent(
     val context = LocalContext.current
     // 酒馆运行时：/js 执行结果 → Toast（M1 可见反馈）
     val tavernJsResult by TavernRuntimeManager.lastJsResult.collectAsStateWithLifecycle()
+    val slashModalRequest by TavernRuntimeManager.pendingSlashModal.collectAsStateWithLifecycle()
+
+    DisposableEffect(Unit) {
+        TavernRuntimeManager.isSlashModalUiAttached = true
+        onDispose {
+            TavernRuntimeManager.isSlashModalUiAttached = false
+        }
+    }
+
+    slashModalRequest?.let { modalReq ->
+        when (modalReq) {
+            is me.rerere.rikkahub.data.st.runtime.SlashModalRequest.Popup -> {
+                AlertDialog(
+                    onDismissRequest = {
+                        modalReq.deferred.complete(if (modalReq.expectResult) "0" else "")
+                    },
+                    title = { Text(modalReq.title?.takeIf { it.isNotBlank() } ?: "提示") },
+                    text = { Text(modalReq.text) },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                modalReq.deferred.complete(if (modalReq.expectResult) "1" else modalReq.text)
+                            }
+                        ) {
+                            Text(modalReq.okButton?.takeIf { it.isNotBlank() } ?: stringResource(R.string.confirm))
+                        }
+                    },
+                    dismissButton = if (modalReq.expectResult || !modalReq.cancelButton.isNullOrBlank()) {
+                        {
+                            TextButton(
+                                onClick = {
+                                    modalReq.deferred.complete(if (modalReq.expectResult) "0" else "")
+                                }
+                            ) {
+                                Text(modalReq.cancelButton?.takeIf { it.isNotBlank() } ?: stringResource(R.string.cancel))
+                            }
+                        }
+                    } else null,
+                )
+            }
+            is me.rerere.rikkahub.data.st.runtime.SlashModalRequest.Input -> {
+                var inputVal by remember(modalReq) { mutableStateOf(modalReq.defaultValue) }
+                AlertDialog(
+                    onDismissRequest = { modalReq.deferred.complete("") },
+                    title = { Text(modalReq.title?.takeIf { it.isNotBlank() } ?: "输入") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (modalReq.prompt.isNotBlank()) {
+                                Text(modalReq.prompt)
+                            }
+                            OutlinedTextField(
+                                value = inputVal,
+                                onValueChange = { inputVal = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = false,
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { modalReq.deferred.complete(inputVal) }) {
+                            Text(stringResource(R.string.confirm))
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { modalReq.deferred.complete("") }) {
+                            Text(stringResource(R.string.cancel))
+                        }
+                    },
+                )
+            }
+            is me.rerere.rikkahub.data.st.runtime.SlashModalRequest.Buttons -> {
+                AlertDialog(
+                    onDismissRequest = { modalReq.deferred.complete("") },
+                    title = { Text("请选择") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (modalReq.prompt.isNotBlank()) {
+                                Text(modalReq.prompt)
+                            }
+                            modalReq.labels.forEach { label ->
+                                OutlinedButton(
+                                    onClick = {
+                                        val out = if (modalReq.multiple) "[\"$label\"]" else label
+                                        modalReq.deferred.complete(out)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(label)
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { modalReq.deferred.complete("") }) {
+                            Text(stringResource(R.string.cancel))
+                        }
+                    },
+                )
+            }
+        }
+    }
 
     // 酒馆运行时事件 → 应用内提示（离屏 WebView 的 toast / MVU 状态桥）
     LaunchedEffect(Unit) {
         var lastToastAt = 0L
         var lastToastMsg = ""
+        // [v245 BUGFIX E2] 接线留痕（真机可判定）
+        TavernRuntimeManager.appendLog("info", "[tavern] onJsEvent bound conv=${conversation.id}")
         TavernRuntimeManager.onJsEvent = { name, payloadJson ->
             val now = System.currentTimeMillis()
             scope.launch {
@@ -505,8 +697,21 @@ private fun ChatPageContent(
             }
         }
     }
+    // [v245 BUGFIX E2] 不再在 onDispose 里清空 onJsEvent（与 E1 同一缺陷类）。
+    // ChatUtil.navigateToChatPage 走 `navigator.clearAndNavigate(...)`（清栈）→ NavDisplay 转场期间
+    // outgoing / incoming 两个 entry 同时组合，incoming 的 side-effect 先跑、outgoing 的 onDispose
+    // 在转场结束后才跑 → 新页面刚接好的 onJsEvent 被旧页面置回 null。
+    // 此后 TavernRuntimeManager 里 `onJsEvent?.invoke(...)` 会**静默丢弃**所有 toast / MVU 事件
+    // （日志里 [js-event] 仍有记录，用户却看不到任何提示）。
+    // 旧闭包 capture 的 rememberCoroutineScope 已随组合取消，残留不会真的执行 UI 操作。
+    // [v245 BUGFIX E2] 真机可判定的留痕：下一轮日志里能直接看到「离开组合时没有清空 onJsEvent」。
     DisposableEffect(Unit) {
-        onDispose { TavernRuntimeManager.onJsEvent = null }
+        onDispose {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[slash] onJsEvent retained after onDispose conv=${conversation.id}（不再置空）",
+            )
+        }
     }
     LaunchedEffect(tavernJsResult) {
         val r = tavernJsResult ?: return@LaunchedEffect
@@ -534,9 +739,43 @@ private fun ChatPageContent(
                 buildChatSlashHost(currentContext.value, vm, currentToaster.value, currentInputState.value, openConversation),
             )
         }
+        TavernRuntimeManager.quietGenerator = { prompt, raw, sys ->
+            val host = buildChatSlashHost(currentContext.value, vm, currentToaster.value, currentInputState.value, openConversation)
+            if (raw) {
+                host.genRaw(prompt = prompt, systemPrompt = sys).orEmpty()
+            } else {
+                host.gen(prompt = prompt, asRole = "system", lock = false, length = 0, name = null, trim = false).orEmpty()
+            }
+        }
+        // [v245 BUGFIX E1] 接线留痕（真机可判定）：日志里能直接看到「谁在什么时候接的线」。
+        TavernRuntimeManager.appendLog("info", "[slash] slashRunner bound conv=${conversation.id}")
         onDispose {
-            TavernRuntimeManager.slashRunner = null
-            StSlashExecutor.debugLogger = null
+            // [v245 BUGFIX E1] **不再置空 slashRunner / debugLogger**（T1「自动发送」根因）。
+            //
+            // 真机取证（round-4 tavern-runtime.log，同一现象两次，00:26:31 与 00:37:29 完全一致）：
+            //   [10-14 00:26:31.943][info] [chat] insertChatMessages n=1 roles=[USER]
+            //   [10-14 00:26:32.016][error] [slash] triggerSlash: slashRunner 未接线…script='/trigger'
+            // chatInserter / lorebookUpserter / lorebookUpdater / userMessageSender 与它由**同一批**
+            // 注入点设置，却**只有 slashRunner 被 onDispose 清空** —— 这就是不对称的证据。
+            //
+            // 机制（已用调用链证实，非推测）：
+            //   ① app/src/main/java/me/rerere/rikkahub/utils/ChatUtil.kt 的 navigateToChatPage(...)
+            //      走 `navigator.clearAndNavigate(...)` → 切会话 / 新建会话会**清空 back stack**，
+            //      旧 Screen.Chat entry 被移除；
+            //   ② NavDisplay 的转场（RouteActivity.kt:325，Chat 相关走 fadeIn togetherWith fadeOut）
+            //      要求 outgoing / incoming 两个 entry **同时**在组合里；Compose 的 DisposableEffect
+            //      顺序是「incoming 先跑 side-effect，outgoing 的 onDispose 在转场结束后才跑」；
+            //   ③ 于是新会话刚把 slashRunner 接好，旧会话的 onDispose 立刻把它置回 null。
+            //   卡脚本的固定序列 `await createChatMessages(...); await triggerSlash('/trigger')`
+            //   必然拿到 null → 开局链路断在 /trigger，而 insertChatMessages 成功（正是日志的样子）。
+            //
+            // 修法：与其它桥保持**同一生命周期**——「最后一个绑定的 ChatPage 拥有运行时桥」是本工程
+            // v214 起的既定约定（chatInserter 等从来不清空）。旧闭包最多存活到下一个 ChatPage 绑定；
+            // 它 capture 的 scope 已随组合取消，不会真的执行导航 / 写输入框。
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[slash] slashRunner retained after onDispose conv=${conversation.id}（不再置空）",
+            )
         }
     }
     val workspaceRepository: WorkspaceRepository = koinInject()
@@ -665,6 +904,17 @@ private fun ChatPageContent(
                         } else {
                             vm.handleMessageSend(inputState.getContents())
                             inputState.clearInput()
+                            val userQrs = selectAutoTriggeredQuickReplies(setting.quickMessages, "user")
+                            if (userQrs.isNotEmpty()) {
+                                scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                    val host = buildChatSlashHost(context, vm, toaster, inputState, openConversation)
+                                    userQrs.forEach { qm ->
+                                        if (qm.content.trim().startsWith("/")) {
+                                            StSlashExecutor.execute(qm.content.trim(), host)
+                                        }
+                                    }
+                                }
+                            }
                             scope.launch {
                                 delay(100.milliseconds)
                                 chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
@@ -779,18 +1029,18 @@ private fun ChatPageContent(
                     },
                     onSlashRerollPick = { seedArg ->
                         val chatKey = conversation.id.toString()
-                        val current = setting.macroChatVariables[chatKey]?.get("__pick_reroll_seed")?.toLongOrNull() ?: 0L
+                        val latest = vm.latestSettingsSnapshot()
+                        val current = latest.macroChatVariables[chatKey]?.get("__pick_reroll_seed")?.toLongOrNull() ?: 0L
                         val next = seedArg.toLongOrNull() ?: (current + 1)
-                        val (newSettings, _) = applyMacroVarSlash(
-                            context = context,
-                            settings = setting,
-                            op = SlashVarOp.SET,
-                            name = "__pick_reroll_seed",
-                            value = next.toString(),
-                            chatKey = chatKey,
-                        )
-                        if (newSettings !== setting) {
-                            vm.updateSettings(newSettings)
+                        vm.patchSettings { s ->
+                            applyMacroVarSlash(
+                                context = context,
+                                settings = s,
+                                op = SlashVarOp.SET,
+                                name = "__pick_reroll_seed",
+                                value = next.toString(),
+                                chatKey = chatKey,
+                            ).first
                         }
                         toaster.show(context.getString(R.string.slash_toast_reroll_done, next))
                     },
@@ -829,25 +1079,39 @@ private fun ChatPageContent(
                         buildChatSlashHost(context, vm, toaster, inputState, openConversation)
                             .swipe(direction, await)
                     },
-                    // checkpoint 族（/checkpoint-*、/branch-create）：整条命令转交 STscript 宿主执行
+                    // STscript 统一执行通道：移入后台协程执行，严禁在 UI 主线程同步调用 runBlocking 造成 WebView 死锁或 ANR
                     onSlashScript = { script ->
-                        StSlashExecutor.execute(
-                            script,
-                            buildChatSlashHost(context, vm, toaster, inputState, openConversation),
-                        )
-                    },
-                    // 快速回复自动执行（对齐酒馆 QR executeWithOptions）：斜杠开头 → STscript 执行；纯文本 → 直接发送
-                    onQuickMessageExecute = { quickMessage ->
-                        val content = quickMessage.content.trim()
-                        if (content.startsWith("/")) {
+                        scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                             val result = StSlashExecutor.execute(
-                                content,
+                                script,
                                 buildChatSlashHost(context, vm, toaster, inputState, openConversation),
                             )
                             if (result.startsWith("未知命令") || result.startsWith("命令执行失败") ||
                                 result.startsWith("命令不可用") || result.startsWith("用法：")
                             ) {
-                                toaster.show(result)
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                    toaster.show(result)
+                                }
+                            }
+                        }
+                        null
+                    },
+                    // 快速回复自动执行（对齐酒馆 QR executeWithOptions）：斜杠开头 → 后台协程 STscript 执行；纯文本 → 直接发送
+                    onQuickMessageExecute = { quickMessage ->
+                        val content = quickMessage.content.trim()
+                        if (content.startsWith("/")) {
+                            scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                val result = StSlashExecutor.execute(
+                                    content,
+                                    buildChatSlashHost(context, vm, toaster, inputState, openConversation),
+                                )
+                                if (result.startsWith("未知命令") || result.startsWith("命令执行失败") ||
+                                    result.startsWith("命令不可用") || result.startsWith("用法：")
+                                ) {
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        toaster.show(result)
+                                    }
+                                }
                             }
                         } else if (content.isNotEmpty()) {
                             if (currentChatModel == null) {
@@ -868,16 +1132,27 @@ private fun ChatPageContent(
                         }
                     },
                     onSlashVar = { op, name, value ->
-                        val (newSettings, result) = applyMacroVarSlash(
+                        val chatKey = conversation.id.toString()
+                        val latest = vm.latestSettingsSnapshot()
+                        val ( previewSettings, result) = applyMacroVarSlash(
                             context = context,
-                            settings = setting,
+                            settings = latest,
                             op = op,
                             name = name,
                             value = value,
-                            chatKey = conversation.id.toString(),
+                            chatKey = chatKey,
                         )
-                        if (newSettings !== setting) {
-                            vm.updateSettings(newSettings)
+                        if (previewSettings !== latest) {
+                            vm.patchSettings { s ->
+                                applyMacroVarSlash(
+                                    context = context,
+                                    settings = s,
+                                    op = op,
+                                    name = name,
+                                    value = value,
+                                    chatKey = chatKey,
+                                ).first
+                            }
                         }
                         result
                     },
@@ -1330,8 +1605,13 @@ private fun GreetingPickerDialog(
                                 MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.width(24.dp),
                         )
+                        val previewText = remember(greeting) {
+                            me.rerere.rikkahub.ui.components.message.extractQuickPlainPreview(greeting)
+                                .take(300)
+                                .ifBlank { greeting.take(300).trim() }
+                        }
                         Text(
-                            text = greeting,
+                            text = previewText,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (isSelected)
                                 MaterialTheme.colorScheme.onPrimaryContainer

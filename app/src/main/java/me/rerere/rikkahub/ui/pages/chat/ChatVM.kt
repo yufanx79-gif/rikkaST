@@ -46,6 +46,17 @@ import me.rerere.rikkahub.data.model.withoutHidden
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.data.st.runtime.applyLorebookDisablePatch
+import me.rerere.rikkahub.data.st.runtime.applyLorebookUpsertPatch
+import me.rerere.rikkahub.data.st.runtime.buildLorebookFromJsrEntries
+import me.rerere.rikkahub.data.st.runtime.updateWorldNameInExtensionsRaw
+import me.rerere.rikkahub.data.st.runtime.parseRuntimeChatInserts
+import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
+import me.rerere.rikkahub.data.model.toMessageNode
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import me.rerere.rikkahub.data.st.runtime.applyTavernChatUpdates
 import me.rerere.rikkahub.data.st.runtime.extractWorldName
 import me.rerere.rikkahub.data.st.runtime.findLorebookIndexByName
@@ -139,7 +150,7 @@ class ChatVM(
 
     // 用户设置
     val settings: StateFlow<Settings> =
-        settingsStore.settingsFlow.stateIn(viewModelScope, SharingStarted.Eagerly, Settings.dummy())
+        settingsStore.settingsFlow.stateIn(viewModelScope, SharingStarted.Eagerly, settingsStore.settingsFlow.value)
 
     // 网络搜索(每个助手独立)
     val enableWebSearch = settings.map {
@@ -178,9 +189,20 @@ class ChatVM(
     // 更新设置
     fun updateSettings(newSettings: Settings): Job {
         return viewModelScope.launch {
-            val oldSettings = settings.value
+            val oldSettings = settingsStore.settingsFlow.value
             checkUserAvatarDelete(oldSettings, newSettings)
             settingsStore.update(newSettings)
+        }
+    }
+
+    /** [P0-3 修复] 基于 SettingsStore 当前最新权威快照的 CAS 更新，避免后台回调（如 thirdPartySettingsSaver）拿旧快照回滚用户刚导入的预设。 */
+    fun patchSettings(transform: (Settings) -> Settings): Job {
+        return viewModelScope.launch {
+            settingsStore.update { current ->
+                val next = transform(current)
+                checkUserAvatarDelete(current, next)
+                next
+            }
         }
     }
 
@@ -400,6 +422,25 @@ class ChatVM(
         chatService.quietGenerate(_conversationId, args, onDraft)
     }
 
+    suspend fun quietGenerateSync(
+        prompt: String,
+        includeHistory: Boolean = true,
+        systemPrompt: String = "",
+        asRole: ChatService.QuietPromptAs = ChatService.QuietPromptAs.SYSTEM,
+        length: Int = 0,
+        name: String? = null,
+        trim: Boolean = false,
+    ): Result<String> = chatService.quietGenerate(
+        conversationId = _conversationId.toString(),
+        prompt = prompt,
+        includeHistory = includeHistory,
+        systemPrompt = systemPrompt,
+        asRole = asRole,
+        length = length,
+        name = name,
+        trim = trim,
+    )
+
     fun saveConversationAsync() {
         viewModelScope.launch {
             chatService.saveConversation(_conversationId, conversation.value)
@@ -490,6 +531,165 @@ class ChatVM(
     }
 
     /**
+     * [v243 BUGFIX A2] JS `RikkaBridge.insertChatMessages`（JSR `createChatMessages` 的宿主落点）。
+     *
+     * 必须**同步**更新会话状态，不能走 [me.rerere.rikkahub.service.ChatService.insertMessage] 的协程队列：
+     * 卡脚本的标准序列是 `await createChatMessages([...]); await triggerSlash('/trigger')`，
+     * 而 ChatService 的每个入口（含 /trigger -> triggerGeneration）都会 `session.getJob()?.cancel()`
+     * —— 排在队列里的插入会被紧随其后的 /trigger 直接取消，楼层丢失且无任何报错。
+     *
+     * [updateConversation] 同步写 session.state 并持久化，因此紧随其后的 /trigger 一定能看到新楼层。
+     *
+     * @return 是否受理（载荷为空/解析失败 false）。
+     */
+    fun insertRuntimeChatMessages(jsonText: String): Boolean {
+        val items = parseRuntimeChatInserts(jsonText)
+        if (items.isEmpty()) return false
+        val current = conversation.value
+        val nodes = items.map { item ->
+            UIMessage(
+                role = item.role,
+                parts = listOf(UIMessagePart.Text(item.message)),
+                name = item.name,
+            ).toMessageNode()
+        }
+        // 消息级变量（MVU stat_data 等）必须与楼层下标对齐：追加等量条目，避免卡脚本写错楼层。
+        runCatching {
+            val existing = TavernVariableStore.getMessageVars(_conversationId.toString())
+            val list = (existing as? JsonArray)?.toMutableList() ?: mutableListOf()
+            items.forEach { list += (it.data ?: JsonObject(emptyMap())) }
+            TavernVariableStore.replaceMessageVars(_conversationId.toString(), JsonArray(list))
+        }
+        // ① 同步写内存状态：紧随其后的 /trigger 必须立刻看到新楼层（updateConversation 只改 state，不落库）
+        val updated = current.copy(messageNodes = current.messageNodes + nodes)
+        updateConversation(updated)
+        // ② 异步落库：不能阻塞 JavaBridge 线程；落库失败也不影响已经生效的内存状态
+        viewModelScope.launch {
+            runCatching { chatService.saveConversation(_conversationId, updated) }
+        }
+        TavernRuntimeManager.appendLog("info", "[chat] insertChatMessages n=${items.size} roles=${items.map { it.role.name }}")
+        return true
+    }
+
+    /** 读取 SettingsStore 最新权威快照（避免组合期旧 settings.value 滞后）。 */
+    fun latestSettingsSnapshot(): Settings = settingsStore.settingsFlow.value
+
+    /**
+     * 按 0 基下标集合同步删除消息楼层（供 STscript `/del` `/cut` 与 JS `deleteChatMessages` 共用），
+     * 同时同步裁剪 `TavernVariableStore` 消息级变量数组，并返回被删除楼层的文本列表。
+     */
+    fun deleteChatMessageIndices(indices: Set<Int>): List<String> {
+        if (indices.isEmpty()) return emptyList()
+        val current = conversation.value
+        val nodes = current.messageNodes
+        val valid = indices.filter { it in nodes.indices }.sorted()
+        if (valid.isEmpty()) return emptyList()
+        val validSet = valid.toSet()
+        val removedTexts = valid.map { idx ->
+            val node = nodes[idx]
+            node.messages.getOrNull(node.selectIndex)?.toText().orEmpty()
+        }
+        val remainingNodes = nodes.filterIndexed { idx, _ -> idx !in validSet }
+        runCatching {
+            val existing = TavernVariableStore.getMessageVars(_conversationId.toString())
+            val list = (existing as? JsonArray)?.toMutableList()
+            if (list != null && list.isNotEmpty()) {
+                val filteredVars = list.filterIndexed { idx, _ -> idx !in validSet }
+                TavernVariableStore.replaceMessageVars(_conversationId.toString(), JsonArray(filteredVars))
+            }
+        }
+        val updated = current.copy(messageNodes = remainingNodes)
+        updateConversation(updated)
+        viewModelScope.launch {
+            runCatching { chatService.saveConversation(_conversationId, updated) }
+        }
+        TavernRuntimeManager.appendLog("info", "[chat] deleteChatMessages indices=$valid remaining=${remainingNodes.size}")
+        return removedTexts
+    }
+
+    /**
+     * JS `RikkaBridge.deleteChatMessages(idsJson)` 宿主落点：解析下标 JSON 数组并同步删除。
+     */
+    fun deleteRuntimeChatMessages(idsJson: String): Boolean {
+        val ids = runCatching {
+            val arr = kotlinx.serialization.json.Json.parseToJsonElement(idsJson) as? JsonArray ?: return@runCatching emptySet()
+            arr.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull }.toSet()
+        }.getOrDefault(emptySet())
+        if (ids.isEmpty()) return false
+        return deleteChatMessageIndices(ids).isNotEmpty()
+    }
+
+    /**
+     * [v243 BUGFIX A3] JSR 世界书条目写入（JS `RikkaBridge.upsertLorebookEntries`）。
+     *
+     * 匹配优先级与 [applyLorebookUpdate] 完全一致（卡内嵌书 → 全局书库）。
+     * 目前只实现**卡内嵌书**写入：卡脚本用的 `getCharWorldbookNames('current').primary`
+     * 就是角色的 `data.extensions.world`，在 rikkaST 里落到 assistant.tavernData.embeddedBook。
+     *
+     * @return 是否命中并产生实际变更。
+     */
+    fun applyLorebookUpsert(bookName: String, payloadJson: String): Boolean {
+        val currentSettings = settingsStore.settingsFlow.value
+        val requested = bookName.trim()
+        if (requested.isEmpty()) return false
+
+        val assistant = currentSettings.getAssistantById(conversation.value.assistantId)
+        val tav = assistant?.tavernData
+        val embedded = tav?.embeddedBook
+        if (assistant != null && tav != null && embedded != null) {
+            val worldName = extractWorldName(tav.extensionsRaw)
+            val name = embedded.name.ifBlank { worldName ?: "" }
+            val matched = requested == "current" ||
+                lorebookNameMatches(name, bookName) || lorebookNameMatches(worldName, bookName)
+            if (matched) {
+                val updatedBook = applyLorebookUpsertPatch(embedded, payloadJson)
+                if (updatedBook != null) {
+                    val newAssistant = assistant.copy(tavernData = tav.copy(embeddedBook = updatedBook))
+                    patchSettings { s ->
+                        s.copy(
+                            assistants = s.assistants.map {
+                                if (it.id == assistant.id) newAssistant else it
+                            },
+                        )
+                    }
+                }
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[lorebook] upsert embedded name='$name' requested='$requested' changed=${updatedBook != null}" +
+                        " before=${embedded.entries.size} after=${updatedBook?.entries?.size ?: embedded.entries.size}" +
+                        " requestedEntries=${describeUpsertPayload(payloadJson)}",
+                )
+                return updatedBook != null
+            }
+        }
+        // ② 全局世界书库（[v243 BUGFIX A3b] 本轮补齐）
+        val index = findLorebookIndexByName(currentSettings.lorebooks, bookName)
+        if (index >= 0) {
+            val target = currentSettings.lorebooks[index]
+            val updatedBook = applyLorebookUpsertPatch(target, payloadJson)
+            if (updatedBook != null) {
+                patchSettings { s ->
+                    val idx = findLorebookIndexByName(s.lorebooks, bookName)
+                    if (idx >= 0) {
+                        val list = s.lorebooks.toMutableList().also { it[idx] = updatedBook }
+                        s.copy(lorebooks = list)
+                    } else s
+                }
+            }
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[lorebook] upsert global name='${target.name}' requested='$requested' changed=${updatedBook != null}" +
+                    " before=${target.entries.size} after=${updatedBook?.entries?.size ?: target.entries.size}" +
+                    " requestedEntries=${describeUpsertPayload(payloadJson)}",
+            )
+            return updatedBook != null
+        }
+
+        TavernRuntimeManager.appendLog("warn", "[lorebook] upsert miss requested='$requested'")
+        return false
+    }
+
+    /**
      * [v214] 世界书写回（JS `RikkaBridge.updateLorebookEntries`）。
      *
      * 匹配优先级与 buildLorebookJson 一致：
@@ -501,11 +701,11 @@ class ChatVM(
      * @return 是否命中并处理了目标书（未命中 false；桥据此回报 JS）。
      */
     fun applyLorebookUpdate(bookName: String, entriesJson: String): Boolean {
-        val currentSettings = settings.value
+        val currentSettings = settingsStore.settingsFlow.value
         val requested = bookName.trim()
         if (requested.isEmpty()) return false
 
-        // ① 卡内嵌书
+        // ① 卡内嵌书（CAS patchSettings，遵守铁律 2）
         val assistant = currentSettings.getAssistantById(conversation.value.assistantId)
         val tav = assistant?.tavernData
         val embedded = tav?.embeddedBook
@@ -517,13 +717,13 @@ class ChatVM(
                 val updatedBook = applyLorebookDisablePatch(embedded, entriesJson)
                 if (updatedBook != null) {
                     val newAssistant = assistant.copy(tavernData = tav.copy(embeddedBook = updatedBook))
-                    updateSettings(
-                        currentSettings.copy(
-                            assistants = currentSettings.assistants.map {
+                    patchSettings { s ->
+                        s.copy(
+                            assistants = s.assistants.map {
                                 if (it.id == assistant.id) newAssistant else it
                             },
-                        ),
-                    )
+                        )
+                    }
                 }
                 TavernRuntimeManager.appendLog(
                     "info",
@@ -533,14 +733,19 @@ class ChatVM(
             }
         }
 
-        // ② 全局世界书库（[v216] 精确优先 → 双侧 trim 兜底）
+        // ② 全局世界书库（[v216] 精确优先 → 双侧 trim 兜底，CAS patchSettings）
         val index = findLorebookIndexByName(currentSettings.lorebooks, bookName)
         if (index >= 0) {
             val target = currentSettings.lorebooks[index]
             val updatedBook = applyLorebookDisablePatch(target, entriesJson)
             if (updatedBook != null) {
-                val newList = currentSettings.lorebooks.toMutableList().also { it[index] = updatedBook }
-                updateSettings(currentSettings.copy(lorebooks = newList))
+                patchSettings { s ->
+                    val idx = findLorebookIndexByName(s.lorebooks, bookName)
+                    if (idx >= 0) {
+                        val newList = s.lorebooks.toMutableList().also { it[idx] = updatedBook }
+                        s.copy(lorebooks = newList)
+                    } else s
+                }
             }
             TavernRuntimeManager.appendLog(
                 "info",
@@ -551,6 +756,117 @@ class ChatVM(
 
         TavernRuntimeManager.appendLog("warn", "[lorebook] apply miss requested='$requested'")
         return false
+    }
+
+    /**
+     * JSR `createOrReplaceWorldbook(name, entries)` / `createWorldbook(name, entries)` 宿主落点：
+     * 在 `Settings.lorebooks` 中创建或替换同名世界书并持久化。
+     */
+    fun createOrReplaceLorebook(bookName: String, entriesJson: String, replaceIfExists: Boolean = true): Boolean {
+        val requested = bookName.trim()
+        if (requested.isEmpty()) return false
+        val currentSettings = settingsStore.settingsFlow.value
+        val existingIdx = findLorebookIndexByName(currentSettings.lorebooks, requested)
+        if (existingIdx >= 0 && !replaceIfExists) {
+            return true
+        }
+        patchSettings { s ->
+            val idx = findLorebookIndexByName(s.lorebooks, requested)
+            val existing = if (idx >= 0) s.lorebooks[idx] else null
+            val built = buildLorebookFromJsrEntries(requested, entriesJson, existing)
+            val nextBooks = s.lorebooks.toMutableList()
+            if (idx >= 0) {
+                nextBooks[idx] = built
+            } else {
+                nextBooks.add(built)
+            }
+            s.copy(lorebooks = nextBooks)
+        }
+        return true
+    }
+
+    /**
+     * JSR `deleteWorldbook(name)` / `deleteLorebook(name)` 宿主落点：
+     * 从 `Settings.lorebooks` 删除同名世界书并清理助手与会话的 `lorebookIds` 引用。
+     */
+    fun deleteLorebookByName(bookName: String): Boolean {
+        val requested = bookName.trim()
+        if (requested.isEmpty()) return false
+        val currentSettings = settingsStore.settingsFlow.value
+        val existingIdx = findLorebookIndexByName(currentSettings.lorebooks, requested)
+        if (existingIdx < 0) return false
+        val removedId = currentSettings.lorebooks[existingIdx].id
+        patchSettings { s ->
+            val idx = findLorebookIndexByName(s.lorebooks, requested)
+            if (idx < 0) return@patchSettings s
+            val targetId = s.lorebooks[idx].id
+            val nextBooks = s.lorebooks.filterIndexed { i, _ -> i != idx }
+            val nextAssistants = s.assistants.map { a ->
+                if (targetId in a.lorebookIds) a.copy(lorebookIds = a.lorebookIds - targetId) else a
+            }
+            s.copy(lorebooks = nextBooks, assistants = nextAssistants)
+        }
+        val conv = conversation.value
+        if (removedId in conv.lorebookIds) {
+            updateConversation(conv.copy(lorebookIds = conv.lorebookIds - removedId))
+            saveConversationAsync()
+        }
+        return true
+    }
+
+    /**
+     * JSR `setChatLorebook` / `rebindCharWorldbooks` / `rebindGlobalWorldbooks` 宿主落点。
+     */
+    fun rebindLorebooks(scope: String, namesJson: String): Boolean {
+        val names = runCatching {
+            val arr = kotlinx.serialization.json.Json.parseToJsonElement(namesJson) as? JsonArray ?: return@runCatching emptyList()
+            arr.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim()?.takeIf { n -> n.isNotEmpty() } }
+        }.getOrDefault(emptyList())
+        val normScope = scope.trim().lowercase()
+        when (normScope) {
+            "global" -> {
+                patchSettings { s ->
+                    val nextBooks = s.lorebooks.map { book ->
+                        val shouldEnable = names.any { lorebookNameMatches(book.name, it) }
+                        if (book.enabled != shouldEnable) book.copy(enabled = shouldEnable) else book
+                    }
+                    s.copy(lorebooks = nextBooks)
+                }
+                return true
+            }
+            "char", "character" -> {
+                val convAssistantId = conversation.value.assistantId
+                patchSettings { s ->
+                    val matchedIds = s.lorebooks
+                        .filter { b -> names.any { lorebookNameMatches(b.name, it) } }
+                        .map { it.id }
+                        .toSet()
+                    val primaryName = names.firstOrNull()
+                    val nextAssistants = s.assistants.map { a ->
+                        if (a.id == convAssistantId) {
+                            val updatedTav = a.tavernData?.let { tav ->
+                                tav.copy(extensionsRaw = updateWorldNameInExtensionsRaw(tav.extensionsRaw, primaryName))
+                            }
+                            a.copy(lorebookIds = matchedIds, tavernData = updatedTav)
+                        } else a
+                    }
+                    s.copy(assistants = nextAssistants)
+                }
+                return true
+            }
+            "chat" -> {
+                val s = settingsStore.settingsFlow.value
+                val matchedIds = s.lorebooks
+                    .filter { b -> names.any { lorebookNameMatches(b.name, it) } }
+                    .map { it.id }
+                    .toSet()
+                val conv = conversation.value
+                updateConversation(conv.copy(lorebookIds = matchedIds))
+                saveConversationAsync()
+                return true
+            }
+            else -> return false
+        }
     }
 
     fun toggleMessageFavorite(node: MessageNode) {
@@ -605,3 +921,26 @@ class ChatVM(
     }
 
 }
+
+
+/**
+ * [v244] 世界书写入诊断：把 `upsertLorebookEntries` 载荷里要写/要删的条目名与 uid 摘出来打进日志。
+ *
+ * 为什么需要：真机「世界书里没有多出我的设定」有两种可能 —— 写没落盘，或写到了另一本书/另一个条目名。
+ * 只打 changed=true 分不清这两种；把条目名打出来，一次复现就能判定，不必再猜。
+ */
+private fun describeUpsertPayload(payloadJson: String): String = runCatching {
+    val obj = kotlinx.serialization.json.Json.parseToJsonElement(payloadJson) as? kotlinx.serialization.json.JsonObject
+        ?: return@runCatching "parse-failed"
+    val upsert = obj["upsert"] as? kotlinx.serialization.json.JsonArray ?: kotlinx.serialization.json.JsonArray(emptyList())
+    val del = obj["delete"] as? kotlinx.serialization.json.JsonArray ?: kotlinx.serialization.json.JsonArray(emptyList())
+    val names = upsert.mapNotNull { el ->
+        val o = el as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+        val nm = (o["name"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull ?: ""
+        val uid = (o["uid"] as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: -1
+        val contentLen = ((o["content"] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull ?: "").length
+        "name='$nm' uid=$uid contentLen=$contentLen"
+    }
+    val uids = del.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull }
+    "upsert=${names.size}(${names.joinToString("; ")}) delete=$uids replaceAll=${(obj["replaceAll"] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull == true}"
+}.getOrDefault("describe-failed")

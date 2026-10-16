@@ -19,6 +19,7 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.GenerationType
 import me.rerere.rikkahub.data.model.SwipeMeta
 import me.rerere.rikkahub.data.st.macro.MacroVarKeyOps
+import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import java.time.LocalDate
@@ -269,6 +270,11 @@ object DefaultPlaceholderProvider : PlaceholderProvider {
             it.settingsStore.settingsFlow.value.authorNote
         }
 
+        placeholder("summary", { Text("对话总结") }) {
+            val ck = it.conversationId?.toString()
+            if (ck.isNullOrBlank()) "" else TavernVariableStore.macroGet(ck, "summary").orEmpty()
+        }
+
         // 注意：{{newline}} 由 MacroEngine 处理（支持 {{newline::N}} 重复 N 次）；
         // 这里不再注册旧占位符，避免遮蔽参数语义。
 
@@ -400,7 +406,20 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
             generationType = ctx.generationType,
             swipeMeta = ctx.swipeMeta,
         )
-        result = StMacroSupport.substitute(result, placeholderCtx, vars, defaultProvider)
+        val activePresetCfg = me.rerere.rikkahub.data.export.parseActiveStPresetConfig(
+            ctx.settings.tavernPresets,
+            me.rerere.rikkahub.data.st.runtime.enabledPresetGroups(
+                ctx.assistant,
+                ctx.settings,
+                ctx.conversationModeInjectionIds,
+            ),
+        )
+        val nestPasses = activePresetCfg.spresetMacroNestDepth.coerceIn(1, 5)
+        for (pass in 0 until nestPasses) {
+            val next = StMacroSupport.substitute(result, placeholderCtx, vars, defaultProvider)
+            result = next
+            if (!result.contains("{{")) break
+        }
 
         // 非作用域 {{trim}} 后处理：去除周围的换行（对齐酒馆格式宏）
         result = result.replace(trimRegex) { "" }
@@ -425,9 +444,17 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
      * 所有修改先落在内存 dirty 表，flush() 时一次性合并写回，避免频繁磁盘写入。
      */
     internal class SettingsMacroVars(
-        private val settingsStore: SettingsStore,
+        private val settingsStore: SettingsStore? = null,
         private val snapshot: Settings,
     ) : MacroVars {
+        companion object {
+            fun get(settings: Settings, chatKey: String, name: String): String =
+                SettingsMacroVars(null, settings).get(chatKey, name).orEmpty()
+
+            fun getGlobal(settings: Settings, name: String): String =
+                SettingsMacroVars(null, settings).get(null, name).orEmpty()
+        }
+
         private val globalDirty = mutableMapOf<String, String>()
         private val chatDirty = mutableMapOf<String, MutableMap<String, String>>()
         private val globalDeleted = mutableSetOf<String>()
@@ -435,12 +462,17 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
 
         override fun get(chatKey: String?, name: String): String? {
             if (chatKey == null) {
-                if (name in globalDeleted) return null
-                return globalDirty[name] ?: snapshot.macroGlobalVariables[name]
+                if (name in globalDeleted || TavernVariableStore.isDeleted(null, name)) return null
+                return globalDirty[name]
+                    ?: TavernVariableStore.macroGet(null, name)
+                    ?: if (TavernVariableStore.isGlobalInitialized()) null else snapshot.macroGlobalVariables[name]
             }
-            if (chatKey in chatDeleted && name in chatDeleted.getValue(chatKey)) return null
+            if ((chatKey in chatDeleted && name in chatDeleted.getValue(chatKey)) || TavernVariableStore.isDeleted(chatKey, name)) {
+                return null
+            }
             return chatDirty[chatKey]?.get(name)
-                ?: snapshot.macroChatVariables[chatKey]?.get(name)
+                ?: TavernVariableStore.macroGet(chatKey, name)
+                ?: if (TavernVariableStore.isChatInitialized(chatKey)) null else snapshot.macroChatVariables[chatKey]?.get(name)
         }
 
         override fun set(chatKey: String?, name: String, value: String) {
@@ -502,28 +534,38 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
             if (globalDirty.isEmpty() && chatDirty.isEmpty() && globalDeleted.isEmpty() && chatDeleted.isEmpty()) {
                 return
             }
-            val latest = settingsStore.settingsFlow.value
-            val newGlobal = latest.macroGlobalVariables.toMutableMap()
-            globalDeleted.forEach { newGlobal.remove(it) }
-            newGlobal.putAll(globalDirty)
+            // 同步写回 TavernVariableStore，保证 JS TavernHelper / MVU 与提示词宏零延迟互通
+            runCatching {
+                globalDeleted.forEach { TavernVariableStore.macroDelete(null, it) }
+                globalDirty.forEach { (k, v) -> TavernVariableStore.macroSet(null, k, v) }
+                chatDeleted.forEach { (chat, names) ->
+                    names.forEach { TavernVariableStore.macroDelete(chat, it) }
+                }
+                chatDirty.forEach { (chat, map) ->
+                    map.forEach { (k, v) -> TavernVariableStore.macroSet(chat, k, v) }
+                }
+            }
+            settingsStore?.update { latest ->
+                val newGlobal = latest.macroGlobalVariables.toMutableMap()
+                globalDeleted.forEach { newGlobal.remove(it) }
+                newGlobal.putAll(globalDirty)
 
-            val newChat = latest.macroChatVariables.toMutableMap()
-            chatDeleted.forEach { (chat, names) ->
-                val m = newChat[chat]?.toMutableMap() ?: mutableMapOf()
-                names.forEach { m.remove(it) }
-                newChat[chat] = m
-            }
-            chatDirty.forEach { (chat, map) ->
-                val m = newChat[chat]?.toMutableMap() ?: mutableMapOf()
-                m.putAll(map)
-                newChat[chat] = m
-            }
-            settingsStore.update(
+                val newChat = latest.macroChatVariables.toMutableMap()
+                chatDeleted.forEach { (chat, names) ->
+                    val m = newChat[chat]?.toMutableMap() ?: mutableMapOf()
+                    names.forEach { m.remove(it) }
+                    newChat[chat] = m
+                }
+                chatDirty.forEach { (chat, map) ->
+                    val m = newChat[chat]?.toMutableMap() ?: mutableMapOf()
+                    m.putAll(map)
+                    newChat[chat] = m
+                }
                 latest.copy(
                     macroGlobalVariables = newGlobal,
                     macroChatVariables = newChat,
                 )
-            )
+            }
         }
     }
 }

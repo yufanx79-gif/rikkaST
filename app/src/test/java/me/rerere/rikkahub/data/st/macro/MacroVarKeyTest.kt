@@ -184,4 +184,38 @@ class MacroVarKeyTest {
         assertTrue(MacroRegistry.hasMacro("exampleSeparator"))
         assertFalse(MacroRegistry.hasMacro("definitely_not_a_macro"))
     }
+
+    @Test
+    fun d4_tavernVariableStoreOverridesStaleSettingsAndDeletionDoesNotResurrect() {
+        val chatId = "test-chat-vars-d4"
+        me.rerere.rikkahub.data.st.runtime.TavernVariableStore.clearForTest()
+        val initialSettings = me.rerere.rikkahub.data.datastore.Settings(
+            init = true,
+            themeId = "sakura",
+            providers = emptyList(),
+            assistants = emptyList(),
+            ttsProviders = emptyList(),
+            modeInjections = emptyList(),
+            macroChatVariables = mapOf(chatId to mapOf("hp" to "100", "deletedKey" to "old")),
+            macroGlobalVariables = mapOf("theme" to "light", "removedGlobal" to "stale"),
+        )
+        val vBefore = me.rerere.rikkahub.data.st.runtime.TavernVariableStore.mutationVersion
+        me.rerere.rikkahub.data.st.runtime.TavernVariableStore.replaceChat(
+            chatId,
+            kotlinx.serialization.json.buildJsonObject {
+                put("hp", kotlinx.serialization.json.JsonPrimitive(50))
+            },
+        )
+        me.rerere.rikkahub.data.st.runtime.TavernVariableStore.replaceGlobal(
+            kotlinx.serialization.json.buildJsonObject {
+                put("theme", kotlinx.serialization.json.JsonPrimitive("dark"))
+            },
+        )
+        assertTrue(me.rerere.rikkahub.data.st.runtime.TavernVariableStore.mutationVersion > vBefore)
+        assertEquals("50", me.rerere.rikkahub.data.ai.transformers.PlaceholderTransformer.SettingsMacroVars.get(initialSettings, chatId, "hp"))
+        assertEquals("", me.rerere.rikkahub.data.ai.transformers.PlaceholderTransformer.SettingsMacroVars.get(initialSettings, chatId, "deletedKey"))
+        assertEquals("dark", me.rerere.rikkahub.data.ai.transformers.PlaceholderTransformer.SettingsMacroVars.getGlobal(initialSettings, "theme"))
+        assertEquals("", me.rerere.rikkahub.data.ai.transformers.PlaceholderTransformer.SettingsMacroVars.getGlobal(initialSettings, "removedGlobal"))
+        me.rerere.rikkahub.data.st.runtime.TavernVariableStore.clearForTest()
+    }
 }
