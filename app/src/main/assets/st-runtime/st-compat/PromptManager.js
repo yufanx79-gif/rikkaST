@@ -4,6 +4,11 @@
  * 对齐 SillyTavern `public/scripts/PromptManager.js` 的 Prompt / PromptCollection 与激活预设读写。
  */
 
+export const INJECTION_POSITION = {
+    RELATIVE: 0,
+    ABSOLUTE: 1,
+};
+
 export class Prompt {
     constructor(collection, identifier, ...rest) {
         this.collection = collection;

@@ -65,7 +65,7 @@ object MacroDefinitions {
         ) { ctx -> "\n".repeat(countArg(ctx) ?: 1) }
 
         // {{noop}} -> ''
-        reg("noop") { "" }
+        reg("noop", aliases = listOf("blank")) { "" }
 
         // {{trim}}：非 scoped → 交由后处理清除标记；scoped → 返回内容（引擎已自动 trim）
         reg("trim", minArgs = 0, maxArgs = 1, argDefs = listOf(MacroArgDef("content", optional = true))) { ctx ->
@@ -104,7 +104,7 @@ object MacroDefinitions {
         // {{// ...}} -> ''。注：实测 ST 中 {{///}} 是“注释宏 + 参数 '/'”而非闭合标签，
         // 故 scoped 配对不会作用于注释宏（与 ST 行为一致）。
         reg(
-            "//", minArgs = 1, maxArgs = 1, list = true, strictArgs = false,
+            "//", minArgs = 0, maxArgs = 1, list = true, strictArgs = false, delayArgResolution = true,
             aliases = listOf("comment"), argDefs = listOf(MacroArgDef("comment")),
         ) { "" }
 
@@ -393,7 +393,7 @@ object MacroDefinitions {
     // ==================== chat-macros.js ====================
 
     private fun registerChat() {
-        reg("lastMessage") { ctx -> lastMessageId(ctx.env)?.let { ctx.env.chat[it].text } ?: "" }
+        reg("lastMessage", aliases = listOf("lastChatMessage")) { ctx -> lastMessageId(ctx.env)?.let { ctx.env.chat[it].text } ?: "" }
         reg("lastMessageId") { ctx -> lastMessageId(ctx.env)?.toString() ?: "" }
         reg("lastUserMessage") { ctx ->
             lastMessageId(ctx.env) { it.isUser && !it.isSystem }?.let { ctx.env.chat[it].text } ?: ""
@@ -455,19 +455,19 @@ object MacroDefinitions {
         reg("groupNotMuted") { it.env.names.groupNotMuted }
         reg("notChar") { it.env.names.notChar }
 
-        reg("charPrompt") { it.env.character.charPrompt }
-        reg("charInstruction", aliases = listOf("charJailbreak")) { it.env.character.charInstruction }
+        reg("charPrompt", aliases = listOf("char_prompt", "system_prompt")) { it.env.character.charPrompt }
+        reg("charInstruction", aliases = listOf("charJailbreak", "post_history_instructions", "jailbreak")) { it.env.character.charInstruction }
         reg("charDescription", aliases = listOf("description")) { it.env.character.description }
         reg("charPersonality", aliases = listOf("personality")) { it.env.character.personality }
         reg("charScenario", aliases = listOf("scenario")) { it.env.character.scenario }
         reg("persona") { it.env.character.persona }
-        reg("mesExamplesRaw") { it.env.character.mesExamplesRaw }
-        reg("mesExamples") { ctx -> buildMesExamples(ctx.env) }
-        reg("charDepthPrompt") { it.env.character.charDepthPrompt }
-        reg("charCreatorNotes", aliases = listOf("creatorNotes")) { it.env.character.creatorNotes }
+        reg("mesExamplesRaw", aliases = listOf("mes_example_raw")) { it.env.character.mesExamplesRaw }
+        reg("mesExamples", aliases = listOf("mes_example")) { ctx -> buildMesExamples(ctx.env) }
+        reg("charDepthPrompt", aliases = listOf("depth_prompt", "char_depth_prompt")) { it.env.character.charDepthPrompt }
+        reg("charCreatorNotes", aliases = listOf("creatorNotes", "creator_notes")) { it.env.character.creatorNotes }
 
         reg(
-            "charFirstMessage", minArgs = 0, maxArgs = 1, aliases = listOf("greeting"),
+            "charFirstMessage", minArgs = 0, maxArgs = 1, aliases = listOf("greeting", "first_mes", "firstMessage"),
             argDefs = listOf(MacroArgDef("index", optional = true, types = listOf("integer"))),
         ) { ctx -> firstMessageAt(ctx.env, ctx.unnamedArgs.getOrNull(0)) }
 
@@ -676,6 +676,9 @@ object MacroDefinitions {
         reg("systemPrompt", minArgs = 0, maxArgs = 0) { ctx ->
             if (!ctx.env.system.syspromptEnabled) ""
             else ctx.env.character.charPrompt.ifBlank { ctx.env.system.syspromptContent }
+        }
+        reg("defaultSystemPrompt", minArgs = 0, maxArgs = 0, aliases = listOf("default_system_prompt")) { ctx ->
+            ctx.env.system.syspromptContent
         }
     }
 

@@ -33,6 +33,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
@@ -157,10 +158,17 @@ class ChatVM(
         it.getCurrentAssistant().enableWebSearch
     }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
-    // 当前模型
+    // 当前模型（Eagerly 订阅并以当前权威设置快照初始化，防止切换会话/面板触发时尚未收集导致 currentChatModel 为 null）
     val currentChatModel = settings.map { settings ->
-        settings.getCurrentChatModel()
-    }.stateIn(viewModelScope, SharingStarted.Lazily, null)
+        val convAssistantId = conversation.value.assistantId
+        val convAssistant = settings.getAssistantById(convAssistantId) ?: settings.getCurrentAssistant()
+        convAssistant.chatModelId?.let { settings.findModelById(it) }
+            ?: settings.getCurrentChatModel()
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.Eagerly,
+        settingsStore.settingsFlow.value.getCurrentChatModel(),
+    )
 
     // 错误状态
     val errors: StateFlow<List<ChatError>> = chatService.errors
@@ -263,10 +271,20 @@ class ChatVM(
      * @param content 消息内容
      * @param answer 是否触发消息生成，如果为false，则仅添加消息到消息列表中
      */
-    fun handleMessageSend(content: List<UIMessagePart>,answer: Boolean = true) {
-        if (content.isEmptyInputMessage()) return
-
-        chatService.sendMessage(_conversationId, content, answer)
+    fun handleMessageSend(content: List<UIMessagePart>, answer: Boolean = true): Boolean {
+        if (content.isEmptyInputMessage()) {
+            TavernRuntimeManager.appendLog(
+                "warn",
+                "[send-diag] handleMessageSend rejected: empty input conv=$_conversationId",
+            )
+            return false
+        }
+        TavernRuntimeManager.recordSendDiagnostic(
+            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_2_HANDLER_ENTERED,
+            conversationId = _conversationId.toString(),
+            detail = "parts=${content.size} answer=$answer",
+        )
+        return chatService.sendMessage(_conversationId, content, answer)
     }
 
     fun handleMessageEdit(parts: List<UIMessagePart>, messageId: Uuid) {

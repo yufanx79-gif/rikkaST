@@ -57,7 +57,18 @@ data class TavernExtensionInfo(
     val loadingOrder: Int,
     val requires: List<String>,
     val hasManifest: Boolean,
-)
+    val optional: List<String> = emptyList(),
+    val minimumClientVersion: String = "",
+    val generateInterceptor: String = "",
+    val hooks: Map<String, String> = emptyMap(),
+) {
+    val requiresNode: Boolean
+        get() = requires.any {
+            it.equals("node", ignoreCase = true) ||
+                it.equals("server", ignoreCase = true) ||
+                it.equals("extras", ignoreCase = true)
+        } || normalizeExtensionFolderAlias(folder).contains("littlewhitebox")
+}
 
 /** 第三方扩展根目录。 */
 fun extensionsBaseDir(context: Context): File = File(context.filesDir, TAVERN_EXTENSIONS_DIR)
@@ -115,6 +126,19 @@ fun parseManifest(folder: String, text: String): TavernExtensionInfo? {
         ?.filter { it.isNotBlank() }
         .orEmpty()
 
+    val optional = (root["optional"] as? JsonArray)
+        ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+        ?.filter { it.isNotBlank() }
+        .orEmpty()
+
+    val hooks = (root["hooks"] as? JsonObject)?.entries
+        ?.mapNotNull { (k, v) ->
+            val fn = (v as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            k to fn
+        }
+        ?.toMap()
+        .orEmpty()
+
     return TavernExtensionInfo(
         folder = folder,
         displayName = str("display_name").ifBlank { folder },
@@ -126,6 +150,10 @@ fun parseManifest(folder: String, text: String): TavernExtensionInfo? {
         loadingOrder = (root["loading_order"] as? JsonPrimitive)?.intOrNull ?: 100,
         requires = requires,
         hasManifest = true,
+        optional = optional,
+        minimumClientVersion = str("minimum_client_version").ifBlank { str("minimumClientVersion") },
+        generateInterceptor = str("generate_interceptor").ifBlank { str("generateInterceptor") },
+        hooks = hooks,
     )
 }
 
@@ -155,17 +183,43 @@ fun sanitizeFolderName(raw: String): String? {
     return name.takeIf { it.isNotEmpty() }
 }
 
+private val EXTENSION_FOLDER_SUFFIX_REGEX =
+    Regex("(?i)-(?:main|master|dev|release|v?\\d+(?:\\.\\d+)*(?:-[a-z0-9._-]+)?)$")
+
+/**
+ * 归一化扩展目录别名：剥离 GitHub 发行版 / 分支压缩包常见的 `-main`、`-master`、`-1.16`、`-v2.2.0` 等后缀，
+ * 使扩展硬编码的 `/scripts/extensions/third-party/ST-Prompt-Template/...` 能命中解压后的 `ST-Prompt-Template-1.16` 目录。
+ */
+fun normalizeExtensionFolderAlias(folder: String): String =
+    folder.trim().replace(EXTENSION_FOLDER_SUFFIX_REGEX, "").lowercase()
+
 /**
  * 把 (folder, relativePath) 解析为扩展目录中的真实文件。
+ * 若精确目录不存在，则按 [normalizeExtensionFolderAlias] 匹配同别名已安装目录。
  * 任何不安全输入或越界路径返回 null；目标不存在或不是文件返回 null。
  */
 fun resolveExtensionFile(baseDir: File, folder: String, relativePath: String): File? {
     if (!isSafeExtensionSegment(folder)) return null
     val segs = relativePath.split('/').filter { it.isNotEmpty() }
     if (segs.isEmpty() || segs.any { !isSafeExtensionSegment(it) }) return null
+    val relJoined = segs.joinToString("/")
     return try {
-        val target = File(baseDir, "$folder/${segs.joinToString("/")}").canonicalFile
         val canonicalBase = baseDir.canonicalFile
+        val directDir = File(baseDir, folder)
+        val candidateDir = if (directDir.isDirectory) {
+            directDir
+        } else {
+            val wantedAlias = normalizeExtensionFolderAlias(folder)
+            baseDir.listFiles()
+                ?.firstOrNull {
+                    it.isDirectory &&
+                        !it.name.startsWith(".") &&
+                        isSafeExtensionSegment(it.name) &&
+                        normalizeExtensionFolderAlias(it.name) == wantedAlias
+                }
+                ?: directDir
+        }
+        val target = File(candidateDir, relJoined).canonicalFile
         if (!target.path.startsWith(canonicalBase.path + File.separator)) return null
         target.takeIf { it.isFile }
     } catch (_: Exception) {
@@ -197,8 +251,16 @@ fun buildRuntimeExtensionsJson(
                     put("folder", e.folder)
                     put("displayName", e.displayName)
                     put("version", e.version)
+                    put("author", e.author)
+                    put("homePage", e.homePage)
                     put("js", e.js)
                     put("css", e.css)
+                    put("loadingOrder", e.loadingOrder)
+                    put("requires", buildJsonArray { e.requires.forEach { add(JsonPrimitive(it)) } })
+                    put("optional", buildJsonArray { e.optional.forEach { add(JsonPrimitive(it)) } })
+                    put("minimumClientVersion", e.minimumClientVersion)
+                    put("generateInterceptor", e.generateInterceptor)
+                    put("hooks", buildJsonObject { e.hooks.forEach { (k, v) -> put(k, v) } })
                 }
             )
         }
@@ -220,12 +282,14 @@ private fun openZip(file: File): ZipInputStream = ZipInputStream(file.inputStrea
  * - 解压扩展根下所有文件；跳过 `.git` / `__MACOSX` / 含 `..` 的路径（zip-slip 防护）；
  * - 更新语义：同名目录先清空再写入。
  */
-fun installFromZipFile(
+/**
+ * 从 zip 文件安装一个或多个扩展（支持像 `all-needs.zip` 这样包含多个顶层扩展目录的合集压缩包，也兼容单扩展压缩包）。
+ */
+fun installAllFromZipFile(
     zipFile: File,
     destBase: File,
     sourceName: String? = null,
-): Result<TavernExtensionInfo> = runCatching {
-    // 1) 枚举 entry 名，定位最浅的 manifest.json
+): Result<List<TavernExtensionInfo>> = runCatching {
     val entries = mutableListOf<String>()
     openZip(zipFile).use { zis ->
         while (true) {
@@ -233,64 +297,81 @@ fun installFromZipFile(
             entries += e.name
         }
     }
-    val manifestPath = entries
+    val allManifests = entries
         .filter { (it == "manifest.json" || it.endsWith("/manifest.json")) && !it.startsWith("__MACOSX/") }
-        .minByOrNull { it.count { c -> c == '/' } }
-        ?: error("安装包中未找到 manifest.json")
-    val prefix = manifestPath.substringBeforeLast('/', "")
+    require(allManifests.isNotEmpty()) { "安装包中未找到 manifest.json" }
 
-    // 2) 目录名推导
-    val folder = sanitizeFolderName(
-        sourceName?.takeIf { it.isNotBlank() }
-            ?: prefix.substringAfterLast('/').takeIf { it.isNotBlank() }
-            ?: zipFile.nameWithoutExtension
-    ) ?: error("无法推导扩展目录名")
+    val minDepth = allManifests.minOf { it.count { c -> c == '/' } }
+    val rootManifests = allManifests.filter { it.count { c -> c == '/' } == minDepth }
+    val isMultiBundle = rootManifests.size > 1
 
-    // 3) 解压扩展根下的文件
     destBase.mkdirs()
-    val destDir = File(destBase, folder)
-    if (destDir.exists()) destDir.deleteRecursively()
-    destDir.mkdirs()
-    val destCanonical = destDir.canonicalFile
-    var totalOut = 0L
-    openZip(zipFile).use { zis ->
-        val buf = ByteArray(64 * 1024)
-        while (true) {
-            val e = zis.nextEntry ?: break
-            if (e.isDirectory) continue
-            val name = e.name
-            if (name.startsWith("__MACOSX/") || name.startsWith(".git/") || name.contains("/.git/")) continue
-            val rel = when {
-                prefix.isEmpty() -> name
-                name.startsWith("$prefix/") -> name.removePrefix("$prefix/")
-                else -> continue
+    val installedList = mutableListOf<TavernExtensionInfo>()
+
+    for (manifestPath in rootManifests) {
+        val prefix = manifestPath.substringBeforeLast('/', "")
+        val folder = sanitizeFolderName(
+            if (isMultiBundle) {
+                prefix.substringAfterLast('/').takeIf { it.isNotBlank() } ?: zipFile.nameWithoutExtension
+            } else {
+                sourceName?.takeIf { it.isNotBlank() }
+                    ?: prefix.substringAfterLast('/').takeIf { it.isNotBlank() }
+                    ?: zipFile.nameWithoutExtension
             }
-            if (rel.isBlank() || rel.contains("..")) continue
-            val outFile = File(destDir, rel).canonicalFile
-            if (!outFile.path.startsWith(destCanonical.path + File.separator)) continue
-            outFile.parentFile?.mkdirs()
-            outFile.outputStream().use { out ->
-                while (true) {
-                    val n = zis.read(buf)
-                    if (n < 0) break
-                    totalOut += n
-                    if (totalOut > MAX_EXTRACT_BYTES) error("解压内容超过上限")
-                    out.write(buf, 0, n)
+        ) ?: error("无法推导扩展目录名")
+
+        val destDir = File(destBase, folder)
+        if (destDir.exists()) destDir.deleteRecursively()
+        destDir.mkdirs()
+        val destCanonical = destDir.canonicalFile
+        var totalOut = 0L
+        openZip(zipFile).use { zis ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val e = zis.nextEntry ?: break
+                if (e.isDirectory) continue
+                val name = e.name
+                if (name.startsWith("__MACOSX/") || name.startsWith(".git/") || name.contains("/.git/")) continue
+                val rel = when {
+                    prefix.isEmpty() -> name
+                    name.startsWith("$prefix/") -> name.removePrefix("$prefix/")
+                    else -> continue
+                }
+                if (rel.isBlank() || rel.contains("..")) continue
+                val outFile = File(destDir, rel).canonicalFile
+                if (!outFile.path.startsWith(destCanonical.path + File.separator)) continue
+                outFile.parentFile?.mkdirs()
+                outFile.outputStream().use { out ->
+                    while (true) {
+                        val n = zis.read(buf)
+                        if (n < 0) break
+                        totalOut += n
+                        if (totalOut > MAX_EXTRACT_BYTES) error("解压内容超过上限")
+                        out.write(buf, 0, n)
+                    }
                 }
             }
         }
-    }
 
-    // 4) 解析解压后的 manifest
-    val manifestText = File(destDir, "manifest.json")
-        .takeIf { it.isFile }
-        ?.let { runCatching { it.readText() }.getOrDefault("") }
-        .orEmpty()
-    parseManifest(folder, manifestText) ?: error("manifest.json 解析失败")
+        val manifestText = File(destDir, "manifest.json")
+            .takeIf { it.isFile }
+            ?.let { runCatching { it.readText() }.getOrDefault("") }
+            .orEmpty()
+        val info = parseManifest(folder, manifestText) ?: error("manifest.json 解析失败 ($folder)")
+        installedList += info
+    }
+    installedList
 }
 
-/** 从 SAF Uri 安装扩展（应用内导入入口）。 */
-suspend fun installFromZipUri(context: Context, uri: Uri): Result<TavernExtensionInfo> =
+fun installFromZipFile(
+    zipFile: File,
+    destBase: File,
+    sourceName: String? = null,
+): Result<TavernExtensionInfo> =
+    installAllFromZipFile(zipFile, destBase, sourceName).mapCatching { it.first() }
+
+/** 从 SAF Uri 安装单个或多个扩展（应用内导入入口，支持合集包一次性安装全部扩展）。 */
+suspend fun installAllFromZipUri(context: Context, uri: Uri): Result<List<TavernExtensionInfo>> =
     withContext(Dispatchers.IO) {
         runCatching {
             val base = extensionsBaseDir(context).apply { mkdirs() }
@@ -300,12 +381,16 @@ suspend fun installFromZipUri(context: Context, uri: Uri): Result<TavernExtensio
                     tmp.outputStream().use { out -> copyWithLimit(input, out, MAX_ARCHIVE_BYTES) }
                 } ?: error("无法读取所选文件")
                 val displayName = queryDisplayName(context, uri)?.removeSuffix(".zip")
-                installFromZipFile(tmp, base, displayName).getOrThrow()
+                installAllFromZipFile(tmp, base, displayName).getOrThrow()
             } finally {
                 tmp.delete()
             }
         }
     }
+
+/** 从 SAF Uri 安装扩展（应用内导入入口）。 */
+suspend fun installFromZipUri(context: Context, uri: Uri): Result<TavernExtensionInfo> =
+    installAllFromZipUri(context, uri).mapCatching { it.first() }
 
 /**
  * 从 http(s) URL 安装扩展（对齐 ST `installExtension(url, branch)` + TauriTavern git ref 解析语义）：

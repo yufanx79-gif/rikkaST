@@ -268,7 +268,22 @@ fun PromptPage(vm: PromptVM = koinViewModel()) {
                 1 -> ModeInjectionTab(
                     modeInjections = settings.promptInjections,
                     onUpdate = { newList ->
-                        vm.patchSettings { current -> current.copy(promptInjections = newList) }
+                        vm.patchSettings { current ->
+                            val oldIds = current.promptInjections.map { it.id }.toSet()
+                            val addedEnabledIds = newList.filter { it.enabled && it.id !in oldIds }.map { it.id }.toSet()
+                            val toggledOnIds = newList.filter { n ->
+                                n.enabled && current.promptInjections.firstOrNull { it.id == n.id }?.enabled == false
+                            }.map { it.id }.toSet()
+                            val autoBindIds = addedEnabledIds + toggledOnIds
+                            current.copy(
+                                promptInjections = newList,
+                                assistants = if (autoBindIds.isNotEmpty()) {
+                                    current.assistants.map { a -> a.copy(modeInjectionIds = a.modeInjectionIds + autoBindIds) }
+                                } else {
+                                    current.assistants
+                                },
+                            )
+                        }
                     },
                 )
 
@@ -276,11 +291,23 @@ fun PromptPage(vm: PromptVM = koinViewModel()) {
                 2 -> LorebookTab(
                     lorebooks = settings.lorebooks,
                     onUpdate = { newLorebooks ->
-                        // 外置世界书更新时，同步回写绑定它的角色卡内嵌世界书
+                        // 外置世界书更新时，同步回写绑定它的角色卡内嵌世界书；对新导入/新启用的全局世界书自动绑定到助手
                         vm.patchSettings { current ->
+                            val oldBookIds = current.lorebooks.map { it.id }.toSet()
+                            val newlyEnabledGlobalIds = newLorebooks.filter { b ->
+                                b.enabled && !b.isCharacterBook && (
+                                    b.id !in oldBookIds ||
+                                        current.lorebooks.firstOrNull { it.id == b.id }?.enabled == false
+                                )
+                            }.map { it.id }.toSet()
+                            val syncedAssistants = syncExternalToEmbedded(current.assistants, newLorebooks).map { a ->
+                                if (newlyEnabledGlobalIds.isNotEmpty()) {
+                                    a.copy(lorebookIds = a.lorebookIds + newlyEnabledGlobalIds)
+                                } else a
+                            }
                             current.copy(
                                 lorebooks = newLorebooks,
-                                assistants = syncExternalToEmbedded(current.assistants, newLorebooks),
+                                assistants = syncedAssistants,
                             )
                         }
                     },
@@ -406,6 +433,9 @@ private fun ModeInjectionTab(
                         ModeInjectionCard(
                             injection = injection,
                             modifier = longPressReorder(isDragging, enabled = !selectMode),
+                            onToggleEnabled = { checked ->
+                                onUpdate(modeInjections.map { if (it.id == injection.id) it.copy(enabled = checked) else it })
+                            },
                             onEdit = { editState.open(injection) },
                             onDelete = { onUpdate(modeInjections - injection) }
                         )
@@ -526,6 +556,7 @@ private fun ModeInjectionCard(
     selectMode: Boolean = false,
     selected: Boolean = false,
     onToggleSelect: () -> Unit = {},
+    onToggleEnabled: ((Boolean) -> Unit)? = null,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -585,6 +616,12 @@ private fun ModeInjectionCard(
                         Icon(HugeIcons.Tools, stringResource(R.string.prompt_page_edit))
                     }
                 }
+            }
+            if (!selectMode && onToggleEnabled != null) {
+                Switch(
+                    checked = injection.enabled,
+                    onCheckedChange = onToggleEnabled,
+                )
             }
             ItemActionMenu(
                 actions = listOf(
@@ -1208,6 +1245,9 @@ private fun LorebookTab(
                         LorebookCard(
                             book = book,
                             modifier = longPressReorder(isDragging, enabled = !selectMode),
+                            onToggleEnabled = { checked ->
+                                onUpdate(lorebooks.map { if (it.id == book.id) it.copy(enabled = checked) else it })
+                            },
                             onEdit = { editState.open(book) },
                             onDelete = { onUpdate(lorebooks - book) }
                         )
@@ -1329,6 +1369,7 @@ private fun LorebookCard(
     selectMode: Boolean = false,
     selected: Boolean = false,
     onToggleSelect: () -> Unit = {},
+    onToggleEnabled: ((Boolean) -> Unit)? = null,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -1401,6 +1442,12 @@ private fun LorebookCard(
                         Icon(HugeIcons.Tools, stringResource(R.string.prompt_page_edit))
                     }
                 }
+            }
+            if (!selectMode && onToggleEnabled != null) {
+                Switch(
+                    checked = book.enabled,
+                    onCheckedChange = onToggleEnabled,
+                )
             }
             ItemActionMenu(
                 actions = listOf(

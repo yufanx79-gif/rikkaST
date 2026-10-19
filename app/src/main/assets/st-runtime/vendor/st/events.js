@@ -4,7 +4,8 @@
  *
  * 本文件为事件契约（event_types 常量表 + 事件总线入口）的参考实现，
  * 被 rikkaST 的酒馆兼容层使用。
- * 本文件未经修改 / 修改说明：仅用于运行时事件总线，未改动语义。
+ * 修改说明：通过 globalThis.__rikkaSharedEventSource 保证不同模块路径
+ * （/st-runtime/vendor/st/events.js 与 /scripts/events.js）共享同一 EventEmitter 单例。
  *
  * 完整第三方声明见仓库根目录 THIRD-PARTY-NOTICES.md。
  */
@@ -120,4 +121,6 @@ export const event_types = {
     ITEMIZED_PROMPTS_DELETED: 'itemized_prompts_deleted',
 };
 
-export const eventSource = new EventEmitter([event_types.APP_READY, event_types.APP_INITIALIZED]);
+const globalScope = typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : {});
+export const eventSource = globalScope.__rikkaSharedEventSource
+    || (globalScope.__rikkaSharedEventSource = new EventEmitter([event_types.APP_READY, event_types.APP_INITIALIZED]));

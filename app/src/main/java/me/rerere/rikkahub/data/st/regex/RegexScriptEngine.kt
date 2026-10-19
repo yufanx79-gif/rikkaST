@@ -1,18 +1,16 @@
 package me.rerere.rikkahub.data.st.regex
 
 /**
- * ST 1.18 正则脚本引擎移植
+ * ST 1.19 正则脚本引擎移植与增强
  *
  * 对齐 public/scripts/extensions/regex/engine.js：
  * - [runRegexScript] / [getRegexedString] / filterString / substitute_find_regex / sanitizeRegexMacro
  * - 替换串支持 `{{match}}`（= $0）、`$1..$99`、`$<name>`；分组引用值会先剔除 trimStrings
  * - 替换串最后整体做一次宏替换（对齐 ST 末尾 substituteParams(replaceWithGroups)）
- *
- * PORT NOTE（与 ST 的差异，均已评估为净行为等价或更合理）：
- * 1. ST 的“无标记”脚本通过 raw 通道一次性改写消息源；本实现不修改消息源，改为在
- *    “提示词组装”与“渲染显示”两条通道各自叠加，净效果一致，且避免破坏原始消息。
- * 2. 非 `/pattern/flags` 形式的 findRegex 按“全局替换”处理（与 RikkaHub 既有 AssistantRegex
- *    行为一致）；`/pattern/` 未带 `g` 时仍严格“仅首个匹配”（对齐 ST）。
+ * - 防御性增强：
+ *   1. 对非专门匹配 `<think>`/`<thinking>`/`<thought>` 的脚本，自动保护思维链块不被立绘/CG 等正文正则穿透误匹配；
+ *   2. 当反引号 `` `...` `` 闭合边界因前文不匹配代码段导致跨行吞噬整段文本（如 `` ` 格式：... - `织乃_zcw_2` ``）时，
+ *      若末尾最后一对反引号子串本身即完整匹配该正则，自动重锚定到末尾真实 token，保留前文不被吞噬。
  */
 object RegexScriptEngine {
 
@@ -83,22 +81,14 @@ object RegexScriptEngine {
         runCatching { android.util.Log.w(TAG, message) }
     }
 
-    /**
-     * PORT NOTE 3（对齐 JS 正则语义）：
-     *
-     * JS 的 `.` 不匹配 `\n` / `\u2028` / `\u2029`，但**匹配 `\r`**；Java/Kotlin 默认的 `.`
-     * 连 `\r` 也不匹配。ST 卡正则大量使用 `(.*?)\n` 形式，而 ST 卡 JSON 的 `first_mes` /
-     * `alternate_greetings` 等字段在 Windows 上编辑过就带 CRLF（`\r\n`）——此时默认语义下
-     * `(.*?)` 无法越过 `\r`，整条正则静默失配，开场白 / 状态栏的 HTML 注入不生效
-     * （外部现象：「预设对话不渲染」，只看到裸 DSL 文本；AI 后续生成的正文是 LF，所以正常）。
-     *
-     * `RegexOption.UNIX_LINES` 让 `.` 只把 `\n` 视作行终止符，从而与 JS 一致。
-     * 实测（Java oracle，俺の彼女卡 25 条正则 × 真卡 CRLF first_mes）：
-     * 默认语义 CRLF 命中 0 条、LF 命中 24 条；加 UNIX_LINES 后 CRLF 命中数与 LF 完全一致。
-     */
     private val JS_REGEX_OPTIONS = setOf(RegexOption.UNIX_LINES)
 
     private val SLASH_FORM = Regex("^/(.*)/([a-zA-Z]*)$", RegexOption.DOT_MATCHES_ALL)
+
+    private val THINK_BLOCK_SHIELD_REGEX = Regex(
+        "<(think|thinking|thought)\\b[^>]*>[\\s\\S]*?(?:</\\1>|$)",
+        RegexOption.IGNORE_CASE,
+    )
 
     private fun compileRegexUncached(pattern: String): Regex {
         val slashForm = SLASH_FORM.matchEntire(pattern)
@@ -109,25 +99,12 @@ object RegexScriptEngine {
                 'i' -> options + RegexOption.IGNORE_CASE
                 'm' -> options + RegexOption.MULTILINE
                 's' -> options + RegexOption.DOT_MATCHES_ALL
-                // u / y / x 等：Kotlin 无对应选项，忽略
                 else -> options
             }
         }
         return Regex(slashForm.groupValues[1], options)
     }
 
-    /**
-     * [v214] 不定长 lookbehind 降级。
-     *
-     * Java/Kotlin 正则要求 lookbehind 具有「显然的最大长度」：`(?<=...[\s\S]*?)` 这类含
-     * `*` / `+` / `{n,}` 的组会直接编译失败（Look-behind group does not have an obvious
-     * maximum length），进而整条脚本被静默跳过。这里定位每个 `(?<=` / `(?<!` 组
-     * （跳过转义与字符类，按括号嵌套配对），把组内不受限量词改写为有界形式：
-     * `*?`→`{0,MAX}?`、`*`→`{0,MAX}`、`+?`→`{1,MAX}?`、`+`→`{1,MAX}`、`{n,}`→`{n,MAX}`
-     * （同时保留 `?`/`+` 懒惰 / 占有后缀）。
-     *
-     * @return 改写后的 pattern；无可改写量词或结构畸形时返回 null。
-     */
     internal fun degradeUnboundedLookbehind(pattern: String): String? {
         val out = StringBuilder(pattern.length + 16)
         var i = 0
@@ -169,7 +146,6 @@ object RegexScriptEngine {
         return if (changed) out.toString() else null
     }
 
-    /** 把 body 内不受限量词改写为 `{min,BOUNDED_LOOKBEHIND_MAX}` 有界形式。 */
     private fun rewriteUnboundedQuantifiers(body: String): String {
         val out = StringBuilder(body.length + 16)
         var i = 0
@@ -244,10 +220,8 @@ object RegexScriptEngine {
         return out.toString()
     }
 
-    /** `{n,}` 形式的无上界量词（[rewriteUnboundedQuantifiers] 用）。 */
     private val UNBOUNDED_QUANTIFIER = Regex("^\\d+,$")
 
-    /** 定位 [openIndex] 处 `(` 的配对 `)`（跳过转义与字符类）；未闭合返回 -1。 */
     private fun findMatchingParen(pattern: String, openIndex: Int): Int {
         var depth = 0
         var i = openIndex
@@ -271,7 +245,6 @@ object RegexScriptEngine {
         return -1
     }
 
-    /** 跳过 `[` 起始的字符类（正确处理转义与首部 `]`）；返回 `]` 之后的索引。 */
     private fun skipCharClass(pattern: String, start: Int): Int {
         var i = start + 1
         if (i < pattern.length && pattern[i] == '^') i++
@@ -286,20 +259,16 @@ object RegexScriptEngine {
         return pattern.length
     }
 
-    /** 是否全局替换（对齐 ST：`/.../g` 为全局；非 slash 形式按全局，见 PORT NOTE 2） */
     private fun isGlobalPattern(pattern: String): Boolean {
         val slashForm = SLASH_FORM.matchEntire(pattern)
             ?: return true
         return slashForm.groupValues[2].contains('g', ignoreCase = true)
     }
 
-    /** 替换串引用 token：`{{match}}` / `$$` / `$&` / `$1` / `$<name>`（对齐 ST replaceAll + JS 原生 $&/$$ 语义） */
     private val REPLACEMENT_TOKEN = Regex("\\{\\{match\\}\\}|\\$\\$|\\$&|\\$(\\d+)|\\$<([^>]+)>", RegexOption.IGNORE_CASE)
 
     /**
      * 对单个脚本执行替换（对齐 ST runRegexScript）。
-     *
-     * @param substitute 宏替换函数（默认恒等；真实调用传入宏引擎的替换）
      */
     fun runRegexScript(
         script: RegexScript,
@@ -320,19 +289,90 @@ object RegexScriptEngine {
         val regex = compileRegex(pattern) ?: return rawString
         val global = isGlobalPattern(pattern)
 
+        // 若该脚本并非专门处理 <think>/<thinking>/<thought> 标签，但输入文本中含有未剥离的思维链块，
+        // 则先用占位符屏蔽思维链块，防止立绘/CG 等正文正则在思维链内部跨行误匹配。
+        val scriptTargetsThinking = pattern.contains("think", ignoreCase = true) ||
+            pattern.contains("thought", ignoreCase = true) ||
+            (RegexPlacement.REASONING in script.placement && script.placement.size == 1)
+        val shieldedBlocks = mutableListOf<String>()
+        val workingInput = if (!scriptTargetsThinking &&
+            (rawString.contains("<think", ignoreCase = true) || rawString.contains("<thought", ignoreCase = true))
+        ) {
+            THINK_BLOCK_SHIELD_REGEX.replace(rawString) { m ->
+                val idx = shieldedBlocks.size
+                shieldedBlocks.add(m.value)
+                "\u0000__RIKKA_THINK_SHIELD_${idx}__\u0000"
+            }
+        } else {
+            rawString
+        }
+
         val sb = StringBuilder()
         var cursor = 0
         var matched = false
-        for (match in regex.findAll(rawString)) {
-            sb.append(rawString, cursor, match.range.first)
+        for (match in regex.findAll(workingInput)) {
+            sb.append(workingInput, cursor, match.range.first)
+            val mVal = match.value
+            // 防御反引号跨行误吞噬：例如前文有 `无关代码` 闭合反引号，后文有 `织乃_zcw_2`，
+            // 当正则写为 /`(.+?_zcw_\d+)`/gs 时，match.value 会从前一个闭合反引号一直跨行吞到 `织乃_zcw_2`。
+            // 若 match.value 首尾均为反引号且内部还包含反引号，检查从最后一个内部反引号开始的子串是否独立完整匹配该正则；
+            // 若匹配，则保留被误吞的前缀文本，仅对末尾真实反引号 token 执行替换。
+            // 防御 1：若 match 跨过了思维链保护占位符（ __RIKKA_THINK_SHIELD_N__ ），重锚定到最后一个占位符之后
+            if (mVal.contains("\u0000__RIKKA_THINK_SHIELD_")) {
+                val lastShieldEnd = mVal.lastIndexOf("__\u0000")
+                if (lastShieldEnd >= 0) {
+                    val afterShieldIdx = lastShieldEnd + 3
+                    val tailAfterShield = mVal.substring(afterShieldIdx)
+                    val subMatch = regex.find(tailAfterShield)
+                    if (subMatch != null) {
+                        sb.append(mVal, 0, afterShieldIdx + subMatch.range.first)
+                        sb.append(buildReplacement(script, subMatch, substitute))
+                        sb.append(tailAfterShield, subMatch.range.last + 1, tailAfterShield.length)
+                        cursor = match.range.last + 1
+                        matched = true
+                        if (!global) break
+                        continue
+                    }
+                }
+            }
+            // 防御 2：当贪婪正则把同一消息内的多对反引号（如 `无关代码` ... `织乃_zcw_2`，或两张独立 CG `织乃_zcw_1` ... `织乃_zcw_2`）
+            // 吞入同一个 match 时，逐个扫描内部独立的 `[^`]+` 反引号对：凡独立匹配该正则的反引号对均各自执行替换，其余原样保留！
+            if (mVal.length > 3 && mVal.first() == '`' && mVal.last() == '`' && mVal.indexOf('`', 1) < mVal.lastIndex) {
+                val pairRegex = Regex("`[^`\\r\\n]+`")
+                val pairMatches = pairRegex.findAll(mVal).toList()
+                if (pairMatches.any { pm -> regex.matchEntire(pm.value) != null }) {
+                    var localCur = 0
+                    for (pm in pairMatches) {
+                        sb.append(mVal, localCur, pm.range.first)
+                        val exactPairMatch = regex.matchEntire(pm.value)
+                        if (exactPairMatch != null) {
+                            sb.append(buildReplacement(script, exactPairMatch, substitute))
+                        } else {
+                            sb.append(pm.value)
+                        }
+                        localCur = pm.range.last + 1
+                    }
+                    sb.append(mVal, localCur, mVal.length)
+                    cursor = match.range.last + 1
+                    matched = true
+                    if (!global) break
+                    continue
+                }
+            }
             sb.append(buildReplacement(script, match, substitute))
             cursor = match.range.last + 1
             matched = true
             if (!global) break
         }
         if (!matched) return rawString
-        sb.append(rawString, cursor, rawString.length)
-        return sb.toString()
+        sb.append(workingInput, cursor, workingInput.length)
+        var out = sb.toString()
+        if (shieldedBlocks.isNotEmpty()) {
+            shieldedBlocks.forEachIndexed { idx, originalBlock ->
+                out = out.replace("\u0000__RIKKA_THINK_SHIELD_${idx}__\u0000", originalBlock)
+            }
+        }
+        return out
     }
 
     /** 组装单个匹配的替换文本（对齐 ST replace 回调 + filterString + 末尾宏替换） */
@@ -341,7 +381,6 @@ object RegexScriptEngine {
         match: MatchResult,
         substitute: (String) -> String,
     ): String {
-        // 剔除 trimStrings（先做宏替换；空串跳过，避免 replaceAll("", "") 死循环语义）
         fun filtered(value: String?): String {
             if (value.isNullOrEmpty()) return ""
             var out: String = value
@@ -363,18 +402,9 @@ object RegexScriptEngine {
                 else -> filtered(match.value)
             }
         }
-        // 替换串末尾整体做一次宏替换（对齐 ST：substituteParams(replaceWithGroups)）
         return substitute(built)
     }
 
-    /**
-     * 对一段文本应用脚本集合（对齐 ST getRegexedString）。
-     *
-     * 过滤顺序与 ST 一致：markdownOnly/promptOnly 通道 → isEdit/runOnEdit → depth → placement。
-     * 说明（PORT NOTE 1）：无标记脚本在显示与提示词两条通道都应用，对应 ST “既不勾选则两者都作用”的净行为。
-     *
-     * @param depth 消息深度（离最新消息的距离）；null 表示不参与 depth 过滤
-     */
     fun getRegexedString(
         rawString: String,
         scripts: List<RegexScript>,
@@ -405,10 +435,6 @@ object RegexScriptEngine {
         return finalString
     }
 
-    /**
-     * 正则转义宏替换值（对齐 ST sanitizeRegexMacro）：
-     * 换行等转义序列化，其余正则元字符加反斜杠。
-     */
     fun sanitizeRegexMacro(value: String): String {
         if (value.isEmpty()) return value
         val sb = StringBuilder(value.length * 2)
@@ -431,9 +457,6 @@ object RegexScriptEngine {
     }
 }
 
-/**
- * 便捷扩展：对文本应用脚本集合（无宏替换器的轻量通道，如显示渲染 / 世界书扫描）。
- */
 fun String.getStRegexed(
     scripts: List<RegexScript>,
     placement: Int,

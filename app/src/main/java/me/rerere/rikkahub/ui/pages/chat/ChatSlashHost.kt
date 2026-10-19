@@ -2109,7 +2109,7 @@ internal fun selectAutoTriggeredQuickReplies(
 ): List<me.rerere.rikkahub.data.model.QuickMessage> {
     val autoIdSet = automationIds.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
     return quickMessages.filter { qm ->
-        if (!qm.setEnabled || qm.content.isBlank()) return@filter false
+        if (!qm.setEnabled || qm.content.isBlank() || qm.preventAutoExecute) return@filter false
         when (eventType.lowercase()) {
             "startup" -> qm.executeOnStartup
             "chatchange", "chat_change" -> qm.executeOnChatChange

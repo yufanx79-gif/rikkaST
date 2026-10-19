@@ -4,9 +4,26 @@
  * 对齐 SillyTavern `public/scripts/custom-request.js`，通过宿主 Chat Completions 桥接发送请求。
  */
 
-const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
+const st = () => (typeof window !== 'undefined' && window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
 export class ChatCompletionService {
+    static async presetToGeneratePayload(preset = {}, customParams = {}, overrides = {}) {
+        const merged = Object.assign({}, preset, customParams, overrides);
+        return {
+            messages: Array.isArray(merged.messages) ? merged.messages : [],
+            model: merged.model || 'unknown',
+            temperature: Number(merged.temperature ?? merged.temp_openai ?? 1.0),
+            frequency_penalty: Number(merged.frequency_penalty ?? merged.freq_pen_openai ?? 0.0),
+            presence_penalty: Number(merged.presence_penalty ?? merged.pres_pen_openai ?? 0.0),
+            top_p: Number(merged.top_p ?? merged.top_p_openai ?? 1.0),
+            max_tokens: Number(merged.max_tokens ?? merged.openai_max_tokens ?? 1024),
+            stream: Boolean(merged.stream ?? merged.stream_openai ?? false),
+            chat_completion_source: merged.chat_completion_source || 'openai',
+            ...customParams,
+            ...overrides,
+        };
+    }
+
     static async sendRequest(payload = {}) {
         return ChatCompletionService.processRequest(payload);
     }

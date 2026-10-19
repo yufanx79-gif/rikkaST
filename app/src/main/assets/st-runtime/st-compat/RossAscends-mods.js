@@ -8,6 +8,10 @@ export const favsToHotswap = [];
 
 export const isMobile = true;
 
+export function shouldSendOnEnter() {
+    return false;
+}
+
 export function getMessageTimeStamp(timestamp) {
     try {
         const d = timestamp ? new Date(timestamp) : new Date();

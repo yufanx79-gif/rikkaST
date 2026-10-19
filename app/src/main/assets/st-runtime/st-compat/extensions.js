@@ -1,15 +1,24 @@
 /**
  * rikkaST st-compat: extensions.js
  * ============================================================
- * 模拟 SillyTavern `public/scripts/extensions.js` 的导出面。
- * 第三方扩展最高频的 `getContext` / `extension_settings` 均由此提供。
+ * 模拟 SillyTavern 1.19.0 `public/scripts/extensions.js` 的完整导出面。
+ * 第三方扩展最高频的 `getContext` / `extension_settings` / `renderExtensionTemplateAsync` / `ModuleWorkerWrapper` 均由此提供。
  */
+
+import { SimpleMutex } from './util/SimpleMutex.js';
 
 const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 const host = () => (window.__rikkaSt || {});
 
+export const UNSET_VALUE = undefined;
+export const EMPTY_AUTHOR = '<No author>';
+export { SimpleMutex, SimpleMutex as ModuleWorkerWrapper };
+
 /** 全扩展共享的设置对象（live：runtime refreshAll 后自动同步）。 */
 export let extension_settings = st().extensionSettings || {};
+export let extensionNames = [];
+export let modules = [];
+
 try {
     window.addEventListener('rikka-st-refresh', () => {
         try {
@@ -24,14 +33,6 @@ try {
 
 /**
  * ── [v202] 预置 `extension_settings.tavern_helper` 的完整默认形状 ──────────
- * 真机实证：JSR 4.11.2 的 `store/settings/global.ts` 在 store 初始化时直接访问
- *     settings.value.script.popuped.characters[0]
- * （它的 zod schema 里 popuped 用的是 `.prefault({})`）。
- * 真机日志：`TypeError: Cannot read properties of undefined (reading '0')`
- *   at dF(...) / useGlobalSettingsStore 的 setup 里。
- * 我们不去改 JSR 的代码，而是**在扩展加载前把这份数据预置成完整形状**：
- * zod 的 default/prefault 对「已存在的完整对象」是幂等 no-op，从此不再残留 undefined。
- * 注意：只补 `script` 子树，其它字段保持 undefined，让 JSR 自己的 default 生效。
  */
 function __rikkaSeedTavernHelperSettings(settings) {
     try {
@@ -56,23 +57,37 @@ export function __rikkaEnsureTavernHelperSeed() {
 
 try { __rikkaEnsureTavernHelperSeed(); } catch (_e) { /* noop */ }
 
+function normalizeFolderAlias(raw) {
+    return String(raw == null ? '' : raw)
+        .trim()
+        .replace(/^third-party\//i, '')
+        .replace(/-(?:main|master|dev|release|v?\d+(?:\.\d+)*(?:-[a-z0-9._-]+)?)$/i, '')
+        .toLowerCase();
+}
+
 /**
  * [v243 BUGFIX C2] 扩展类型表。
- *
- * JSR 的 `extensionTypes` 形状是 `{ 'third-party/<folder>': 'local', ... }`
- * （见 JS-Slash-Runner/src/function/extension.ts:26-29 `Object.keys(extensionTypes).find(k => k.endsWith(id))`），
- * 而 rikkaST 原来只导出 `{ SYSTEM, LOCAL, GLOBAL }` —— 卡脚本按 JSR 形状查会永远 miss。
- * 这里做成**混合表**：保留原有三个常量键（向后兼容），同时按 JSR 形状补 `third-party/<folder>`
- * 条目，并在 `rikka-st-refresh`（宿主同步扩展清单后广播）时重新取数。
+ * 同时提供保留常量键与 `third-party/<folder>` 映射（含去版本后缀别名）。
  */
 export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global' };
 
 function __rikkaRefreshExtensionTypes() {
     try {
         const list = host().extensions || [];
+        const names = [];
         for (const e of list) {
-            if (e && e.folder) extensionTypes['third-party/' + String(e.folder)] = 'local';
+            if (e && e.folder) {
+                const f = String(e.folder);
+                const fullName = 'third-party/' + f;
+                extensionTypes[fullName] = 'local';
+                names.push(fullName);
+                const alias = normalizeFolderAlias(f);
+                if (alias && alias !== f.toLowerCase()) {
+                    extensionTypes['third-party/' + alias] = 'local';
+                }
+            }
         }
+        extensionNames = names;
     } catch (_e) { /* noop */ }
 }
 try { __rikkaRefreshExtensionTypes(); } catch (_e) { /* noop */ }
@@ -81,33 +96,83 @@ export function getContext() {
     return st();
 }
 
+export function getApiUrl() {
+    return (extension_settings && extension_settings.apiUrl) || 'http://127.0.0.1:5100';
+}
+
+export async function doExtrasFetch(url, options = {}) {
+    return fetch(url, options);
+}
+
 /** 写扩展字段的便捷函数（对齐 ST：extension_settings[name][field] = value）。 */
 export function writeExtensionField(extensionName, fieldName, value) {
     try {
         if (!extension_settings[extensionName]) extension_settings[extensionName] = {};
         extension_settings[extensionName][fieldName] = value;
+        saveMetadataDebounced();
     } catch (_e) { /* noop */ }
+}
+
+export function writeExtensionFieldBulk(extensionName, fields = {}) {
+    try {
+        if (!extension_settings[extensionName]) extension_settings[extensionName] = {};
+        if (fields && typeof fields === 'object') {
+            Object.assign(extension_settings[extensionName], fields);
+        }
+        saveMetadataDebounced();
+    } catch (_e) { /* noop */ }
+}
+
+export function loadExtensionSettings(_settings = {}) {
+    try {
+        __rikkaRefreshExtensionTypes();
+    } catch (_e) { /* noop */ }
+}
+
+export function isOfficialExtension(_name) {
+    return false;
+}
+
+export function cancelDebouncedMetadataSave() {}
+
+export async function runGenerationInterceptors(_chat, _contextSize, _abort, _type) {
+    return false;
 }
 
 /**
- * 扩展模板渲染。
- * v197 之前这里返回空串，导致 ST-Prompt-Template / 记忆增强表格 append 空字符串 → 设置页黑屏。
- * 真正实现由 runtime.js 挂到 window.renderExtensionTemplateAsync，这里只做 live proxy。
+ * 扩展模板渲染（异步与同步兼容）。
+ * 真正实现由 runtime.js 挂到 window.renderExtensionTemplateAsync / window.renderTemplateAsync。
  */
-export function renderExtensionTemplateAsync(extensionName, templateId, templateData = {}, sanitize = true) {
+export function renderExtensionTemplateAsync(extensionName, templateId, templateData = {}, sanitize = true, localize = true) {
     try {
         const f = window.renderExtensionTemplateAsync;
-        if (typeof f === 'function') return f(extensionName, templateId, templateData, sanitize);
+        if (typeof f === 'function') return f(extensionName, templateId, templateData, sanitize, localize);
     } catch (_e) { /* noop */ }
     return Promise.resolve('');
 }
 
-export function renderTemplateAsync(path, name, data) {
+export function renderExtensionTemplate(extensionName, templateId, templateData = {}, sanitize = true, localize = true) {
+    try {
+        const f = window.renderExtensionTemplate;
+        if (typeof f === 'function') return f(extensionName, templateId, templateData, sanitize, localize);
+    } catch (_e) { /* noop */ }
+    return '';
+}
+
+export function renderTemplateAsync(pathOrTemplateId, nameOrData, data) {
     try {
         const f = window.renderTemplateAsync;
-        if (typeof f === 'function') return f(path, name, data);
+        if (typeof f === 'function') return f(pathOrTemplateId, nameOrData, data);
     } catch (_e) { /* noop */ }
     return Promise.resolve('');
+}
+
+export function renderTemplate(pathOrTemplateId, nameOrData, data) {
+    try {
+        const f = window.renderTemplate;
+        if (typeof f === 'function') return f(pathOrTemplateId, nameOrData, data);
+    } catch (_e) { /* noop */ }
+    return '';
 }
 
 export function saveMetadataDebounced() {
@@ -129,21 +194,25 @@ export const __setReplayContext = () => {};
 export function openThirdPartyExtensionMenu() {}
 
 /**
- * [v243 BUGFIX C1] 扩展清单查询。
- *
- * 旧实现只比 `folder` / `name` 两个字段。宿主 buildRuntimeExtensionsJson() 下发的正式字段是
- * `displayName`（UI 显示名，如「酒馆助手」「提示词模板」），卡脚本用显示名查就会 miss ——
- * 表现就是「明明装了插件，卡却报未检测到」。
- * 现在对 folder / name / displayName 三个字段做「去空格 + 不区分大小写」的精确匹配。
+ * [v243 BUGFIX C1 + ST 1.19.0 别名支持] 扩展清单查询。
  */
 export function getExtensionManifest(extensionName) {
     try {
+        const c = st();
+        if (c && typeof c.getExtensionManifest === 'function') {
+            const m = c.getExtensionManifest(extensionName);
+            if (m) return m;
+        }
         const list = host().extensions || [];
         const want = String(extensionName == null ? '' : extensionName).trim().toLowerCase();
         if (!want) return null;
+        const wantAlias = normalizeFolderAlias(want);
         const norm = (v) => String(v == null ? '' : v).trim().toLowerCase();
         return list.find((e) => e && (
-            norm(e.folder) === want || norm(e.name) === want || norm(e.displayName) === want
+            norm(e.folder) === want ||
+            norm(e.name) === want ||
+            norm(e.displayName) === want ||
+            (wantAlias && normalizeFolderAlias(e.folder) === wantAlias)
         )) || null;
     } catch (_e) { return null; }
 }

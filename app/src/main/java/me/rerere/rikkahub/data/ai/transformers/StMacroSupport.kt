@@ -69,10 +69,24 @@ internal object StMacroSupport {
         provider: PlaceholderProvider,
     ): MacroEnv {
         val settings = ctx.settingsStore.settingsFlow.value
-        val userName = settings.displaySetting.userNickname.ifBlank { "user" }
-        val charName = ctx.assistant.name.ifBlank { "assistant" }
+        val activePersona = settings.personas
+            .firstOrNull { p -> p.id == settings.activePersonaId && p.enabled }
+        val userName = activePersona?.name?.takeIf { it.isNotBlank() }
+            ?: settings.displaySetting.userNickname.ifBlank { "user" }
+        val charName = ctx.assistant.tavernData?.nickname?.takeIf { it.isNotBlank() }
+            ?: ctx.assistant.name.ifBlank { "assistant" }
         val groupName = resolvePlaceholder(provider, "group", ctx)?.takeIf { it.isNotBlank() } ?: charName
         val tav = ctx.assistant.tavernData
+        val activeGroups = me.rerere.rikkahub.data.st.runtime.enabledPresetGroups(ctx.assistant, settings)
+        val activePresetCfg = me.rerere.rikkahub.data.export.parseActiveStPresetConfig(settings.tavernPresets, activeGroups)
+        val maxContextTokens = activePresetCfg.maxContext ?: 16384
+        val maxResponseTokens = ctx.assistant.maxTokens ?: activePresetCfg.maxTokens ?: 2048
+        val enabledExtensions = runCatching {
+            me.rerere.rikkahub.data.st.extensions.listExtensions(ctx.context)
+                .filter { it.folder !in settings.tavernThirdPartyDisabled }
+                .flatMap { listOf(it.folder, me.rerere.rikkahub.data.st.extensions.normalizeExtensionFolderAlias(it.folder)) }
+                .toSet()
+        }.getOrDefault(emptySet())
 
         return MacroEnv(
             names = MacroEnv.Names(
@@ -88,9 +102,7 @@ internal object StMacroSupport {
                 description = tav?.description ?: "",
                 personality = tav?.personality ?: "",
                 scenario = tav?.scenario ?: "",
-                persona = settings.personas
-                    .firstOrNull { p -> p.id == settings.activePersonaId && p.enabled }
-                    ?.description ?: "",
+                persona = activePersona?.description ?: "",
                 mesExamplesRaw = tav?.mesExample ?: "",
                 version = tav?.characterVersion ?: "",
                 charDepthPrompt = tav?.depthPrompt ?: "",
@@ -102,6 +114,9 @@ internal object StMacroSupport {
                 model = ctx.model.displayName,
                 chatIdHash = ctx.conversationId?.let { MacroHash.getStringHash(it.toString()) },
                 generationType = ctx.generationType?.value ?: "",
+                maxContextTokens = maxContextTokens,
+                maxResponseTokens = maxResponseTokens,
+                enabledExtensions = enabledExtensions,
                 // [v234 S1] systemPrompt 宏数据源：宿主助手系统提示词充当 ST sysprompt
                 syspromptEnabled = ctx.assistant.systemPrompt.isNotBlank(),
                 syspromptContent = ctx.assistant.systemPrompt,

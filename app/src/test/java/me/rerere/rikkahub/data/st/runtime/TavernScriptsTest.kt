@@ -628,4 +628,27 @@ class TavernScriptsTest {
         val updatedExt = updateWorldNameInExtensionsRaw("""{"foo":1}""", "新世界书")
         assertEquals("新世界书", extractWorldName(updatedExt))
     }
+
+    @Test
+    fun parseStGenerationHookResultSupportsVariableLengthAndAbortAndMesFallback() {
+        val rewrittenArray = """[
+            {"role":"system","content":"table injected"},
+            {"role":"user","content":"hello","name":"Alice"},
+            {"role":"assistant","mes":"iphone formatted"}
+        ]"""
+        val res1 = parseStGenerationHookResult(rewrittenArray)
+        assertNotNull(res1)
+        assertFalse(res1!!.aborted)
+        assertEquals(3, res1.messages.size)
+        assertEquals(MessageRole.SYSTEM, res1.messages[0].role)
+        assertEquals("table injected", res1.messages[0].toText())
+        assertEquals("Alice", res1.messages[1].name)
+        assertEquals("iphone formatted", res1.messages[2].toText())
+
+        val abortedPayload = """{"messages":[{"role":"user","content":"hi"}],"aborted":true}"""
+        val res2 = parseStGenerationHookResult(abortedPayload)
+        assertNotNull(res2)
+        assertTrue(res2!!.aborted)
+        assertEquals(1, res2.messages.size)
+    }
 }

@@ -282,7 +282,7 @@ fun AssistantExtensionsPage(id: String) {
                         // 编辑界面 = 全局的 ModeInjectionEditSheet，逐字一致（用户要求「和全局保持一致」）。
                         PresetManagementSection(
                             modeInjections = settings.modeInjections,
-                            entryChecked = { assistant.modeInjectionIds.contains(it.id) },
+                            entryChecked = { it.enabled && assistant.modeInjectionIds.contains(it.id) },
                             onToggleEntry = { entry, checked ->
                                 vm.patchSettings { current ->
                                     togglePresetEntryForAssistant(current, assistant.id, entry.id, checked)

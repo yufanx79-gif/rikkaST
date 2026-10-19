@@ -87,11 +87,7 @@ fun enabledPresetGroups(
     extraModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
 ): Set<String> {
     if (assistant == null || settings == null) return emptySet()
-    val ids = if (assistant.allowConversationPromptInjection && extraModeInjectionIds.isNotEmpty()) {
-        extraModeInjectionIds
-    } else {
-        assistant.modeInjectionIds + extraModeInjectionIds
-    }
+    val ids = assistant.modeInjectionIds + extraModeInjectionIds
     return settings.modeInjections
         .filter { it.id in ids && it.enabled && !it.presetGroup.isNullOrBlank() }
         .mapNotNull { it.presetGroup }
@@ -1114,25 +1110,51 @@ fun buildStMessagesJson(messages: List<me.rerere.ai.ui.UIMessage>): String = bui
     }
 }.toString()
 
-/** 反序列化改写结果；字段缺失/role 非法时返回 null（调用方保留原文）。 */
-fun parseStMessagesJson(json: String): List<me.rerere.ai.ui.UIMessage>? {
+/**
+ * [ST 1.19.0] 生成前钩子（generate_interceptor + PROMPT_READY + SETTINGS_READY）返回结构。
+ * 支持可变长消息数组改写（ST-Prompt-Template 插入消息、st-memory-enhancement 注入表格）以及 abort 终止。
+ */
+data class StGenerationHookResult(
+    val messages: List<me.rerere.ai.ui.UIMessage>,
+    val aborted: Boolean = false,
+)
+
+/** 解析生成钩子返回结果（兼容 `[...]` 数组与 `{"messages":[...],"aborted":true}` 对象两种形状）。 */
+fun parseStGenerationHookResult(json: String): StGenerationHookResult? {
     return runCatching {
-        val arr = Json.parseToJsonElement(json)
-        if (arr !is JsonArray) return null
-        arr.map { el ->
+        val root = Json.parseToJsonElement(json)
+        val aborted = (root as? JsonObject)?.get("aborted")?.let { (it as? JsonPrimitive)?.contentOrNull == "true" } ?: false
+        val arr = when (root) {
+            is JsonArray -> root
+            is JsonObject -> root["messages"] as? JsonArray ?: return null
+            else -> return null
+        }
+        val msgs = arr.map { el ->
             val obj = el as? JsonObject ?: return null
-            val roleRaw = (obj["role"] as? JsonPrimitive)?.contentOrNull?.lowercase() ?: return null
+            val roleRaw = (obj["role"] as? JsonPrimitive)?.contentOrNull?.lowercase() ?: "user"
             val role = when (roleRaw) {
                 "system" -> me.rerere.ai.core.MessageRole.SYSTEM
-                "user" -> me.rerere.ai.core.MessageRole.USER
+                "user", "tool" -> me.rerere.ai.core.MessageRole.USER
                 "assistant" -> me.rerere.ai.core.MessageRole.ASSISTANT
                 else -> return null
             }
-            val content = (obj["content"] as? JsonPrimitive)?.contentOrNull ?: return null
-            me.rerere.ai.ui.UIMessage(role = role, parts = listOf(me.rerere.ai.ui.UIMessagePart.Text(content)))
+            val content = (obj["content"] as? JsonPrimitive)?.contentOrNull
+                ?: (obj["mes"] as? JsonPrimitive)?.contentOrNull
+                ?: return null
+            val name = (obj["name"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            me.rerere.ai.ui.UIMessage(
+                role = role,
+                parts = listOf(me.rerere.ai.ui.UIMessagePart.Text(content)),
+                name = name,
+            )
         }
+        StGenerationHookResult(messages = msgs, aborted = aborted)
     }.getOrNull()
 }
+
+/** 反序列化改写结果；字段缺失/role 非法时返回 null（调用方保留原文）。 */
+fun parseStMessagesJson(json: String): List<me.rerere.ai.ui.UIMessage>? =
+    parseStGenerationHookResult(json)?.messages
 
 /**
  * [v208] P0-3：世界书名列表 + 全局启用书（ST `world_names` / `selected_world_info` / `world_info`）。
@@ -1147,12 +1169,15 @@ fun parseStMessagesJson(json: String): List<me.rerere.ai.ui.UIMessage>? {
 fun buildWorldNamesJson(settings: Settings?, assistant: Assistant?): String {
     val names = LinkedHashSet<String>()
     val selected = LinkedHashSet<String>()
-    // ① 宿主世界书库（enabled 的进 selected_world_info = ST「全局启用」语义）
+    // ① 宿主世界书库（全局世界书 enabled 的进 selected_world_info；角色卡专属世界书仅在绑定给当前助手时进 selected）
     if (settings != null) {
+        val boundIds = assistant?.lorebookIds.orEmpty()
         settings.lorebooks.forEach { book ->
             if (book.name.isNotBlank()) {
                 names.add(book.name)
-                if (book.enabled) selected.add(book.name)
+                if (book.enabled && (!book.isCharacterBook || book.id in boundIds)) {
+                    selected.add(book.name)
+                }
             }
         }
     }

@@ -255,22 +255,30 @@ fun ChatInput(
     )
 
     fun sendMessage() {
+        // [Bug B 修复] 先捕获当前输入快照与非空状态，再执行失焦与收起软键盘，
+        // 避免部分输入法在 clearFocus(force=true) 时回滚未提交预编辑文本或触发焦点转移丢字。
+        val rawText = state.textContent.text.toString()
+        val text = rawText.trimStart()
+        val wasEmpty = state.isEmpty()
+        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.recordSendDiagnostic(
+            stage = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.SendDiagnosticStage.STAGE_1_SEND_CLICKED,
+            conversationId = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.activeConversationId.orEmpty(),
+            detail = "source=ChatInput textLen=${rawText.length} media=${state.messageContent.size} isEditing=${state.isEditing()} loading=$loading",
+        )
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
         if (loading) {
             // 生成中：斜杠命令不打断当前生成（官方 waitUntilCondition 语义），提示等待；普通消息仍可取消
-            val pendingText = state.textContent.text.toString().trimStart()
-            if (pendingText.startsWith("/")) {
+            if (text.startsWith("/")) {
                 toaster.show(slashContext.getString(R.string.slash_toast_generating))
                 return
             }
             // 输入框为空时点击发送 = 停止生成；有内容时走官方消息队列（onSendClick）。
-            if (state.isEmpty()) {
+            if (wasEmpty) {
                 onCancelClick()
                 return
             }
         }
-        val text = state.textContent.text.toString().trimStart()
         if (text.startsWith("/")) {
             val cmd = matchSlashCommand(text, slashCommands)
             if (shouldRouteToStSlashExecutor(text, cmd) && onSlashScript != null) {
@@ -688,8 +696,8 @@ private fun TextInputRow(
     val settings = LocalSettings.current
     val filesManager: FilesManager = koinInject()
     val skillManager: SkillManager = koinInject()
-    val assistant = settings.getCurrentAssistant()
-    val quickMessages = remember(settings.quickMessages, assistant.quickMessageIds) {
+    val assistant = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.activeAssistant ?: settings.getCurrentAssistant()
+    val quickMessages = remember(settings.quickMessages, assistant.id, assistant.quickMessageIds) {
         settings.getQuickMessagesOfAssistant(assistant)
     }
     // 斜杠命令
@@ -1731,8 +1739,10 @@ private fun QuickMessageButton(
             quickMessages.forEach { quickMessage ->
                 Surface(
                     onClick = {
-                        // 自动执行（对齐酒馆 QR）：有宿主时直接运行，否则退回填入输入框
-                        if (quickMessage.autoExecute && onQuickMessageExecute != null) {
+                        // 自动执行（对齐酒馆 QR）：已启用 autoExecute 或内容为斜杠脚本时直接运行，否则填入输入框
+                        val isSlashContent = quickMessage.content.trim().startsWith("/") ||
+                            quickMessage.content.lineSequence().any { it.trim().startsWith("/") }
+                        if ((quickMessage.autoExecute || isSlashContent) && onQuickMessageExecute != null) {
                             onQuickMessageExecute.invoke(quickMessage)
                         } else {
                             state.appendText(quickMessage.content)

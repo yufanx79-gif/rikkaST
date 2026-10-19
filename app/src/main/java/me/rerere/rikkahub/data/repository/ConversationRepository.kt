@@ -9,7 +9,9 @@ import androidx.paging.map
 import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 import me.rerere.ai.ui.UIMessage
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.fts.MessageFtsManager
@@ -248,16 +250,16 @@ class ConversationRepository(
             }
         }
 
-    suspend fun getConversationById(uuid: Uuid): Conversation? {
+    suspend fun getConversationById(uuid: Uuid): Conversation? = withContext(Dispatchers.IO) {
         val entity = conversationDAO.getConversationById(uuid.toString())
-        return if (entity != null) {
+        if (entity != null) {
             val nodes = loadMessageNodes(entity.id)
             conversationEntityToConversation(entity, nodes)
         } else null
     }
 
-    suspend fun existsConversationById(uuid: Uuid): Boolean {
-        return conversationDAO.existsById(uuid.toString())
+    suspend fun existsConversationById(uuid: Uuid): Boolean = withContext(Dispatchers.IO) {
+        conversationDAO.existsById(uuid.toString())
     }
 
     suspend fun getMessageNodeCount(conversationId: Uuid): Int {
@@ -274,24 +276,24 @@ class ConversationRepository(
         }.toMap()
     }
 
-    suspend fun insertConversation(conversation: Conversation) {
+    suspend fun insertConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
+        val convEntity = conversationToConversationEntity(conversation)
+        val nodeEntities = buildMessageNodeEntities(conversation.id.toString(), conversation.messageNodes)
         database.withTransaction {
-            conversationDAO.insert(
-                conversationToConversationEntity(conversation)
-            )
-            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            conversationDAO.insert(convEntity)
+            messageNodeDAO.insertAll(nodeEntities)
         }
         messageFtsManager.indexConversation(conversation)
     }
 
-    suspend fun updateConversation(conversation: Conversation) {
+    suspend fun updateConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
+        val convEntity = conversationToConversationEntity(conversation)
+        val nodeEntities = buildMessageNodeEntities(conversation.id.toString(), conversation.messageNodes)
         database.withTransaction {
-            conversationDAO.update(
-                conversationToConversationEntity(conversation)
-            )
+            conversationDAO.update(convEntity)
             // 删除旧的节点，插入新的节点
             messageNodeDAO.deleteByConversation(conversation.id.toString())
-            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            messageNodeDAO.insertAll(nodeEntities)
         }
         messageFtsManager.indexConversation(conversation)
     }
@@ -465,8 +467,8 @@ class ConversationRepository(
         }
     }
 
-    private suspend fun saveMessageNodes(conversationId: String, nodes: List<MessageNode>) {
-        val entities = nodes.mapIndexed { index, node ->
+    private fun buildMessageNodeEntities(conversationId: String, nodes: List<MessageNode>): List<MessageNodeEntity> {
+        return nodes.mapIndexed { index, node ->
             MessageNodeEntity(
                 id = node.id.toString(),
                 conversationId = conversationId,
@@ -475,7 +477,10 @@ class ConversationRepository(
                 selectIndex = node.selectIndex
             )
         }
-        messageNodeDAO.insertAll(entities)
+    }
+
+    private suspend fun saveMessageNodes(conversationId: String, nodes: List<MessageNode>) {
+        messageNodeDAO.insertAll(buildMessageNodeEntities(conversationId, nodes))
     }
 }
 

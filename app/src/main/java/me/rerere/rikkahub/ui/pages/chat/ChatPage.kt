@@ -92,6 +92,7 @@ import kotlinx.coroutines.launch
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.hugeicons.HugeIcons
@@ -108,6 +109,7 @@ import me.rerere.rikkahub.ui.theme.AppType
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.findProvider
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.datastore.getSelectedASRProvider
 import me.rerere.rikkahub.data.files.FilesManager
@@ -124,6 +126,7 @@ import me.rerere.rikkahub.ui.components.ai.SlashVarOp
 import me.rerere.rikkahub.ui.components.ai.applyMacroVarSlash
 import me.rerere.rikkahub.ui.components.ai.completion.WorkspaceCompletionProvider
 import me.rerere.rikkahub.ui.components.ai.rememberChatAttachmentPickerActions
+import me.rerere.rikkahub.ui.components.chat.TavernFloatingWindowOverlay
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.Navigator
@@ -174,11 +177,16 @@ fun ChatPage(
     }
 
     // 酒馆运行时：注册当前会话上下文（变量 / MVU / 脚本宿主）
+    val chatListState = rememberLazyListState()
     val tavernLatestConversation = rememberUpdatedState(conversation)
     val tavernLatestSettings = rememberUpdatedState(setting)
     // [v214 / P0-1] key 追加 assistantId 与 setting.init：会话/设置数据从 dummy 切换到真实值时必须重跑
     LaunchedEffect(conversation.id, conversation.assistantId, setting.init) {
         TavernRuntimeManager.ensureStarted(context)
+        TavernRuntimeManager.activeAssistantSupplier = {
+            tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId)
+        }
+        TavernRuntimeManager.setActiveAssistantId(tavernLatestConversation.value.assistantId.toString())
         TavernRuntimeManager.chatJsonSupplier = {
             val conv = tavernLatestConversation.value
             buildTavernChatJson(conv, TavernVariableStore.getMessageVars(conv.id.toString()))
@@ -232,10 +240,26 @@ fun ChatPage(
         TavernRuntimeManager.lorebookUpdater = { name, json ->
             vm.applyLorebookUpdate(name, json)
         }
-        // [v214] 面板表单发送桥（JS RikkaBridge.sendUserMessage）
+        // [v214 / Bug B 修复] 面板表单发送桥（JS RikkaBridge.sendUserMessage）：记录诊断并在发送成功后自动滚到底部
         TavernRuntimeManager.userMessageSender = { text ->
-            vm.handleMessageSend(listOf(UIMessagePart.Text(text)))
-            true
+            TavernRuntimeManager.recordSendDiagnostic(
+                stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_1_SEND_CLICKED,
+                conversationId = tavernLatestConversation.value.id.toString(),
+                detail = "source=panel_sendUserMessage textLen=${text.length}",
+            )
+            val sent = vm.handleMessageSend(listOf(UIMessagePart.Text(text)))
+            if (sent) {
+                scope.launch {
+                    val targetIdx = (tavernLatestConversation.value.messageNodes.size + 5).coerceAtLeast(0)
+                    TavernRuntimeManager.recordSendDiagnostic(
+                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
+                        conversationId = tavernLatestConversation.value.id.toString(),
+                        detail = "source=panel_sendUserMessage targetIdx=$targetIdx firstVisible=${chatListState.firstVisibleItemIndex}",
+                    )
+                    chatListState.requestScrollToItem(targetIdx)
+                }
+            }
+            sent
         }
         // [v243 BUGFIX A2] JSR createChatMessages / deleteChatMessages 落点（同步更新，不触发生成）
         TavernRuntimeManager.chatInserter = { jsonText -> vm.insertRuntimeChatMessages(jsonText) }
@@ -264,8 +288,9 @@ fun ChatPage(
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                     val host = buildChatSlashHost(context, vm, toaster, vm.inputState, openConversation)
                     combinedQrs.forEach { qm ->
-                        if (qm.content.trim().startsWith("/")) {
-                            StSlashExecutor.execute(qm.content.trim(), host)
+                        val c = qm.content.trim()
+                        if (c.startsWith("/") || c.lineSequence().any { it.trim().startsWith("/") }) {
+                            StSlashExecutor.execute(c, host)
                         }
                     }
                 }
@@ -380,7 +405,6 @@ fun ChatPage(
         }
     }
 
-    val chatListState = rememberLazyListState()
     LaunchedEffect(nodeId, conversation.messageNodes.size) {
         if (!vm.chatListInitialized && conversation.messageNodes.isNotEmpty()) {
             if (nodeId != null) {
@@ -894,30 +918,59 @@ private fun ChatPageContent(
 
                     onCancelClick = { vm.stopGeneration() },
                     onSendClick = {
-                        if (currentChatModel == null) {
+                        val effectiveModel = currentChatModel
+                            ?: setting.getCurrentChatModel()
+                            ?: setting.findModelById(setting.chatModelId)
+                        if (effectiveModel == null) {
+                            TavernRuntimeManager.appendLog(
+                                "warn",
+                                "[send-diag] onSendClick aborted: no chat model selected conv=${conversation.id}",
+                            )
                             toaster.show(context.getString(R.string.slash_toast_no_model), type = ToastType.Error)
                             return@ChatInput
                         }
-                        if (inputState.isEditing()) {
-                            vm.handleMessageEdit(inputState.getContents(), inputState.editingMessage!!)
+                        val contents = inputState.getContents()
+                        if (contents.isEmptyInputMessage()) {
+                            return@ChatInput
+                        }
+                        val editingId = inputState.editingMessage
+                        val isValidEditTarget = editingId != null &&
+                            conversation.messageNodes.any { node -> node.messages.any { it.id == editingId } }
+                        if (isValidEditTarget) {
+                            vm.handleMessageEdit(contents, editingId!!)
                             inputState.clearInput()
                         } else {
-                            vm.handleMessageSend(inputState.getContents())
-                            inputState.clearInput()
-                            val userQrs = selectAutoTriggeredQuickReplies(setting.quickMessages, "user")
-                            if (userQrs.isNotEmpty()) {
-                                scope.launch(kotlinx.coroutines.Dispatchers.Default) {
-                                    val host = buildChatSlashHost(context, vm, toaster, inputState, openConversation)
-                                    userQrs.forEach { qm ->
-                                        if (qm.content.trim().startsWith("/")) {
-                                            StSlashExecutor.execute(qm.content.trim(), host)
+                            if (editingId != null) {
+                                // 若曾误触历史消息遗留了已失效的 editingMessage，自动清除并按正常新消息发送
+                                inputState.editingMessage = null
+                            }
+                            val sent = vm.handleMessageSend(contents)
+                            if (sent) {
+                                inputState.clearInput()
+                                val userQrs = selectAutoTriggeredQuickReplies(setting.quickMessages, "user")
+                                if (userQrs.isNotEmpty()) {
+                                    scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                        val host = buildChatSlashHost(context, vm, toaster, inputState, openConversation)
+                                        userQrs.forEach { qm ->
+                                            val c = qm.content.trim()
+                                            if (c.startsWith("/") || c.lineSequence().any { it.trim().startsWith("/") }) {
+                                                StSlashExecutor.execute(c, host)
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            scope.launch {
-                                delay(100.milliseconds)
-                                chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                                scope.launch {
+                                    val immediateTarget = (vm.conversation.value.messageNodes.size + 5).coerceAtLeast(0)
+                                    TavernRuntimeManager.recordSendDiagnostic(
+                                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
+                                        conversationId = conversation.id.toString(),
+                                        detail = "source=ChatPage_onSendClick targetIdx=$immediateTarget firstVisible=${chatListState.firstVisibleItemIndex}",
+                                    )
+                                    chatListState.requestScrollToItem(immediateTarget)
+                                    delay(120.milliseconds)
+                                    val settledTarget = (vm.conversation.value.messageNodes.size + 5).coerceAtLeast(0)
+                                    chatListState.requestScrollToItem(settledTarget)
+                                }
                             }
                         }
                     },
@@ -1099,7 +1152,7 @@ private fun ChatPageContent(
                     // 快速回复自动执行（对齐酒馆 QR executeWithOptions）：斜杠开头 → 后台协程 STscript 执行；纯文本 → 直接发送
                     onQuickMessageExecute = { quickMessage ->
                         val content = quickMessage.content.trim()
-                        if (content.startsWith("/")) {
+                        if (content.startsWith("/") || content.lineSequence().any { it.trim().startsWith("/") }) {
                             scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                                 val result = StSlashExecutor.execute(
                                     content,
@@ -1207,8 +1260,15 @@ private fun ChatPageContent(
                     inputState.setMessageText(msg.toText())
                 },
                 onEdit = { msg ->
-                    inputState.setContents(msg.parts)
-                    inputState.editingMessage = msg.id
+                    if (msg.role == MessageRole.ASSISTANT &&
+                        setting.displaySetting.enableWebViewPerfReduction &&
+                        setting.displaySetting.webViewPerfMode == me.rerere.rikkahub.data.datastore.WebViewPerfMode.HISTORICAL_SNAPSHOT_IMAGE
+                    ) {
+                        toaster.show("当前已选择历史楼层图片固化方案，不能修改助手的消息")
+                    } else {
+                        inputState.setContents(msg.parts)
+                        inputState.editingMessage = msg.id
+                    }
                 },
                 onForkMessage = { msg ->
                     scope.launch {
@@ -1310,6 +1370,11 @@ private fun ChatPageContent(
                 CharacterExpressionOverlay(
                     setting = setting,
                     conversation = conversation,
+                )
+
+                // [ST 1.19.0 体验升级] 常驻右侧悬浮球与全能悬浮窗容器（ST-iPhonie 小手机 / 记忆表格 / 小白X / 角色卡悬浮窗）
+                TavernFloatingWindowOverlay(
+                    settings = setting,
                 )
 
                 // [v233 主人拍板] 顶栏遮罩**总开关**（默认关：「顶栏模糊直接给我删掉吧，太难看」）。

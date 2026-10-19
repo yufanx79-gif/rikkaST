@@ -67,6 +67,7 @@ import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.files.FileUtils
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import me.rerere.rikkahub.ui.components.ui.CardGroup
+import me.rerere.rikkahub.ui.pages.setting.components.WebViewPerfReductionCard
 import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.context.LocalToaster
@@ -426,6 +427,14 @@ fun SettingPreferencesUIPage(vm: SettingVM = koinViewModel()) {
                         )
                     }
                 }
+            }
+
+            item {
+                WebViewPerfReductionCard(
+                    displaySetting = displaySetting,
+                    onUpdateDisplaySetting = ::updateDisplaySetting,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
             }
 
             item {

@@ -135,6 +135,7 @@ fun ChatMessage(
     assistant: Assistant? = null,
     lastMessage: Boolean = false,
     messageDepth: Int? = null,
+    messageIndex: Int = 0,
     onFork: () -> Unit,
     onRegenerate: () -> Unit,
     onImpersonate: (() -> Unit)? = null,
@@ -208,6 +209,7 @@ fun ChatMessage(
                 onToolAnswer = onToolAnswer,
                 onUserMessageClick = if (message.role == MessageRole.USER) onEdit else null,
                 messageDepth = messageDepth ?: if (lastMessage) 0 else null,
+                isHistoricalFloor = !lastMessage,
             )
 
             message.translation?.let { translation ->
@@ -239,6 +241,7 @@ fun ChatMessage(
                     node = node,
                     onUpdate = onUpdate,
                     isLastMessage = lastMessage,
+                    messageIndex = messageIndex,
                     onOpenActionSheet = {
                         showActionsSheet = true
                     },
@@ -329,6 +332,7 @@ private fun MessagePartsBlock(
     onUserMessageClick: (() -> Unit)? = null,
     messageKey: String,
     messageDepth: Int? = null,
+    isHistoricalFloor: Boolean = false,
 ) {
     val context = LocalContext.current
     val contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
@@ -537,6 +541,7 @@ private fun MessagePartsBlock(
                                                 content = segRendered,
                                                 loading = loading,
                                                 onClickCitation = handleClickCitation,
+                                                isHistoricalFloor = isHistoricalFloor,
                                             )
                                         }
                                     }

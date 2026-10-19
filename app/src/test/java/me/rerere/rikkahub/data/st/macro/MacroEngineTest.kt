@@ -208,9 +208,12 @@ class MacroEngineTest {
         assertEquals("x", eval("{{// hello}}x"))
         assertEquals("x", eval("{{comment::hi}}x"))
         assertEquals("", eval("{{///}}"))
-        assertEquals("a", eval("{{//}}a{{///}}"))
+        assertEquals("", eval("{{//}}a{{///}}"))
         assertEquals("", eval("{{//}}"))
-        assertEquals("First\nSecond", eval("{{//}}First\nSecond{{///}}"))
+        assertEquals("", eval("{{//}}First\nSecond{{///}}"))
+        assertEquals("BeforeAfter", eval("Before{{//}}This entire block is a comment.{{///}}After"))
+        assertEquals("AB", eval("A{{//}}ignored{{////}}B"))
+        assertEquals("XY", eval("X{{//}}{{user}} should be ignored{{///}}Y", MacroEnv().apply { names.user = "Alice" }))
     }
 
     @Test

@@ -116,6 +116,8 @@ data class QuickMessage(
     val contextMenu: Boolean = false,
     /** 是否在快捷栏隐藏按钮（仅通过 /qr 或钩子调用） */
     val hidden: Boolean = false,
+    /** 是否阻止自动触发执行（对齐 QR v2 preventAutoExecute） */
+    val preventAutoExecute: Boolean = false,
 )
 
 @Serializable

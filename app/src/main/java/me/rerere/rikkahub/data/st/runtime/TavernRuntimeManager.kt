@@ -42,6 +42,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.ui.StreamChunk
+import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.st.extensions.extensionsBaseDir
 import me.rerere.rikkahub.data.st.extensions.isSafeExtensionSegment
 import me.rerere.rikkahub.data.st.extensions.resolveExtensionFile
@@ -150,6 +151,20 @@ object TavernRuntimeManager {
         "testingcf.jsdelivr.net",
         "fastly.jsdelivr.net",
         "gcore.jsdelivr.net",
+        "cdnjs.cloudflare.com",
+        "unpkg.com",
+        "esm.sh",
+        "cdn.bootcdn.net",
+        "s4.zstatic.net",
+    )
+
+    private val OFFLINE_FONT_AND_STYLE_HOSTS = setOf(
+        "fonts.googleapis.com",
+        "fonts.gstatic.com",
+        "use.fontawesome.com",
+        "kit.fontawesome.com",
+        "at.alicdn.com",
+        "ka-f.fontawesome.com",
     )
 
     // 延迟创建：JVM 单元测试（android.jar 桩）下 Looper.getMainLooper() 会抛 "not mocked"，
@@ -260,6 +275,172 @@ object TavernRuntimeManager {
     /** [v211] 生成管线钩子（CHAT_COMPLETION_SETTINGS_READY）的挂起回调表。 */
     val pendingGenHooks = ConcurrentHashMap<Long, CompletableDeferred<String>>()
     private val genHookSeqCounter = AtomicLong(0)
+
+    /** [ST 1.19.0] MessageFormatter 三阶段钩子状态与挂起回调表。 */
+    @Volatile var hasMessageFormatterHooks: Boolean = false
+        private set
+    private val messageFormatterVersionCounter = AtomicLong(0)
+    private val _messageFormatterVersionFlow = MutableStateFlow(0L)
+    val messageFormatterVersionFlow: StateFlow<Long> get() = _messageFormatterVersionFlow
+    val messageFormatterVersion: Long get() = messageFormatterVersionCounter.get()
+    val pendingFormatterStages = ConcurrentHashMap<Long, CompletableDeferred<String>>()
+    private val formatterStageSeqCounter = AtomicLong(0)
+
+    /** Optional test/host hook for evaluating MessageFormatter stages without an Android WebView instance. */
+    @Volatile
+    var customMessageFormatterEvaluator: (suspend (stage: String, text: String, characterName: String, isUser: Boolean) -> String?)? = null
+
+    fun updateMessageFormatterHooksState(active: Boolean) {
+        hasMessageFormatterHooks = active
+        val next = messageFormatterVersionCounter.incrementAndGet()
+        _messageFormatterVersionFlow.value = next
+    }
+
+    suspend fun runMessageFormatterStageAsync(
+        stage: String,
+        text: String,
+        characterName: String = "",
+        isUser: Boolean = false,
+        timeoutMs: Long = 1_500L,
+    ): String {
+        if (!hasMessageFormatterHooks) return text
+        if (isInJavaBridgeCall()) return text
+        customMessageFormatterEvaluator?.let { evaluator ->
+            return runCatching {
+                withTimeoutOrNull(timeoutMs) {
+                    evaluator(stage, text, characterName, isUser)
+                } ?: text
+            }.getOrDefault(text)
+        }
+        if (!pageReady) return text
+        val wv = webView ?: return text
+        val seq = formatterStageSeqCounter.incrementAndGet()
+        val deferred = CompletableDeferred<String>()
+        pendingFormatterStages[seq] = deferred
+        val ctxJson = JSONObject().apply {
+            put("characterName", characterName)
+            put("ch_name", characterName)
+            put("isSystem", false)
+            put("isUser", isUser)
+            put("messageId", -1)
+            put("isReasoning", false)
+        }.toString()
+        mainHandler.post {
+            runCatching {
+                wv.evaluateJavascript(
+                    "window.__rikkaRunMessageFormatterStage && window.__rikkaRunMessageFormatterStage($seq, ${JSONObject.quote(stage)}, ${JSONObject.quote(text)}, ${JSONObject.quote(ctxJson)});",
+                    null,
+                )
+            }.onFailure {
+                pendingFormatterStages.remove(seq)?.complete(text)
+            }
+        }
+        return try {
+            withTimeoutOrNull(timeoutMs) { deferred.await() } ?: text
+        } catch (_: Exception) {
+            text
+        } finally {
+            pendingFormatterStages.remove(seq)
+        }
+    }
+
+    fun runMessageFormatterStageBlocking(
+        stage: String,
+        text: String,
+        characterName: String = "",
+        isUser: Boolean = false,
+        timeoutMs: Long = 1_500L,
+    ): String {
+        if (!hasMessageFormatterHooks) return text
+        val isMain = runCatching { Looper.myLooper() == Looper.getMainLooper() && Looper.getMainLooper() != null }.getOrDefault(false)
+        if (isMain && customMessageFormatterEvaluator == null) return text
+        return try {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                runMessageFormatterStageAsync(stage, text, characterName, isUser, timeoutMs)
+            }
+        } catch (_: Exception) {
+            text
+        }
+    }
+
+    // ==================== [Bug B] 7 阶段发送诊断记录 ====================
+    enum class SendDiagnosticStage(val stepNumber: Int, val label: String) {
+        STAGE_1_SEND_CLICKED(1, "用户点击发送"),
+        STAGE_2_HANDLER_ENTERED(2, "进入发送处理函数"),
+        STAGE_3_USER_MSG_PERSISTED(3, "用户消息写入会话状态与持久化层"),
+        STAGE_4_SCROLL_TRIGGERED(4, "触发列表滚动"),
+        STAGE_5_GENERATION_STARTED(5, "启动助手生成任务"),
+        STAGE_6_MODEL_REQUEST_SENT(6, "发起模型请求"),
+        STAGE_7_GENERATION_FINISHED(7, "生成完成/失败/取消"),
+    }
+
+    data class SendDiagnosticRecord(
+        val seq: Long,
+        val stage: SendDiagnosticStage,
+        val conversationId: String,
+        val detail: String,
+        val timestampMs: Long = System.currentTimeMillis(),
+    )
+
+    private val sendDiagnosticSeq = AtomicLong(0)
+    private val sendDiagnosticRecords = ConcurrentLinkedQueue<SendDiagnosticRecord>()
+    private const val MAX_SEND_DIAG_RECORDS = 200
+
+    @Volatile
+    var lastSendCriticalWindowStartMs: Long = 0L
+        private set
+
+    val isSendOrHookInFlight: Boolean
+        get() {
+            if (pendingGenHooks.isNotEmpty()) return true
+            val started = lastSendCriticalWindowStartMs
+            if (started <= 0L) return false
+            return (System.currentTimeMillis() - started) in 0L..4_000L
+        }
+
+    fun recordSendDiagnostic(
+        stage: SendDiagnosticStage,
+        conversationId: String,
+        detail: String,
+    ): SendDiagnosticRecord {
+        when (stage) {
+            SendDiagnosticStage.STAGE_1_SEND_CLICKED,
+            SendDiagnosticStage.STAGE_2_HANDLER_ENTERED,
+            SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED,
+            SendDiagnosticStage.STAGE_5_GENERATION_STARTED -> {
+                lastSendCriticalWindowStartMs = System.currentTimeMillis()
+            }
+            SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT,
+            SendDiagnosticStage.STAGE_7_GENERATION_FINISHED -> {
+                lastSendCriticalWindowStartMs = 0L
+            }
+            else -> {}
+        }
+        val record = SendDiagnosticRecord(
+            seq = sendDiagnosticSeq.incrementAndGet(),
+            stage = stage,
+            conversationId = conversationId,
+            detail = detail,
+        )
+        sendDiagnosticRecords.offer(record)
+        while (sendDiagnosticRecords.size > MAX_SEND_DIAG_RECORDS) {
+            sendDiagnosticRecords.poll()
+        }
+        appendLog(
+            "info",
+            "[send-diag][#${record.seq}][S${stage.stepNumber}:${stage.name}] conv=$conversationId $detail",
+        )
+        return record
+    }
+
+    fun getSendDiagnosticRecords(conversationId: String? = null): List<SendDiagnosticRecord> {
+        val all = sendDiagnosticRecords.toList()
+        return if (conversationId == null) all else all.filter { it.conversationId == conversationId }
+    }
+
+    fun clearSendDiagnosticRecords() {
+        sendDiagnosticRecords.clear()
+    }
     private var jsResultSeq = 0L
 
     /** [v229 A1] 运行时自持协程作用域（跑 `/generate` 的流式生成；不阻塞 WebView 线程）。 */
@@ -393,8 +574,10 @@ object TavernRuntimeManager {
     }
 
     @Volatile private var exitInfoLogged = false
+    @Volatile var lastAbnormalExitSummary: String? = null
+        private set
 
-    /** [P0-2] Android 11+ 启动时自取证：读取上一次进程退出的内核级原因（Native abort / LMKD / OOM / ANR 及 PSS/RSS）写入日志。 */
+    /** [P0-2] Android 11+ 启动时自取证：读取上一次进程退出的内核级原因（Native abort / LMKD / OOM / ANR 及 PSS/RSS）写入日志与崩溃报告目录。 */
     private fun logLastProcessExitInfo(context: Context) {
         if (exitInfoLogged) return
         exitInfoLogged = true
@@ -403,12 +586,40 @@ object TavernRuntimeManager {
                 val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
                 val exits = am?.getHistoricalProcessExitReasons(context.packageName, 0, 3).orEmpty()
                 for ((idx, info) in exits.withIndex()) {
-                    appendLog(
-                        "warn",
-                        "[exit-info] prev_exit[$idx]: reason=${info.reason} status=${info.status} " +
-                            "importance=${info.importance} pss=${info.pss}kB rss=${info.rss}kB " +
-                            "ts=${info.timestamp} desc=${info.description}",
-                    )
+                    val summary = "[exit-info] prev_exit[$idx]: reason=${info.reason} status=${info.status} " +
+                        "importance=${info.importance} pss=${info.pss}kB rss=${info.rss}kB " +
+                        "ts=${info.timestamp} desc=${info.description}"
+                    appendLog("warn", summary)
+                    if (idx == 0 && info.reason in setOf(
+                            android.app.ApplicationExitInfo.REASON_CRASH,
+                            android.app.ApplicationExitInfo.REASON_CRASH_NATIVE,
+                            android.app.ApplicationExitInfo.REASON_ANR,
+                            android.app.ApplicationExitInfo.REASON_LOW_MEMORY,
+                            android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE,
+                            android.app.ApplicationExitInfo.REASON_SIGNALED,
+                        )
+                    ) {
+                        lastAbnormalExitSummary = summary
+                        runCatching {
+                            val crashDir = java.io.File(context.filesDir, "crash_logs").apply { mkdirs() }
+                            val reportFile = java.io.File(crashDir, "native_exit_${info.timestamp}.log")
+                            if (!reportFile.exists()) {
+                                val traceText = runCatching {
+                                    info.traceInputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText().take(32_000) }
+                                }.getOrNull().orEmpty()
+                                reportFile.writeText(
+                                    buildString {
+                                        appendLine("=== RikkaST Process Exit Diagnostic Report ===")
+                                        appendLine(summary)
+                                        if (traceText.isNotBlank()) {
+                                            appendLine("--- Trace ---")
+                                            appendLine(traceText)
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
                 }
             }.onFailure { t ->
                 appendLog("warn", "[exit-info] query failed: ${t.message}")
@@ -444,6 +655,21 @@ object TavernRuntimeManager {
     /** 当前焦点会话（由聊天页面/生成流程更新）。 */
     @Volatile var activeConversationId: String? = null
         private set
+
+    /** 当前焦点会话所属的助手 ID（用于立绘/CG 资源解析与 Node 伴生服务会话隔离）。 */
+    @Volatile var activeAssistantId: String? = null
+        get() = field ?: activeAssistant?.id?.toString()
+        private set
+
+    /** 由 UI 层注入：当前焦点会话的 Assistant 实例提供器。 */
+    @Volatile var activeAssistantSupplier: (() -> Assistant?)? = null
+
+    val activeAssistant: Assistant?
+        get() = runCatching { activeAssistantSupplier?.invoke() }.getOrNull()
+
+    fun setActiveAssistantId(assistantId: String?) {
+        activeAssistantId = assistantId?.takeIf { it.isNotBlank() }
+    }
 
     /** [R9] 开发者模式：开启后 [fireEvent] 额外把事件写入 tavern-runtime.log。 */
     @Volatile var developerMode: Boolean = false
@@ -545,16 +771,155 @@ object TavernRuntimeManager {
     @Volatile var isMvuActive: Boolean = false
         private set
 
+    // ==================== [10-19-21] 通用悬浮窗状态 & 双通道 TTS 隔离 ====================
+    data class FloatingWindowSummary(
+        val hasIphonie: Boolean = false,
+        val hasMemory: Boolean = false,
+        val hasLittleWhiteBox: Boolean = false,
+        val hasCardFloating: Boolean = false,
+        val cardFloatingCount: Int = 0,
+    ) {
+        val hasAny: Boolean
+            get() = hasIphonie || hasMemory || hasLittleWhiteBox || hasCardFloating
+    }
+
+    data class StIphonieTtsState(
+        val phase: String = "idle",
+        val playing: Boolean = false,
+        val message: String = "等待播放",
+    )
+
+    private val _floatingWindowsFlow = MutableStateFlow(FloatingWindowSummary())
+    val floatingWindowsFlow: StateFlow<FloatingWindowSummary> get() = _floatingWindowsFlow
+
+    private val _requestedFloatingTargetFlow = MutableStateFlow<String?>(null)
+    val requestedFloatingTargetFlow: StateFlow<String?> get() = _requestedFloatingTargetFlow
+
+    private val _stIphonieTtsStateFlow = MutableStateFlow(StIphonieTtsState())
+    val stIphonieTtsStateFlow: StateFlow<StIphonieTtsState> get() = _stIphonieTtsStateFlow
+
+    /** 由上游系统原生 TTS (LocalTTSState) 注册的停止回调：当 ST-iPhonie 开始播音时自动停止原生 TTS，防止双通道冲突。 */
+    @Volatile
+    var nativeTtsStopper: (() -> Unit)? = null
+
+    val isStIphonieSpeaking: Boolean
+        get() = _stIphonieTtsStateFlow.value.playing || _stIphonieTtsStateFlow.value.phase == "playing"
+
+    fun requestOpenFloatingWindow(target: String = "iphonie") {
+        _requestedFloatingTargetFlow.value = target
+    }
+
+    fun dismissFloatingWindow() {
+        _requestedFloatingTargetFlow.value = null
+        eval("window.__rikkaCloseFloatingStage && window.__rikkaCloseFloatingStage();")
+    }
+
+    fun switchFloatingWindowTarget(target: String) {
+        _requestedFloatingTargetFlow.value = target
+        val escaped = JSONObject.quote(target)
+        eval("window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped);")
+    }
+
+    /** 停止 ST-iPhonie 角色语音（当上游系统原生 TTS 启动或用户点击停止时调用）。 */
+    fun stopStIphonieTts(reason: String = "manual") {
+        appendLog("debug", "[tts-isolation] stopping ST-iPhonie TTS (reason=$reason)")
+        _stIphonieTtsStateFlow.value = _stIphonieTtsStateFlow.value.copy(phase = "idle", playing = false)
+        broadcast("window.__rikkaStopIphonieTts && window.__rikkaStopIphonieTts();")
+    }
+
+    /** 切换 ST-iPhonie 暂停/继续播放。 */
+    fun toggleStIphonieTts() {
+        nativeTtsStopper?.let { stopper -> mainHandler.post { runCatching { stopper() } } }
+        broadcast("window.__rikkaToggleIphonieTts && window.__rikkaToggleIphonieTts();")
+    }
+
+    /** 使用 ST-iPhonie 角色语音通道朗读指定楼层（与系统原生 TTS 通道独立区分）。 */
+    fun playFloorWithStIphonie(floorIndex: Int) {
+        nativeTtsStopper?.let { stopper -> mainHandler.post { runCatching { stopper() } } }
+        eval("window.__rikkaPlayFloorIphonieTts && window.__rikkaPlayFloorIphonieTts($floorIndex);")
+    }
+
+    /**
+     * 将常驻主运行时 WebView 挂载到可视悬浮窗容器（零二次白屏、零 IndexedDB 锁冲突、100% 保持小手机与卡脚本实时状态）。
+     */
+    fun attachHostWebViewToContainer(container: android.view.ViewGroup, target: String) {
+        ensureStarted(container.context)
+        val wv = webView ?: return
+        runCatching {
+            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+            wv.setBackgroundColor(android.graphics.Color.parseColor("#121318"))
+            wv.isFocusable = true
+            wv.isFocusableInTouchMode = true
+            container.addView(
+                wv,
+                android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            val escaped = JSONObject.quote(target)
+            wv.evaluateJavascript(
+                "window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped);",
+                null,
+            )
+        }.onFailure { e ->
+            appendLog("error", "[floating] attachHostWebViewToContainer failed: ${e.message}")
+        }
+    }
+
+    /**
+     * 从可视悬浮窗容器安全摘除常驻主运行时 WebView（不销毁实例，继续在后台保持小手机语音与脚本运行）。
+     */
+    fun detachHostWebViewFromContainer(container: android.view.ViewGroup) {
+        val wv = webView ?: return
+        runCatching {
+            wv.evaluateJavascript("window.__rikkaCloseFloatingStage && window.__rikkaCloseFloatingStage();", null)
+            wv.clearFocus()
+            wv.isFocusable = false
+            wv.isFocusableInTouchMode = false
+            if (wv.parent === container) {
+                container.removeView(wv)
+            }
+        }
+    }
+
     /** 处理 JS 侧生命周期事件（由桥回调触发）。 */
     fun handleJsLifecycleEvent(name: String, payloadJson: String = "{}") {
         when (name) {
             "mvu_ready" -> isMvuActive = true
             "mvu_error" -> isMvuActive = false
+            "iphonie_tts_state" -> runCatching {
+                val obj = JSONObject(payloadJson)
+                val phase = obj.optString("phase", "idle")
+                val playing = obj.optBoolean("playing", false)
+                val msg = obj.optString("message", "")
+                _stIphonieTtsStateFlow.value = StIphonieTtsState(
+                    phase = phase,
+                    playing = playing,
+                    message = msg,
+                )
+                if (playing) {
+                    nativeTtsStopper?.let { stopper ->
+                        mainHandler.post { runCatching { stopper() } }
+                    }
+                }
+            }
+            "floating_windows_changed" -> runCatching {
+                val obj = JSONObject(payloadJson)
+                _floatingWindowsFlow.value = FloatingWindowSummary(
+                    hasIphonie = obj.optBoolean("hasIphonie", false),
+                    hasMemory = obj.optBoolean("hasMemory", false),
+                    hasLittleWhiteBox = obj.optBoolean("hasLittleWhiteBox", false),
+                    hasCardFloating = obj.optBoolean("hasCardFloating", false),
+                    cardFloatingCount = obj.optInt("cardFloatingCount", 0),
+                )
+            }
+            "request_open_floating_window" -> runCatching {
+                val obj = JSONObject(payloadJson)
+                val target = obj.optString("target", "iphonie").ifBlank { "iphonie" }
+                requestOpenFloatingWindow(target)
+            }
             // [v218.1] 面板渲染完成 → 主运行时补发 ST 的 RENDERED 事件。
-            // 依据 notes/recon-ext-compat-20261001.md §2.3：扩展侧（记忆增强表格 index.js:1072、
-            // ST-PT handler.ts:986/964、JSR macro_like.ts:127-128）全靠 USER/CHARACTER_MESSAGE_RENDERED
-            // 刷新视图，此前宿主一条都不发。面板 WebView 与主运行时是两个 realm（eventSource 各一份），
-            // 所以必须经桥转发到主运行时发射。
             "panel_rendered" -> runCatching {
                 val obj = JSONObject(payloadJson)
                 val id = obj.optInt("messageId", -1)
@@ -639,6 +1004,7 @@ object TavernRuntimeManager {
         wv.settings.allowContentAccess = false
         wv.settings.mediaPlaybackRequiresUserGesture = false
         wv.settings.blockNetworkImage = false
+        wv.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView,
@@ -701,55 +1067,197 @@ object TavernRuntimeManager {
         wv.loadUrl("${BASE_URL}index.html")
     }
 
-    /** 资产拦截：/st-runtime/... → assets/st-runtime/...（含 ES module MIME）；CDN 请求 → 本地 vendor。 */
+    /** 资产拦截：/st-runtime/... → assets/st-runtime/...（含 ES module MIME）；角色立绘/CG资产多级回退；CDN 请求 → 本地 vendor。 */
     internal fun interceptAsset(uri: Uri): WebResourceResponse? {
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        if (scheme == "embeded" || scheme == "embedded" || scheme == "ccdefault") {
+            val ctx = appContext ?: return notFound()
+            val rawTarget = uri.toString()
+                .removePrefix("embeded://")
+                .removePrefix("embedded://")
+                .removePrefix("ccdefault:")
+            val resolved = resolveLocalCharacterAssetFile(ctx, rawTarget)
+            return if (resolved != null) openFileResponse(resolved) ?: notFound() else notFound()
+        }
         if (uri.host != HOST && uri.host != "st.rikka.local") return interceptCdn(uri)
         val path = uri.path ?: return notFound()
         // 0) 第三方扩展资源（真实文件端点）：
-        //    /scripts/extensions/third-party/<folder>/<path> → filesDir/tavern-extensions/third-party/...
         if (path.startsWith("/scripts/extensions/third-party/")) return openThirdPartyAsset(path)
-        //    扩展内相对路径拼接（extensionFolderPath = "scripts/extensions/..."）：
-        //    /st-runtime/scripts/extensions/third-party/... → 剥前缀后同上
         if (path.startsWith("/st-runtime/scripts/extensions/third-party/")) {
             return openThirdPartyAsset(path.removePrefix("/st-runtime"))
         }
-        // runtime.js 的 renderTemplateAsync 生成的是 /third-party/<folder>/<tpl>.html；
-        // 为兼容这个 ST 常见相对路径，映射到真实的 /scripts/extensions/third-party/**。
         if (path.startsWith("/third-party/")) {
             return openThirdPartyAsset("/scripts/extensions$path")
         }
-        // 0.2) 本地角色资产（.charx 解压资产与表情立绘）：/charx_assets/<id>/<rel> 或 /sprites/<id>/<file>
-        if (path.startsWith("/charx_assets/") || path.startsWith("/sprites/")) {
+        // 0.15) [ST 1.19.0 / LittleWhiteBox / ST-iPhonie] 用户文件与图片存储端点：/user/files/* 与 /user/images/*
+        if (path.startsWith("/user/files/") || path.startsWith("/user/images/")) {
             val ctx = appContext ?: return notFound()
-            val rel = path.removePrefix("/")
-            val topDir = rel.substringBefore('/')
-            if (topDir == "charx_assets" || topDir == "sprites") {
-                val allowedRoot = runCatching { File(ctx.filesDir, topDir).canonicalFile }.getOrNull()
-                val targetFile = runCatching { File(ctx.filesDir, rel).canonicalFile }.getOrNull()
-                if (allowedRoot != null && targetFile != null &&
-                    targetFile.path.startsWith(allowedRoot.path + File.separator) &&
-                    targetFile.isFile
-                ) {
-                    return openFileResponse(targetFile) ?: notFound()
-                }
+            val subRel = path.removePrefix("/user/")
+            val allowedRoot = runCatching { File(ctx.filesDir, "tavern-user").canonicalFile }.getOrNull()
+            val targetFile = runCatching { File(File(ctx.filesDir, "tavern-user"), subRel).canonicalFile }.getOrNull()
+            if (allowedRoot != null && targetFile != null &&
+                targetFile.path.startsWith(allowedRoot.path + File.separator) &&
+                targetFile.isFile
+            ) {
+                return openFileResponse(targetFile) ?: notFound()
+            }
+            resolveLocalCharacterAssetFile(ctx, subRel)?.let { return openFileResponse(it) ?: notFound() }
+            return notFound()
+        }
+        // 0.2) 本地角色资产（.charx 解压资产、表情立绘、/characters/、/api/sprites/ 与 /charx_assets/lookup/）：
+        if (path.startsWith("/charx_assets/") ||
+            path.startsWith("/sprites/") ||
+            path.startsWith("/characters/") ||
+            path.startsWith("/api/sprites/")
+        ) {
+            val ctx = appContext ?: return notFound()
+            val resolved = resolveLocalCharacterAssetFile(ctx, path)
+            if (resolved != null) {
+                return openFileResponse(resolved) ?: notFound()
             }
             return notFound()
         }
-        // 0.5) [v228 S1] ST `/version` 端点（**能力闸门**，不是 rikkaST 自身版本）。
-        //    JSR `src/util/tavern.ts:24-27`：await fetch('/version').then(r => r.json()).then(d => d.pkgVersion)
-        //      .catch(() => '1.0.0')  —— 全库所有 compare(version, ...) 闸门的唯一数据源（dist/index.js:74）。
-        //    以前这里落到 notFound()（404 text/plain）→ .json() 抛错 → 全部闸门按 1.0.0 走旧分支。
-        //    取值判据见 notes/recon-version-gate-20261008.md §4。
+        // 0.5) [v228 S1] ST `/version` 端点
         if (path == "/version") return versionResponse()
-        // 1) ST 核心模块兼容层（第三方扩展 import 的 ../../../script.js / extensions.js / lib.js …）：
-        //    /script.js、/lib.js、/scripts/<name>.js → st-runtime/st-compat/ 下的 shim 模块
+        // 1) ST 核心模块兼容层
         routeStCompat(path)?.let { return it }
-        // 2) /npm/ 前缀 → st-runtime/vendor/npm/（MVU bundle 及其依赖的本地端点）
+        // 2) /npm/ 前缀 → st-runtime/vendor/npm/
         val assetPath = when {
             path.startsWith("/npm/") -> "st-runtime/vendor$path"
             else -> path.trimStart('/')
         }
-        return openAsset(assetPath) ?: notFound()
+        openAsset(assetPath)?.let { return it }
+        // 3) 若 panel.html 内相对路径图片（如 <img src="织乃_zcw_2.png"> 或 <img src="sprites/xxx.webp">）
+        //    解析到了 /st-runtime/<rel> 且非内置静态资源，则自动回退到角色立绘/charx_assets 查找！
+        val ctx = appContext
+        if (ctx != null) {
+            val candidateRel = path.removePrefix("/st-runtime/").trimStart('/')
+            if (candidateRel.isNotEmpty() && !candidateRel.endsWith(".js") && !candidateRel.endsWith(".html")) {
+                resolveLocalCharacterAssetFile(ctx, candidateRel)?.let {
+                    return openFileResponse(it) ?: notFound()
+                }
+            }
+        }
+        return notFound()
+    }
+
+    /**
+     * 统一解析角色卡立绘 / CG / CharX 资产文件（供 WebView `interceptAsset` 与原生 `ZoomableAsyncImage` 共同调用）：
+     * 1. 先检查 `filesDir/charx_assets`、`filesDir/sprites`、`filesDir/tavern-user` 下的精确路径；
+     * 2. 若精确路径不存在（例如卡片正则写了 `.png` 但实际资源为 `.webp`/`.jpg`，或按 `asset.name` 如 `织乃_zcw_2` 引用），
+     *    调用 [me.rerere.rikkahub.data.st.expressions.SpriteRepository.resolveAnySpriteOrAssetFile] 按文件名/stem 跨扩展名检索；
+     * 3. 若磁盘上仍未找到（例如用户在旧版本已导入该角色卡，当时 `data.assets` 未落盘），
+     *    直接检查当前活跃助手内存中的 `tavernData.assets` 并即时解码落盘后返回！
+     */
+    internal fun resolveLocalCharacterAssetFile(ctx: Context, rawPath: String): File? {
+        val clean = runCatching { Uri.decode(rawPath) }.getOrDefault(rawPath)
+            .substringBefore('?')
+            .substringBefore('#')
+            .replace('\\', '/')
+            .removePrefix("embeded://")
+            .removePrefix("embedded://")
+            .removePrefix("ccdefault:")
+            .trimStart('/')
+        if (clean.isBlank()) return null
+
+        val topDir = clean.substringBefore('/')
+        if (topDir == "charx_assets" || topDir == "sprites") {
+            val subAfterTop = clean.substringAfter('/', "")
+            if (!subAfterTop.startsWith("lookup/")) {
+                val allowedRoot = runCatching { File(ctx.filesDir, topDir).canonicalFile }.getOrNull()
+                val exactFile = runCatching { File(ctx.filesDir, clean).canonicalFile }.getOrNull()
+                if (allowedRoot != null && exactFile != null &&
+                    exactFile.path.startsWith(allowedRoot.path + File.separator) &&
+                    exactFile.isFile
+                ) {
+                    return exactFile
+                }
+            }
+        }
+
+        val explicitAssistantId = if (clean.startsWith("charx_assets/") && !clean.startsWith("charx_assets/lookup/")) {
+            clean.removePrefix("charx_assets/").substringBefore('/').let { runCatching { kotlin.uuid.Uuid.parse(it) }.getOrNull() }
+        } else null
+        val queryTarget = when {
+            clean.startsWith("charx_assets/lookup/") -> clean.removePrefix("charx_assets/lookup/")
+            clean.startsWith("charx_assets/") -> clean.removePrefix("charx_assets/").substringAfter('/', clean.substringAfterLast('/'))
+            clean.startsWith("sprites/") -> clean.removePrefix("sprites/").substringAfter('/', clean.substringAfterLast('/'))
+            clean.startsWith("characters/") -> clean.removePrefix("characters/").substringAfter('/', clean.substringAfterLast('/'))
+            clean.startsWith("api/sprites/") -> clean.removePrefix("api/sprites/").substringAfter('/', clean.substringAfterLast('/'))
+            else -> clean
+        }
+
+        val activeAst = activeAssistant
+        me.rerere.rikkahub.data.st.expressions.SpriteRepository.resolveAnySpriteOrAssetFile(
+            context = ctx,
+            assistantId = explicitAssistantId ?: activeAst?.id,
+            rawNameOrPath = queryTarget,
+        )?.let { return it }
+
+        // 惰性从当前助手内存 tavernData.assets 解码落盘（兼容旧版本已导入未落盘的角色卡）
+        if (activeAst != null) {
+            val assets = activeAst.tavernData?.assets.orEmpty()
+            if (assets.isNotEmpty()) {
+                val targetBase = queryTarget.substringAfterLast('/')
+                val targetStem = targetBase.substringBeforeLast('.').ifBlank { targetBase }
+                val safeTargetStem = me.rerere.rikkahub.data.st.expressions.SpriteRepository.sanitizeAssetStem(targetStem)
+                val matchedAsset = assets.firstOrNull { a ->
+                    val aBase = a.name.substringAfterLast('/')
+                    val aStem = aBase.substringBeforeLast('.').ifBlank { aBase }
+                    val aSafe = me.rerere.rikkahub.data.st.expressions.SpriteRepository.sanitizeAssetStem(aStem)
+                    a.name.equals(targetBase, ignoreCase = true) ||
+                        aStem.equals(targetStem, ignoreCase = true) ||
+                        aSafe.equals(safeTargetStem, ignoreCase = true)
+                }
+                if (matchedAsset != null) {
+                    val decoded = me.rerere.rikkahub.data.st.expressions.SpriteRepository.decodeDataUri(matchedAsset.uri)
+                    if (decoded != null) {
+                        val ext = (decoded.second ?: matchedAsset.ext.ifBlank { "png" }).lowercase()
+                        val outDir = me.rerere.rikkahub.data.st.expressions.SpriteRepository.charxAssetDir(ctx, activeAst.id)
+                        val outFile = File(outDir, "${safeTargetStem.ifBlank { "sprite" }}.$ext")
+                        runCatching { outFile.writeBytes(decoded.first) }
+                        if (outFile.isFile) return outFile
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * 供 Coil (`ZoomableAsyncImage`) 解析本地角色立绘/CG 资产或 `data:image/...` URI。
+     */
+    fun resolveLocalAssetForCoil(context: Context, rawUrlOrPath: String): Any? {
+        val m = rawUrlOrPath.trim()
+        if (m.isEmpty()) return null
+        if (m.startsWith("embeded://", ignoreCase = true) ||
+            m.startsWith("embedded://", ignoreCase = true) ||
+            m.startsWith("ccdefault:", ignoreCase = true)
+        ) {
+            return resolveLocalCharacterAssetFile(context, m)
+        }
+        val localPrefix = listOf(
+            "https://appassets.androidplatform.net/",
+            "https://st.rikka.local/",
+            "http://appassets.androidplatform.net/",
+            "http://st.rikka.local/",
+        ).firstOrNull { m.startsWith(it, ignoreCase = true) }
+        if (localPrefix != null) {
+            val rel = m.substring(localPrefix.length)
+            return resolveLocalCharacterAssetFile(context, rel)
+        }
+        if (m.startsWith("/charx_assets/") ||
+            m.startsWith("/sprites/") ||
+            m.startsWith("/characters/") ||
+            m.startsWith("/api/sprites/") ||
+            m.startsWith("/user/images/")
+        ) {
+            return resolveLocalCharacterAssetFile(context, m)
+        }
+        if (!m.contains("://") && !m.startsWith("data:", ignoreCase = true) && !m.startsWith("content:", ignoreCase = true) && !m.startsWith("file:", ignoreCase = true)) {
+            resolveLocalCharacterAssetFile(context, m)?.let { return it }
+        }
+        return null
     }
 
     /** 打开本地资产（命中返回 200 响应，未命中返回 null）。 */
@@ -838,7 +1346,7 @@ object TavernRuntimeManager {
         val segs = rel.split('/')
         if (segs.isEmpty()) return false
         return segs.all { seg ->
-            seg.isNotEmpty() && seg.none { c ->
+            seg.isNotEmpty() && seg != "." && seg != ".." && seg.none { c ->
                 !(c.isLetterOrDigit() || c == '_' || c == '-' || c == '.')
             }
         }
@@ -851,14 +1359,74 @@ object TavernRuntimeManager {
      * 未命中本地资产时返回 null 放行真实网络（在线可用，离线降级为加载失败）。
      */
     private fun interceptCdn(uri: Uri): WebResourceResponse? {
-        val host = uri.host ?: return null
-        if (host !in CDN_HOSTS) return null
-        val path = uri.path ?: return null
-        openAsset("st-runtime/vendor$path")?.let { return it }
-        deversionNpm(path)?.let { de ->
-            openAsset("st-runtime/vendor$de")?.let { return it }
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return null
+        val path = uri.path.orEmpty()
+        val lowerPath = path.lowercase(Locale.ROOT)
+
+        // 0) 拦截 st-memory-enhancement 版本检查等外网阻塞探针，0ms 离线返回
+        if (host == "api.muyoo.com.cn") {
+            return WebResourceResponse(
+                "application/json",
+                "utf-8",
+                200,
+                "OK",
+                mapOf("Access-Control-Allow-Origin" to "*"),
+                "{\"success\":true,\"isLatest\":true}".byteInputStream(Charsets.UTF_8),
+            )
+        }
+
+        // 1) 拦截无 VPN 下导致 WebView 卡死 15~30s 的 Google Fonts / FontAwesome 等外网字体与样式表
+        if (host in OFFLINE_FONT_AND_STYLE_HOSTS) {
+            return emptyOfflineStyleOrFontResponse(lowerPath)
+        }
+
+        // 2) CDN 本地化优先匹配 vendor/
+        if (host in CDN_HOSTS) {
+            if (path.isNotEmpty()) {
+                openAsset("st-runtime/vendor$path")?.let { return it }
+                deversionNpm(path)?.let { de ->
+                    openAsset("st-runtime/vendor$de")?.let { return it }
+                }
+                // 针对 cdnjs / bootcdn / unpkg / jsdelivr 常见库文件名映射到内置 vendor/lib/
+                val fileName = lowerPath.substringAfterLast('/')
+                when {
+                    fileName.startsWith("jquery") && fileName.endsWith(".js") ->
+                        openAsset("st-runtime/vendor/lib/jquery-3.5.1.min.js")?.let { return it }
+                    fileName.startsWith("lodash") && fileName.endsWith(".js") ->
+                        openAsset("st-runtime/vendor/lib/lodash.min.js")?.let { return it }
+                    fileName.startsWith("toastr") && fileName.endsWith(".js") ->
+                        openAsset("st-runtime/vendor/lib/toastr.min.js")?.let { return it }
+                    fileName.startsWith("select2") && fileName.endsWith(".js") ->
+                        openAsset("st-runtime/vendor/lib/select2.min.js")?.let { return it }
+                    fileName.startsWith("select2") && fileName.endsWith(".css") ->
+                        openAsset("st-runtime/vendor/lib/select2.min.css")?.let { return it }
+                    fileName.startsWith("katex") && fileName.endsWith(".js") ->
+                        openAsset("st-runtime/vendor/katex/katex.min.js")?.let { return it }
+                    fileName.startsWith("katex") && fileName.endsWith(".css") ->
+                        openAsset("st-runtime/vendor/katex/katex.min.css")?.let { return it }
+                    (fileName.contains("font-awesome") || fileName.contains("fontawesome") || fileName.endsWith(".css") || fileName.endsWith(".woff2") || fileName.endsWith(".woff") || fileName.endsWith(".ttf")) ->
+                        return emptyOfflineStyleOrFontResponse(lowerPath)
+                }
+            }
         }
         return null
+    }
+
+    private fun emptyOfflineStyleOrFontResponse(lowerPath: String): WebResourceResponse {
+        val isFont = lowerPath.endsWith(".woff2") || lowerPath.endsWith(".woff") || lowerPath.endsWith(".ttf") || lowerPath.endsWith(".otf")
+        val mime = if (isFont) "font/woff2" else "text/css"
+        val bytes = if (isFont) ByteArray(0) else "/* offline css shim */".toByteArray(Charsets.UTF_8)
+        return WebResourceResponse(
+            mime,
+            "utf-8",
+            200,
+            "OK",
+            mapOf(
+                "Access-Control-Allow-Origin" to "*",
+                "Cache-Control" to "max-age=86400",
+            ),
+            bytes.inputStream(),
+        )
     }
 
     /** /npm/name@1.2.3/rest → /npm/name/rest（兼容 scoped 包名 @scope/name@1.2.3）。 */
@@ -939,7 +1507,7 @@ object TavernRuntimeManager {
      * 改动它 = 一次性切换所有下游扩展的能力分支，必须同步改 `assets/st-runtime/runtime.js` 的
      * `TAVERN_ST_COMPAT_VERSION`，并更新 `notes/recon-version-gate-20261008.md` §4 的判据。
      */
-    const val TAVERN_ST_COMPAT_VERSION = "1.13.5"
+    const val TAVERN_ST_COMPAT_VERSION = "1.19.0"
 
     // ==================== 执行 / 事件 ====================
 
@@ -1122,6 +1690,12 @@ object TavernRuntimeManager {
         )
     }
 
+    /** 重新扫描并通知主运行时与辅助 WebView 重载第三方扩展。 */
+    fun reloadThirdPartyExtensions() {
+        broadcast("window.__rikkaReloadThirdPartyExtensions && window.__rikkaReloadThirdPartyExtensions();")
+        fireEvent(EVENT_SETTINGS_UPDATED, "{}")
+    }
+
     // ==================== [v214] JS 写回桥（世界书 / 面板表单发送） ====================
 
     /** [v214] JS `RikkaBridge.updateLorebookEntries`：整本书条目 disable 补丁 → 宿主持久化。 */
@@ -1278,18 +1852,25 @@ object TavernRuntimeManager {
         val line = "[$ts][$level] $message"
         logs.offer(line)
         while (logs.size > MAX_LOGS) logs.poll()
-        android.util.Log.d(TAG, line)
-        persistLog(line)
+        runCatching { android.util.Log.d(TAG, line) }
+        persistLogAsync(line)
     }
 
-    /** 追加写入持久化日志文件（滚动上限 [LOG_FILE_MAX_BYTES]，失败静默）。 */
-    private fun persistLog(line: String) {
+    /** 异步追加写入持久化日志文件（在 Dispatchers.IO 后台执行，杜绝阻塞主线程造成 UI 卡顿）。 */
+    private fun persistLogAsync(line: String) {
+        if (appContext == null) return
+        runtimeScope.launch(Dispatchers.IO) {
+            persistLogSync(line)
+        }
+    }
+
+    private fun persistLogSync(line: String) {
         val ctx = appContext ?: return
         runCatching {
             val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
             val file = File(dir, LOG_FILE_NAME)
             synchronized(logFileLock) {
-                if (file.length() > LOG_FILE_MAX_BYTES) {
+                if (file.exists() && file.length() > LOG_FILE_MAX_BYTES) {
                     val tail = file.readText().takeLast((LOG_FILE_MAX_BYTES / 2).toInt())
                     file.writeText(tail.substringAfter('\n', tail))
                 }
@@ -1311,7 +1892,7 @@ object TavernRuntimeManager {
     @Keep
     class TavernJsBridge {
         @JavascriptInterface
-        fun getVersion(): String = "1.18.0"
+        fun getVersion(): String = TAVERN_ST_COMPAT_VERSION
 
         @JavascriptInterface
         fun getActiveConversationId(): String = activeConversationId ?: ""
@@ -1687,9 +2268,26 @@ object TavernRuntimeManager {
             TavernVariableStore.flushNow()
         }
 
-        /** 第三方扩展装载列表（runtime 启动时注入 script/link 用）。 */
+                /** 第三方扩展装载列表（runtime 启动时注入 script/link 用；supplier 未挂载时直接扫描磁盘目录兜底）。 */
         @JavascriptInterface
-        fun getThirdPartyExtensionsJson(): String = thirdPartyExtensionsSupplier?.invoke() ?: "[]"
+        fun getThirdPartyExtensionsJson(): String {
+            thirdPartyExtensionsSupplier?.invoke()?.takeIf { it.isNotBlank() && it != "[]" }?.let { return it }
+            val ctx = appContext ?: return thirdPartyExtensionsSupplier?.invoke() ?: "[]"
+            return runCatching {
+                val list = me.rerere.rikkahub.data.st.extensions.listExtensions(ctx)
+                me.rerere.rikkahub.data.st.extensions.buildRuntimeExtensionsJson(list, emptySet())
+            }.getOrDefault("[]")
+        }
+
+        /** 专供扩展设置页（extension-settings.html?ext=...）使用：直接从磁盘扫描全部已安装扩展，不受启停过滤或页面切换竞态影响。 */
+        @JavascriptInterface
+        fun getAllThirdPartyExtensionsJson(): String {
+            val ctx = appContext ?: return getThirdPartyExtensionsJson()
+            return runCatching {
+                val list = me.rerere.rikkahub.data.st.extensions.listExtensions(ctx)
+                me.rerere.rikkahub.data.st.extensions.buildRuntimeExtensionsJson(list, emptySet())
+            }.getOrDefault(getThirdPartyExtensionsJson())
+        }
 
         /** 第三方扩展设置（extension_settings 非 variables 部分）。 */
         @JavascriptInterface
@@ -1862,6 +2460,129 @@ object TavernRuntimeManager {
         /** 通道自检（真机取证用）。 */
         @JavascriptInterface
         fun chatCompletionProbe(): String = TavernRuntimeManager.chatCompletionError("probe")
+
+        // ==================== [ST 1.19.0] MessageFormatter & 用户文件/图片 & 共享 Node.js 桥 ====================
+
+        @JavascriptInterface
+        fun onMessageFormatterHooksChanged(active: Boolean) {
+            updateMessageFormatterHooksState(active)
+        }
+
+        @JavascriptInterface
+        fun onMessageFormatterStageResult(seq: Long, resultText: String) {
+            try {
+                pendingFormatterStages.remove(seq)?.complete(resultText)
+            } catch (_: Exception) {
+            }
+        }
+
+        @JavascriptInterface
+        fun writeUserFileBase64(name: String, base64Data: String): String {
+            val ctx = appContext ?: return ""
+            val safeName = name.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").takeIf { it.isNotEmpty() && it != "." && it != ".." } ?: return ""
+            return runCatching {
+                val dir = File(ctx.filesDir, "tavern-user/files").apply { mkdirs() }
+                val file = File(dir, safeName)
+                val cleanB64 = base64Data.substringAfter("base64,", base64Data)
+                val bytes = java.util.Base64.getMimeDecoder().decode(cleanB64)
+                file.writeBytes(bytes)
+                "/user/files/$safeName"
+            }.getOrDefault("")
+        }
+
+        @JavascriptInterface
+        fun readUserFileJson(name: String): String {
+            val ctx = appContext ?: return JSONObject().put("exists", false).toString()
+            val safeName = name.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").takeIf { it.isNotEmpty() && it != "." && it != ".." }
+                ?: return JSONObject().put("exists", false).toString()
+            val file = File(ctx.filesDir, "tavern-user/files/$safeName")
+            if (!file.isFile) return JSONObject().put("exists", false).toString()
+            return runCatching {
+                val b64 = java.util.Base64.getEncoder().encodeToString(file.readBytes())
+                JSONObject().apply {
+                    put("exists", true)
+                    put("name", safeName)
+                    put("mime", mimeOf(safeName))
+                    put("base64", b64)
+                }.toString()
+            }.getOrElse { JSONObject().put("exists", false).toString() }
+        }
+
+        @JavascriptInterface
+        fun deleteUserFile(name: String): Boolean {
+            val ctx = appContext ?: return false
+            val safeName = name.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").takeIf { it.isNotEmpty() && it != "." && it != ".." } ?: return false
+            val file = File(ctx.filesDir, "tavern-user/files/$safeName")
+            return runCatching { file.delete() }.getOrDefault(false)
+        }
+
+        @JavascriptInterface
+        fun writeUserImageBase64(folder: String, filename: String, base64Data: String): String {
+            val ctx = appContext ?: return ""
+            val safeFolder = folder.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").ifBlank { "default" }
+            val safeFile = filename.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").takeIf { it.isNotEmpty() && it != "." && it != ".." } ?: return ""
+            return runCatching {
+                val dir = File(ctx.filesDir, "tavern-user/images/$safeFolder").apply { mkdirs() }
+                val file = File(dir, safeFile)
+                val cleanB64 = base64Data.substringAfter("base64,", base64Data)
+                val bytes = java.util.Base64.getMimeDecoder().decode(cleanB64)
+                file.writeBytes(bytes)
+                "/user/images/$safeFolder/$safeFile"
+            }.getOrDefault("")
+        }
+
+        @JavascriptInterface
+        fun listUserImagesJson(folder: String): String {
+            val ctx = appContext ?: return "[]"
+            val safeFolder = folder.trim().replace(Regex("[^a-zA-Z0-9._\u4e00-\u9fa5-]"), "_").ifBlank { "default" }
+            val dir = File(ctx.filesDir, "tavern-user/images/$safeFolder")
+            if (!dir.isDirectory) return "[]"
+            val arr = org.json.JSONArray()
+            dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }?.forEach { f ->
+                arr.put("/user/images/$safeFolder/${f.name}")
+            }
+            return arr.toString()
+        }
+
+        @JavascriptInterface
+        fun deleteUserImage(relPath: String): Boolean {
+            val ctx = appContext ?: return false
+            val allowedRoot = runCatching { File(ctx.filesDir, "tavern-user/images").canonicalFile }.getOrNull() ?: return false
+            val target = runCatching { File(allowedRoot, relPath.removePrefix("/")).canonicalFile }.getOrNull() ?: return false
+            if (!target.path.startsWith(allowedRoot.path + File.separator)) return false
+            return runCatching { target.delete() }.getOrDefault(false)
+        }
+
+        @JavascriptInterface
+        fun nodePluginHttpRequestAsync(
+            reqId: String,
+            method: String,
+            pathWithQuery: String,
+            headersJson: String,
+            body: String,
+        ) {
+            TavernNodeServiceManager.dispatchPluginHttpRequestAsync(
+                context = appContext,
+                reqId = reqId,
+                method = method,
+                pathWithQuery = pathWithQuery,
+                headersJson = headersJson,
+                body = body,
+                assistantId = activeAssistantId,
+                conversationId = activeConversationId,
+            ) { respJson ->
+                eval(
+                    "window.__rikkaNodeHttpCallback && window.__rikkaNodeHttpCallback(" +
+                        JSONObject.quote(reqId) + "," +
+                        JSONObject.quote(respJson) + ");",
+                )
+            }
+        }
+
+        @JavascriptInterface
+        fun nodePluginHttpAbort(reqId: String) {
+            TavernNodeServiceManager.abortPluginHttpRequest(reqId)
+        }
     }
 
     // ==================== [v229 A1] /api/backends/chat-completions/{status,generate} ====================

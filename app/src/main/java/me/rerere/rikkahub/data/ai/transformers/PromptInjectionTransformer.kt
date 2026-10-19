@@ -171,18 +171,51 @@ object PromptInjectionTransformer : InputMessageTransformer {
             ctx.settings.authorNoteInterval > 0 &&
             userMsgCount > 0 &&
             (userMsgCount % ctx.settings.authorNoteInterval == 0)
+        // 确保在「提示词管理」全局开启的提示词注入（promptInjections）与外置全局世界书（!isCharacterBook）
+        // 以及助手级绑定在 allowConversationPromptInjection 开启时不会因会话级集合为空而被静默丢弃
+        val allPromptInjectionIds = ctx.settings.promptInjections.map { it.id }.toSet()
+        val enabledPromptInjectionIds = ctx.settings.promptInjections.filter { it.enabled }.map { it.id }.toSet()
+        val baseAssistantModeIds = if (ctx.assistant.modeInjectionIds.intersect(allPromptInjectionIds).isEmpty() && enabledPromptInjectionIds.isNotEmpty()) {
+            ctx.assistant.modeInjectionIds + enabledPromptInjectionIds
+        } else {
+            ctx.assistant.modeInjectionIds
+        }
+        val enabledGlobalLorebookIds = ctx.settings.lorebooks
+            .filter { it.enabled && !it.isCharacterBook }
+            .map { it.id }
+            .toSet()
+        val embeddedBookName = ctx.assistant.tavernData?.embeddedBook?.name?.trim().orEmpty()
+        val matchedCharLorebookIds = if (embeddedBookName.isNotEmpty()) {
+            ctx.settings.lorebooks
+                .filter { it.enabled && it.name.trim().equals(embeddedBookName, ignoreCase = true) }
+                .map { it.id }
+                .toSet()
+        } else emptySet()
+        val baseAssistantLorebookIds = ctx.assistant.lorebookIds + enabledGlobalLorebookIds + matchedCharLorebookIds
+        val runtimeAssistant = ctx.assistant.copy(
+            modeInjectionIds = baseAssistantModeIds,
+            lorebookIds = baseAssistantLorebookIds,
+        )
+        val runtimeConvModeIds = if (ctx.assistant.allowConversationPromptInjection) {
+            baseAssistantModeIds + ctx.conversationModeInjectionIds
+        } else {
+            ctx.conversationModeInjectionIds
+        }
+        val runtimeConvLorebookIds = if (ctx.assistant.allowConversationPromptInjection) {
+            baseAssistantLorebookIds + ctx.conversationLorebookIds
+        } else {
+            ctx.conversationLorebookIds
+        }
+
         val result = transformMessages(
             messages = messages,
-            assistant = ctx.assistant,
+            assistant = runtimeAssistant,
             // [第6轮 D1 方案 A] 两通道并集：预设仓（modeInjections）+ 提示词注入（promptInjections）。
-            // 启用集共用 assistant.modeInjectionIds / conversation.modeInjectionIds（UUID 唯一），
-            // 所以这里只需把两个列表合起来交给下游 filter(enabled && id in ids)。
-            // promptInjections 为空时与旧行为**逐字等价**（+ emptyList()）。
             modeInjections = ctx.settings.modeInjections + ctx.settings.promptInjections,
             lorebooks = ctx.settings.lorebooks,
             regexScripts = mergeRegexScripts(
                 ctx.settings.regexScripts,
-                ctx.assistant,
+                runtimeAssistant,
                 activeGroups,
                 activePresetConfig.spresetEnabledRegexIds,
                 activePresetConfig.spresetDisabledRegexIds,
@@ -194,8 +227,8 @@ object PromptInjectionTransformer : InputMessageTransformer {
             userName = effectiveUserName,
             orderedMarkers = activePresetConfig.orderedMarkers,
             disabledMarkers = activePresetConfig.disabledMarkers,
-            conversationModeInjectionIds = ctx.conversationModeInjectionIds,
-            conversationLorebookIds = ctx.conversationLorebookIds,
+            conversationModeInjectionIds = runtimeConvModeIds,
+            conversationLorebookIds = runtimeConvLorebookIds,
             activeStickyEntries = activeSticky,
             cooldownEntries = cooldowns,
             delayOverrideEntries = delayMap,

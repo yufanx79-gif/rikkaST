@@ -348,6 +348,7 @@ private fun ChatListNormal(
                             loading = loading && index == lastMessageIndex,
                             lastMessage = index == lastMessageIndex,
                             messageDepth = (lastMessageIndex - index).coerceAtLeast(0),
+                            messageIndex = index,
                             onRegenerate = {
                                 onRegenerate(node.currentMessage)
                             },

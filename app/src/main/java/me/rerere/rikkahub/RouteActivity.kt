@@ -248,8 +248,10 @@ class RouteActivity : ComponentActivity() {
             )
             else -> intent.getStringExtra("conversationId")?.let { Screen.Chat(it) }
         }
-        if (destination != null && backStack.lastOrNull() != destination) {
-            backStack.add(destination)
+        if (destination != null) {
+            Navigator(backStack).navigate(destination) {
+                launchSingleTop = true
+            }
         }
     }
 
@@ -285,8 +287,14 @@ class RouteActivity : ComponentActivity() {
         )
 
         val backStack = rememberNavBackStack(startScreen)
+        val navController = remember(backStack) { Navigator(backStack) { startScreen } }
+        // [Bug A 修复] 强保证进入 NavDisplay 前导航栈非空（防止状态恢复或并发返回把根栈弹空）
+        if (backStack.isEmpty()) {
+            navController.ensureNonEmpty(startScreen)
+        }
         SideEffect {
             navStack = backStack
+            navController.ensureNonEmpty(startScreen)
             while (pendingIntents.isNotEmpty()) {
                 handleIntent(pendingIntents.removeFirst())
             }
@@ -294,7 +302,7 @@ class RouteActivity : ComponentActivity() {
 
         SharedTransitionLayout {
             CompositionLocalProvider(
-                LocalNavController provides Navigator(backStack),
+                LocalNavController provides navController,
                 LocalSharedTransitionScope provides this,
                 LocalSettings provides settings,
                 LocalToaster provides toastState,
@@ -326,7 +334,7 @@ class RouteActivity : ComponentActivity() {
                             rememberViewModelStoreNavEntryDecorator(),
                         ),
                         modifier = Modifier.fillMaxSize(),
-                        onBack = { backStack.removeLastOrNull() },
+                        onBack = { navController.popBackStack() },
                         // [v221 UI 二期] 转场接 MotionScheme（此前硬编码 tween(300)/spring 默认值）：
                         // 几何保持不变（位移比例 / 缩放 0.7f / 淡入淡出），只把时长/曲线交给
                         // MaterialTheme.motionScheme（Theme.kt 已全局注入 MotionScheme.expressive()）。

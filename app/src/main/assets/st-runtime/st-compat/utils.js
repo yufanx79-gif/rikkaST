@@ -4,7 +4,7 @@
  * 模拟 SillyTavern `public/scripts/utils.js` 的导出面（常用工具函数真实现）。
  */
 
-const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
+const st = () => (typeof window !== 'undefined' && window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
 // ---------------------------------------------------------------- 基础工具
 export function debounce(fn, wait = 300) {
@@ -22,9 +22,14 @@ export function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+export function getSortableDelay() {
+    return 0;
+}
+
 export function uuidv4() {
     try {
-        if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        if (typeof window !== 'undefined' && window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
     } catch (_e) { /* noop */ }
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
@@ -82,6 +87,27 @@ export async function getBase64Async(file) {
     }
 }
 
+export async function getFileText(file) {
+    try {
+        if (!file) return '';
+        if (typeof file === 'string') return file;
+        if (typeof file.text === 'function') return await file.text();
+        if (typeof FileReader !== 'undefined') {
+            return await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result ?? ''));
+                reader.onerror = reject;
+                reader.readAsText(file);
+            });
+        }
+    } catch (_e) { /* noop */ }
+    return '';
+}
+
+export async function extractTextFromOffice(file) {
+    return getFileText(file);
+}
+
 export function ensureImageFormatSupported(file) {
     // P0：不做格式转换，原样返回（ST 在浏览器端做 PNG 转换）。
     return file;
@@ -90,6 +116,7 @@ export function ensureImageFormatSupported(file) {
 // ---------------------------------------------------------------- 文件 / 剪贴板
 /** P0：宿主文件系统下载未接线 → 返回空（调用方通常忽略返回值）。 */
 export async function saveBase64AsFile(base64Data, characterName, filename, extension, ...rest) {
+    void base64Data; void characterName; void filename; void extension; void rest;
     return '';
 }
 

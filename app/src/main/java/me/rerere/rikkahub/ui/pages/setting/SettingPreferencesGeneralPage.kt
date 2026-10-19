@@ -36,6 +36,7 @@ import me.rerere.rikkahub.ui.components.ui.LevelPickerRow
 import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.components.ui.SegmentedTabs
 import me.rerere.rikkahub.ui.pages.setting.components.DeveloperModeSwitch
+import me.rerere.rikkahub.ui.pages.setting.components.WebViewPerfReductionCard
 import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.utils.plus
@@ -384,6 +385,14 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                         )
                     }
                 }
+            }
+
+            item {
+                WebViewPerfReductionCard(
+                    displaySetting = displaySetting,
+                    onUpdateDisplaySetting = ::updateDisplaySetting,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
             }
 
             item {

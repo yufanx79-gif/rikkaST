@@ -16,12 +16,15 @@
     <!-- [v235 R2] KaTeX 0.16.45（MIT，本地 vendored，离线）：消息/面板里的 $$..$$ 与 \(..\) 渲染 -->
     <link rel="stylesheet" href="./vendor/katex/katex.min.css">
     <script src="./vendor/katex/katex.min.js"></script>
+    <!-- 统一扩展弹窗与常驻悬浮窗暗色高对比样式（当主运行时 WebView 挂载到聊天页悬浮窗时直接生效） -->
+    <link rel="stylesheet" href="./extension-settings.css">
 </head>
 <body>
     <div id="st-runtime-root" style="display:none"></div>
-    <!-- 批次十七：ST 兼容 DOM 容器。第三方扩展把设置界面 append 到这些节点上，
-         以前宿主一个都没有（jQuery 对空集合 append 静默 no-op），所以「扩展点了没反应」。 -->
+    <!-- 批次十七：ST 兼容 DOM 容器。第三方扩展把设置界面 append 到这些节点上。
+         平时在后台保持隐藏；当用户在聊天页点击右侧悬浮窗切换至「记忆表格 / 小白X / 扩展面板」时动态展示。 -->
     <div id="rikka-st-compat-dom" style="display:none" aria-hidden="true">
+        <div id="top-settings-holder"></div>
         <div id="extensions_settings"></div>
         <div id="extensions_settings2"></div>
         <div id="extensionsMenu"></div>
@@ -30,20 +33,22 @@
         <div id="translation_container"></div>
         <div id="extensions_details"></div>
         <div id="mvu-standalone-buttons"></div>
-        <!-- v207：JSR 的 v7() 会 `$('#send_form')` 再 `new MutationObserver(...).observe(n[0], …)`；
-             宿主没有这个节点 → n[0] === undefined → 真机 `TypeError: parameter 1 is not of type 'Node'`
-             （报告 notes/recon-B-dom.md）。ST 里它是 <form>，但这里**故意用 div**：
-             扩展会对它调 .submit()，真 <form> 会导航刷新整个 WebView。 -->
-        <div id="send_form"></div>
+        <div id="user-settings-block"></div>
+        <div id="rikka-ext-workbench-root"></div>
     </div>
-    <!-- [v212 · §5.F] highlight.js 11.9.0（BSD-3，真库，来自 Rikkahub-Revised assets）必须在 third-party-globals.js 之前加载，
-         让占位守卫因 "window.hljs !== undefined" 自动让位；此前 JSR /code、斜杠帮助、<pre><code> 均无高亮。 -->
+    <div id="rikka-hidden-st-stubs" style="display:none !important;" aria-hidden="true">
+        <div id="form_sheld" style="display:none !important;">
+            <div id="send_form" style="display:none !important;">
+                <textarea id="send_textarea" style="display:none !important;"></textarea>
+            </div>
+        </div>
+        <div id="chat" style="display:none !important;"></div>
+    </div>
+    <!-- [v212 · §5.F] highlight.js 11.9.0（BSD-3，真库，来自 Rikkahub-Revised assets）必须在 third-party-globals.js 之前加载 -->
     <script src="./vendor/lib/hljs.min.js"></script>
     <link rel="stylesheet" href="./vendor/lib/hljs-theme.css">
     <script src="./vendor/lib/third-party-globals.js"></script>
-    <!-- [v209] select2 4.1.0（MIT/GPL，ST 自带同款）：st-memory-enhancement 等扩展的
-         jQuery 插件依赖；必须在 jQuery 之后加载。此前缺失 → [global] unhandledrejection:
-         TypeError: $(...).select2 is not a function（真机 v207/v208 会话 x3）。 -->
+    <!-- [v209] select2 4.1.0（MIT/GPL，ST 自带同款） -->
     <link rel="stylesheet" href="./vendor/lib/select2.min.css">
     <link rel="stylesheet" href="./vendor/lib/select2-overrides.css">
     <script src="./vendor/lib/select2.min.js"></script>

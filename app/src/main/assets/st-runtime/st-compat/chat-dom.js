@@ -2,19 +2,6 @@
  * rikkaST st-compat: chat-dom.js
  * ============================================================
  * R1 —— ST `#chat` 楼层 DOM 桩（让卡内脚本 / ST-Prompt-Template 能真实读写楼层节点）
- *
- * 契约对齐（ST 1.19.0 `public/script.js`，只对齐签名/行为，不抄实现）：
- *   - updateMessageBlock(messageId, message, { rerenderMessage = true } = {})   (script.js:2033)
- *       把 messageFormatting(mes.extra.display_text ?? mes.mes, name, is_system, is_user, id, {}, false)
- *       的产物写进该楼层 `.mes_text`；随后 addCopyToCodeBlocks + appendMediaToMessage。
- *   - addCopyToCodeBlocks(messageElement)                                       (script.js:2479)
- *       对 `pre code` 逐个补 hljs 高亮 + `.code-copy` 复制按钮（真插节点，不抛）。
- *   - appendMediaToMessage(mes, messageElement, scrollBehavior)                 (script.js:2216)
- *       把 mes.extra.media / mes.extra.files 真插成 `.mes_media_wrapper` / `.mes_file_wrapper` 子节点。
- *   - CHAT_CHANGED / chat_id_changed 后重建楼层。
- *
- * 宿主差异：ST 用 jQuery + `#message_image_template` 模板；这里用原生 DOM，
- * 容器为**隐藏**的 `#chat`（同 `#tavern_helper` 做法，不干扰宿主自己的聊天列表渲染）。
  */
 
 const MEDIA_TOKEN = 'mes_media_wrapper';
@@ -57,7 +44,6 @@ function bodyOf(d) {
 function asElement(el) {
     if (!el) return null;
     if (typeof el.appendChild === 'function' || typeof el.querySelector === 'function') return el;
-    // 数组式包装（jQuery 集合）：空集合返回 null，否则取首个真实元素
     if (typeof el.length === 'number') {
         return (el[0] && typeof el[0].appendChild === 'function') ? el[0] : null;
     }
@@ -75,8 +61,7 @@ function messageText(message) {
 }
 
 /**
- * 确保 `#chat` 容器存在（隐藏）。返回容器元素（无 document 时返回 null）。
- * 同 `#tavern_helper` 做法：display:none 的 body 末尾容器。
+ * 确保 `#chat` 容器存在（始终隐藏，不污染扩展设置页或面板）。
  */
 export function ensureChatDom() {
     const d = doc();
@@ -87,10 +72,10 @@ export function ensureChatDom() {
         el = d.createElement('div');
         el.setAttribute('id', 'chat');
         try { el.id = 'chat'; } catch (_e) { /* noop */ }
-        try { el.style.display = 'none'; } catch (_e) { /* noop */ }
         const body = bodyOf(d);
         if (body && typeof body.appendChild === 'function') body.appendChild(el);
     }
+    try { el.style.display = 'none'; } catch (_e) { /* noop */ }
     _chatEl = el;
     return el;
 }
@@ -154,7 +139,6 @@ function renderFloor(d, root, mesId, message) {
 
 /**
  * 为每条消息建 `div.mes[mesid="i"]`（内含 `div.mes_text`），带 is_user / is_system class。
- * 先清空再重建（对齐 CHAT_CHANGED 语义）。返回渲染的楼层数。
  */
 export function renderFloors(chat) {
     const d = doc();
@@ -172,8 +156,6 @@ export function renderFloors(chat) {
 
 /**
  * ST `updateMessageBlock(messageId, message, { rerenderMessage = true })`。
- * 兼容：第二参为字符串时按正文处理（旧调用方 `updateMessageBlock(id, html)`）。
- * 返回是否命中/创建了楼层。
  */
 export function updateMessageBlock(messageId, message, options) {
     const d = doc();
@@ -203,11 +185,6 @@ function copyText(text) {
     return Promise.resolve(false);
 }
 
-/**
- * ST `addCopyToCodeBlocks(messageElement)`（script.js:2479）真执行版：
- * 对 `pre code` 逐个插 `.code-copy` 按钮（hljs 高亮由宿主/渲染层负责）。
- * 返回处理过的代码块数。
- */
 export function addCopyToCodeBlocks(messageElement) {
     const d = doc();
     messageElement = asElement(messageElement);
@@ -236,11 +213,6 @@ function mediaUrl(entry) {
     return '';
 }
 
-/**
- * ST `appendMediaToMessage(mes, messageElement)`（script.js:2216）真执行版：
- * `mes.extra.media` → `.mes_media_wrapper` 内 `.mes_img`；`mes.extra.files` → `.mes_file_wrapper` 内 `.mes_file`。
- * 返回新增的媒体/文件节点数。
- */
 export function appendMediaToMessage(mes, messageElement) {
     const d = doc();
     messageElement = asElement(messageElement);
@@ -289,11 +261,6 @@ export function appendMediaToMessage(mes, messageElement) {
     return added;
 }
 
-/**
- * 监听 `chat_changed` / `chat_id_changed` → 重建楼层。
- * eventSource 需实现 `.on(type, fn)`；无载荷时用 getChat() 兜底。
- * 返回订阅成功与否。
- */
 export function attachChatListeners(eventSource) {
     if (!eventSource || typeof eventSource.on !== 'function') return false;
     const handler = (payload) => {

@@ -326,7 +326,97 @@ internal fun parseV2Card(context: Context?, json: JsonObject, background: String
         tavernData = tavData,
     )
 
-    return assistant to lorebooks
+    return materializeCardAssetsAndRewrites(context, assistant, lorebooks)
+}
+
+/**
+ * 将 V3 角色卡 `data.assets` 中的内嵌图片（`data:image/...`）同步落盘到 `charx_assets/<id>/` 与 `sprites/<id>/`，
+ * 并将角色卡各字段、世界书与内嵌正则中的 `embeded://` / `embedded://` / `ccdefault:` 路径重写为可拦截的本地 URL。
+ */
+internal fun materializeCardAssetsAndRewrites(
+    context: Context?,
+    assistant: Assistant,
+    lorebooks: List<Lorebook>,
+): Pair<Assistant, List<Lorebook>> {
+    val tav = assistant.tavernData ?: return assistant to lorebooks
+    if (tav.assets.isEmpty()) return assistant to lorebooks
+    val uriRewriteMap = LinkedHashMap<String, String>()
+    val charxBaseDir = context?.filesDir?.let { java.io.File(it, "charx_assets/${assistant.id}").apply { mkdirs() } }
+    val spriteBaseDir = context?.filesDir?.let { java.io.File(it, "sprites/${assistant.id}").apply { mkdirs() } }
+
+    for (asset in tav.assets) {
+        val rawName = asset.name.trim()
+        val safeStem = me.rerere.rikkahub.data.st.expressions.SpriteRepository.sanitizeAssetStem(
+            rawName.substringAfterLast('/').substringBeforeLast('.').ifBlank { rawName }
+        )
+        val decoded = me.rerere.rikkahub.data.st.expressions.SpriteRepository.decodeDataUri(asset.uri)
+        val ext = (decoded?.second ?: asset.ext.lowercase().takeIf { it.isNotBlank() } ?: "png").lowercase()
+        val fileName = if (safeStem.isNotBlank()) "$safeStem.$ext" else continue
+        if (decoded != null) {
+            if (charxBaseDir != null) {
+                runCatching { java.io.File(charxBaseDir, fileName).writeBytes(decoded.first) }
+            }
+            if (spriteBaseDir != null) {
+                runCatching { java.io.File(spriteBaseDir, fileName).writeBytes(decoded.first) }
+            }
+        }
+        val targetUrl = if (charxBaseDir != null) {
+            "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$fileName"
+        } else if (asset.uri.startsWith("data:", ignoreCase = true)) {
+            asset.uri
+        } else {
+            "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$fileName"
+        }
+        if (rawName.isNotBlank()) {
+            uriRewriteMap["embeded://$rawName"] = targetUrl
+            uriRewriteMap["embedded://$rawName"] = targetUrl
+            uriRewriteMap["ccdefault:$rawName"] = targetUrl
+            uriRewriteMap["embeded://$rawName.$ext"] = targetUrl
+            uriRewriteMap["embedded://$rawName.$ext"] = targetUrl
+            uriRewriteMap["ccdefault:$rawName.$ext"] = targetUrl
+        }
+    }
+    if (uriRewriteMap.isEmpty()) return assistant to lorebooks
+    fun rewriteText(text: String): String {
+        if (!text.contains("embed", ignoreCase = true) && !text.contains("ccdefault:", ignoreCase = true)) return text
+        var out = text
+        for ((k, v) in uriRewriteMap.entries.sortedByDescending { it.key.length }) {
+            out = out.replace(k, v, ignoreCase = true)
+        }
+        return out
+    }
+    val updatedTav = tav.copy(
+        firstMessage = rewriteText(tav.firstMessage),
+        alternateGreetings = tav.alternateGreetings.map(::rewriteText),
+        groupOnlyGreetings = tav.groupOnlyGreetings.map(::rewriteText),
+        description = rewriteText(tav.description),
+        systemPrompt = rewriteText(tav.systemPrompt),
+        mesExample = rewriteText(tav.mesExample),
+        postHistoryInstructions = rewriteText(tav.postHistoryInstructions),
+        creatorNotes = rewriteText(tav.creatorNotes),
+        depthPrompt = rewriteText(tav.depthPrompt),
+        embeddedBook = tav.embeddedBook?.let { eb ->
+            eb.copy(entries = eb.entries.map { it.copy(content = rewriteText(it.content)) })
+        },
+        embeddedRegexScripts = tav.embeddedRegexScripts.map { rx ->
+            rx.copy(replaceString = rewriteText(rx.replaceString))
+        },
+    )
+    val updatedPresetMessages = assistant.presetMessages.map { msg ->
+        msg.copy(
+            parts = msg.parts.map { part ->
+                if (part is me.rerere.ai.ui.UIMessagePart.Text) part.copy(text = rewriteText(part.text)) else part
+            }
+        )
+    }
+    val updatedLorebooks = lorebooks.map { lb ->
+        lb.copy(entries = lb.entries.map { it.copy(content = rewriteText(it.content)) })
+    }
+    return assistant.copy(
+        systemPrompt = rewriteText(assistant.systemPrompt),
+        presetMessages = updatedPresetMessages,
+        tavernData = updatedTav,
+    ) to updatedLorebooks
 }
 
 // ==================== V3 Parser ====================
@@ -382,7 +472,7 @@ internal fun parseV3Card(context: Context?, json: JsonObject, background: String
         tavernData = tavData,
     )
 
-    return assistant to lorebooks
+    return materializeCardAssetsAndRewrites(context, assistant, lorebooks)
 }
 
 // ==================== Helpers ====================
@@ -1049,7 +1139,18 @@ internal fun parseCharxBytes(
     val enrichedAssets = if (existingAssets.isNotEmpty()) {
         existingAssets.map { asset ->
             val cleanUri = asset.uri.removePrefix("embeded://").removePrefix("embedded://").removePrefix("ccdefault:").trimStart('/')
-            val matchedBytes = zipAssets[cleanUri]
+            val decodedUri = runCatching { android.net.Uri.decode(cleanUri) }.getOrDefault(cleanUri)
+            val cleanDirAndStem = cleanUri.substringBeforeLast('.', cleanUri)
+            val matchedEntry = zipAssets.entries.firstOrNull { (k, _) ->
+                k.equals(cleanUri, ignoreCase = true) || k.equals(decodedUri, ignoreCase = true)
+            } ?: zipAssets.entries.firstOrNull { (k, _) ->
+                cleanDirAndStem.isNotBlank() && k.substringBeforeLast('.', k).equals(cleanDirAndStem, ignoreCase = true)
+            } ?: zipAssets.entries.firstOrNull { (k, _) ->
+                asset.name.isNotBlank() && k.substringAfterLast('/').substringBeforeLast('.').equals(asset.name.substringBeforeLast('.'), ignoreCase = true)
+            } ?: zipAssets.entries.firstOrNull { (k, _) ->
+                cleanUri.isNotBlank() && k.substringAfterLast('/').equals(cleanUri.substringAfterLast('/'), ignoreCase = true)
+            }
+            val matchedBytes = matchedEntry?.value
             if (matchedBytes != null) {
                 val b64 = java.util.Base64.getEncoder().encodeToString(matchedBytes)
                 val ext = asset.ext.ifBlank { cleanUri.substringAfterLast('.', "png") }
@@ -1073,9 +1174,11 @@ internal fun parseCharxBytes(
     }
     val uriRewriteMap = LinkedHashMap<String, String>()
     val charxBaseDir = context?.filesDir?.let { java.io.File(it, "charx_assets/${assistant.id}").apply { mkdirs() } }
+    val spriteBaseDir = context?.filesDir?.let { java.io.File(it, "sprites/${assistant.id}").apply { mkdirs() } }
     zipAssets.forEach { (rawPath, assetBytes) ->
         val cleanRel = rawPath.replace('\\', '/').trimStart('/')
         val ext = cleanRel.substringAfterLast('.', "png").lowercase()
+        val baseName = cleanRel.substringAfterLast('/')
         val targetUrl = if (charxBaseDir != null) {
             val outFile = java.io.File(charxBaseDir, cleanRel)
             val canonicalBase = charxBaseDir.canonicalPath
@@ -1083,6 +1186,13 @@ internal fun parseCharxBytes(
             if (canonicalOut.path.startsWith(canonicalBase)) {
                 canonicalOut.parentFile?.mkdirs()
                 runCatching { canonicalOut.writeBytes(assetBytes) }
+            }
+            val isUniqueBaseName = zipAssets.keys.count { it.substringAfterLast('/').equals(baseName, ignoreCase = true) } == 1
+            if (baseName.isNotBlank() && baseName != cleanRel && isUniqueBaseName) {
+                runCatching { java.io.File(charxBaseDir, baseName).writeBytes(assetBytes) }
+            }
+            if (spriteBaseDir != null && baseName.isNotBlank()) {
+                runCatching { java.io.File(spriteBaseDir, baseName).writeBytes(assetBytes) }
             }
             "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$cleanRel"
         } else {
@@ -1092,13 +1202,59 @@ internal fun parseCharxBytes(
         uriRewriteMap["embeded://$cleanRel"] = targetUrl
         uriRewriteMap["embedded://$cleanRel"] = targetUrl
         uriRewriteMap["ccdefault:$cleanRel"] = targetUrl
+        if (baseName.isNotBlank()) {
+            uriRewriteMap["embeded://$baseName"] = targetUrl
+            uriRewriteMap["embedded://$baseName"] = targetUrl
+            uriRewriteMap["ccdefault:$baseName"] = targetUrl
+        }
+    }
+    // 同时按 card.json data.assets 的 name 建立别名落盘与重写（解决正则按 asset.name 如 `织乃_zcw_2` 引用但 zip 内路径为 assets/other/image/1.png 的问题）
+    existingAssets.forEach { asset ->
+        val cleanUri = asset.uri.removePrefix("embeded://").removePrefix("embedded://").removePrefix("ccdefault:").trimStart('/')
+        val decodedUri = runCatching { android.net.Uri.decode(cleanUri) }.getOrDefault(cleanUri)
+        val cleanDirAndStem = cleanUri.substringBeforeLast('.', cleanUri)
+        val matchedEntry = zipAssets.entries.firstOrNull { (k, _) ->
+            k.equals(cleanUri, ignoreCase = true) || k.equals(decodedUri, ignoreCase = true)
+        } ?: zipAssets.entries.firstOrNull { (k, _) ->
+            cleanDirAndStem.isNotBlank() && k.substringBeforeLast('.', k).equals(cleanDirAndStem, ignoreCase = true)
+        } ?: zipAssets.entries.firstOrNull { (k, _) ->
+            asset.name.isNotBlank() && k.substringAfterLast('/').substringBeforeLast('.').equals(asset.name.substringBeforeLast('.'), ignoreCase = true)
+        }
+        val matchedBytes = matchedEntry?.value
+        val rawName = asset.name.trim()
+        val safeStem = me.rerere.rikkahub.data.st.expressions.SpriteRepository.sanitizeAssetStem(
+            rawName.substringAfterLast('/').substringBeforeLast('.').ifBlank { rawName }
+        )
+        val ext = (matchedEntry?.key?.substringAfterLast('.', "")?.takeIf { it.isNotBlank() }
+            ?: asset.ext.ifBlank { cleanUri.substringAfterLast('.', "png") }).lowercase()
+        if (matchedBytes != null && safeStem.isNotBlank()) {
+            val aliasFileName = "$safeStem.$ext"
+            if (charxBaseDir != null) {
+                runCatching { java.io.File(charxBaseDir, aliasFileName).writeBytes(matchedBytes) }
+            }
+            if (spriteBaseDir != null) {
+                runCatching { java.io.File(spriteBaseDir, aliasFileName).writeBytes(matchedBytes) }
+            }
+            val aliasUrl = if (charxBaseDir != null) {
+                "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$aliasFileName"
+            } else {
+                val b64 = java.util.Base64.getEncoder().encodeToString(matchedBytes)
+                "data:image/$ext;base64,$b64"
+            }
+            uriRewriteMap["embeded://$rawName"] = aliasUrl
+            uriRewriteMap["embedded://$rawName"] = aliasUrl
+            uriRewriteMap["ccdefault:$rawName"] = aliasUrl
+            uriRewriteMap["embeded://$rawName.$ext"] = aliasUrl
+            uriRewriteMap["embedded://$rawName.$ext"] = aliasUrl
+            uriRewriteMap["ccdefault:$rawName.$ext"] = aliasUrl
+        }
     }
     fun rewriteCharxText(text: String): String {
         if (uriRewriteMap.isEmpty() || (!text.contains("embed", ignoreCase = true) && !text.contains("ccdefault:", ignoreCase = true))) {
             return text
         }
         var out = text
-        for ((k, v) in uriRewriteMap) {
+        for ((k, v) in uriRewriteMap.entries.sortedByDescending { it.key.length }) {
             out = out.replace(k, v, ignoreCase = true)
         }
         return out

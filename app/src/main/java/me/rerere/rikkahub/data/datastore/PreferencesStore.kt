@@ -1138,6 +1138,18 @@ enum class BackgroundEffectType {
 }
 
 @Serializable
+enum class WebViewPerfMode {
+    @SerialName("hibernate_pool")
+    HIBERNATE_POOL,
+
+    @SerialName("live_quiescent")
+    LIVE_QUIESCENT,
+
+    @SerialName("historical_snapshot_image")
+    HISTORICAL_SNAPSHOT_IMAGE,
+}
+
+@Serializable
 data class DisplaySetting(
     val userAvatar: Avatar = Avatar.Dummy,
     val userNickname: String = "",
@@ -1184,6 +1196,8 @@ data class DisplaySetting(
     val italicsColor: String = "",  // empty = default (#919191), otherwise hex
     val autoEmbedOnImport: Boolean = true,  // 导入后自动向量化
     val embeddingEnabled: Boolean = true,   // 向量搜索总开关（关则仅使用FTS5文本搜索）
+    val enableWebViewPerfReduction: Boolean = false, // 性能降低开关（开启后显示三种 WebView 降载方案）
+    val webViewPerfMode: WebViewPerfMode = WebViewPerfMode.HIBERNATE_POOL, // 性能降低方案：1=休眠方案 2=全视觉静默方案 3=历史楼层转图片方案
 )
 
 @Serializable
@@ -1242,7 +1256,9 @@ fun List<ProviderSetting>.findModelById(uuid: Uuid): Model? {
 }
 
 fun Settings.getCurrentChatModel(): Model? {
-    return findModelById(this.getCurrentAssistant().chatModelId ?: this.chatModelId)
+    val assistantModelId = this.getCurrentAssistant().chatModelId
+    return assistantModelId?.let { findModelById(it) }
+        ?: findModelById(this.chatModelId)
 }
 
 fun Settings.getCurrentAssistant(): Assistant {
@@ -1254,7 +1270,9 @@ fun Settings.getAssistantById(id: Uuid): Assistant? {
 }
 
 fun Settings.getQuickMessagesOfAssistant(assistant: Assistant) =
-    quickMessages.filter { it.id in assistant.quickMessageIds }
+    quickMessages.filter {
+        it.setEnabled && !it.hidden && (it.id in assistant.quickMessageIds || it.setName.isNotBlank())
+    }
 
 fun Settings.getSelectedTTSProvider(): TTSProviderSetting? {
     return selectedTTSProviderId?.let { id ->

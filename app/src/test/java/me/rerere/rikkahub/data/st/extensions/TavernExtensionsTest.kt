@@ -339,4 +339,54 @@ class TavernExtensionsTest {
         assertEquals("myext", deriveNameFromUrl("https://example.com/files/myext.zip?token=1"))
         assertEquals("myext", deriveNameFromUrl("https://example.com/files/myext/"))
     }
+
+    @Test
+    fun parseManifestSt119LifecycleAndInterceptorFields() {
+        val parsed = parseManifest(
+            "st-iphonie",
+            """{"display_name":"ST-iPhonie","version":"0.8.15","js":"index.js","css":"style.css",
+               "loading_order":10,"requires":["a"],"optional":["b"],
+               "minimum_client_version":"1.19.0","generate_interceptor":"stIphonieInterceptor",
+               "hooks":{"activate":"onActivate","enable":"onEnable","disable":"onDisable","delete":"onDelete"}}"""
+        )
+        assertNotNull(parsed)
+        parsed!!
+        assertEquals("st-iphonie", parsed.folder)
+        assertEquals(listOf("a"), parsed.requires)
+        assertEquals(listOf("b"), parsed.optional)
+        assertEquals("1.19.0", parsed.minimumClientVersion)
+        assertEquals("stIphonieInterceptor", parsed.generateInterceptor)
+        assertEquals("onActivate", parsed.hooks["activate"])
+        assertEquals("onDisable", parsed.hooks["disable"])
+
+        val runtimeArr = Json.parseToJsonElement(buildRuntimeExtensionsJson(listOf(parsed), emptySet())).jsonArray
+        assertEquals(1, runtimeArr.size)
+        val obj = runtimeArr[0].jsonObject
+        assertEquals("stIphonieInterceptor", obj["generateInterceptor"]!!.jsonPrimitive.content)
+        assertEquals("1.19.0", obj["minimumClientVersion"]!!.jsonPrimitive.content)
+        assertEquals("onActivate", obj["hooks"]!!.jsonObject["activate"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun resolveExtensionFileMatchesVersionOrBranchSuffixAlias() {
+        val base = tmp.newFolder("exts_alias")
+        File(base, "ST-Prompt-Template-1.16/dist").mkdirs()
+        File(base, "ST-Prompt-Template-1.16/dist/ejs.workers.js").writeText("worker")
+        File(base, "JS-Slash-Runner-main/lib").mkdirs()
+        File(base, "JS-Slash-Runner-main/lib/tailwindcss.min.js").writeText("tw")
+
+        assertEquals("st-prompt-template", normalizeExtensionFolderAlias("ST-Prompt-Template-1.16"))
+        assertEquals("js-slash-runner", normalizeExtensionFolderAlias("JS-Slash-Runner-main"))
+
+        val hit1 = resolveExtensionFile(base, "ST-Prompt-Template", "dist/ejs.workers.js")
+        assertNotNull(hit1)
+        assertEquals("ejs.workers.js", hit1!!.name)
+
+        val hit2 = resolveExtensionFile(base, "JS-Slash-Runner", "lib/tailwindcss.min.js")
+        assertNotNull(hit2)
+        assertEquals("tailwindcss.min.js", hit2!!.name)
+
+        // Path traversal is still strictly rejected even when alias resolution is active
+        assertNull(resolveExtensionFile(base, "ST-Prompt-Template", "../JS-Slash-Runner-main/lib/tailwindcss.min.js"))
+    }
 }

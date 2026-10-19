@@ -166,9 +166,9 @@ EventEmitter.prototype.emit = async function (event) {
     }
 };
 
-EventEmitter.prototype.emitAndWait = function (event) {
+EventEmitter.prototype.emitAndWait = async function (event) {
     let args = [].slice.call(arguments, 1);
-    if (localStorage.getItem('eventTracing') === 'true') {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('eventTracing') === 'true') {
         console.trace('Event emitted: ' + event, args);
     } else {
         console.debug('Event emitted: ' + event);
@@ -182,7 +182,7 @@ EventEmitter.prototype.emitAndWait = function (event) {
 
         for (i = 0; i < length; i++) {
             try {
-                listeners[i].apply(this, args);
+                await listeners[i].apply(this, args);
             }
             catch (err) {
                 console.error(err);

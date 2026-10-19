@@ -246,9 +246,14 @@ fun MarkdownBlock(
     } else null
 
     val coloredContent = if (quoteColor != null) {
-        val codeBlocks = CODE_BLOCK_REGEX.findAll(content).map { it.range }.toList()
+        val protectedRanges = buildList {
+            CODE_BLOCK_REGEX.findAll(content).forEach { add(it.range) }
+            Regex("<(style|script)\\b[^>]*>[\\s\\S]*?</\\1>|<[^>]+>|!\\[[^\\]]*\\]\\([^)]*\\)", RegexOption.IGNORE_CASE)
+                .findAll(content)
+                .forEach { add(it.range) }
+        }
         QUOTE_REGEX.replace(content) { match ->
-            if (codeBlocks.any { match.range.first in it }) match.value
+            if (protectedRanges.any { match.range.first in it || match.range.last in it }) match.value
             else "<span style=\"color:$quoteColor\">${match.value}</span>"
         }
     } else content

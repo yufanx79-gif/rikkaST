@@ -122,6 +122,7 @@ class GenerationLoop(
         model: Model,
         context: android.content.Context,
         conversationRepo: me.rerere.rikkahub.data.repository.ConversationRepository,
+        conversationModeInjectionIds: Set<Uuid> = emptySet(),
     ): List<UIMessage> {
         val activePersona = settings.personas
             .find { it.id == settings.activePersonaId }
@@ -145,7 +146,7 @@ class GenerationLoop(
 
         val activePresetCfg = parseActiveStPresetConfig(
             settings.tavernPresets,
-            enabledPresetGroups(assistant, settings),
+            enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
         )
         val mainIdentity = if ("main" in activePresetCfg.disabledMarkers && !conversationOverride) {
             ""
@@ -321,7 +322,7 @@ class GenerationLoop(
         )
     }
     // ── 预构建：system 消息列表（循环不变，移到外面）──
-    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, tools, model, context, conversationRepo)
+    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, tools, model, context, conversationRepo, conversationModeInjectionIds)
 
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
@@ -839,22 +840,34 @@ class GenerationLoop(
         //   return [chat, ...]  ← 改写后的结果继续用。ST-PT handler.ts:980 监听 SETTINGS_READY 并
         //   data.messages = await processGenerateAfter(data.messages)；MVU bundle 5 处监听（含 eventMakeLast）。
         // 仅对酒馆卡助手生效；WebView 未就绪 / 超时 / 无监听器 → null → 原样直通（零开销）。
-        if (assistant.tavernData != null) {
+        if (assistant.tavernData != null || TavernRuntimeManager.isStarted) {
+            var abortedByInterceptor = false
             runCatching {
                 val payload = me.rerere.rikkahub.data.st.runtime.buildStMessagesJson(internalMessages)
                 val rewritten = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.runGenerationHooks(payload)
                 if (rewritten != null) {
-                    val parsed = runCatching { me.rerere.rikkahub.data.st.runtime.parseStMessagesJson(rewritten) }.getOrNull()
-                    if (parsed != null && parsed.size == internalMessages.size) {
-                        internalMessages = parsed
-                        android.util.Log.i("RikkaTavern", "[gen-hooks] messages rewritten by extensions (${parsed.size})")
+                    val hookOutcome = runCatching { me.rerere.rikkahub.data.st.runtime.parseStGenerationHookResult(rewritten) }.getOrNull()
+                    if (hookOutcome != null && hookOutcome.aborted) {
+                        abortedByInterceptor = true
+                        android.util.Log.i("RikkaTavern", "[gen-hooks] generation aborted by extension generate_interceptor")
+                    } else if (hookOutcome != null && hookOutcome.messages.isNotEmpty()) {
+                        internalMessages = hookOutcome.messages
+                        android.util.Log.i("RikkaTavern", "[gen-hooks] messages rewritten by extensions (${hookOutcome.messages.size})")
                     } else {
-                        android.util.Log.w("RikkaTavern", "[gen-hooks] rewrite rejected (size mismatch or parse failed)")
+                        android.util.Log.w("RikkaTavern", "[gen-hooks] rewrite rejected (empty messages or parse failed)")
                     }
                 } else {
                     android.util.Log.i("RikkaTavern", "[gen-hooks] no rewrite (null/timeout/not-ready)")
                 }
             }.onFailure { android.util.Log.w("RikkaTavern", "[gen-hooks] failed: ${it.message}") }
+            if (abortedByInterceptor) {
+                TavernRuntimeManager.recordSendDiagnostic(
+                    stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                    conversationId = conversationId?.toString().orEmpty(),
+                    detail = "status=ABORTED_BY_INTERCEPTOR",
+                )
+                return
+            }
         }
         var messages: List<UIMessage> = messages
         val params = TextGenerationParams(
@@ -874,6 +887,11 @@ class GenerationLoop(
                 preset = postPresetCfg,
             ),
             sessionId = (conversationId ?: Uuid.random()).toString(),
+        )
+        TavernRuntimeManager.recordSendDiagnostic(
+            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT,
+            conversationId = conversationId?.toString().orEmpty(),
+            detail = "model=${model.modelId} internalMessages=${internalMessages.size} stream=$stream",
         )
         try {
             if (stream) {

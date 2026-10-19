@@ -2,7 +2,10 @@
  * rikkaST st-compat: power-user.js
  * ============================================================
  * 模拟 SillyTavern `public/scripts/power-user.js` 的导出面（P0 核心对象 + 常用枚举）。
- * `power_user` 为宽容对象：扩展读未知字段得到 undefined（与 ST 行为一致）。
+ * `power_user` 为宽容对象，并与宿主 `extension_settings` (`state.thirdPartySettings`) 双向原位同步持久化：
+ * - `st-memory-enhancement` 等插件会将配置写入 `power_user.muyoo_dataTable`、`power_user.IMPORTANT_USER_PRIVACY_DATA`、
+ *   `power_user.table_database_templates`、`power_user.table_selected_sheets` 并调用 `saveSettings()`；
+ * - 本模块在初始化与 `rikka-st-refresh` 时原位合并（in-place `Object.assign`）上述字段，确保引用恒定且跨页面/重启 100% 持久生效。
  */
 
 const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
@@ -20,7 +23,7 @@ const persona_description_positions_enum = {
 
 export const persona_description_positions = persona_description_positions_enum;
 
-/** Power User 设置（P0 只读默认值；后续可接宿主设置）。 */
+/** Power User 设置（与宿主 extensionSettings 双向原位镜像）。 */
 export const power_user = {
     persona_description: '',
     persona_description_position: persona_description_positions_enum.IN_PROMPT,
@@ -60,12 +63,78 @@ export const power_user = {
     auto_connect: true,
 };
 
+const PERSISTED_POWER_USER_KEYS = [
+    'muyoo_dataTable',
+    'IMPORTANT_USER_PRIVACY_DATA',
+    'table_database_templates',
+    'table_selected_sheets',
+    'message_template',
+];
+
+export function syncPowerUserFromExtensionSettings() {
+    try {
+        const ctx = st();
+        const ext = (ctx && ctx.extensionSettings) || null;
+        if (!ext || typeof ext !== 'object') return;
+        const puBucket = (ext.__power_user__ && typeof ext.__power_user__ === 'object') ? ext.__power_user__ : {};
+        for (const k of Object.keys(puBucket)) {
+            if (puBucket[k] !== undefined && !PERSISTED_POWER_USER_KEYS.includes(k)) {
+                power_user[k] = puBucket[k];
+            }
+        }
+        // 兼容直接存储在 st_memory_enhancement 下的配置
+        if (ext.st_memory_enhancement && typeof ext.st_memory_enhancement === 'object') {
+            if (!ext.muyoo_dataTable || typeof ext.muyoo_dataTable !== 'object') {
+                ext.muyoo_dataTable = {};
+            }
+            Object.assign(ext.muyoo_dataTable, ext.st_memory_enhancement);
+        }
+        for (const k of PERSISTED_POWER_USER_KEYS) {
+            const incoming = ext[k] !== undefined ? ext[k] : puBucket[k];
+            if (incoming !== undefined) {
+                if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+                    if (!power_user[k] || typeof power_user[k] !== 'object' || Array.isArray(power_user[k])) {
+                        power_user[k] = {};
+                    }
+                    Object.assign(power_user[k], incoming);
+                    ext[k] = power_user[k];
+                } else {
+                    power_user[k] = incoming;
+                    ext[k] = incoming;
+                }
+            } else if (power_user[k] !== undefined) {
+                ext[k] = power_user[k];
+            }
+        }
+    } catch (_e) { /* noop */ }
+}
+
+export function syncPowerUserToExtensionSettings() {
+    try {
+        const ctx = st();
+        const ext = (ctx && ctx.extensionSettings) || null;
+        if (!ext || typeof ext !== 'object') return;
+        if (!ext.__power_user__ || typeof ext.__power_user__ !== 'object') {
+            ext.__power_user__ = {};
+        }
+        for (const k of PERSISTED_POWER_USER_KEYS) {
+            if (power_user[k] !== undefined) {
+                ext[k] = power_user[k];
+                ext.__power_user__[k] = power_user[k];
+            }
+        }
+    } catch (_e) { /* noop */ }
+}
+
+try {
+    window.__rikkaSyncPowerUserFromExt = syncPowerUserFromExtensionSettings;
+    window.__rikkaSyncPowerUserToExt = syncPowerUserToExtensionSettings;
+    syncPowerUserFromExtensionSettings();
+    window.addEventListener('rikka-st-refresh', syncPowerUserFromExtensionSettings);
+} catch (_e) { /* noop */ }
+
 export const flushEphemeralStoppingStrings = () => {};
 
-// ── [batch16] 三个缺失的导出 ──────────────────────────────
-// 依据：refdeps\st-memory-enhancement\services\appFuncManager.js:6
-//   `import { power_user, applyPowerUserSettings, getContextSettings, loadPowerUserSettings } from "/scripts/power-user.js";`
-// 真实 ST 语义见 refdeps\sillytavern\scripts_power-user.js（:1554 / :1475 / :1925）。
 try { if (!power_user.context) power_user.context = {}; } catch (err) { /* noop */ }
 
 /** ST power-user.js:1554：把 settings.power_user 合并进 power_user。 */
@@ -75,13 +144,14 @@ export async function loadPowerUserSettings(settings = {}, data = null) {
         if (fromSettings && typeof fromSettings === 'object') Object.assign(power_user, fromSettings);
         const fromData = data && data.power_user;
         if (fromData && typeof fromData === 'object') Object.assign(power_user, fromData);
+        syncPowerUserFromExtensionSettings();
     } catch (err) {
         console.warn('[power-user.js] loadPowerUserSettings failed:', err);
     }
     return power_user;
 }
 
-/** ST power-user.js:1475：应用外观设置。宿主没有 ST 核心 DOM，这里只做能做的两件事（不抛错）。 */
+/** ST power-user.js:1475：应用外观设置。 */
 export function applyPowerUserSettings() {
     try {
         if (power_user.reduce_motion) document.body.classList.add('reduce-motion');
@@ -98,7 +168,7 @@ export function getContextSettings() {
         const ctx = power_user.context || {};
         for (const key of Object.keys(ctx)) compiled[key] = ctx[key];
         for (const key of ['max_context', 'amount_gen', 'max_context_unlocked', 'instruct', 'context', 'sysprompt', 'reasoning']) {
-            if (power_user[key] !== undefined && compiled[key] === undefined) compiled[key] = power_user[key];
+            if (power_user[key] !== undefined) compiled[key] = power_user[key];
         }
     } catch (err) {
         console.warn('[power-user.js] getContextSettings failed:', err);
@@ -106,17 +176,11 @@ export function getContextSettings() {
     return compiled;
 }
 
-// ── [v213] getCustomStoppingStrings（ST power-user.js:3078）──────────
-// JSR createGenerationParametersCompat.ts:72 动态 import 具名读取；
-// 旧版无此导出 → undefined（动态 import 解构缺名不抛 SyntaxError，但调用时 TypeError）。
-export function getCustomStoppingStrings(limit) {
+// Re-export getTokenizerModel from st() context if available (ST 1.19.0)
+export function getTokenizerModel() {
     try {
-        const raw = power_user.custom_stopping_strings;
-        if (!raw) return [];
-        let arr = [];
-        try { arr = JSON.parse(raw); } catch (_e) { arr = String(raw).split(String.fromCharCode(10)).map((s) => s.trim()).filter(Boolean); }
-        if (!Array.isArray(arr)) return [];
-        const out = arr.filter((s) => typeof s === "string" && s.length > 0);
-        return typeof limit === "number" && limit > 0 ? out.slice(0, limit) : out;
-    } catch (_e) { return []; }
+        const c = st();
+        if (c && typeof c.getTokenizerModel === 'function') return c.getTokenizerModel();
+    } catch (_e) { /* noop */ }
+    return '';
 }

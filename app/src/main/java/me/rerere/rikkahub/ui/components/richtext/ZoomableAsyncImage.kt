@@ -17,6 +17,7 @@ import coil3.request.allowHardware
 import coil3.request.crossfade
 import coil3.request.placeholder
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.ui.components.ui.ImagePreviewDialog
 import me.rerere.rikkahub.ui.components.ui.LocalExportContext
 import me.rerere.rikkahub.ui.modifier.shimmer
@@ -33,20 +34,15 @@ fun ZoomableAsyncImage(
 ) {
     var showImageViewer by remember { mutableStateOf(false) }
     val context = LocalContext.current
-    val placeholder = if(LocalDarkMode.current) R.drawable.placeholder_dark else R.drawable.placeholder
+    val placeholder = if (LocalDarkMode.current) R.drawable.placeholder_dark else R.drawable.placeholder
     val export = LocalExportContext.current
     val resolvedData: Any? = remember(model, context) {
         val m = model?.trim().orEmpty()
-        val localPrefix = listOf(
-            "https://appassets.androidplatform.net/",
-            "https://st.rikka.local/",
-        ).firstOrNull { m.startsWith(it, ignoreCase = true) }
-        if (localPrefix != null) {
-            val rel = m.substring(localPrefix.length).substringBefore('?').substringBefore('#')
-            if (rel.startsWith("charx_assets/") || rel.startsWith("sprites/")) {
-                java.io.File(context.filesDir, rel).takeIf { it.isFile } ?: model
-            } else model
-        } else model
+        if (m.isEmpty()) {
+            model
+        } else {
+            TavernRuntimeManager.resolveLocalAssetForCoil(context, m) ?: model
+        }
     }
     val coilModel = ImageRequest.Builder(context)
         .data(resolvedData)
@@ -77,7 +73,8 @@ fun ZoomableAsyncImage(
         },
     )
     if (showImageViewer) {
-        ImagePreviewDialog(images = listOf(model ?: "")) {
+        val previewTarget = (resolvedData as? java.io.File)?.absolutePath ?: (model ?: "")
+        ImagePreviewDialog(images = listOf(previewTarget)) {
             showImageViewer = false
         }
     }

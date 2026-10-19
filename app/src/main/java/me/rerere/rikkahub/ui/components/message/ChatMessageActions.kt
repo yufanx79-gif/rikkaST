@@ -64,10 +64,12 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.checkpointLink
 import me.rerere.rikkahub.data.model.isHidden
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.context.LocalTTSState
+import me.rerere.rikkahub.ui.hooks.stripStIphonieProtocolTagsForNativeTts
 import me.rerere.rikkahub.utils.copyMessageToClipboard
 import me.rerere.rikkahub.utils.extractQuotedContentAsText
 import me.rerere.rikkahub.utils.navigateToChatPage
@@ -84,6 +86,8 @@ fun ColumnScope.ChatMessageActionButtons(
     onUpdate: (MessageNode) -> Unit,
     /** 是否为会话最后一条消息（决定右箭头越界是否可生成新 swipe 变体）。 */
     isLastMessage: Boolean = false,
+    /** ST 聊天楼层索引（与 conversation.messageNodes 的索引一致）。 */
+    messageIndex: Int = 0,
     onRegenerate: () -> Unit,
     onImpersonate: (() -> Unit)? = null,
     onOpenActionSheet: () -> Unit,
@@ -140,6 +144,7 @@ fun ColumnScope.ChatMessageActionButtons(
         )
 
         if (message.role == MessageRole.ASSISTANT) {
+            // 通道 A：上游系统/供应商原生 TTS 朗读（带自动剥离 <tts> 标签与停止小手机语音的仲裁）
             val tts = LocalTTSState.current
             val isSpeaking by tts.isSpeaking.collectAsState()
             val isAvailable by tts.isAvailable.collectAsState()
@@ -154,7 +159,7 @@ fun ColumnScope.ChatMessageActionButtons(
                         indication = LocalIndication.current,
                         onClick = {
                             if (!isSpeaking) {
-                                val text = message.toText()
+                                val text = stripStIphonieProtocolTagsForNativeTts(message.toText())
                                 var textToSpeak = text
                                 if (settings.displaySetting.ttsOnlyReadQuoted) {
                                     textToSpeak = textToSpeak.extractQuotedContentAsText() ?: textToSpeak
@@ -172,6 +177,31 @@ fun ColumnScope.ChatMessageActionButtons(
                     .size(16.dp),
                 tint = if (isAvailable) actionIconColor else actionIconColor.copy(alpha = 0.38f)
             )
+
+            // 通道 B：ST-iPhonie 小手机角色语音专属入口（与上游原生 TTS 通道严格区分）
+            val iphonieState by TavernRuntimeManager.stIphonieTtsStateFlow.collectAsState()
+            val floatingSummary by TavernRuntimeManager.floatingWindowsFlow.collectAsState()
+            val hasIphonieExt = floatingSummary.hasIphonie ||
+                settings.tavernExtensionSettings.contains("stTtsDialogue", ignoreCase = true)
+            val msgRawText = remember(message) { message.toText() }
+            if (hasIphonieExt || msgRawText.contains("<tts>", ignoreCase = true)) {
+                Text(
+                    text = if (iphonieState.playing) "⏹📱" else "📱",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (iphonieState.playing) MaterialTheme.colorScheme.primary else actionIconColor,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable {
+                            if (iphonieState.playing) {
+                                TavernRuntimeManager.stopStIphonieTts("message_action_stop")
+                            } else {
+                                tts.stop()
+                                TavernRuntimeManager.playFloorWithStIphonie(messageIndex)
+                            }
+                        }
+                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                )
+            }
 
             // 冒充按钮
             if (onImpersonate != null) {
@@ -393,30 +423,36 @@ fun ChatMessageActionsSheet(
                 }
             }
 
-            // Edit
-            Card(
-                onClick = {
-                    onDismissRequest()
-                    onEdit()
-                },
-                shape = MaterialTheme.shapes.medium
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    modifier = Modifier
-                        .padding(16.dp)
-                        .fillMaxWidth()
+            // Edit（方案三开启时禁止修改助手的消息）
+            val currentSettings = LocalSettings.current
+            val isAssistantEditLocked = message.role == MessageRole.ASSISTANT &&
+                currentSettings.displaySetting.enableWebViewPerfReduction &&
+                currentSettings.displaySetting.webViewPerfMode == me.rerere.rikkahub.data.datastore.WebViewPerfMode.HISTORICAL_SNAPSHOT_IMAGE
+            if (!isAssistantEditLocked) {
+                Card(
+                    onClick = {
+                        onDismissRequest()
+                        onEdit()
+                    },
+                    shape = MaterialTheme.shapes.medium
                 ) {
-                    Icon(
-                        imageVector = HugeIcons.Edit01,
-                        contentDescription = null,
-                        modifier = Modifier.padding(4.dp)
-                    )
-                    Text(
-                        text = stringResource(R.string.edit),
-                        style = MaterialTheme.typography.titleMedium,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier
+                            .padding(16.dp)
+                            .fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = HugeIcons.Edit01,
+                            contentDescription = null,
+                            modifier = Modifier.padding(4.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.edit),
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                    }
                 }
             }
 

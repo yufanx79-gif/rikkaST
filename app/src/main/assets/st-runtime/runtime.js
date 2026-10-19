@@ -32,6 +32,9 @@ import { normalizeStCharacter } from './character-shape.js';
 import { power_user as stCompatPowerUser } from './st-compat/power-user.js';
 // [v236 R1] ST `#chat` 楼层 DOM 桩（updateMessageBlock / addCopyToCodeBlocks / appendMediaToMessage）
 import * as chatDom from './st-compat/chat-dom.js';
+import { MessageFormatter, formatting_stage } from './st-compat/message-formatter.js';
+import { accountStorage } from './st-compat/util/AccountStorage.js';
+import { ChatCompletionService } from './st-compat/custom-request.js';
 
 // ---------------------------------------------------------------- ESM 库（zod / yaml）
 import * as zodModule from './vendor/lib/zod.esm.js';
@@ -56,8 +59,8 @@ const LOG_PREFIX = '[RikkaTavern]';
         const STATUS_PATH = '/api/backends/chat-completions/status';
         const GENERATE_PATH = '/api/backends/chat-completions/generate';
         const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+        const pendingNode = {};
 
-        // ---- 请求体读取（fetch(url, {body}) / fetch(new Request(url, {body})) 两种写法）----
         const readBody = async (url, options) => {
             try {
                 if (options && typeof options.body === 'string') return options.body;
@@ -76,43 +79,105 @@ const LOG_PREFIX = '[RikkaTavern]';
         };
         const pathOf = (u) => {
             try {
-                const i = String(u).indexOf('/api/');
-                return i >= 0 ? String(u).slice(i) : String(u);
-            } catch (_e) { return ''; }
+                const parsed = new URL(String(u), window.location ? window.location.href : 'https://st.rikka.local/');
+                return parsed.pathname;
+            } catch (_e) {
+                const s = String(u || '');
+                const i = s.indexOf('/api/');
+                if (i >= 0) return s.slice(i);
+                const j = s.indexOf('/user/');
+                if (j >= 0) return s.slice(j);
+                return s;
+            }
         };
 
         window.__rikkaApiChunk = function (reqId, payload) {
             try {
                 const q = window.__rikkaApiPending && window.__rikkaApiPending[reqId];
                 if (q) q.push(payload);
+                const s = window.__rikkaApiStreams && window.__rikkaApiStreams[reqId];
+                if (s && typeof s.wake === 'function') s.wake();
             } catch (_e) { /* noop */ }
         };
-        window.__rikkaApiFinish = function (reqId) {
+        window.__rikkaApiFinish = function (reqId, status) {
             try {
                 const s = window.__rikkaApiStreams && window.__rikkaApiStreams[reqId];
                 if (!s) return;
+                s.finished = true;
+                s.status = status || 'DONE';
                 delete window.__rikkaApiStreams[reqId];
                 if (typeof s.close === 'function') s.close();
             } catch (_e) { /* noop */ }
         };
+        window.__rikkaNodeHttpCallback = function (reqId, respJson) {
+            const p = pendingNode[reqId];
+            if (!p) return;
+            delete pendingNode[reqId];
+            try {
+                const parsed = typeof respJson === 'string' ? JSON.parse(respJson) : respJson;
+                p.resolve(parsed);
+            } catch (e) {
+                p.reject(e);
+            }
+        };
 
-        const jsonResponse = (payload, status) => new Response(payload, {
-            status: status || 200,
-            headers: { 'Content-Type': 'application/json' },
-        });
+        const jsonResponse = (payload, status) => new Response(
+            typeof payload === 'string' ? payload : JSON.stringify(payload),
+            {
+                status: status || 200,
+                headers: { 'Content-Type': 'application/json' },
+            }
+        );
 
         const handleGenerate = async (url, options) => {
             const body = await readBody(url, options);
+            let parsedReq = {};
+            try { parsedReq = JSON.parse(body || '{}'); } catch (_e) { parsedReq = {}; }
+            const isStreaming = Boolean(parsedReq && parsedReq.stream === true);
+
             const reqId = 'a1-' + Date.now() + '-' + Math.random().toString(36).slice(2);
             window.__rikkaApiPending = window.__rikkaApiPending || {};
             window.__rikkaApiStreams = window.__rikkaApiStreams || {};
             window.__rikkaApiPending[reqId] = [];
             const queue = window.__rikkaApiPending[reqId];
+
+            if (!isStreaming) {
+                return await new Promise((resolve) => {
+                    window.__rikkaApiStreams[reqId] = {
+                        finished: false,
+                        wake: function () {},
+                        close: function () {
+                            const chunks = (window.__rikkaApiPending[reqId] || []).slice();
+                            delete window.__rikkaApiPending[reqId];
+                            const fullBody = chunks.join('') || JSON.stringify({
+                                id: 'chatcmpl-' + reqId,
+                                object: 'chat.completion',
+                                created: Math.floor(Date.now() / 1000),
+                                model: parsedReq.model || '',
+                                choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
+                            });
+                            resolve(jsonResponse(fullBody, 200));
+                        },
+                    };
+                    try {
+                        callBridge('chatCompletionStart', reqId, body);
+                    } catch (err) {
+                        delete window.__rikkaApiPending[reqId];
+                        delete window.__rikkaApiStreams[reqId];
+                        resolve(jsonResponse({ error: { message: String(err && err.message || err) } }, 500));
+                    }
+                });
+            }
+
             let wake = null;
             const pump = () => { if (wake) { const w = wake; wake = null; w(); } };
-            window.__rikkaApiStreams[reqId] = {
-                close: function () { delete window.__rikkaApiPending[reqId]; pump(); },
+            const streamState = {
+                finished: false,
+                status: 'DONE',
+                wake: pump,
+                close: function () { pump(); },
             };
+            window.__rikkaApiStreams[reqId] = streamState;
             const encoder = new TextEncoder();
             const stream = new ReadableStream({
                 start: function (controller) {
@@ -120,23 +185,35 @@ const LOG_PREFIX = '[RikkaTavern]';
                         try {
                             callBridge('chatCompletionStart', reqId, body);
                             while (true) {
-                                if (!queue.length) {
-                                    if (!window.__rikkaApiPending[reqId]) { controller.close(); return; }
-                                    await new Promise(function (res) { wake = res; });
-                                    continue;
+                                while (queue.length > 0) {
+                                    const payload = queue.shift();
+                                    controller.enqueue(encoder.encode('data: ' + payload + '\n\n'));
                                 }
-                                const payload = queue.shift();
-                                controller.enqueue(encoder.encode('data: ' + payload + '\\n\\n'));
+                                if (streamState.finished) {
+                                    delete window.__rikkaApiPending[reqId];
+                                    if (streamState.status === 'DONE') {
+                                        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                                    }
+                                    controller.close();
+                                    return;
+                                }
+                                await new Promise(function (res) { wake = res; });
                             }
                         } catch (err) {
+                            delete window.__rikkaApiPending[reqId];
                             try { controller.error(err); } catch (_e) { /* noop */ }
                         }
                     })();
                 },
+                cancel: function () {
+                    delete window.__rikkaApiPending[reqId];
+                    delete window.__rikkaApiStreams[reqId];
+                    try { callBridge('chatCompletionCancel', reqId); } catch (_e) { /* noop */ }
+                },
             });
             return new Response(stream, {
                 status: 200,
-                headers: { 'Content-Type': 'text/event-stream' },
+                headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
             });
         };
 
@@ -150,11 +227,229 @@ const LOG_PREFIX = '[RikkaTavern]';
             return jsonResponse('{"object":"list","data":[],"model":""}', 200);
         };
 
+        const handleFilesUpload = async (url, options) => {
+            try {
+                const bodyObj = JSON.parse((await readBody(url, options)) || '{}');
+                const name = String(bodyObj.name || '');
+                const dataB64 = String(bodyObj.data || '');
+                const savedPath = callBridge('writeUserFileBase64', name, dataB64);
+                const finalPath = savedPath || ('/user/files/' + name);
+                const cleanSavedName = String(finalPath).replace(/^\/?user\/files\//, '');
+                window.__rikkaMemFiles = window.__rikkaMemFiles || {};
+                window.__rikkaMemFiles[name] = dataB64;
+                window.__rikkaMemFiles[cleanSavedName] = dataB64;
+                return jsonResponse({ path: finalPath, name: cleanSavedName }, 200);
+            } catch (e) {
+                return jsonResponse({ error: { message: String(e && e.message || e) } }, 400);
+            }
+        };
+
+        const handleFilesDelete = async (url, options) => {
+            try {
+                const bodyObj = JSON.parse((await readBody(url, options)) || '{}');
+                const rawPath = String(bodyObj.path || bodyObj.name || '');
+                const cleanName = rawPath.replace(/^\/?user\/files\//, '');
+                callBridge('deleteUserFile', cleanName);
+                if (window.__rikkaMemFiles) delete window.__rikkaMemFiles[cleanName];
+                return jsonResponse({ ok: true }, 200);
+            } catch (e) {
+                return jsonResponse({ error: { message: String(e && e.message || e) } }, 400);
+            }
+        };
+
+        const handleUserFileGet = async (p) => {
+            const cleanName = decodeURIComponent(p.slice('/user/files/'.length));
+            try {
+                const rawJson = callBridge('readUserFileJson', cleanName);
+                if (rawJson) {
+                    const info = JSON.parse(rawJson);
+                    if (info && info.exists && typeof info.base64 === 'string') {
+                        const bin = atob(info.base64);
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                        return new Response(bytes, {
+                            status: 200,
+                            headers: { 'Content-Type': info.mime || 'application/octet-stream', 'Cache-Control': 'no-store' },
+                        });
+                    }
+                    return new Response('Not Found', { status: 404 });
+                }
+            } catch (_e) { /* fallback to mem */ }
+            if (window.__rikkaMemFiles && Object.prototype.hasOwnProperty.call(window.__rikkaMemFiles, cleanName)) {
+                const bin = atob(window.__rikkaMemFiles[cleanName]);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                return new Response(bytes, { status: 200, headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' } });
+            }
+            return null;
+        };
+
+        const handleImagesUpload = async (url, options) => {
+            try {
+                const bodyObj = JSON.parse((await readBody(url, options)) || '{}');
+                const format = String(bodyObj.format || 'png').replace(/[^a-zA-Z0-9]/g, '') || 'png';
+                const charFolder = String(bodyObj.ch_name || 'default').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
+                const filename = String(bodyObj.filename || (Date.now() + '.' + format));
+                const dataB64 = String(bodyObj.image || bodyObj.data || '').replace(/^data:[^;]+;base64,/, '');
+                const savedPath = callBridge('writeUserImageBase64', charFolder, filename, dataB64);
+                window.__rikkaMemImages = window.__rikkaMemImages || {};
+                const relPath = charFolder + '/' + filename;
+                window.__rikkaMemImages[relPath] = dataB64;
+                return jsonResponse({ path: savedPath || ('/user/images/' + relPath) }, 200);
+            } catch (e) {
+                return jsonResponse({ error: { message: String(e && e.message || e) } }, 400);
+            }
+        };
+
+        const handleImagesList = async (url, options) => {
+            try {
+                const bodyText = await readBody(url, options);
+                const bodyObj = bodyText ? JSON.parse(bodyText) : {};
+                const folder = String(bodyObj.folder || bodyObj.ch_name || 'default');
+                const listJson = callBridge('listUserImagesJson', folder);
+                if (typeof listJson === 'string' && listJson.length > 0) {
+                    return jsonResponse(listJson, 200);
+                }
+                return jsonResponse('[]', 200);
+            } catch (_e) {
+                return jsonResponse('[]', 200);
+            }
+        };
+
+        const handleImagesDelete = async (url, options) => {
+            try {
+                const bodyObj = JSON.parse((await readBody(url, options)) || '{}');
+                const relPath = String(bodyObj.path || '').replace(/^\/?user\/images\//, '');
+                callBridge('deleteUserImage', relPath);
+                if (window.__rikkaMemImages) delete window.__rikkaMemImages[relPath];
+                return jsonResponse({ ok: true }, 200);
+            } catch (e) {
+                return jsonResponse({ error: { message: String(e && e.message || e) } }, 400);
+            }
+        };
+
+        const handleNodePluginRequest = async (url, options, p) => {
+            if (!bridge || typeof bridge.nodePluginHttpRequestAsync !== 'function') {
+                return jsonResponse({ ok: false, error: 'Node.js runtime bridge unavailable' }, 503);
+            }
+            const method = String((options && options.method) || (url && url.method) || 'GET').toUpperCase();
+            const bodyStr = (method === 'GET' || method === 'HEAD') ? '' : await readBody(url, options);
+            let headersObj = {};
+            const rawHeaders = (options && options.headers) || (url && url.headers);
+            if (rawHeaders) {
+                if (typeof rawHeaders.forEach === 'function') {
+                    rawHeaders.forEach((v, k) => { headersObj[k] = v; });
+                } else if (typeof rawHeaders === 'object') {
+                    headersObj = Object.assign({}, rawHeaders);
+                }
+            }
+            let search = '';
+            try {
+                search = new URL(urlOf(url), window.location ? window.location.href : 'https://st.rikka.local/').search || '';
+            } catch (_e) { search = ''; }
+            const reqId = 'node-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
+            return await new Promise((resolve, reject) => {
+                pendingNode[reqId] = {
+                    resolve: (resp) => {
+                        const status = Number(resp && resp.status) || 502;
+                        const respHeaders = Object.assign({ 'Content-Type': 'application/json' }, (resp && resp.headers) || {});
+                        const bodyPayload = resp && typeof resp.body === 'string' ? resp.body : JSON.stringify((resp && resp.body) || {});
+                        resolve(new Response(bodyPayload, { status, headers: respHeaders }));
+                    },
+                    reject,
+                };
+                if (options && options.signal) {
+                    options.signal.addEventListener('abort', () => {
+                        delete pendingNode[reqId];
+                        try { callBridge('nodePluginHttpAbort', reqId); } catch (_e) { /* noop */ }
+                        reject(new DOMException('Aborted', 'AbortError'));
+                    });
+                }
+                try {
+                    callBridge('nodePluginHttpRequestAsync', reqId, method, p + search, JSON.stringify(headersObj), bodyStr);
+                } catch (e) {
+                    delete pendingNode[reqId];
+                    resolve(jsonResponse({ ok: false, error: String(e && e.message || e) }, 503));
+                }
+            });
+        };
+
+        // [10-19-21] 补齐 jQuery UI easing 函数（st-memory-enhancement appHeaderTableBaseDrawer.js 强依赖 easeInOutCubic）
+        try {
+            const jq = window.jQuery || window.$;
+            if (jq && jq.easing) {
+                if (typeof jq.easing.easeInOutCubic !== 'function') {
+                    jq.easing.easeInOutCubic = function (x) {
+                        return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+                    };
+                }
+                if (typeof jq.easing.easeOutCubic !== 'function') {
+                    jq.easing.easeOutCubic = function (x) { return 1 - Math.pow(1 - x, 3); };
+                }
+                if (typeof jq.easing.easeInCubic !== 'function') {
+                    jq.easing.easeInCubic = function (x) { return x * x * x; };
+                }
+                if (typeof jq.easing.easeInOutQuad !== 'function') {
+                    jq.easing.easeInOutQuad = function (x) {
+                        return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
+                    };
+                }
+            }
+        } catch (_eJq) { /* noop */ }
+
+        // [10-19-21] 追踪扩展设置页打开的 IndexedDB 连接，退出设置页时主动 close()，杜绝第二次进入 ST-iPhonie 时因未关闭连接锁死白屏
+        try {
+            if (window.indexedDB && typeof window.indexedDB.open === 'function' && !window.indexedDB.__rikkaWrapped) {
+                const origIdbOpen = window.indexedDB.open.bind(window.indexedDB);
+                const openedDbs = (window.__rikkaOpenedIdbDatabases = window.__rikkaOpenedIdbDatabases || new Set());
+                window.indexedDB.open = function (name, version) {
+                    const req = version !== undefined ? origIdbOpen(name, version) : origIdbOpen(name);
+                    try {
+                        req.addEventListener('success', function () {
+                            const db = req.result;
+                            if (db) {
+                                openedDbs.add(db);
+                                db.addEventListener('versionchange', function () {
+                                    try { db.close(); } catch (_e) { /* noop */ }
+                                    openedDbs.delete(db);
+                                });
+                                db.addEventListener('close', function () {
+                                    openedDbs.delete(db);
+                                });
+                            }
+                        });
+                    } catch (_eIdb) { /* noop */ }
+                    return req;
+                };
+                window.indexedDB.__rikkaWrapped = true;
+            }
+        } catch (_eIdbWrap) { /* noop */ }
+
         window.fetch = function (url, options) {
             try {
-                const p = pathOf(urlOf(url));
+                const rawUrl = urlOf(url);
+                if (rawUrl && /api\.muyoo\.com\.cn/i.test(rawUrl)) {
+                    return Promise.resolve(jsonResponse({ success: true, isLatest: true }, 200));
+                }
+                if (rawUrl && /fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|kit\.fontawesome\.com/i.test(rawUrl)) {
+                    return Promise.resolve(new Response('/* offline font shim */', {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/css; charset=utf-8' },
+                    }));
+                }
+                const p = pathOf(rawUrl);
+                const method = String((options && options.method) || (url && url.method) || 'GET').toUpperCase();
                 if (p.indexOf(STATUS_PATH) === 0) return handleStatus();
                 if (p.indexOf(GENERATE_PATH) === 0) return handleGenerate(url, options);
+                if (p === '/api/files/upload' && method === 'POST') return handleFilesUpload(url, options);
+                if (p === '/api/files/delete' && method === 'POST') return handleFilesDelete(url, options);
+                if (p.indexOf('/user/files/') === 0 && method === 'GET') {
+                    return handleUserFileGet(p).then((res) => res || (originalFetch ? originalFetch(url, options) : new Response('Not Found', { status: 404 })));
+                }
+                if (p === '/api/images/upload' && method === 'POST') return handleImagesUpload(url, options);
+                if (p === '/api/images/list') return handleImagesList(url, options);
+                if (p === '/api/images/delete' && method === 'POST') return handleImagesDelete(url, options);
+                if (p.indexOf('/api/plugins/') === 0 || p.indexOf('/api/host/') === 0 || p === '/health') return handleNodePluginRequest(url, options, p);
             } catch (e) {
                 callBridge('log', 'warn', '[a1] fetch patch error: ' + String(e && e.message || e));
             }
@@ -386,7 +681,26 @@ function pullThirdPartySettings(force) {
             allowWIScan: false,
         };
     }
-    state.thirdPartySettings = obj;
+    if (!state.thirdPartySettings || typeof state.thirdPartySettings !== 'object' || Array.isArray(state.thirdPartySettings)) {
+        state.thirdPartySettings = obj;
+    } else {
+        (function deepMergeInPlace(target, source) {
+            for (const k of Object.keys(source)) {
+                const sv = source[k];
+                const tv = target[k];
+                if (sv && typeof sv === 'object' && !Array.isArray(sv) && tv && typeof tv === 'object' && !Array.isArray(tv)) {
+                    deepMergeInPlace(tv, sv);
+                } else {
+                    target[k] = sv;
+                }
+            }
+        })(state.thirdPartySettings, obj);
+    }
+    try {
+        if (typeof window.__rikkaSyncPowerUserFromExt === 'function') {
+            window.__rikkaSyncPowerUserFromExt();
+        }
+    } catch (_ePu) { /* noop */ }
 }
 
 // 角色信息（ST `characters[i]` / v1CharData 语义）
@@ -508,6 +822,9 @@ function pushGlobalVars() {
 
 function pushThirdPartySettingsNow() {
     try {
+        if (typeof window.__rikkaSyncPowerUserToExt === 'function') {
+            window.__rikkaSyncPowerUserToExt();
+        }
         callBridge('saveThirdPartySettings', JSON.stringify(state.thirdPartySettings || {}));
         thirdPartySettingsDirty = false;
     } catch (e) { safeWarn('pushThirdPartySettings failed', e); }
@@ -560,8 +877,14 @@ function pushChatContent() {
 function saveMetadataDebounced() { clearTimeout(tMeta); tMeta = setTimeout(pushChatVars, 800); }
 function saveSettingsDebounced() {
     thirdPartySettingsDirty = true;
+    try {
+        if (typeof window.__rikkaSyncPowerUserToExt === 'function') {
+            window.__rikkaSyncPowerUserToExt();
+        }
+    } catch (_e) { /* noop */ }
     clearTimeout(tGlobal);
-    tGlobal = setTimeout(() => { pushGlobalVars(); pushThirdPartySettingsNow(); }, 800);
+    const delayMs = window.__RIKKA_EXT_SETTINGS_MODE__ ? 40 : 400;
+    tGlobal = setTimeout(() => { pushGlobalVars(); pushThirdPartySettingsNow(); }, delayMs);
 }
 function flushAll() {
     clearTimeout(tChat); clearTimeout(tMeta); clearTimeout(tGlobal);
@@ -866,10 +1189,17 @@ const stSwipeFacade = {
 };
 
 /** ST ctx.messageFormatter（st-context.js:275）：最小实现（Markdown 渲染由宿主/面板负责）。 */
-const stMessageFormatterFacade = {
-    format: (text) => String(text == null ? '' : text),
-    sanitize: (text) => String(text == null ? '' : text),
-    generate: (text) => String(text == null ? '' : text),
+const stMessageFormatterFacade = MessageFormatter;
+window.__rikkaMessageFormatter = MessageFormatter;
+
+window.__rikkaRunMessageFormatterStage = function (seq, stage, text, contextJson) {
+    let ctx = {};
+    try { ctx = contextJson ? JSON.parse(contextJson) : {}; } catch (_e) { ctx = {}; }
+    const out = MessageFormatter.runStage(stage, String(text == null ? '' : text), ctx);
+    try {
+        callBridge('onMessageFormatterStageResult', seq, String(out));
+    } catch (_e) { /* noop */ }
+    return out;
 };
 
 const ST_SYMBOL_IGNORE = Symbol('ST.ignore');
@@ -909,21 +1239,37 @@ try { mathRender.setKatex(window.katex); } catch (_e) { /* noop */ }
  * isReasoning=true 时包 reasoning 折叠块（对齐 ST 的 reasoning 视觉语义）。
  */
 function stMessageFormatting(text, ch_name, isSystem, isUser, messageId, sanitizerOverrides, isReasoning) {
-    const raw = String(text == null ? "" : text);
+    const baseCtx = {
+        characterName: String(ch_name ?? state.name2 ?? ''),
+        ch_name: String(ch_name ?? state.name2 ?? ''),
+        isSystem: Boolean(isSystem),
+        isUser: Boolean(isUser),
+        messageId: typeof messageId === 'number' ? messageId : -1,
+        isReasoning: Boolean(isReasoning),
+    };
+    let raw = String(text == null ? "" : text);
+    try {
+        raw = MessageFormatter.runStage(formatting_stage.BEFORE_REGEX, raw, baseCtx);
+    } catch (_e) { /* noop */ }
+    try {
+        raw = MessageFormatter.runStage(formatting_stage.AFTER_REGEX, raw, baseCtx);
+    } catch (_e) { /* noop */ }
     let html = raw;
     try {
-        // [v235 R2] 数学离线渲染：先占位（保护围栏/行内代码里的分隔符），Markdown 之后再回填 KaTeX HTML
         const pre = mathRender.stashMath(raw);
         let body = pre.text;
         if (typeof window.showdown !== "undefined" && window.showdown && typeof window.showdown.Converter === "function") {
             if (!stMessageFormatting._converter) {
-                try { stMessageFormatting._converter = new window.showdown.Converter({ simpleLineBreaks: false, ghCodeBlocks: true }); }
+                try { stMessageFormatting._converter = new window.showdown.Converter({ simpleLineBreaks: false, ghCodeBlocks: true, tables: true, strikethrough: true }); }
                 catch (_e) { stMessageFormatting._converter = new window.showdown.Converter(); }
             }
             body = stMessageFormatting._converter.makeHtml(body);
         }
         html = pre.restore(body);
     } catch (_e) { html = raw; }
+    try {
+        html = MessageFormatter.runStage(formatting_stage.AFTER_MARKDOWN, html, baseCtx);
+    } catch (_e) { /* noop */ }
     if (isReasoning) {
         html = '<div class="reasoning_block"><details open><summary>思考过程</summary>' + html + '</details></div>';
     }
@@ -936,7 +1282,7 @@ function stMessageFormatting(text, ch_name, isSystem, isUser, messageId, sanitiz
 // 取值依据见 notes/recon-version-gate-20261008.md §4：1.13.5 = 打开 JSR 的 G1/G2/G3 三条闸门，
 // 同时**不开** 1.15.0（宿主 createGenerationParameters 还是桩、MacroRegistry 模块缺失）。
 // Kotlin 侧同一个值定义在 TavernRuntimeManager.TAVERN_ST_COMPAT_VERSION（回归测试会比对两处一致）。
-const TAVERN_ST_COMPAT_VERSION = '1.13.5';
+const TAVERN_ST_COMPAT_VERSION = '1.19.0';
 
 const stCtx = {
     get chat() {
@@ -1059,7 +1405,8 @@ const stCtx = {
     get tags() { return []; },
     get tagMap() { return {}; },
     get menuType() { return 0; },
-    get accountStorage() { return {}; },
+    get accountStorage() { return accountStorage; },
+    get ChatCompletionService() { return ChatCompletionService; },
     get streamingProcessor() { return {}; },
     get loader() { return {}; },
     get createCharacterData() { return {}; },
@@ -1143,9 +1490,24 @@ const stCtx = {
             if (n > 0) await shimChat.deleteChatMessages([n - 1]);
         } catch (_e) { /* noop */ }
     },
-    deleteMessage: async (index) => {
+    deleteMessage: async (index, _swipeId, _confirm, deleteToolCalls = false) => {
         try {
-            if (index !== undefined && index !== null) await shimChat.deleteChatMessages([Number(index)]);
+            if (index === undefined || index === null) return;
+            const idx = Number(index);
+            const ids = [idx];
+            if (deleteToolCalls && Array.isArray(state.chat)) {
+                let nextIdx = idx + 1;
+                while (nextIdx < state.chat.length) {
+                    const m = state.chat[nextIdx];
+                    if (m && (m.role === 'tool' || (m.extra && m.extra.tool_calls))) {
+                        ids.push(nextIdx);
+                        nextIdx++;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            await shimChat.deleteChatMessages(ids);
         } catch (_e) { /* noop */ }
     },
     saveReply: async () => {},
@@ -1187,8 +1549,33 @@ const stCtx = {
     scrollChatToBottom: () => {},
     scrollOnMediaLoad: () => {},
     getTextGenServer: () => '',
-    extractMessageFromData: (data) => (data && typeof data === 'object' ? String(data.mes || data.content || '') : ''),
-    getExtensionManifest: () => null,
+    extractMessageFromData: (data, activeApi) => stCompatScript.extractMessageFromData(data, activeApi),
+    getExtensionManifest: (extId) => {
+        try {
+            const key = String(extId || '').trim();
+            if (!key) return null;
+            const shortKey = key.replace(/^third-party\//, '');
+            const normAlias = (s) => String(s || '').trim().replace(/-(?:main|master|dev|release|v?\d+(?:\.\d+)*(?:-[a-z0-9._-]+)?)$/i, '').toLowerCase();
+            const wantedAlias = normAlias(shortKey);
+            const list = (window.__rikkaSt && Array.isArray(window.__rikkaSt.extensions)) ? window.__rikkaSt.extensions : [];
+            const hit = list.find((e) => e && (e.folder === key || e.folder === shortKey || e.displayName === key || (wantedAlias && normAlias(e.folder) === wantedAlias)));
+            if (!hit) return null;
+            return Object.assign({
+                display_name: hit.displayName || hit.folder,
+                loading_order: hit.loadingOrder ?? 100,
+                requires: Array.isArray(hit.requires) ? hit.requires : [],
+                optional: Array.isArray(hit.optional) ? hit.optional : [],
+                js: hit.js || '',
+                css: hit.css || '',
+                author: hit.author || '',
+                version: hit.version || '',
+                homePage: hit.homePage || '',
+                minimum_client_version: hit.minimumClientVersion || '',
+                generate_interceptor: hit.generateInterceptor || '',
+                hooks: hit.hooks || {},
+            }, hit.manifest || {});
+        } catch (_e) { return null; }
+    },
     openThirdPartyExtensionMenu: () => {},
     renderExtensionTemplate: (extensionName, templateId, templateData) => renderExtensionTemplateAsync(extensionName, templateId, templateData),
     renderExtensionTemplateAsync: (extensionName, templateId, templateData) => renderExtensionTemplateAsync(extensionName, templateId, templateData),
@@ -1204,7 +1591,7 @@ const stCtx = {
 // ---------------------------------------------------------------- SillyTavern 全局（顶层静态成员，MVU bundle 大量使用）
 const SillyTavern = {
     name: 'SillyTavern',
-    version: '1.18.0',
+    version: '1.19.0',
     libs: {},
     getContext: () => stCtx,
     callGenericPopup: callGenericPopupStub,
@@ -1518,6 +1905,32 @@ function richestTavernHelper() {
     return src;
 }
 
+/**
+ * [核心修复 · 核对项3] 当第三方扩展 JS-Slash-Runner (酒馆助手) 加载并执行 `globalThis.TavernHelper = fq()` 时，
+ * 会覆盖父窗口 `window.TavernHelper` 及裸全局上的聊天/世界书/变量/斜杠/提示词注入函数（改为走 ST 网页 DOM/HTTP）。
+ * 本函数将宿主 RikkaBridge 支撑的核心实现强制重绑回 `window.TavernHelper`、`window.TavernHelper._bind` 与 `window`，
+ * 同时完整保留 JSR 扩展挂载的额外 API（如 `audioPlay`、`builtin`、`_th_impl` 等），确保酒馆助手与宿主 100% 协同生效！
+ */
+function rebindHostTavernHelperShims() {
+    try {
+        const live = (window.TavernHelper && typeof window.TavernHelper === 'object') ? window.TavernHelper : {};
+        for (const name of CORE_BARE_GLOBALS) {
+            const hostFn = TavernHelper[name];
+            if (typeof hostFn === 'function') {
+                try { live[name] = hostFn; } catch (_e) { /* noop */ }
+                try {
+                    if (live._bind && typeof live._bind === 'object') {
+                        live._bind['_' + name] = hostFn;
+                    }
+                } catch (_e) { /* noop */ }
+                try { window[name] = hostFn; } catch (_e) { /* noop */ }
+            }
+        }
+        window.TavernHelper = live;
+        window.__mvu_shims__ = live;
+    } catch (_e) { /* noop */ }
+}
+
 // [v228 S6] 事件 API 的裸全局清单（监听表必须**随 iframe 隔离**）。
 // 为什么只隔离事件类：其余裸全局（变量/宏/按钮）都是无状态转发，共享闭包没有串扰问题；
 // 而 eventOn/eventOnce/.../eventClearAll 带着「监听表」这个可变状态（shims/event-shims.js）。
@@ -1652,39 +2065,91 @@ window.klona = window.klona || ((obj) => {
 //   $('#extensions_settings').append(await renderExtensionTemplateAsync('third-party/<folder>', 'settings'));
 // 路径规则：/<folder>/<templateId>.html，由宿主资产路由伺服（第三方扩展目录已可直读）。
 // 模板里的 {{key}} 用传进来的 data 做最简替换（ST 用 Handlebars；扩展的 settings 模板绝大多数是纯 HTML）。
-async function renderTemplateAsync(path, name, data) {
-    const rel = String(path == null ? '' : path).replace(/^\/+/, '');
-    const tpl = String(name == null ? '' : name).replace(/^\/+/, '');
-    // [v235 I5] 归一化重复斜杠：扩展常传 '/third-party/<folder>/' 这类带尾斜杠的 path，
-    // 旧实现会拼出 // 从而在资产路由上 404（模板静默变空串）。
-    const url = ('/' + rel + '/' + tpl + '.html').replace(/\/{2,}/g, '/');
-    let html = '';
-    try {
-        const res = await fetch(url, { cache: 'no-store' });
-        if (!res.ok) throw new Error('http=' + res.status);
-        html = await res.text();
-    } catch (e) {
-        try { console.warn(`${LOG_PREFIX} renderTemplateAsync failed: ${url}`, e); } catch (_e) { /* noop */ }
-        return '';
-    }
-    // [v207] 去掉模板首部的注释与空白 —— 对齐真 ST（templates.js 会过 DOMPurify.sanitize，注释被丢掉）。
-    // 真机证据：记忆增强表格的 `manager.html` 整份就是一行 `<!-- manager.html -->`，
-    // jQuery $(html) 于是造出 #comment(nodeType=8)，扩展 `$(await getTemplate('manager')).get(0)`
-    // 拿到的就是注释节点 → `initializedTableView.querySelector is not a function`
-    // （报告 notes/recon-B-dom.md；ST 侧同样的模板不会炸，差的就是这一步）。
-    html = html.replace(/^(?:\s|<!--[\s\S]*?-->)+/, '');
+const __rikkaTemplateCache = new Map();
+
+function __rikkaInterpolateTemplate(rawHtml, data) {
+    let html = String(rawHtml == null ? '' : rawHtml).replace(/^(?:\s|<!--[\s\S]*?-->)+/, '');
     if (data && typeof data === 'object') {
         html = html.replace(/\{\{\{\s*([\w.$]+)\s*\}\}\}/g, (m, k) => (k in data ? String(data[k]) : m));
         html = html.replace(/\{\{\s*([\w.$]+)\s*\}\}/g, (m, k) => (k in data ? String(data[k]) : m));
     }
     return html;
 }
-async function renderExtensionTemplateAsync(extensionName, templateId, templateData, _sanitize) {
-    const raw = String(extensionName == null ? '' : extensionName);
-    const folder = raw.startsWith('third-party/') ? raw : `third-party/${raw}`;
-    return renderTemplateAsync(folder, templateId, templateData);
+
+function __rikkaResolveTemplateUrl(pathOrTemplateId, nameOrData) {
+    if (typeof nameOrData !== 'string') {
+        const tplId = String(pathOrTemplateId == null ? '' : pathOrTemplateId).replace(/^\/+/, '');
+        if (!tplId) return '';
+        const rawUrl = tplId.endsWith('.html') ? ('/' + tplId) : (`/scripts/templates/${tplId}.html`);
+        return rawUrl.replace(/\/{2,}/g, '/');
+    }
+    const rel = String(pathOrTemplateId == null ? '' : pathOrTemplateId).replace(/^\/+/, '');
+    const tpl = String(nameOrData == null ? '' : nameOrData).replace(/^\/+/, '').replace(/\.html$/i, '');
+    return ('/' + rel + '/' + tpl + '.html').replace(/\/{2,}/g, '/');
 }
+
+async function renderTemplateAsync(path, name, data) {
+    const isOneArg = typeof name !== 'string';
+    const templateData = isOneArg ? (name && typeof name === 'object' ? name : {}) : data;
+    const url = __rikkaResolveTemplateUrl(path, name);
+    if (!url) return '';
+    let html = '';
+    try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('http=' + res.status);
+        html = await res.text();
+        __rikkaTemplateCache.set(url, html);
+    } catch (e) {
+        if (__rikkaTemplateCache.has(url)) {
+            html = __rikkaTemplateCache.get(url);
+        } else {
+            try { console.warn(`${LOG_PREFIX} renderTemplateAsync failed: ${url}`, e); } catch (_e) { /* noop */ }
+            return '';
+        }
+    }
+    return __rikkaInterpolateTemplate(html, templateData);
+}
+
+function renderTemplate(path, name, data) {
+    const isOneArg = typeof name !== 'string';
+    const templateData = isOneArg ? (name && typeof name === 'object' ? name : {}) : data;
+    const url = __rikkaResolveTemplateUrl(path, name);
+    if (!url) return '';
+    if (__rikkaTemplateCache.has(url)) {
+        return __rikkaInterpolateTemplate(__rikkaTemplateCache.get(url), templateData);
+    }
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false);
+        xhr.send();
+        if (xhr.status >= 200 && xhr.status < 300) {
+            const html = xhr.responseText || '';
+            __rikkaTemplateCache.set(url, html);
+            return __rikkaInterpolateTemplate(html, templateData);
+        }
+    } catch (_e) { /* noop */ }
+    return '';
+}
+
+async function renderExtensionTemplateAsync(extensionName, templateId, templateData, _sanitize) {
+    const raw = String(extensionName == null ? '' : extensionName).replace(/^\/+/, '');
+    const folder = raw.startsWith('third-party/') || raw.startsWith('scripts/extensions/third-party/')
+        ? raw
+        : `third-party/${raw}`;
+    return renderTemplateAsync(folder, String(templateId == null ? '' : templateId), templateData);
+}
+
+function renderExtensionTemplate(extensionName, templateId, templateData, _sanitize) {
+    const raw = String(extensionName == null ? '' : extensionName).replace(/^\/+/, '');
+    const folder = raw.startsWith('third-party/') || raw.startsWith('scripts/extensions/third-party/')
+        ? raw
+        : `third-party/${raw}`;
+    return renderTemplate(folder, String(templateId == null ? '' : templateId), templateData);
+}
+
+try { window.renderTemplate = renderTemplate; } catch (_e) { /* noop */ }
 try { window.renderTemplateAsync = renderTemplateAsync; } catch (_e) { /* noop */ }
+try { window.renderExtensionTemplate = renderExtensionTemplate; } catch (_e) { /* noop */ }
 try { window.renderExtensionTemplateAsync = renderExtensionTemplateAsync; } catch (_e) { /* noop */ }
 
 // ============================================================
@@ -1702,113 +2167,204 @@ try { window.renderExtensionTemplateAsync = renderExtensionTemplateAsync; } catc
 //
 // Kotlin 调用：TavernRuntimeManager.runGenerationHooks(messagesJson)
 // 返回：JSON 字符串（改写后的 messages 数组）或 null（无监听器/超时 → 调用方保留原文，零开销直通）。
+const loadedExtensionHooks = {};
+const loadedInterceptors = [];
+
+async function invokeExtensionHook(folder, hookName) {
+    const entry = loadedExtensionHooks[folder];
+    if (!entry || !entry.hooks) return false;
+    const fnName = entry.hooks[hookName];
+    if (!fnName) return false;
+    const fn = (entry.mod && typeof entry.mod[fnName] === 'function')
+        ? entry.mod[fnName]
+        : (typeof window[fnName] === 'function' ? window[fnName] : null);
+    if (typeof fn !== 'function') return false;
+    try {
+        await fn();
+        return true;
+    } catch (e) {
+        console.error('[RikkaTavern] extension lifecycle hook error:', folder, hookName, fnName, e);
+        return false;
+    }
+}
+
+window.__rikkaInvokeExtensionLifecycleHook = async function (folder, hookName) {
+    return await invokeExtensionHook(String(folder || ''), String(hookName || ''));
+};
+
+async function runGenerationInterceptors(chatMessages, contextSize, type) {
+    if (!Array.isArray(loadedInterceptors) || loadedInterceptors.length === 0) {
+        return { aborted: false };
+    }
+    let aborted = false;
+    const abortFn = function (reason) {
+        aborted = true;
+        if (reason) {
+            try { callBridge("log", "info", "[gen-hooks] generate_interceptor aborted: " + String(reason)); } catch (_e) { /* noop */ }
+        }
+    };
+    for (let i = 0; i < loadedInterceptors.length; i++) {
+        const item = loadedInterceptors[i];
+        const fn = (item.mod && typeof item.mod[item.name] === 'function')
+            ? item.mod[item.name]
+            : (typeof window[item.name] === 'function' ? window[item.name] : null);
+        if (typeof fn !== 'function') continue;
+        try {
+            await fn(chatMessages, contextSize, abortFn, type || 'normal');
+            if (aborted) break;
+        } catch (err) {
+            console.error('[RikkaTavern] generate_interceptor error (' + item.folder + ':' + item.name + '):', err);
+        }
+    }
+    return { aborted };
+}
+
 window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq, messagesJson) {
     try {
-        const messages = JSON.parse(messagesJson);
-        if (!Array.isArray(messages)) return null;
-        // ST-PT handleChatCompletionReady（handler.ts:201-210）：
-        //   data.messages = await processGenerateAfter(data.messages, data.type ?? generateType)
-        // 我们无法知道扩展内部是否异步，因此发一个【载荷对象】，扩展把改写结果写回 data.messages；
-        // eventSource.emitAndWait 会等全部同步 handler 跑完（我方 eventSource 同步派发）。
-        // [v213] chat 与 messages 指向同一数组引用：SETTINGS_READY 消费方（ST-PT/MVU）读写 data.messages，
-        // PROMPT_READY 消费方（st-memory onChatCompletionPromptReady，index.js:625）读写 data.chat —— 同引用保证两边改写互相可见。
-        // [v228 S1 前置] JSR >= 1.13.5 的 macro_like.ts:15-25 在 GENERATE_AFTER_DATA 分支里读
-        //   `for (const message of event_data.prompt)` 并改写 message.content；缺 prompt 会抛 TypeError
-        //   被宿主 try/catch 吞掉 -> 宏替换静默退化（notes/recon-version-gate-20261008.md §2 G2）。
-        //   prompt 与 messages / chat 指向**同一数组引用**，所以监听者改写 content 会直接作用于本次生成。
-        const eventData = { messages, prompt: messages, chat: messages, type: '', chatId: state.chatId, dryRun: false };
-        // [v222] ST GENERATION_AFTER_COMMANDS（vendor/st/events.js:22）：
-        //   ST-PT 的 handleGenerateBefore / handleFilterInstall 靠它跑提示词模板与过滤器安装，
-        //   **必须在 prompt 组装之前完成** —— 所以并入这条可等待桥（Kotlin 侧 suspend + 15s）。
-        //   必须用 await eventSource.emit(...)：vendor/st/eventemitter.js 的 emitAndWait 是同步派发、
-        //   **不等异步监听器**，而 ST-PT 的 handler 是 async；用 emitAndWait 会与组装竞态。
-        //   也不许走 window.__rikkaEmit（fire-and-forget）。严禁在注释里使用反引号（外层模板字符串红线）。
-        try {
-            // [v225 T7] 真机可见性：本事件在 JS 侧发射（不走 Kotlin fireEvent），不会自动写 [event] 日志；
-            // 补一行 RikkaBridge.log，使 developerMode 下真机日志能确认它在 prompt 组装之前出现。
-            // payload 与 ST 语义对齐：args = [type, options, dryRun]。
-            try { callBridge("log", "info", "[event] GENERATION_AFTER_COMMANDS " + JSON.stringify({ args: ["normal", {}, false] })); } catch (_eLog) { /* noop */ }
-            await eventSource.emit(event_types.GENERATION_AFTER_COMMANDS, eventData);
-        } catch (eAfter) {
-            console.error('[RikkaTavern] GENERATION_AFTER_COMMANDS handler failed:', (eAfter && eAfter.stack) || eAfter);
+        const parsedInput = JSON.parse(messagesJson || '[]');
+        const rawMessages = Array.isArray(parsedInput)
+            ? parsedInput
+            : (parsedInput && Array.isArray(parsedInput.messages) ? parsedInput.messages : null);
+        if (!Array.isArray(rawMessages)) return null;
+
+        let activeMessages = rawMessages.map((m) => {
+            const contentStr = m && typeof m.content === 'string' ? m.content : String((m && m.mes) ?? '');
+            const mesStr = m && typeof m.mes === 'string' ? m.mes : contentStr;
+            const roleStr = m && m.role ? String(m.role) : 'user';
+            const out = Object.assign({}, m, {
+                role: roleStr,
+                content: contentStr,
+                mes: mesStr,
+                _origContent: contentStr,
+                _origMes: mesStr,
+                is_user: m && typeof m.is_user === 'boolean' ? m.is_user : (roleStr === 'user'),
+                is_system: m && typeof m.is_system === 'boolean' ? m.is_system : (roleStr === 'system'),
+            });
+            return out;
+        });
+
+        let aborted = false;
+        const interceptRes = await runGenerationInterceptors(activeMessages, 32768, 'normal');
+        if (interceptRes && interceptRes.aborted) {
+            aborted = true;
         }
-        // [v228 S4] ST GENERATE_BEFORE_COMBINE_PROMPTS（vendor/st/events.js:56；真源 script.js:5234
-        //   "await eventSource.emit(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, data)"）。
-        //   语义：提示词层合并**之前**把组装输入交给监听者，监听者可就地改写（ST 的 data.messages 即最终 messages）。
-        //   我方等价物 = eventData（messages / chat 同引用，改写立刻生效）；载荷键名与 ST 同名。
-        //   必须 await：ST-PT 的 handler 是 async，而 emitAndWait 不等异步监听器（会与组装竞态）。
-        try {
-            try { callBridge("log", "info", "[event] GENERATE_BEFORE_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-            await eventSource.emit(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, eventData);
-        } catch (eBeforeCombine) {
-            console.error('[RikkaTavern] GENERATE_BEFORE_COMBINE_PROMPTS handler failed:', (eBeforeCombine && eBeforeCombine.stack) || eBeforeCombine);
-        }
-        // [v227 N1] GENERATE_AFTER_DATA（ST events.js:58；真源 script.js:5318
-        // "await emit(GENERATE_AFTER_DATA, generate_data, dryRun)"，dryRun 恒 false）。
-        // 订阅方（本机参考库实证）：JSR src/panel/render/macro_like.ts:104、
-        // ST-Prompt-Template src/modules/handler.ts:979（handleGenerateAfter）。
-        // payload 复用同一个 eventData（messages/chat/type/chatId/dryRun），第二参 dryRun=false。
-        try {
-            // [v225 T7] 真机可见性：JS 侧发射不走 Kotlin fireEvent，补一行日志才能在 developerMode 下确认。
-            try { callBridge("log", "info", "[event] GENERATE_AFTER_DATA " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-            await eventSource.emit(event_types.GENERATE_AFTER_DATA, eventData, false);
-        } catch (eAfterData) {
-            console.error('[RikkaTavern] GENERATE_AFTER_DATA handler failed:', (eAfterData && eAfterData.stack) || eAfterData);
-        }
-        try {
-            if (typeof eventSource.emitAndWait === 'function') {
-                eventSource.emitAndWait(event_types.CHAT_COMPLETION_SETTINGS_READY, eventData);
-            } else {
-                eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, eventData);
+
+        // Sync .mes <-> .content after generate_interceptor (e.g., ST-iPhonie stIphonieInterceptor mutates .mes)
+        for (let i = 0; i < activeMessages.length; i++) {
+            const item = activeMessages[i];
+            if (!item || typeof item !== 'object') continue;
+            if (typeof item.mes === 'string' && item.mes !== item._origMes) {
+                item.content = item.mes;
+                item._origContent = item.content;
+                item._origMes = item.mes;
+            } else if (typeof item.content === 'string' && item.content !== item._origContent) {
+                item.mes = item.content;
+                item._origContent = item.content;
+                item._origMes = item.mes;
             }
-        } catch (e) {
-            console.error('[RikkaTavern] generation hook handler failed:', (e && e.stack) || e);
         }
-        // [v213] PROMPT_READY：st-memory 的「AI 读表」注入通路（ST openai.js:1619 契约时机，载荷 {chat, dryRun}）。
-        // SETTINGS_READY 之后发出，与 ST 顺序一致（先 settings 后 prompt —— ST-PT 在 settings 里做 format，st-memory 在 prompt 里注入表格数据）。
-        try {
-            if (typeof eventSource.emitAndWait === "function") {
-                eventSource.emitAndWait(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
-            } else {
-                eventSource.emit(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
-            }
-        } catch (e2) {
-            console.error("[RikkaTavern] prompt-ready hook handler failed:", (e2 && e2.stack) || e2);
-        }
-        // [v228 S4] ST GENERATE_AFTER_COMBINE_PROMPTS（vendor/st/events.js:57；真源 script.js:5242-5244
-        //   "const eventData = { prompt: finalPrompt, dryRun }; await emit(AFTER, eventData); finalPrompt = eventData.prompt;"）。
-        //   rikkaST 没有「扁平化 prompt 字符串」，组合结果就是 messages 数组：
-        //     prompt   = 组合结果的串行化（监听者可把它改成新的 JSON 数组 -> 生效）；
-        //     messages = 同一份活动引用（与 ST 的 data 同构：改它，后续生成就用改后的值）。
-        try {
-            const afterData = {
-                prompt: JSON.stringify(eventData.messages),
-                messages: eventData.messages,
-                chat: eventData.chat,
-                type: eventData.type || '',
-                chatId: eventData.chatId,
+
+        if (!aborted) {
+            const eventData = {
+                type: '',
+                chatId: state.chatId,
                 dryRun: false,
             };
-            try { callBridge("log", "info", "[event] GENERATE_AFTER_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-            await eventSource.emit(event_types.GENERATE_AFTER_COMBINE_PROMPTS, afterData);
-            // ST 真源 script.js:5244 的语义是 `finalPrompt = eventData.prompt` —— **prompt 优先**。
-            // 所以先看 prompt 有没有被监听者改掉；没改再看 messages 是否被换成了新数组。
-            if (typeof afterData.prompt === 'string' && Array.isArray(eventData.messages) &&
-                afterData.prompt !== JSON.stringify(eventData.messages)) {
-                try {
-                    const reparsed = JSON.parse(afterData.prompt);
-                    if (Array.isArray(reparsed) && reparsed.length > 0) eventData.messages = reparsed;
-                } catch (_eParse) { /* 非 JSON 数组的 prompt 无法表达 -> 忽略（不猜） */ }
-            } else if (Array.isArray(afterData.messages)) {
-                eventData.messages = afterData.messages;
+            Object.defineProperty(eventData, 'messages', {
+                enumerable: true,
+                configurable: true,
+                get() { return activeMessages; },
+                set(v) { if (Array.isArray(v)) activeMessages = v; },
+            });
+            Object.defineProperty(eventData, 'chat', {
+                enumerable: true,
+                configurable: true,
+                get() { return activeMessages; },
+                set(v) { if (Array.isArray(v)) activeMessages = v; },
+            });
+            Object.defineProperty(eventData, 'prompt', {
+                enumerable: true,
+                configurable: true,
+                get() { return activeMessages; },
+                set(v) { if (Array.isArray(v)) activeMessages = v; },
+            });
+
+            try {
+                try { callBridge("log", "info", "[event] GENERATION_AFTER_COMMANDS " + JSON.stringify({ args: ["normal", {}, false] })); } catch (_eLog) { /* noop */ }
+                await eventSource.emitAndWait(event_types.GENERATION_AFTER_COMMANDS, eventData);
+            } catch (eAfter) {
+                console.error('[RikkaTavern] GENERATION_AFTER_COMMANDS handler failed:', (eAfter && eAfter.stack) || eAfter);
             }
-        } catch (eAfterCombine) {
-            console.error('[RikkaTavern] GENERATE_AFTER_COMBINE_PROMPTS handler failed:', (eAfterCombine && eAfterCombine.stack) || eAfterCombine);
+
+            try {
+                try { callBridge("log", "info", "[event] GENERATE_BEFORE_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                await eventSource.emitAndWait(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, eventData);
+            } catch (eBeforeCombine) {
+                console.error('[RikkaTavern] GENERATE_BEFORE_COMBINE_PROMPTS handler failed:', (eBeforeCombine && eBeforeCombine.stack) || eBeforeCombine);
+            }
+
+            try {
+                try { callBridge("log", "info", "[event] GENERATE_AFTER_DATA " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                await eventSource.emitAndWait(event_types.GENERATE_AFTER_DATA, eventData, false);
+            } catch (eAfterData) {
+                console.error('[RikkaTavern] GENERATE_AFTER_DATA handler failed:', (eAfterData && eAfterData.stack) || eAfterData);
+            }
+
+            // Official SillyTavern 1.19.0 order: CHAT_COMPLETION_PROMPT_READY (openai.js:1619) fires BEFORE CHAT_COMPLETION_SETTINGS_READY (openai.js:3146)
+            try {
+                await eventSource.emitAndWait(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
+            } catch (ePrompt) {
+                console.error("[RikkaTavern] prompt-ready hook handler failed:", (ePrompt && ePrompt.stack) || ePrompt);
+            }
+
+            try {
+                await eventSource.emitAndWait(event_types.CHAT_COMPLETION_SETTINGS_READY, eventData);
+            } catch (eSettings) {
+                console.error('[RikkaTavern] generation hook handler failed:', (eSettings && eSettings.stack) || eSettings);
+            }
+
+            try {
+                const afterData = {
+                    prompt: JSON.stringify(activeMessages),
+                    messages: activeMessages,
+                    chat: activeMessages,
+                    type: eventData.type || '',
+                    chatId: eventData.chatId,
+                    dryRun: false,
+                };
+                try { callBridge("log", "info", "[event] GENERATE_AFTER_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                await eventSource.emitAndWait(event_types.GENERATE_AFTER_COMBINE_PROMPTS, afterData);
+                if (typeof afterData.prompt === 'string' && Array.isArray(activeMessages) &&
+                    afterData.prompt !== JSON.stringify(activeMessages)) {
+                    try {
+                        const reparsed = JSON.parse(afterData.prompt);
+                        if (Array.isArray(reparsed) && reparsed.length > 0) activeMessages = reparsed;
+                    } catch (_eParse) { /* ignore non-JSON prompt */ }
+                } else if (Array.isArray(afterData.messages)) {
+                    activeMessages = afterData.messages;
+                }
+            } catch (eAfterCombine) {
+                console.error('[RikkaTavern] GENERATE_AFTER_COMBINE_PROMPTS handler failed:', (eAfterCombine && eAfterCombine.stack) || eAfterCombine);
+            }
         }
-        // [v213] 收口：messages / chat 任一被改写都生效（同引用下二者等价，这里双兜底）。
-        const out = Array.isArray(eventData.messages) ? eventData.messages : (Array.isArray(eventData.chat) ? eventData.chat : messages);
-        const json = JSON.stringify(out);
-        // [v211] 通过 bridge 把改写结果回传给 Kotlin（对应 runGenerationHooks 的挂起等待）
+
+        const normalized = (Array.isArray(activeMessages) ? activeMessages : []).map((m) => {
+            if (!m || typeof m !== 'object') {
+                return { role: 'user', content: String(m ?? '') };
+            }
+            const role = String(m.role || (m.is_system ? 'system' : (m.is_user === false ? 'assistant' : 'user')));
+            let content = '';
+            if (typeof m.content === 'string' && typeof m.mes === 'string' && m.mes !== m.content) {
+                content = (m.mes !== m._origMes) ? m.mes : m.content;
+            } else {
+                content = typeof m.content === 'string' ? m.content : String(m.mes ?? '');
+            }
+            const outObj = { role, content };
+            if (m.name) outObj.name = String(m.name);
+            return outObj;
+        });
+
+        const json = aborted ? JSON.stringify({ messages: normalized, aborted: true }) : JSON.stringify(normalized);
         try {
             if (window.RikkaBridge && typeof window.RikkaBridge.onGenerationHooksResult === 'function') {
                 window.RikkaBridge.onGenerationHooksResult(seq, JSON.stringify(json));
@@ -1843,6 +2399,27 @@ window.__rikkaEmit = function __rikkaEmit(name, payload) {
                     setTimeout(notifyChatReady, 300);
                 });
             } catch (_e) { /* noop */ }
+        }
+        if (name === 'settings_updated') {
+            try {
+                const prevIphonieJson = JSON.stringify((state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null);
+                thirdPartySettingsDirty = false;
+                refreshSettings();
+                pullThirdPartySettings(true);
+                const nextIphonieJson = JSON.stringify((state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null);
+                if (prevIphonieJson !== nextIphonieJson && window.__rikkaLoadedExtModules) {
+                    const ipMod = window.__rikkaLoadedExtModules.get('st-iphonie');
+                    const panelEl = document.getElementById('sttts-panel');
+                    if (ipMod && typeof ipMod.disable === 'function' && typeof ipMod.enable === 'function' && !(panelEl && panelEl.open)) {
+                        Promise.resolve().then(async () => {
+                            try {
+                                await ipMod.disable();
+                                await ipMod.enable();
+                            } catch (_eIp) { /* noop */ }
+                        });
+                    }
+                }
+            } catch (_eSet) { /* noop */ }
         }
         if (name === 'third_party_extensions_changed') {
             // 第三方扩展安装/启停/删除：重装扩展资源（已装载 URL 不重复执行）
@@ -2454,17 +3031,47 @@ function injectThirdPartyStyles(list) {
     }
 }
 
+function parseSimpleSemver(v) {
+    const m = String(v || '').trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return [0, 0, 0];
+    return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
+}
+
+function isSemverAtLeast(currentVer, minVer) {
+    if (!minVer) return true;
+    const cur = parseSimpleSemver(currentVer);
+    const req = parseSimpleSemver(minVer);
+    for (let i = 0; i < 3; i++) {
+        if (cur[i] > req[i]) return true;
+        if (cur[i] < req[i]) return false;
+    }
+    return true;
+}
+
 function injectThirdPartyModule(ext, js) {
     const src = thirdPartyAssetUrl(ext.folder, js);
-    // 模块注册表按 URL 缓存：同一 URL 不会二次执行（防重复注册事件监听）
     if (thirdPartyLoadedUrls.has(src)) return Promise.resolve();
     thirdPartyLoadedUrls.add(src);
-    // 用动态 import() 而不是 <script type="module" src>：
-    // script 元素的 error 事件拿不到任何原因（连 HTTP 状态都没有），
-    // 动态 import 会抛出真正的 Error（含失败的具体子模块），再补一次 fetch 拿状态码。
     return Promise.resolve()
         .then(() => import(src))
-        .then(() => {
+        .then(async (mod) => {
+            loadedExtensionHooks[ext.folder] = {
+                mod: mod || null,
+                hooks: (ext && ext.hooks && typeof ext.hooks === 'object') ? ext.hooks : {},
+            };
+            if (ext && ext.generateInterceptor) {
+                const existingIdx = loadedInterceptors.findIndex((x) => x.folder === ext.folder);
+                if (existingIdx !== -1) loadedInterceptors.splice(existingIdx, 1);
+                loadedInterceptors.push({
+                    folder: ext.folder,
+                    name: String(ext.generateInterceptor),
+                    loadingOrder: Number(ext.loadingOrder) || 100,
+                    mod: mod || null,
+                });
+                loadedInterceptors.sort((a, b) => a.loadingOrder - b.loadingOrder);
+            }
+            await invokeExtensionHook(ext.folder, 'enable');
+            await invokeExtensionHook(ext.folder, 'activate');
             try { callBridge('log', 'info', `[third-party] loaded ${ext.folder}/${js}`); } catch (_e) { /* noop */ }
         })
         .catch(async (err) => {
@@ -2480,34 +3087,73 @@ function injectThirdPartyModule(ext, js) {
         });
 }
 
+function normalizeExtFolderAliasJs(raw) {
+    return String(raw == null ? '' : raw)
+        .trim()
+        .replace(/^third-party\//i, '')
+        .replace(/-(?:main|master|dev|release|v?\d+(?:\.\d+)*(?:-[a-z0-9._-]+)?)$/i, '')
+        .toLowerCase();
+}
+
 async function loadThirdPartyExtensions(force) {
-    let raw = '[]';
-    try { raw = callBridge('getThirdPartyExtensionsJson') || '[]'; } catch (_e) { raw = '[]'; }
-    let list = [];
-    try { const parsed = JSON.parse(raw); if (Array.isArray(parsed)) list = parsed; } catch (_e) { list = []; }
-    // [v197] 扩展设置页：URL 参数 ext=<folder> 时只加载被点击的那个扩展。
     let settingsFolderForLoad = '';
     try { settingsFolderForLoad = new URLSearchParams(location.search).get('ext') || ''; } catch (_e) { settingsFolderForLoad = ''; }
+    let raw = '[]';
+    try {
+        if (settingsFolderForLoad) {
+            raw = callBridge('getAllThirdPartyExtensionsJson') || callBridge('getThirdPartyExtensionsJson') || '[]';
+        } else {
+            raw = callBridge('getThirdPartyExtensionsJson') || '[]';
+        }
+    } catch (_e) { raw = '[]'; }
+    let list = [];
+    try { const parsed = JSON.parse(raw); if (Array.isArray(parsed)) list = parsed; } catch (_e) { list = []; }
     if (settingsFolderForLoad) {
         const beforeFilter = list.length;
-        list = list.filter((e) => String(e.folder || '') === settingsFolderForLoad);
+        const targetAlias = normalizeExtFolderAliasJs(settingsFolderForLoad);
+        list = list.filter((e) => {
+            const f = String((e && e.folder) || '');
+            return f === settingsFolderForLoad || (targetAlias && normalizeExtFolderAliasJs(f) === targetAlias);
+        });
         try {
             if (list.length === 0) {
-                callBridge('log', 'error', `[third-party] 设置页目标扩展不存在或已停用: ${settingsFolderForLoad} (active=${beforeFilter})`);
+                callBridge('log', 'error', `[third-party] 设置页目标扩展不存在或已停用: ${settingsFolderForLoad} (installed=${beforeFilter})`);
             } else {
-                callBridge('log', 'info', `[third-party] 设置页过滤 ext=${settingsFolderForLoad} matched=${list.length}/${beforeFilter}`);
+                callBridge('log', 'info', `[third-party] 设置页过滤 ext=${settingsFolderForLoad} matched=${list.length}/${beforeFilter} (${list.map(x => x.folder).join(',')})`);
             }
         } catch (_e) { /* noop */ }
     }
+
+    const activeFolders = new Set(list.map((e) => String(e.folder || '')).filter(Boolean));
+    list = list.filter((ext) => {
+        if (!ext || !ext.folder) return false;
+        if (ext.minimumClientVersion && !isSemverAtLeast(TAVERN_ST_COMPAT_VERSION, ext.minimumClientVersion)) {
+            try {
+                callBridge('log', 'warn', `[third-party] 跳过扩展 ${ext.folder}: 需要客户端版本 >= ${ext.minimumClientVersion} (当前 ${TAVERN_ST_COMPAT_VERSION})`);
+            } catch (_e) { /* noop */ }
+            return false;
+        }
+        if (Array.isArray(ext.requires) && ext.requires.length > 0 && !settingsFolderForLoad) {
+            const missing = ext.requires.filter((req) => !activeFolders.has(String(req)));
+            if (missing.length > 0) {
+                try {
+                    callBridge('log', 'warn', `[third-party] 跳过扩展 ${ext.folder}: 缺少依赖扩展 ${missing.join(', ')}`);
+                } catch (_e) { /* noop */ }
+                return false;
+            }
+        }
+        return true;
+    });
+
+    list.sort((a, b) => (Number(a.loadingOrder) || 100) - (Number(b.loadingOrder) || 100));
+
     const signature = list.map((e) => `${String(e.folder)}:${String(e.js)}:${String(e.css || '')}`).join('|');
     if (!force && signature === lastThirdPartySignature) return;
     lastThirdPartySignature = signature;
 
-    // 拆卸旧资源（重装语义：先移除旧标签，再按新列表注入）
     for (const el of thirdPartyStyleEls.splice(0)) { try { el.remove(); } catch (_e) { /* noop */ } }
     for (const el of thirdPartyScriptEls.splice(0)) { try { el.remove(); } catch (_e) { /* noop */ } }
 
-    // 供 getExtensionManifest 等扩展 API 查询
     try {
         window.__rikkaSt = window.__rikkaSt || {};
         window.__rikkaSt.extensions = list;
@@ -2522,13 +3168,31 @@ async function loadThirdPartyExtensions(force) {
         await injectThirdPartyModule(ext, js);
     }
 
-    // 全部模块装载完成后：广播刷新（shim live bindings）+ 上报
     try { window.dispatchEvent(new Event('rikka-st-refresh')); } catch (_e) { /* noop */ }
     try {
         callBridge('log', 'info', `[third-party] loaded ${list.length}: ${list.map((e) => e.displayName || e.folder).join(', ')}`);
     } catch (_e) { /* noop */ }
     emitToHost('third_party_extensions_loaded', { count: list.length, folders: list.map((e) => e.folder) });
 }
+
+window.__rikkaOnExtensionDisabled = async function (folder) {
+    const f = String(folder || '');
+    await invokeExtensionHook(f, 'disable');
+    MessageFormatter.clearHooksByOwner(f);
+    for (let i = loadedInterceptors.length - 1; i >= 0; i--) {
+        if (loadedInterceptors[i].folder === f) loadedInterceptors.splice(i, 1);
+    }
+};
+
+window.__rikkaOnExtensionDeleted = async function (folder) {
+    const f = String(folder || '');
+    await invokeExtensionHook(f, 'delete');
+    MessageFormatter.clearHooksByOwner(f);
+    delete loadedExtensionHooks[f];
+    for (let i = loadedInterceptors.length - 1; i >= 0; i--) {
+        if (loadedInterceptors[i].folder === f) loadedInterceptors.splice(i, 1);
+    }
+};
 
 // Kotlin 侧触发（安装/启停/删除扩展后）：eval("__rikkaReloadThirdPartyExtensions()")
 window.__rikkaReloadThirdPartyExtensions = () => loadThirdPartyExtensions(true);
@@ -3214,14 +3878,38 @@ function installPanelMode() {
                 }
             }
         } catch (_e) { /* noop */ }
+        // [10-19-21 通用悬浮窗适配] 检测楼层面板内展开的 position:fixed / position:absolute / <dialog open> 悬浮窗（如角色卡自带手机、地图、背包、状态弹窗）
+        let maxFloatingOverlayH = 0;
+        try {
+            const candidates = document.querySelectorAll('dialog[open], [style*="fixed"], [style*="absolute"], .modal, .popup, [class*="modal"], [class*="popup"], [class*="phone"], [class*="map"], [id*="modal"], [id*="phone"], [id*="map"]');
+            for (let i = 0; i < candidates.length; i++) {
+                const el = candidates[i];
+                if (!el || el === root || el.id === 'send_textarea') continue;
+                const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0) continue;
+                const pos = cs.position;
+                const isDialog = el.tagName === 'DIALOG' && el.hasAttribute('open');
+                if (pos === 'fixed' || pos === 'absolute' || isDialog) {
+                    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                    const hBox = r ? Math.ceil(Math.max(r.height || 0, r.bottom || 0)) : 0;
+                    const hScroll = el.scrollHeight || 0;
+                    const bestH = Math.max(hBox, hScroll);
+                    if (bestH > 140) {
+                        // 若是全屏或大型悬浮窗（手机/地图），确保至少给足 560px 可视高度，防止被折叠态 48px 高度裁切
+                        const targetH = (pos === 'fixed' || isDialog) ? Math.max(bestH, 560) : bestH;
+                        if (targetH > maxFloatingOverlayH) maxFloatingOverlayH = targetH;
+                    }
+                }
+            }
+        } catch (_eFloat) { /* noop */ }
         const rootBoxH = Math.ceil((root.getBoundingClientRect && root.getBoundingClientRect().height) || 0);
         const rootScrollH = root.scrollHeight || 0;
         const rootOffsetH = root.offsetHeight || 0;
         // 若 root 有子元素，优先使用子元素包络与 root 自身盒高度，避免 body/documentElement 因 WebView 视口高度锁死在旧高值
         const hasChildren = root.children && root.children.length > 0;
         const parts = hasChildren
-            ? [rootBoxH, rootOffsetH, Math.ceil(maxChildBottom), Math.ceil(maxDescendantBottom), rootScrollH]
-            : [rootScrollH, rootBoxH, rootOffsetH];
+            ? [rootBoxH, rootOffsetH, Math.ceil(maxChildBottom), Math.ceil(maxDescendantBottom), rootScrollH, maxFloatingOverlayH]
+            : [rootScrollH, rootBoxH, rootOffsetH, maxFloatingOverlayH];
         const valid = parts.filter((v) => typeof v === 'number' && isFinite(v) && v >= 0);
         return valid.length ? Math.max.apply(null, valid) : 0;
     };
@@ -3280,8 +3968,37 @@ function installPanelMode() {
         .replace(/^\s*```[a-zA-Z0-9_-]*\s*\r?\n/, '')
         .replace(/\r?\n```\s*$/, '')
         .replace(/^\s*```[a-zA-Z0-9_-]*\s*$/gm, '');
+    const rewriteEmbeddedAssetUrls = (s) => String(s == null ? '' : s)
+        .replace(
+            /(\b(?:src|href|poster)\s*=\s*["'])(?:embeded:\/\/|embedded:\/\/|ccdefault:)([^"']+)(["'])/gi,
+            (_m, p1, rel, p3) => p1 + 'https://appassets.androidplatform.net/charx_assets/lookup/' + encodeURIComponent(rel.replace(/^\/+/, '')) + p3
+        )
+        .replace(
+            /(["'\(])(?:embeded:\/\/|embedded:\/\/|ccdefault:)([^"'\)\r\n]+)(["'\)])/gi,
+            (_m, p1, rel, p3) => p1 + 'https://appassets.androidplatform.net/charx_assets/lookup/' + encodeURIComponent(rel.replace(/^\/+/, '')) + p3
+        );
+    const injectImgNoReferrerAndOrigSrc = (s) => String(s == null ? '' : s).replace(
+        /<img\b([^>]*?)>/gi,
+        (full, attrs) => {
+            let newAttrs = attrs;
+            if (!/\breferrerpolicy\s*=/i.test(newAttrs)) {
+                newAttrs += ' referrerpolicy="no-referrer"';
+            }
+            if (!/\bdata-rikka-orig-src\s*=/i.test(newAttrs)) {
+                const srcMatch = newAttrs.match(/\bsrc\s*=\s*(["'])([^"']+)\1/i);
+                if (srcMatch && srcMatch[2]) {
+                    const safeOrig = srcMatch[2].replace(/"/g, '&quot;');
+                    newAttrs += ' data-rikka-orig-src="' + safeOrig + '"';
+                }
+            }
+            return '<img' + newAttrs + '>';
+        }
+    );
+    const stripBlockingExternalFonts = (s) => String(s == null ? '' : s)
+        .replace(/@import\s+url\(\s*['"]?https?:\/\/(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|kit\.fontawesome\.com)[^)'"]*['"]?\s*\)\s*;?/gi, '/* offline-font-stripped */')
+        .replace(/<link\b[^>]*href\s*=\s*["']https?:\/\/(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|kit\.fontawesome\.com)[^"']*["'][^>]*>/gi, '');
     const normalizeHtml = (html) => {
-        const unfenced = stripFences(html);
+        const unfenced = stripBlockingExternalFonts(injectImgNoReferrerAndOrigSrc(rewriteEmbeddedAssetUrls(stripFences(html))));
         if (/<!doctype|<html[\s>]/i.test(unfenced)) {
             try {
                 const doc = new DOMParser().parseFromString(unfenced, 'text/html');
@@ -3291,13 +4008,64 @@ function installPanelMode() {
         }
         return convertPanelVh(unfenced);
     };
-    // [DIAG B] 资源加载失败捕获（capture 阶段，target 就是元素本身）：
-    // 面板 HTML 常引用 cdnjs font-awesome / Google Fonts，离线或被拦时图标字体静默变空白，
-    // 这正是「面板渲染有问题」的一类肉眼可见症状，必须在日志里留痕。
+    // [DIAG B + 立绘/CG自愈] 资源加载失败捕获与 <img> 自动多级回退自愈（capture 阶段）：
+    // 1. 首屏已在 normalizeHtml 中注入 referrerpolicy="no-referrer" 与 data-rikka-orig-src，确保外部图床首帧即无 Referer 加载；
+    // 2. 若仍失败，始终以 data-rikka-orig-src 作为基准构建候选链（绝不因中间尝试 lookup URL 而丢失原始外部图床地址）：
+    //    - 外部图床 URL 优先重试跨扩展名（.webp/.png/.jpg），再回退本地 /charx_assets/lookup/<baseName>；
+    //    - 相对路径 / 内嵌资产优先走 /charx_assets/lookup/<baseName>。
     const badLoads = [];
     window.addEventListener('error', (ev) => {
         try {
             const t2 = ev && ev.target;
+            if (t2 && t2 !== window && t2.tagName === 'IMG') {
+                const curSrc = String(t2.getAttribute('src') || t2.src || '');
+                const origSrc = String(t2.dataset.rikkaOrigSrc || curSrc || '');
+                if (origSrc && !t2.dataset.rikkaOrigSrc) {
+                    t2.dataset.rikkaOrigSrc = origSrc;
+                }
+                const step = Number(t2.dataset.rikkaImgRetry || '0');
+                if (!t2.referrerPolicy || t2.referrerPolicy !== 'no-referrer') {
+                    try { t2.referrerPolicy = 'no-referrer'; } catch (_e) { /* noop */ }
+                }
+                if (origSrc && step < 5) {
+                    let baseName = '';
+                    try {
+                        const cleanPath = decodeURIComponent(origSrc.split('?')[0].split('#')[0]);
+                        baseName = cleanPath.split('/').pop() || '';
+                    } catch (_e) {
+                        baseName = origSrc.split('?')[0].split('#')[0].split('/').pop() || '';
+                    }
+                    const candidates = [];
+                    const isExternalHttp = /^https?:\/\//i.test(origSrc) &&
+                        !origSrc.includes('appassets.androidplatform.net') &&
+                        !origSrc.includes('st.rikka.local');
+                    if (isExternalHttp) {
+                        const noQuery = origSrc.split('?')[0];
+                        const extMatch = noQuery.match(/\.(png|webp|jpg|jpeg|gif)$/i);
+                        if (extMatch) {
+                            const curExt = extMatch[1].toLowerCase();
+                            const stemUrl = noQuery.slice(0, -extMatch[0].length);
+                            for (const altExt of ['webp', 'png', 'jpg']) {
+                                if (altExt !== curExt) candidates.push(stemUrl + '.' + altExt);
+                            }
+                        }
+                    }
+                    if (baseName && baseName.length < 120 && !/[\r\n]/.test(baseName)) {
+                        const lookupUrl = 'https://appassets.androidplatform.net/charx_assets/lookup/' + encodeURIComponent(baseName);
+                        if (origSrc !== lookupUrl && !candidates.includes(lookupUrl)) {
+                            candidates.push(lookupUrl);
+                        }
+                    }
+                    const nextUrl = candidates[step];
+                    if (nextUrl && nextUrl !== curSrc) {
+                        t2.dataset.rikkaImgRetry = String(step + 1);
+                        try { ev.stopImmediatePropagation(); } catch (_e) { /* noop */ }
+                        t2.src = nextUrl;
+                        setTimeout(report, 150);
+                        return;
+                    }
+                }
+            }
             if (t2 && t2 !== window && t2.tagName && (t2.tagName === 'LINK' || t2.tagName === 'SCRIPT' || t2.tagName === 'IMG')) {
                 const url = String(t2.href || t2.src || '');
                 let host = '';
@@ -3359,6 +4127,11 @@ function installPanelMode() {
     const varsWait = (html) => {
         lastPanelHtml = html;
         if (varsReady || varsWaitTimer) return;
+        // 若面板根本未引用 MVU / getVariables / stat_data（例如纯立绘/CG卡片），无需启动 200ms 变量轮询与重挂载！
+        if (!/Mvu|getMvuData|getVariables|stat_data|mag_variable/i.test(String(html || ''))) {
+            varsReady = true;
+            return;
+        }
         // 挂载时变量就已经就绪 → 卡脚本已经拿到数据，不必等待、不必重挂
         if (hasMvuVars(readMvuVars())) { varsReady = true; return; }
         let ticks = 0;
@@ -3500,6 +4273,37 @@ function installPanelMode() {
     document.addEventListener('transitionend', scheduleDynamicReport, true);
     document.addEventListener('animationend', scheduleDynamicReport, true);
     document.addEventListener('input', scheduleDynamicReport, true);
+    document.addEventListener('click', () => {
+        scheduleDynamicReport();
+        setTimeout(report, 180);
+        setTimeout(report, 420);
+    }, true);
+    document.addEventListener('pointerup', () => {
+        setTimeout(report, 60);
+        setTimeout(report, 240);
+    }, true);
+    const panelIntervals = new Set();
+    const origSetInterval = window.setInterval.bind(window);
+    const origClearInterval = window.clearInterval.bind(window);
+    window.setInterval = function (fn, ms, ...args) {
+        const id = origSetInterval(fn, ms, ...args);
+        panelIntervals.add(id);
+        return id;
+    };
+    window.clearInterval = function (id) {
+        panelIntervals.delete(id);
+        return origClearInterval(id);
+    };
+    window.__rikkaQuiescePanel = () => {
+        try {
+            if (varsWaitTimer) { origClearInterval(varsWaitTimer); varsWaitTimer = null; }
+            for (const id of Array.from(panelIntervals)) {
+                origClearInterval(id);
+            }
+            panelIntervals.clear();
+            report();
+        } catch (_e) { /* noop */ }
+    };
     window.__rikkaSyncAfterHostRestart = () => {
         try {
             syncThirdPartyExtensionMetadata();
@@ -3607,82 +4411,1257 @@ function installPanelMode() {
     console.log(`${LOG_PREFIX} PANEL mode ready (mount API: __rikkaPanelMount)`);
 }
 
+// ---------------------------------------------------------------- [10-19-21] 通用悬浮窗舞台与双通道 TTS 隔离桥
+function openRealStIphoniePanel() {
+    try {
+        const wand = document.getElementById('sttts-wand-entry');
+        const realOpenBtn = document.querySelector('#sttts-extension-entry #sttts-open');
+        if (realOpenBtn && realOpenBtn.getAttribute('data-rikka-fallback') !== 'true') {
+            realOpenBtn.click();
+        } else if (wand) {
+            wand.click();
+        }
+        const dlg = document.getElementById('sttts-panel');
+        if (dlg) {
+            dlg.classList.remove('floating');
+            dlg.style.setProperty('position', 'fixed', 'important');
+            dlg.style.setProperty('inset', '0', 'important');
+            dlg.style.setProperty('left', '0', 'important');
+            dlg.style.setProperty('top', '0', 'important');
+            dlg.style.setProperty('width', '100vw', 'important');
+            dlg.style.setProperty('height', '100vh', 'important');
+            dlg.style.setProperty('max-width', '100vw', 'important');
+            dlg.style.setProperty('max-height', '100vh', 'important');
+            dlg.style.setProperty('transform', 'none', 'important');
+            dlg.style.setProperty('z-index', '9999', 'important');
+            const ifr = dlg.querySelector('iframe');
+            if (ifr) {
+                ifr.style.setProperty('width', '100%', 'important');
+                ifr.style.setProperty('height', '100%', 'important');
+                ifr.style.setProperty('transform', 'none', 'important');
+            }
+            if (!dlg.open) {
+                try { dlg.showModal(); } catch (_e) { dlg.setAttribute('open', 'true'); dlg.style.display = 'block'; }
+            }
+            return true;
+        }
+    } catch (_e) { /* noop */ }
+    return false;
+}
+
+function installUniversalFloatingAndTtsBridge() {
+    if (window.__rikkaFloatingBridgeInstalled) return;
+    window.__rikkaFloatingBridgeInstalled = true;
+
+    // 1) 双通道 TTS 隔离控制：停止/暂停/楼层触发 ST-iPhonie 角色语音
+    window.__rikkaStopIphonieTts = function () {
+        try {
+            const stopBtn = document.getElementById('sttts-stop');
+            if (stopBtn && !stopBtn.disabled) {
+                stopBtn.click();
+                return true;
+            }
+            document.querySelectorAll('audio').forEach((a) => {
+                try { a.pause(); } catch (_e) { /* noop */ }
+            });
+        } catch (_e) { /* noop */ }
+        return false;
+    };
+
+    window.__rikkaToggleIphonieTts = function () {
+        try {
+            const toggleBtn = document.getElementById('sttts-toggle');
+            if (toggleBtn && !toggleBtn.disabled) {
+                toggleBtn.click();
+                return true;
+            }
+            const allBtn = document.getElementById('sttts-all');
+            if (allBtn) {
+                allBtn.click();
+                return true;
+            }
+        } catch (_e) { /* noop */ }
+        return false;
+    };
+
+    window.__rikkaPlayFloorIphonieTts = function (floorIndex) {
+        try {
+            refreshAll();
+            const idx = Number(floorIndex);
+            const targetMes = Number.isFinite(idx) && idx >= 0
+                ? document.querySelector(`#chat .mes[mesid="${idx}"]`)
+                : null;
+            if (targetMes) {
+                const waveBtn = targetMes.querySelector('[data-sttts-action="all"], [data-sttts-action="line"]');
+                if (waveBtn) {
+                    waveBtn.click();
+                    return true;
+                }
+            }
+            const allBtn = document.getElementById('sttts-all');
+            if (allBtn) {
+                allBtn.click();
+                return true;
+            }
+        } catch (_e) { /* noop */ }
+        return false;
+    };
+
+    // 监听 ST-iPhonie 播放状态变化，一旦开始播放立即通知宿主停止上游系统原生 TTS，杜绝双通道声音冲突
+    let lastTtsStatusText = '';
+    let lastTtsPlaying = false;
+    const checkIphonieTtsStatus = () => {
+        try {
+            const statusSpan = document.querySelector('#sttts-extension-entry .sttts-status');
+            const stopBtn = document.getElementById('sttts-stop');
+            const toggleBtn = document.getElementById('sttts-toggle');
+            const statusText = statusSpan ? String(statusSpan.textContent || '').trim() : '';
+            const isPlayingOrGen = Boolean(stopBtn && !stopBtn.disabled);
+            const isPaused = Boolean(toggleBtn && !toggleBtn.disabled && String(toggleBtn.textContent || '').includes('继续'));
+            const phase = isPlayingOrGen ? (isPaused ? 'paused' : 'playing') : 'idle';
+            if (statusText !== lastTtsStatusText || isPlayingOrGen !== lastTtsPlaying) {
+                lastTtsStatusText = statusText;
+                lastTtsPlaying = isPlayingOrGen;
+                emitToHost('iphonie_tts_state', {
+                    phase,
+                    playing: isPlayingOrGen && !isPaused,
+                    message: statusText || (isPlayingOrGen ? '正在播放角色语音' : '等待播放'),
+                });
+            }
+        } catch (_e) { /* noop */ }
+    };
+    setInterval(checkIphonieTtsStatus, 600);
+
+    // 2) 扫描宿主与卡脚本 iframe 中的可用悬浮窗（小手机 / 记忆表格 / 小白X / 角色卡自定义手机或地图悬浮窗）
+    const KNOWN_INTERNAL_IDS = new Set([
+        'st-runtime-root',
+        'rikka-st-compat-dom',
+        'rikka-hidden-st-stubs',
+        'mvu-runtime-iframe',
+        'sheet_cell_style_container',
+        'sttts-panel',
+        'sttts-floating',
+    ]);
+
+    function detectCardFloatingNodes() {
+        const customNodes = [];
+        try {
+            Array.from(document.body.children || []).forEach((el) => {
+                if (!el || !el.tagName) return;
+                const tag = el.tagName.toUpperCase();
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') return;
+                const id = String(el.id || '');
+                if (KNOWN_INTERNAL_IDS.has(id)) return;
+                if (tag === 'IFRAME' && String(el.name || '').startsWith('TH-script--')) return;
+                if (el.classList && (el.classList.contains('sttts-call-island') || el.classList.contains('sttts-msg-island') || el.classList.contains('sttts-music-island') || el.classList.contains('sttts-voice-island') || el.classList.contains('sttts-note-island') || el.classList.contains('toast-container'))) {
+                    return;
+                }
+                customNodes.push({ kind: 'body_node', id: id || tag, el });
+            });
+            for (const [sid, frame] of scriptIframes) {
+                try {
+                    const doc = frame && frame.contentDocument;
+                    const body = doc && doc.body;
+                    if (!body) continue;
+                    const visibleChildren = Array.from(body.children || []).filter((c) => {
+                        if (!c || !c.tagName) return false;
+                        const t = c.tagName.toUpperCase();
+                        return t !== 'SCRIPT' && t !== 'STYLE' && t !== 'LINK';
+                    });
+                    if (visibleChildren.length > 0) {
+                        customNodes.push({ kind: 'script_iframe', id: String(sid), frame });
+                    }
+                } catch (_e2) { /* noop */ }
+            }
+        } catch (_e) { /* noop */ }
+        return customNodes;
+    }
+
+    let lastFloatingSummaryJson = '';
+    const reportFloatingWindows = () => {
+        try {
+            const list = (window.__rikkaSt && Array.isArray(window.__rikkaSt.extensions)) ? window.__rikkaSt.extensions : [];
+            const hasIphonie = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('st-iphonie')) || !!document.getElementById('sttts-extension-entry');
+            const hasMemory = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('st-memory-enhancement')) || !!document.getElementById('table_database_settings_drawer');
+            const hasXbx = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('littlewhitebox')) || !!document.querySelector('.littlewhitebox');
+            const cardNodes = detectCardFloatingNodes();
+            const summary = {
+                hasIphonie,
+                hasMemory,
+                hasLittleWhiteBox: hasXbx,
+                hasCardFloating: cardNodes.length > 0,
+                cardFloatingCount: cardNodes.length,
+            };
+            const json = JSON.stringify(summary);
+            if (json !== lastFloatingSummaryJson) {
+                lastFloatingSummaryJson = json;
+                emitToHost('floating_windows_changed', summary);
+            }
+        } catch (_e) { /* noop */ }
+    };
+    setInterval(reportFloatingWindows, 1500);
+    setTimeout(reportFloatingWindows, 500);
+
+    // 3) 切换主运行时 WebView 的可视悬浮窗舞台（当用户在聊天页点击右侧常驻悬浮球时直接挂载显示）
+    window.__rikkaOpenFloatingTarget = async function (target) {
+        try {
+            refreshAll();
+            const compatDom = document.getElementById('rikka-st-compat-dom');
+            const dlg = document.getElementById('sttts-panel');
+            // 先还原卡脚本 iframe 的临时全屏样式
+            for (const [, frame] of scriptIframes) {
+                if (frame && frame.__rikkaExpandedForFloating) {
+                    frame.__rikkaExpandedForFloating = false;
+                    frame.style.cssText = 'display:none;width:0;height:0;border:none;position:absolute;pointer-events:none;';
+                }
+            }
+
+            if (target === 'iphonie') {
+                if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                let opened = openRealStIphoniePanel();
+                if (!opened) {
+                    await new Promise((r) => setTimeout(r, 250));
+                    opened = openRealStIphoniePanel();
+                }
+                return opened;
+            }
+
+            if (dlg && dlg.open) {
+                try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
+            }
+
+            if (target === 'memory_table') {
+                if (compatDom) {
+                    compatDom.style.setProperty('display', 'block', 'important');
+                    compatDom.removeAttribute('aria-hidden');
+                }
+                const drawer = document.getElementById('table_database_settings_drawer');
+                const content = document.getElementById('table_drawer_content');
+                if (drawer) drawer.style.setProperty('display', 'block', 'important');
+                if (content) {
+                    content.classList.remove('closedDrawer');
+                    content.removeAttribute('data-slide-toggle');
+                    content.style.setProperty('display', 'block', 'important');
+                }
+                ['#database-content', '#editor-content', '#setting-content'].forEach((sel, idx) => {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        el.style.setProperty('display', idx === 0 ? 'block' : 'none');
+                        el.style.setProperty('height', 'auto', 'important');
+                        el.style.setProperty('overflow', 'visible', 'important');
+                    }
+                });
+                return true;
+            }
+
+            if (target === 'littlewhitebox') {
+                if (compatDom) {
+                    compatDom.style.setProperty('display', 'block', 'important');
+                    compatDom.removeAttribute('aria-hidden');
+                }
+                const xbx = document.querySelector('.littlewhitebox');
+                if (xbx) {
+                    xbx.style.setProperty('display', 'block', 'important');
+                    xbx.scrollIntoView({ block: 'start' });
+                }
+                return true;
+            }
+
+            if (target === 'card_floating') {
+                if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                const cardNodes = detectCardFloatingNodes();
+                for (const item of cardNodes) {
+                    if (item.kind === 'body_node' && item.el && item.el.style) {
+                        item.el.style.setProperty('display', 'block', 'important');
+                        item.el.style.setProperty('visibility', 'visible', 'important');
+                        item.el.style.setProperty('z-index', '9500', 'important');
+                    } else if (item.kind === 'script_iframe' && item.frame) {
+                        item.frame.__rikkaExpandedForFloating = true;
+                        item.frame.style.cssText = 'display:block !important;position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;border:none !important;z-index:9500 !important;pointer-events:auto !important;background:transparent !important;';
+                    }
+                }
+                return true;
+            }
+        } catch (e) {
+            console.warn('[floating] __rikkaOpenFloatingTarget failed:', e);
+        }
+        return false;
+    };
+
+    window.__rikkaCloseFloatingStage = function () {
+        try {
+            const dlg = document.getElementById('sttts-panel');
+            if (dlg && dlg.open) {
+                try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
+            }
+            const compatDom = document.getElementById('rikka-st-compat-dom');
+            if (compatDom && !window.__RIKKA_EXT_SETTINGS_MODE__) {
+                compatDom.style.setProperty('display', 'none', 'important');
+            }
+            for (const [, frame] of scriptIframes) {
+                if (frame && frame.__rikkaExpandedForFloating) {
+                    frame.__rikkaExpandedForFloating = false;
+                    frame.style.cssText = 'display:none;width:0;height:0;border:none;position:absolute;pointer-events:none;';
+                }
+            }
+        } catch (_e) { /* noop */ }
+    };
+}
+
 // ---------------------------------------------------------------- 启动
 (async function boot() {
-    // [v197] 扩展设置页模式：只装载第三方扩展自身的设置 UI，不加载卡脚本 / MVU。
+    // [10-19-21 深度适配] 扩展设置页模式：
+    // 1. 杜绝二次进入白屏（退出时主动关闭全部 IndexedDB 连接并调用扩展 disable 钩子）；
+    // 2. 杜绝预插重复 DOM 导致事件绑定失效；
+    // 3. 为全部五大扩展提供 100% 可读、直接读写 extension_settings 并即时持久化的交互式控制面板。
     if (window.__RIKKA_EXT_SETTINGS_MODE__) {
         console.log(`${LOG_PREFIX} booting in EXT SETTINGS mode ...`);
-        // [v197 hotfix] 设置页可见诊断状态：即使扩展注入失败也不至于纯黑。
+        const extFolder = new URLSearchParams(location.search).get('ext') || '';
+        const extAlias = normalizeExtFolderAliasJs(extFolder);
+
+        window.__rikkaCleanupExtSettings = function () {
+            try { flushAll(); } catch (_e) { /* noop */ }
+            try {
+                for (const f of Object.keys(loadedExtensionHooks)) {
+                    try { invokeExtensionHook(f, 'disable'); } catch (_e2) { /* noop */ }
+                }
+            } catch (_e) { /* noop */ }
+            try {
+                const dbs = window.__rikkaOpenedIdbDatabases;
+                if (dbs && typeof dbs.forEach === 'function') {
+                    dbs.forEach((db) => {
+                        try { db.close(); } catch (_e2) { /* noop */ }
+                    });
+                    dbs.clear();
+                }
+            } catch (_e) { /* noop */ }
+        };
+        window.addEventListener('pagehide', () => {
+            try { window.__rikkaCleanupExtSettings(); } catch (_e) { /* noop */ }
+        });
+
         try {
             const statusEl = document.getElementById('rikka-ext-settings-status');
             if (statusEl) {
                 statusEl.style.display = 'block';
-                statusEl.textContent = `正在加载扩展设置：${new URLSearchParams(location.search).get('ext') || '(未指定扩展)'} …`;
+                statusEl.textContent = `正在加载扩展设置：${extFolder || '(未指定扩展)'} …`;
             }
         } catch (_e) { /* noop */ }
 
         if (typeof $ === 'undefined') safeWarn('jQuery missing! shims may break.');
         refreshAll();
-        emitToHost('ext_settings_ready', { version: '1.0.0' });
+        emitToHost('ext_settings_ready', { version: '1.1.0' });
+
+        function markImmediateSaved(badgeEl) {
+            try {
+                pushGlobalVars();
+                pushThirdPartySettingsNow();
+                if (badgeEl) {
+                    badgeEl.textContent = '✅ 已实时保存并生效 (' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) + ')';
+                }
+            } catch (_e) { /* noop */ }
+        }
+
+        const STPT_I18N_MAP = {
+            'Prompt template settings': '提示词模板 (ST-Prompt-Template) 核心设置',
+            'PT Enable': '启用提示词模板扩展 (总开关)',
+            'PT Enable Generate-time evaluation': '处理生成内容 (Generate 阶段模板求值)',
+            'PT Enable GENERATE evaluation': '启用 [GENERATE:BEFORE/AFTER] 世界书注入',
+            'PT Enable @INJECT evaluation': '启用 @INJECT 世界书定向注入',
+            'PT Enable Chat message evaluation': '处理聊天楼层消息 (Render 阶段模板求值)',
+            'PT Enable RENDER evaluation': '启用 [RENDER:BEFORE/AFTER] 楼层状态栏注入',
+            'PT Enable code blocks': '允许处理楼层消息中的 <pre> 代码块',
+            'PT Permanent evaluation results': '预计算并固化原始消息模板结果 (避免重复求值)',
+            'PT Filter chat message': '生成前隐藏楼层消息内的模板语句',
+            'PT chat depth limit': '楼层处理最大深度 (-1 表示无限制)',
+            'PT Enable Autosave': '模板处理完成后立即保存会话',
+            'PT Enable Preload': '打开角色卡时立即预加载并执行世界书 (初始化变量/define)',
+            'PT Disabling with statement': '禁用 with 语句块 (解决 getvar is not defined 冲突)',
+            'PT Enable debug logging': '控制台输出详细模板调试日志',
+            'PT Invert entry enable': '旧版兼容模式：将禁用的 GENERATE/RENDER/INJECT 条目视为启用',
+            'PT Compile workers': '在 Web Worker 中编译模板',
+            'PT Environmental isolation': '在隔离沙箱 (iframe) 中执行代码',
+            'PT Enable cache': '模板编译缓存 (加速重复渲染)',
+            'Disable': '禁用',
+            'Enable': '启用',
+            'Only worldinfo': '仅世界书',
+            'PT cache size': '编译缓存容量上限 (0 为不限制)',
+            'PT cache hasher': '缓存 Hash 算法',
+        };
+
+        const STPT_DEFAULTS = {
+            '#pt_enabled': { name: 'enabled', value: true },
+            '#pt_generate_enabled': { name: 'generate_enabled', value: true },
+            '#pt_generate_loader_enabled': { name: 'generate_loader_enabled', value: true },
+            '#pt_inject_loader_enabled': { name: 'inject_loader_enabled', value: true },
+            '#pt_render_enabled': { name: 'render_enabled', value: true },
+            '#pt_render_loader_enabled': { name: 'render_loader_enabled', value: true },
+            '#pt_code_blocks': { name: 'code_blocks', value: true },
+            '#pt_permanent_evaluation': { name: 'permanent_evaluation', value: false },
+            '#pt_filter_chat_message': { name: 'filter_chat_message', value: false },
+            '#pt_chat_depth': { name: 'chat_depth', value: -1 },
+            '#pt_autosave_enabled': { name: 'autosave_enabled', value: false },
+            '#pt_preload_worldinfo': { name: 'preload_worldinfo', value: true },
+            '#pt_with_context_disabled': { name: 'with_context_disabled', value: false },
+            '#pt_debug_enabled': { name: 'debug_enabled', value: false },
+            '#pt_invert_enabled': { name: 'invert_enabled', value: false },
+            '#pt_compile_workers': { name: 'compile_workers', value: false },
+            '#pt_sandbox': { name: 'sandbox', value: false },
+            '#pt_cache_enabled': { name: 'cache_enabled', value: 0 },
+            '#pt_cache_size': { name: 'cache_size', value: 128 },
+            '#pt_cache_hasher': { name: 'cache_hasher', value: 'h32ToString' },
+        };
+
+        function localizeDomI18n(rootEl) {
+            if (!rootEl) return;
+            rootEl.querySelectorAll('[data-i18n]').forEach((el) => {
+                const key = String(el.getAttribute('data-i18n') || '').trim();
+                if (STPT_I18N_MAP[key]) {
+                    el.textContent = STPT_I18N_MAP[key];
+                }
+            });
+        }
+
+        function bindStptSettingsDom() {
+            const root = document.getElementById('prompt_template_settings');
+            if (!root) return false;
+            localizeDomI18n(root);
+            if (!state.thirdPartySettings.EjsTemplate || typeof state.thirdPartySettings.EjsTemplate !== 'object') {
+                state.thirdPartySettings.EjsTemplate = Object.assign({}, state.thirdPartySettings.ST_Prompt_Template || {});
+            }
+            const cfg = state.thirdPartySettings.EjsTemplate;
+            state.thirdPartySettings.ST_Prompt_Template = cfg;
+            for (const [sel, meta] of Object.entries(STPT_DEFAULTS)) {
+                if (cfg[meta.name] === undefined) cfg[meta.name] = meta.value;
+                const el = root.querySelector(sel);
+                if (!el) continue;
+                if (typeof meta.value === 'boolean') {
+                    el.checked = !!cfg[meta.name];
+                } else {
+                    el.value = String(cfg[meta.name]);
+                    const counter = root.querySelector(`*[data-for="${sel.slice(1)}"]`);
+                    if (counter) counter.value = String(cfg[meta.name]);
+                }
+                if (!el.__rikkaStptBound) {
+                    el.__rikkaStptBound = true;
+                    const syncSetting = (fromCounter) => {
+                        if (typeof meta.value === 'boolean') {
+                            cfg[meta.name] = !!el.checked;
+                        } else if (typeof meta.value === 'number') {
+                            const srcEl = fromCounter || el;
+                            const num = Number(srcEl.value);
+                            cfg[meta.name] = Number.isFinite(num) ? num : meta.value;
+                            el.value = String(cfg[meta.name]);
+                            const counter = root.querySelector(`*[data-for="${sel.slice(1)}"]`);
+                            if (counter) counter.value = String(cfg[meta.name]);
+                        } else {
+                            cfg[meta.name] = String(el.value);
+                        }
+                        if (globalThis.EjsTemplate && typeof globalThis.EjsTemplate.setFeatures === 'function') {
+                            try { globalThis.EjsTemplate.setFeatures({ [meta.name]: cfg[meta.name] }); } catch (_e) { /* noop */ }
+                        }
+                        pushThirdPartySettingsNow();
+                    };
+                    el.addEventListener('change', () => syncSetting(null));
+                    const counter = root.querySelector(`*[data-for="${sel.slice(1)}"]`);
+                    if (counter) {
+                        counter.addEventListener('change', () => syncSetting(counter));
+                    }
+                }
+            }
+            const resetBtn = root.querySelector('#pt_reset');
+            if (resetBtn && !resetBtn.__rikkaStptBound) {
+                resetBtn.__rikkaStptBound = true;
+                resetBtn.addEventListener('click', () => {
+                    for (const [, meta] of Object.entries(STPT_DEFAULTS)) {
+                        cfg[meta.name] = meta.value;
+                    }
+                    bindStptSettingsDom();
+                    pushThirdPartySettingsNow();
+                });
+            }
+            return true;
+        }
+
+        function mountStptTestBench() {
+            const wbRoot = document.getElementById('rikka-ext-workbench-root') || document.getElementById('extensions_settings');
+            if (!wbRoot || document.getElementById('rikka-stpt-modal')) return;
+            const card = document.createElement('div');
+            card.id = 'rikka-stpt-modal';
+            card.className = 'rikka-ext-card';
+            card.innerHTML = `
+                <h3>🧪 EJS 模板实时测试台 (ST-Prompt-Template)</h3>
+                <div class="notes" style="margin-bottom:8px;">支持直接测试 <code>&lt;% ... %&gt;</code>、<code>getvar()</code> / <code>setvar()</code> 与角色上下文变量，点击下方按钮立即求值：</div>
+                <textarea id="rikka-stpt-test-input" rows="4" style="width:100%;font-family:monospace;" placeholder="示例：当前角色：<%= char %>，用户：<%= user %>，HP=<%= getvar('hp') || 100 %>">当前角色：<%= char %> | 用户：<%= user %> | 楼层数：<%= lastMessageId %></textarea>
+                <div class="flex-container" style="margin-top:8px;">
+                    <button type="button" id="rikka-stpt-run-btn" class="menu_button">▶ 立即执行 EJS 模板</button>
+                    <button type="button" id="rikka-stpt-vars-btn" class="menu_button">📊 查看当前会话/全局变量</button>
+                </div>
+                <pre id="rikka-stpt-test-output">等待执行…</pre>
+            `;
+            wbRoot.appendChild(card);
+            const inputEl = card.querySelector('#rikka-stpt-test-input');
+            const outEl = card.querySelector('#rikka-stpt-test-output');
+            card.querySelector('#rikka-stpt-run-btn').addEventListener('click', async () => {
+                const tpl = String((inputEl && inputEl.value) || '');
+                try {
+                    let rendered = '';
+                    if (globalThis.EjsTemplate && typeof globalThis.EjsTemplate.evalTemplate === 'function') {
+                        const ctx = await globalThis.EjsTemplate.prepareContext({ runType: 'command' });
+                        rendered = await globalThis.EjsTemplate.evalTemplate(tpl, ctx);
+                    } else {
+                        rendered = await ejsRender.renderEjsText(tpl, buildEjsContext());
+                    }
+                    outEl.textContent = `[执行成功]\n${rendered}`;
+                } catch (err) {
+                    outEl.textContent = `[执行出错] ${String((err && (err.stack || err.message)) || err)}`;
+                }
+            });
+            card.querySelector('#rikka-stpt-vars-btn').addEventListener('click', () => {
+                try {
+                    refreshAll();
+                    const chatVars = (state.chatMetadata && state.chatMetadata.variables) || {};
+                    const globalVars = (state.extensionSettings && state.extensionSettings.variables && state.extensionSettings.variables.global) || {};
+                    outEl.textContent = JSON.stringify({ chatVariables: chatVars, globalVariables: globalVars }, null, 2);
+                } catch (err) {
+                    outEl.textContent = String(err);
+                }
+            });
+        }
+
+        function mountJsrWorkbench() {
+            const wbRoot = document.getElementById('rikka-ext-workbench-root') || document.getElementById('extensions_settings');
+            if (!wbRoot || document.getElementById('rikka-jsr-workbench')) return;
+            const card = document.createElement('div');
+            card.id = 'rikka-jsr-workbench';
+            card.className = 'rikka-ext-card';
+            let scripts = [];
+            try {
+                const rawScripts = callBridge('getTavernScriptsJson') || '{}';
+                const helper = (JSON.parse(rawScripts) || {}).tavern_helper || {};
+                scripts = Array.isArray(helper.scripts) ? helper.scripts : [];
+            } catch (_e) { scripts = []; }
+            const scriptItemsHtml = scripts.length
+                ? scripts.map((s, idx) => `<div class="list-group-item" style="justify-content:space-between;"><span><b>#${idx + 1}</b> ${String(s.name || s.id || '未命名脚本')}</span><span class="rikka-save-badge">${scriptEnabled(s.enabled) ? '✅ 已启用' : '⏸ 已停用'}</span></div>`).join('')
+                : `<div class="notes">当前未导入额外的脚本条目（可通过顶部「导入 JSR 脚本 JSON」按钮一键导入）。</div>`;
+            card.innerHTML = `
+                <h3>🛠 酒馆助手 (JS-Slash-Runner) 脚本库与变量管理器</h3>
+                <div class="notes" style="margin-bottom:6px;">已注册 TavernHelper API 数量：<b>${Object.keys(window.TavernHelper || {}).length}</b> 个 · 兼容版本：<b>${TAVERN_ST_COMPAT_VERSION}</b></div>
+                <div style="margin:8px 0;">${scriptItemsHtml}</div>
+                <div class="notes" style="margin:10px 0 4px;">当前会话变量 (chat_metadata.variables JSON)：</div>
+                <textarea id="rikka-jsr-vars-editor" rows="5" style="width:100%;font-family:monospace;"></textarea>
+                <div class="flex-container" style="margin-top:8px;">
+                    <button type="button" id="rikka-jsr-save-vars" class="menu_button">💾 保存变量修改</button>
+                    <button type="button" id="rikka-jsr-refresh-vars" class="menu_button">🔄 刷新变量</button>
+                </div>
+                <pre id="rikka-jsr-status" style="display:none;"></pre>
+            `;
+            wbRoot.appendChild(card);
+            const editor = card.querySelector('#rikka-jsr-vars-editor');
+            const statusBox = card.querySelector('#rikka-jsr-status');
+            const loadVarsToEditor = () => {
+                try {
+                    refreshAll();
+                    const vars = (state.chatMetadata && state.chatMetadata.variables) || {};
+                    editor.value = JSON.stringify(vars, null, 2);
+                } catch (_e) { editor.value = '{}'; }
+            };
+            loadVarsToEditor();
+            card.querySelector('#rikka-jsr-refresh-vars').addEventListener('click', loadVarsToEditor);
+            card.querySelector('#rikka-jsr-save-vars').addEventListener('click', () => {
+                try {
+                    const parsed = JSON.parse(editor.value || '{}');
+                    if (window.TavernHelper && typeof window.TavernHelper.replaceVariables === 'function') {
+                        window.TavernHelper.replaceVariables(parsed, { type: 'chat' });
+                    } else {
+                        state.chatMetadata.variables = parsed;
+                        flushAll();
+                    }
+                    statusBox.style.display = 'block';
+                    statusBox.textContent = '✅ 会话变量已保存并同步至宿主';
+                } catch (err) {
+                    statusBox.style.display = 'block';
+                    statusBox.textContent = '❌ JSON 格式错误：' + String((err && err.message) || err);
+                }
+            });
+        }
+
+        // [Task 2 核心修复] 记忆增强插件 (st-memory-enhancement) 直接设置与控制面板：
+        // 1. 直接双向绑定 state.thirdPartySettings.muyoo_dataTable (及 power_user.muyoo_dataTable)；
+        // 2. 点击任何开关/下拉框/输入框立即写入并调用 pushThirdPartySettingsNow() 落盘，同时同步插件原生 DOM 节点；
+        // 3. 提供一键切换「对话数据表 / 表格模板编辑 / 完整高级设置」按钮。
+        function mountMemoryEnhancementQuickSettings() {
+            const holder = document.getElementById('top-settings-holder') || document.getElementById('rikka-ext-workbench-root');
+            if (!holder) return;
+            if (!state.thirdPartySettings.muyoo_dataTable || typeof state.thirdPartySettings.muyoo_dataTable !== 'object') {
+                state.thirdPartySettings.muyoo_dataTable = Object.assign({
+                    isExtensionAble: true,
+                    isAiReadTable: true,
+                    isAiWriteTable: true,
+                    isTableToChat: false,
+                    injection_mode: 'deep_system',
+                    deep: 2,
+                    step_by_step: false,
+                    use_main_api: true,
+                    step_by_step_use_main_api: true,
+                    confirm_before_execution: true,
+                    bool_silent_refresh: false,
+                    table_to_chat_can_edit: false,
+                    table_to_chat_mode: 'context_bottom',
+                    table_cell_width_mode: 'wide1_2_cell',
+                }, state.thirdPartySettings.st_memory_enhancement || {});
+            }
+            const cfg = state.thirdPartySettings.muyoo_dataTable;
+            stCompatPowerUser.muyoo_dataTable = cfg;
+            if (!state.thirdPartySettings.IMPORTANT_USER_PRIVACY_DATA || typeof state.thirdPartySettings.IMPORTANT_USER_PRIVACY_DATA !== 'object') {
+                state.thirdPartySettings.IMPORTANT_USER_PRIVACY_DATA = {};
+            }
+            const priv = state.thirdPartySettings.IMPORTANT_USER_PRIVACY_DATA;
+            stCompatPowerUser.IMPORTANT_USER_PRIVACY_DATA = priv;
+
+            let card = document.getElementById('rikka-memory-quick-settings');
+            if (!card) {
+                card = document.createElement('div');
+                card.id = 'rikka-memory-quick-settings';
+                card.className = 'rikka-ext-card';
+                card.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h3 style="margin:0;">📊 记忆增强表格 · 核心开关与实时设置</h3>
+                        <span id="rikka-mem-save-badge" class="rikka-save-badge">已就绪</span>
+                    </div>
+                    <div class="notes" style="margin-bottom:10px;">点击下方任意开关或修改数值将立即生效并自动持久化到酒馆会话：</div>
+                    <div class="flex-container" style="margin-bottom:10px;">
+                        <button type="button" data-mem-tab="setting" class="menu_button">⚙️ 展开完整设置项</button>
+                        <button type="button" data-mem-tab="editor" class="menu_button">📐 表格模板编辑器</button>
+                        <button type="button" data-mem-tab="database" class="menu_button">📊 当前对话数据表</button>
+                        <button type="button" id="rikka-mem-rebuild-btn" class="menu_button">🔄 立即整理表格</button>
+                        <button type="button" id="rikka-mem-step-btn" class="menu_button">▶ 手动触发分步填表</button>
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_enable"><b>启用记忆增强表格插件 (总开关)</b><span class="rikka-setting-desc">开启后在生成与接收消息时自动维护记忆表格</span></label>
+                        <input type="checkbox" id="rk_mem_enable">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_read"><b>允许 AI 读取表格数据 (读表开关)</b><span class="rikka-setting-desc">将当前记忆表格注入给模型参考</span></label>
+                        <input type="checkbox" id="rk_mem_read">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_write"><b>允许 AI 修改/写入表格 (写表开关)</b><span class="rikka-setting-desc">解析模型回复中的 tableEdit 指令自动更新表格</span></label>
+                        <input type="checkbox" id="rk_mem_write">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_to_chat"><b>推送表格状态栏至聊天界面</b><span class="rikka-setting-desc">在消息中直接展示可视化表格视图</span></label>
+                        <input type="checkbox" id="rk_mem_to_chat">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_step"><b>启用独立分步填表模式 (回复后单独填表)</b><span class="rikka-setting-desc">关闭则随聊天回复同步填表；开启则在回复后单独请求填表</span></label>
+                        <input type="checkbox" id="rk_mem_step">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_use_main_api"><b>使用主聊天 API 进行表格整理/填表</b><span class="rikka-setting-desc">默认复用当前主模型，无需额外交替配置 Key</span></label>
+                        <input type="checkbox" id="rk_mem_use_main_api">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_mem_inject_mode"><b>表格注入模式与深度</b><span class="rikka-setting-desc">控制表格在提示词中的插入位置</span></label>
+                        <div class="flex-container">
+                            <select id="rk_mem_inject_mode" style="min-width:130px;">
+                                <option value="deep_system">深层 System 注入</option>
+                                <option value="deep_user">深层 User 注入</option>
+                                <option value="deep_assistant">深层 Assistant 注入</option>
+                                <option value="injection_off">关闭注入</option>
+                            </select>
+                            <input type="number" id="rk_mem_deep" min="0" max="99" style="width:70px;" title="注入深度">
+                        </div>
+                    </div>
+                `;
+                holder.insertBefore(card, holder.firstChild);
+
+                const badge = card.querySelector('#rikka-mem-save-badge');
+                const bindToggle = (rkId, propName, nativeSel, defaultVal) => {
+                    const el = card.querySelector(rkId);
+                    if (!el) return;
+                    if (cfg[propName] === undefined) cfg[propName] = defaultVal;
+                    el.checked = !!cfg[propName];
+                    el.addEventListener('change', () => {
+                        cfg[propName] = !!el.checked;
+                        const nativeEl = document.querySelector(nativeSel);
+                        if (nativeEl && nativeEl.checked !== el.checked) {
+                            nativeEl.checked = el.checked;
+                            try { $(nativeEl).trigger('change'); } catch (_e) { /* noop */ }
+                        }
+                        markImmediateSaved(badge);
+                    });
+                };
+
+                bindToggle('#rk_mem_enable', 'isExtensionAble', '#table_switch', true);
+                bindToggle('#rk_mem_read', 'isAiReadTable', '#table_read_switch', true);
+                bindToggle('#rk_mem_write', 'isAiWriteTable', '#table_edit_switch', true);
+                bindToggle('#rk_mem_to_chat', 'isTableToChat', '#table_to_chat', false);
+                bindToggle('#rk_mem_step', 'step_by_step', '#fill_table_time', false);
+                bindToggle('#rk_mem_use_main_api', 'use_main_api', '#use_main_api', true);
+
+                const modeSel = card.querySelector('#rk_mem_inject_mode');
+                if (modeSel) {
+                    modeSel.value = String(cfg.injection_mode || 'deep_system');
+                    modeSel.addEventListener('change', () => {
+                        cfg.injection_mode = String(modeSel.value);
+                        const nativeMode = document.querySelector('#dataTable_injection_mode');
+                        if (nativeMode) {
+                            nativeMode.value = cfg.injection_mode;
+                            try { $(nativeMode).trigger('change'); } catch (_e) { /* noop */ }
+                        }
+                        markImmediateSaved(badge);
+                    });
+                }
+
+                const deepInput = card.querySelector('#rk_mem_deep');
+                if (deepInput) {
+                    deepInput.value = String(cfg.deep ?? 2);
+                    deepInput.addEventListener('change', () => {
+                        cfg.deep = Math.abs(Number(deepInput.value) || 0);
+                        deepInput.value = String(cfg.deep);
+                        const nativeDeep = document.querySelector('#dataTable_deep');
+                        if (nativeDeep) {
+                            nativeDeep.value = String(cfg.deep);
+                            try { $(nativeDeep).trigger('input'); } catch (_e) { /* noop */ }
+                        }
+                        markImmediateSaved(badge);
+                    });
+                }
+
+                card.querySelectorAll('[data-mem-tab]').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        const tab = btn.getAttribute('data-mem-tab');
+                        showMemoryEnhancementSection(tab);
+                    });
+                });
+
+                const rebuildBtn = card.querySelector('#rikka-mem-rebuild-btn');
+                if (rebuildBtn) {
+                    rebuildBtn.addEventListener('click', () => {
+                        const nativeBtn = document.getElementById('table_clear_up');
+                        if (nativeBtn) nativeBtn.click();
+                        else if (window.toastr) window.toastr.info('请在对话页面或加载对话后执行整理表格');
+                    });
+                }
+                const stepBtn = card.querySelector('#rikka-mem-step-btn');
+                if (stepBtn) {
+                    stepBtn.addEventListener('click', () => {
+                        const nativeBtn = document.getElementById('trigger_step_by_step_button');
+                        if (nativeBtn) nativeBtn.click();
+                        else if (window.toastr) window.toastr.info('请在对话页面或加载对话后触发分步填表');
+                    });
+                }
+            }
+        }
+
+        function showMemoryEnhancementSection(tab) {
+            const drawer = document.getElementById('table_database_settings_drawer');
+            const drawerContent = document.getElementById('table_drawer_content');
+            if (drawer) drawer.style.setProperty('display', 'block', 'important');
+            if (drawerContent) {
+                drawerContent.classList.remove('closedDrawer');
+                drawerContent.removeAttribute('data-slide-toggle');
+                drawerContent.style.setProperty('display', 'block', 'important');
+            }
+            const dbDiv = document.getElementById('database-content');
+            const edDiv = document.getElementById('editor-content');
+            const stDiv = document.getElementById('setting-content');
+            if (tab === 'database') {
+                if (dbDiv) dbDiv.style.setProperty('display', 'block', 'important');
+                if (edDiv) edDiv.style.setProperty('display', 'none', 'important');
+                if (stDiv) stDiv.style.setProperty('display', 'none', 'important');
+                if (dbDiv) dbDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else if (tab === 'editor') {
+                if (dbDiv) dbDiv.style.setProperty('display', 'none', 'important');
+                if (edDiv) edDiv.style.setProperty('display', 'block', 'important');
+                if (stDiv) stDiv.style.setProperty('display', 'none', 'important');
+                if (edDiv) edDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+                // 默认在设置页同时展示完整设置项与模板编辑器，彻底杜绝看到空白数据表
+                if (stDiv) stDiv.style.setProperty('display', 'block', 'important');
+                if (edDiv) edDiv.style.setProperty('display', 'block', 'important');
+                if (dbDiv) dbDiv.style.setProperty('display', 'block', 'important');
+                if (stDiv) stDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        // [Task 1 & Task 2 核心修复] 小手机 (ST-iPhonie) 直接设置与真机面板启动器：
+        // 1. 直接读写 state.thirdPartySettings.stTtsDialogue（ST-iPhonie 真实命名空间 NAMESPACE='stTtsDialogue'）；
+        // 2. 绝不伪造重复 #sttts-extension-entry / #sttts-open 节点，保证点击「打开小手机主屏幕」100% 触发 ST-iPhonie 真实闭包 openPanel()！
+        function mountStIphonieQuickSettings() {
+            const holder = document.getElementById('top-settings-holder') || document.getElementById('rikka-ext-workbench-root');
+            if (!holder) return;
+            if (!state.thirdPartySettings.stTtsDialogue || typeof state.thirdPartySettings.stTtsDialogue !== 'object') {
+                state.thirdPartySettings.stTtsDialogue = {};
+            }
+            const cfg = state.thirdPartySettings.stTtsDialogue;
+            if (cfg.enabled === undefined) cfg.enabled = true;
+            if (!cfg.general || typeof cfg.general !== 'object') cfg.general = {};
+            if (!cfg.narration || typeof cfg.narration !== 'object') cfg.narration = {};
+            if (!cfg.sounds || typeof cfg.sounds !== 'object') cfg.sounds = {};
+            if (!cfg.music || typeof cfg.music !== 'object') cfg.music = {};
+            if (!cfg.draw || typeof cfg.draw !== 'object') cfg.draw = {};
+
+            const g = cfg.general;
+            if (g.voiceEnabled === undefined) g.voiceEnabled = true;
+            if (g.hideStoryWaves === undefined) g.hideStoryWaves = false;
+            if (g.floatingEnabled === undefined) g.floatingEnabled = true;
+            if (g.voiceIsland === undefined) g.voiceIsland = false;
+            if (g.autoVoice === undefined) g.autoVoice = false;
+            if (g.pregenerate === undefined) g.pregenerate = false;
+            if (g.stripVoice === undefined) g.stripVoice = true;
+            if (!g.voiceMode) g.voiceMode = 'inline';
+
+            let card = document.getElementById('rikka-iphonie-quick-settings');
+            if (!card) {
+                card = document.createElement('div');
+                card.id = 'rikka-iphonie-quick-settings';
+                card.className = 'rikka-ext-card';
+                card.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h3 style="margin:0;">📱 ST-iPhonie · 小手机与角色语音核心设置</h3>
+                        <span id="rikka-iphonie-save-badge" class="rikka-save-badge">已就绪</span>
+                    </div>
+                    <div class="notes" style="margin-bottom:10px;">下方开关直接控制 ST-iPhonie 角色语音、聊天页右侧常驻悬浮窗与正文出图（与系统原生 TTS 独立双通道隔离，互不冲突）：</div>
+                    <div class="flex-container" style="margin-bottom:12px;">
+                        <button type="button" id="rk-iphonie-open-screen" class="menu_button" style="background:#355691;border-color:#8ab4f8;font-weight:600;">📱 打开小手机全屏主界面 (音色/API Key/微信/朋友圈)</button>
+                        <button type="button" id="rk-iphonie-play-all" class="menu_button">🔊 整条播放当前台词</button>
+                        <button type="button" id="rk-iphonie-stop" class="menu_button">⏹ 停止小手机语音</button>
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_voice_enabled"><b>开启正文角色语音配音 (<tts> 台词声波)</b><span class="rikka-setting-desc">开启后自动为助手回复注入角色配音规则并在气泡内渲染可点击声波</span></label>
+                        <input type="checkbox" id="rk_ip_voice_enabled">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_floating_enabled"><b>启用聊天页右侧常驻「小手机/悬浮窗」按钮</b><span class="rikka-setting-desc">在助手聊天界面右侧常驻显示小手机与角色卡悬浮窗快捷入口</span></label>
+                        <input type="checkbox" id="rk_ip_floating_enabled">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_auto_voice"><b>遇到新角色时自动挑选音色</b><span class="rikka-setting-desc">新出场角色尚未绑定音色时自动从候选池分配合适音色</span></label>
+                        <input type="checkbox" id="rk_ip_auto_voice">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_pregenerate"><b>新回复生成后后台提前合成语音</b><span class="rikka-setting-desc">新楼层完成后自动在后台静默缓存语音，点击声波即刻秒播</span></label>
+                        <input type="checkbox" id="rk_ip_pregenerate">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_strip_voice"><b>发送给模型前自动剥离历史 <tts> 标签 (省 Token)</b><span class="rikka-setting-desc">气泡内保留声波，但上下文历史只发纯文本译文</span></label>
+                        <input type="checkbox" id="rk_ip_strip_voice">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_hide_waves"><b>隐藏正文内的声波图标 (仅通过小手机/灵动岛播放)</b><span class="rikka-setting-desc">适合重度美化卡防止声波破坏排版</span></label>
+                        <input type="checkbox" id="rk_ip_hide_waves">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_voice_island"><b>开启台词灵动岛小窗</b><span class="rikka-setting-desc">在屏幕顶部显示当前朗读台词与逐句控制条</span></label>
+                        <input type="checkbox" id="rk_ip_voice_island">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_narration"><b>开启整篇旁白朗读</b><span class="rikka-setting-desc">朗读角色台词的同时由旁白音色朗读台词之间的叙述正文</span></label>
+                        <input type="checkbox" id="rk_ip_narration">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_sounds"><b>开启正文环境音效 (<sfx> 音效标签)</b><span class="rikka-setting-desc">自动识别并播放回复中的环境音与动作音效</span></label>
+                        <input type="checkbox" id="rk_ip_sounds">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_draw"><b>开启正文插画生成 (<pic> 标签绘图)</b><span class="rikka-setting-desc">支持 NovelAI / GPT / ComfyUI 正文自动或点击出图</span></label>
+                        <input type="checkbox" id="rk_ip_draw">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_ip_voice_mode"><b>角色配音生成模式</b><span class="rikka-setting-desc">随正文一次生成或正文完成后单独请求配音</span></label>
+                        <select id="rk_ip_voice_mode" style="min-width:150px;">
+                            <option value="inline">随正文一起生成 (默认)</option>
+                            <option value="separate">回复后单独配音</option>
+                        </select>
+                    </div>
+                `;
+                holder.insertBefore(card, holder.firstChild);
+
+                const badge = card.querySelector('#rikka-iphonie-save-badge');
+                const bindObjCheck = (sel, targetObj, key, defVal) => {
+                    const el = card.querySelector(sel);
+                    if (!el) return;
+                    if (targetObj[key] === undefined) targetObj[key] = defVal;
+                    el.checked = !!targetObj[key];
+                    el.addEventListener('change', () => {
+                        targetObj[key] = !!el.checked;
+                        markImmediateSaved(badge);
+                    });
+                };
+
+                bindObjCheck('#rk_ip_voice_enabled', g, 'voiceEnabled', true);
+                bindObjCheck('#rk_ip_floating_enabled', g, 'floatingEnabled', true);
+                bindObjCheck('#rk_ip_auto_voice', g, 'autoVoice', false);
+                bindObjCheck('#rk_ip_pregenerate', g, 'pregenerate', false);
+                bindObjCheck('#rk_ip_strip_voice', g, 'stripVoice', true);
+                bindObjCheck('#rk_ip_hide_waves', g, 'hideStoryWaves', false);
+                bindObjCheck('#rk_ip_voice_island', g, 'voiceIsland', false);
+                bindObjCheck('#rk_ip_narration', cfg.narration, 'enabled', false);
+                bindObjCheck('#rk_ip_sounds', cfg.sounds, 'enabled', false);
+                bindObjCheck('#rk_ip_draw', cfg.draw, 'enabled', false);
+
+                const modeEl = card.querySelector('#rk_ip_voice_mode');
+                if (modeEl) {
+                    modeEl.value = String(g.voiceMode || 'inline');
+                    modeEl.addEventListener('change', () => {
+                        g.voiceMode = String(modeEl.value);
+                        markImmediateSaved(badge);
+                    });
+                }
+
+                card.querySelector('#rk-iphonie-open-screen').addEventListener('click', () => {
+                    window.__rikkaExtSettingsAction('open_iphonie_app');
+                });
+                card.querySelector('#rk-iphonie-play-all').addEventListener('click', () => {
+                    const btn = document.getElementById('sttts-all');
+                    if (btn) btn.click();
+                });
+                card.querySelector('#rk-iphonie-stop').addEventListener('click', () => {
+                    const btn = document.getElementById('sttts-stop');
+                    if (btn) btn.click();
+                });
+            }
+        }
+
+        // [Task 2 核心修复] 小白X (LittleWhiteBox) 直接开关控制面板
+        function mountLittleWhiteBoxQuickSettings() {
+            const holder = document.getElementById('top-settings-holder') || document.getElementById('rikka-ext-workbench-root');
+            if (!holder) return;
+            if (!state.thirdPartySettings.LittleWhiteBox || typeof state.thirdPartySettings.LittleWhiteBox !== 'object') {
+                state.thirdPartySettings.LittleWhiteBox = {
+                    enabled: true,
+                    renderEnabled: true,
+                    maxRenderedMessages: 5,
+                    drawProvider: 'disabled',
+                    recorded: { enabled: true },
+                    storySummary: { enabled: true },
+                    storyOutline: { enabled: false },
+                    variablesCore: { enabled: true },
+                    variablesPanel: { enabled: false },
+                    templateEditor: { enabled: true },
+                    tasks: { enabled: true },
+                    immersive: { enabled: false },
+                    preview: { enabled: false },
+                    tts: { enabled: false },
+                };
+            }
+            const cfg = state.thirdPartySettings.LittleWhiteBox;
+            let card = document.getElementById('rikka-xbx-quick-settings');
+            if (!card) {
+                card = document.createElement('div');
+                card.id = 'rikka-xbx-quick-settings';
+                card.className = 'rikka-ext-card';
+                card.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h3 style="margin:0;">📦 小白X (LittleWhiteBox) · 核心功能开关</h3>
+                        <span id="rikka-xbx-save-badge" class="rikka-save-badge">已就绪</span>
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_enabled"><b>启用 LittleWhiteBox 总开关</b></label>
+                        <input type="checkbox" id="rk_xbx_enabled">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_render"><b>启用前端 HTML 渲染器 (iframe 渲染)</b></label>
+                        <input type="checkbox" id="rk_xbx_render">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_summary"><b>启用大小总结 (Story Summary)</b></label>
+                        <input type="checkbox" id="rk_xbx_summary">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_vars"><b>启用变量核心 (Variables Core 2.0/1.0)</b></label>
+                        <input type="checkbox" id="rk_xbx_vars">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_tasks"><b>启用定时/条件任务 (Scheduled Tasks)</b></label>
+                        <input type="checkbox" id="rk_xbx_tasks">
+                    </div>
+                    <div class="rikka-setting-row">
+                        <label for="rk_xbx_template"><b>启用角色卡模板编辑器 (Template Editor)</b></label>
+                        <input type="checkbox" id="rk_xbx_template">
+                    </div>
+                `;
+                holder.insertBefore(card, holder.firstChild);
+                const badge = card.querySelector('#rikka-xbx-save-badge');
+                const bindTop = (rkId, key, nativeId, defVal) => {
+                    const el = card.querySelector(rkId);
+                    if (!el) return;
+                    if (cfg[key] === undefined) cfg[key] = defVal;
+                    el.checked = !!cfg[key];
+                    el.addEventListener('change', () => {
+                        cfg[key] = !!el.checked;
+                        const nativeEl = document.getElementById(nativeId);
+                        if (nativeEl && nativeEl.checked !== el.checked) {
+                            nativeEl.checked = el.checked;
+                            try { $(nativeEl).trigger('change'); } catch (_e) { /* noop */ }
+                        }
+                        markImmediateSaved(badge);
+                    });
+                };
+                const bindSub = (rkId, subKey, nativeId, defVal) => {
+                    const el = card.querySelector(rkId);
+                    if (!el) return;
+                    if (!cfg[subKey] || typeof cfg[subKey] !== 'object') cfg[subKey] = { enabled: defVal };
+                    el.checked = !!cfg[subKey].enabled;
+                    el.addEventListener('change', () => {
+                        cfg[subKey].enabled = !!el.checked;
+                        const nativeEl = document.getElementById(nativeId);
+                        if (nativeEl && nativeEl.checked !== el.checked) {
+                            nativeEl.checked = el.checked;
+                            try { $(nativeEl).trigger('change'); } catch (_e) { /* noop */ }
+                        }
+                        markImmediateSaved(badge);
+                    });
+                };
+                bindTop('#rk_xbx_enabled', 'enabled', 'xiaobaix_enabled', true);
+                bindTop('#rk_xbx_render', 'renderEnabled', 'xiaobaix_render_enabled', true);
+                bindSub('#rk_xbx_summary', 'storySummary', 'xiaobaix_story_summary_enabled', true);
+                bindSub('#rk_xbx_vars', 'variablesCore', 'xiaobaix_variables_core_enabled', true);
+                bindSub('#rk_xbx_tasks', 'tasks', 'scheduled_tasks_enabled', true);
+                bindSub('#rk_xbx_template', 'templateEditor', 'xiaobaix_template_enabled', true);
+            }
+        }
+
+        function bindLittleWhiteBoxDom() {
+            const grid = document.querySelector('.littlewhitebox.settings-grid');
+            if (!grid) return false;
+            const tabs = grid.querySelectorAll('.menu-tab[data-target]');
+            const sections = grid.querySelectorAll('.settings-content > .settings-section');
+            tabs.forEach((tab) => {
+                if (tab.__rikkaXbxTabBound) return;
+                tab.__rikkaXbxTabBound = true;
+                tab.addEventListener('click', () => {
+                    const target = tab.getAttribute('data-target');
+                    tabs.forEach((t) => t.classList.toggle('active', t === tab));
+                    sections.forEach((sec) => {
+                        const match = target && sec.classList.contains(target);
+                        sec.style.display = match ? 'block' : 'none';
+                    });
+                });
+            });
+            return true;
+        }
+
+        async function ensureExtensionSettingsUiMounted(targetFolder) {
+            const alias = normalizeExtFolderAliasJs(targetFolder);
+            const extSettingsRoot = document.getElementById('extensions_settings');
+            if (!extSettingsRoot) return;
+            const list = (window.__rikkaSt && Array.isArray(window.__rikkaSt.extensions)) ? window.__rikkaSt.extensions : [];
+            const matchedExt = list.find((e) => e && (e.folder === targetFolder || normalizeExtFolderAliasJs(e.folder) === alias));
+            const actualFolder = (matchedExt && matchedExt.folder) ? matchedExt.folder : targetFolder;
+
+            if (alias.includes('st-prompt-template')) {
+                if (!document.getElementById('prompt_template_settings') && actualFolder) {
+                    const html = await renderExtensionTemplateAsync(`third-party/${actualFolder}`, 'settings');
+                    if (html) {
+                        extSettingsRoot.insertAdjacentHTML('beforeend', html);
+                    }
+                }
+                bindStptSettingsDom();
+                mountStptTestBench();
+            } else if (alias.includes('js-slash-runner') || alias.includes('tavern_helper')) {
+                mountJsrWorkbench();
+            } else if (alias.includes('st-memory-enhancement')) {
+                // 挂载直接可交互的记忆增强核心设置卡片，绝不重复注入 index.html 破坏原生 InitBinging()
+                mountMemoryEnhancementQuickSettings();
+                localizeDomI18n(document.body);
+            } else if (alias.includes('littlewhitebox')) {
+                mountLittleWhiteBoxQuickSettings();
+                bindLittleWhiteBoxDom();
+            } else if (alias.includes('st-iphonie')) {
+                mountStIphonieQuickSettings();
+            } else if (actualFolder && extSettingsRoot.children.length === 0) {
+                const html = await renderExtensionTemplateAsync(`third-party/${actualFolder}`, 'settings');
+                if (html) {
+                    extSettingsRoot.insertAdjacentHTML('beforeend', html);
+                }
+            }
+        }
+
+        function normalizeExtensionSettingsDom() {
+            try {
+                // 0) 强制隐藏 #chat 与 #form_sheld，绝不让聊天正文出现在插件设置页
+                ['#chat', '#form_sheld', '#send_form', '#rikka-hidden-st-stubs'].forEach((sel) => {
+                    document.querySelectorAll(sel).forEach((el) => {
+                        if (el && el.style) el.style.setProperty('display', 'none', 'important');
+                    });
+                });
+                // 1) 确保所有顶层抽屉与设置面板可见（不强制覆盖 #database-content/#editor-content/#setting-content 的单页切换，除非三者全被隐藏）
+                const forceVisibleSelectors = [
+                    '#prompt_template_settings',
+                    '#tavern_helper',
+                    '#table_database_settings_drawer',
+                    '#table_drawer_content',
+                    '#memory_enhancement_settings_inline_drawer_content',
+                    '.memory_enhancement_container',
+                    '#xiaobaix_settings',
+                    '.littlewhitebox',
+                    '#sttts-extension-entry',
+                    '.inline-drawer-content',
+                    '.drawer-content',
+                ];
+                for (const sel of forceVisibleSelectors) {
+                    document.querySelectorAll(sel).forEach((el) => {
+                        if (el && el.style && el.getAttribute('data-rikka-collapsed') !== 'true') {
+                            if (el.style.display === 'none') el.style.display = 'block';
+                            el.removeAttribute('data-slide-toggle');
+                            el.classList.remove('closedDrawer');
+                        }
+                    });
+                }
+                if (extAlias.includes('st-memory-enhancement')) {
+                    const stDiv = document.getElementById('setting-content');
+                    const edDiv = document.getElementById('editor-content');
+                    const dbDiv = document.getElementById('database-content');
+                    if (stDiv && !stDiv.__rikkaInitialShown) {
+                        stDiv.__rikkaInitialShown = true;
+                        stDiv.style.setProperty('display', 'block', 'important');
+                        if (edDiv) edDiv.style.setProperty('display', 'block', 'important');
+                        if (dbDiv) dbDiv.style.setProperty('display', 'block', 'important');
+                    }
+                } else if (extAlias.includes('st-prompt-template')) {
+                    bindStptSettingsDom();
+                } else if (extAlias.includes('littlewhitebox')) {
+                    bindLittleWhiteBoxDom();
+                }
+                // 2) 全局监听扩展设置页内的任何 input/change 事件，确保插件原生控件修改后立即写回宿主
+                if (!document.body.__rikkaGlobalInputSyncBound) {
+                    document.body.__rikkaGlobalInputSyncBound = true;
+                    document.body.addEventListener('change', () => {
+                        setTimeout(() => {
+                            try { pushGlobalVars(); pushThirdPartySettingsNow(); } catch (_e) { /* noop */ }
+                        }, 20);
+                    }, true);
+                }
+                // 3) 为 .inline-drawer-toggle / .inline-drawer-header 绑定点击折叠切换
+                document.querySelectorAll('.inline-drawer-toggle, .inline-drawer-header').forEach((hdr) => {
+                    if (hdr.__rikkaDrawerBound) return;
+                    hdr.__rikkaDrawerBound = true;
+                    hdr.addEventListener('click', (ev) => {
+                        const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : '';
+                        if (tag === 'input' || tag === 'select' || tag === 'button' || tag === 'a' || tag === 'i') return;
+                        const drawer = hdr.closest('.inline-drawer');
+                        const content = drawer ? drawer.querySelector('.inline-drawer-content') : null;
+                        if (content) {
+                            const hidden = content.getAttribute('data-rikka-collapsed') === 'true';
+                            content.setAttribute('data-rikka-collapsed', hidden ? 'false' : 'true');
+                            content.style.setProperty('display', hidden ? 'block' : 'none', 'important');
+                        }
+                    });
+                });
+                const statusEl = document.getElementById('rikka-ext-settings-status');
+                if (statusEl && statusEl.getAttribute('data-error') !== 'true') {
+                    statusEl.textContent = '扩展设置已就绪';
+                    statusEl.style.display = 'none';
+                }
+            } catch (_e) { /* noop */ }
+        }
+
+        window.__rikkaExtSettingsAction = async function (action, payloadJson) {
+            try {
+                const payload = payloadJson ? JSON.parse(payloadJson) : {};
+                if (action === 'expand_all' || action === 'expand_all_drawers') {
+                    document.querySelectorAll('[data-rikka-collapsed="true"]').forEach((el) => {
+                        el.setAttribute('data-rikka-collapsed', 'false');
+                        el.style.setProperty('display', 'block', 'important');
+                    });
+                    if (extAlias.includes('st-memory-enhancement')) {
+                        showMemoryEnhancementSection('all');
+                    }
+                    normalizeExtensionSettingsDom();
+                    return true;
+                }
+                if (action === 'open_stpt_modal') {
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    normalizeExtensionSettingsDom();
+                    const modal = document.getElementById('rikka-stpt-modal') || document.getElementById('prompt_template_settings');
+                    if (modal) {
+                        modal.style.display = 'block';
+                        modal.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        const input = document.getElementById('rikka-stpt-test-input');
+                        if (input) input.focus();
+                    }
+                    return true;
+                }
+                if (action === 'open_jsr_scripts') {
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    normalizeExtensionSettingsDom();
+                    const wb = document.getElementById('rikka-jsr-workbench') || document.getElementById('tavern_helper');
+                    if (wb) {
+                        wb.style.display = 'block';
+                        wb.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                    return true;
+                }
+                if (action === 'open_memory_table' || action === 'switch_memory_tab') {
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    normalizeExtensionSettingsDom();
+                    showMemoryEnhancementSection(payload.tab || 'all');
+                    return true;
+                }
+                if (action === 'open_xbx_panel') {
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    normalizeExtensionSettingsDom();
+                    const grid = document.querySelector('.littlewhitebox') || document.getElementById('rikka-xbx-quick-settings');
+                    if (grid) {
+                        grid.style.display = 'block';
+                        grid.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                    return true;
+                }
+                if (action === 'open_iphonie' || action === 'open_iphonie_app') {
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    if (openRealStIphoniePanel()) return true;
+                    // 若 ST-iPhonie 仍在异步初始化 IndexedDB，等待 350ms 后重试一次真实入口
+                    await new Promise((r) => setTimeout(r, 350));
+                    if (openRealStIphoniePanel()) return true;
+                    // 通知宿主弹出常驻运行时小手机悬浮窗
+                    emitToHost('request_open_floating_window', { target: 'iphonie' });
+                    return true;
+                }
+                if (action === 'reload_settings') {
+                    pullThirdPartySettings(true);
+                    ensureStStateShapes();
+                    await eventSource.emit(event_types.SETTINGS_UPDATED);
+                    await ensureExtensionSettingsUiMounted(extFolder);
+                    normalizeExtensionSettingsDom();
+                    return true;
+                }
+            } catch (e) {
+                console.warn('[ext-settings] action failed', action, e);
+            }
+            return false;
+        };
+
         const t0 = Date.now();
         try {
+            // 先立即挂载直接可交互的设置面板（0ms 首屏可见，绝不白屏）
+            await ensureExtensionSettingsUiMounted(extFolder);
+            normalizeExtensionSettingsDom();
             await loadThirdPartyExtensions(false);
+            rebindHostTavernHelperShims();
+            // 发射 ST 标准就绪事件链，驱动 JS-Slash-Runner / ST-Prompt-Template / st-memory-enhancement / LittleWhiteBox 挂载设置面板
+            try { await eventSource.emit(event_types.SETTINGS_LOADED); } catch (_e) { /* noop */ }
+            try { await eventSource.emit(event_types.EXTENSION_SETTINGS_LOADED); } catch (_e) { /* noop */ }
+            try { await eventSource.emit(event_types.SETTINGS_UPDATED); } catch (_e) { /* noop */ }
+            try { await eventSource.emit('chatLoaded'); } catch (_e) { /* noop */ }
+            try { await eventSource.emit(event_types.CHAT_CHANGED, state.chatId || 'default'); } catch (_e) { /* noop */ }
+            try { await eventSource.emit(event_types.APP_READY); } catch (_e) { /* noop */ }
+            await ensureExtensionSettingsUiMounted(extFolder);
         } catch (e) {
             const msg = (e && (e.stack || e.message)) || String(e);
             try { callBridge("log", "error", `[ext-settings] load failed: ${msg}`); } catch (_e) { /* noop */ }
-            const statusEl = document.getElementById("rikka-ext-settings-status");
-            if (statusEl) {
-                statusEl.setAttribute("data-error", "true");
-                statusEl.textContent = `扩展加载失败：${msg}`;
-            }
+            await ensureExtensionSettingsUiMounted(extFolder);
         }
         console.log(`${LOG_PREFIX} ext settings phase done in ${Date.now() - t0}ms`);
         try {
-            const extFolder = new URLSearchParams(location.search).get('ext') || '';
             emitToHost('ext_settings_loaded', { folder: extFolder });
         } catch (_e) { /* noop */ }
-        // [v197 hotfix] 加载完成后更新状态：有 UI 则收起提示，没有 UI 则明确告诉用户。
-        try {
-            const statusEl = document.getElementById('rikka-ext-settings-status');
-            const uiCount = (id) => {
-                const el = document.getElementById(id);
-                return el && el.children ? el.children.length : 0;
-            };
-            const hasUi = (
-                uiCount('extensions_settings') +
-                uiCount('extensions_settings2') +
-                uiCount('translation_container') +
-                uiCount('extensionsMenu') +
-                uiCount('extensions_menu') +
-                uiCount('extensions-settings-button')
-            ) > 0;
-            if (statusEl) {
-                if (hasUi) {
-                    statusEl.textContent = '扩展设置已加载';
-                    setTimeout(() => { statusEl.style.display = 'none'; }, 500);
-                } else {
-                    statusEl.textContent = '扩展已加载，但没有检测到设置界面。若该扩展只提供运行时功能，这是正常的；否则请把日志发给 AI。';
-                }
-            }
-        } catch (_e) { /* noop */ }
-        setTimeout(() => {
-            try {
-                const statusEl = document.getElementById('rikka-ext-settings-status');
-                const uiCount = (id) => {
-                    const el = document.getElementById(id);
-                    return el && el.children ? el.children.length : 0;
-                };
-                const hasUi = (
-                    uiCount('extensions_settings') +
-                    uiCount('extensions_settings2') +
-                    uiCount('translation_container') +
-                    uiCount('extensionsMenu') +
-                    uiCount('extensions_menu') +
-                    uiCount('extensions-settings-button')
-                ) > 0;
-                if (statusEl && hasUi) statusEl.style.display = 'none';
-            } catch (_e) { /* noop */ }
-        }, 1500);
+        normalizeExtensionSettingsDom();
+        setTimeout(() => { ensureExtensionSettingsUiMounted(extFolder).then(normalizeExtensionSettingsDom); }, 300);
+        setTimeout(() => { ensureExtensionSettingsUiMounted(extFolder).then(normalizeExtensionSettingsDom); }, 900);
         return;
     }
     // Panel 模式（C4）：消息内嵌渲染宿主 —— 启动时仅轻量拉取元数据与变量（refreshForPanelMode），按需惰性拉取聊天正文
@@ -3703,6 +5682,7 @@ function installPanelMode() {
     // v206：JSR 会在 ready 回调里另建一个同名容器（文档序在我方之前）→ 短期轮询把身份 div 补进去
     keepTavernHelperDom(['mvu-standalone'], 30000);
     refreshAll();
+    installUniversalFloatingAndTtsBridge();
     emitToHost('script_ready', { version: '1.1.0' });
     console.log(`${LOG_PREFIX} shims installed: ${Object.keys(TavernHelper).length} keys`);
     // [P0-1 根因1修复] 重排冷启动顺序，消除冷启动直落重度脚本卡（如大小姐）时的 CrRendererMain 死锁：
@@ -3710,13 +5690,15 @@ function installPanelMode() {
     //    确保 window.TavernHelper（180 keys）完整就绪后再启动角色卡脚本 iframe，避免 JSR 覆盖 TavernHelper 与 6 个 iframe 并发争抢。
     const extT0 = Date.now();
     try { await loadThirdPartyExtensions(false); } catch (_e) { /* noop */ }
+    rebindHostTavernHelperShims();
     try {
-        if (window.TavernHelper && typeof window.TavernHelper === 'object') {
-            window.TavernHelper.injectPrompts = shimInject.injectPrompts;
-            window.TavernHelper.uninjectPrompts = shimInject.uninjectPrompts;
+        if (typeof $ === 'function') {
+            $(() => { rebindHostTavernHelperShims(); });
         }
-        window.injectPrompts = shimInject.injectPrompts;
-        window.uninjectPrompts = shimInject.uninjectPrompts;
+        setTimeout(rebindHostTavernHelperShims, 80);
+        setTimeout(rebindHostTavernHelperShims, 350);
+        await eventSource.emit(event_types.EXTENSION_SETTINGS_LOADED);
+        await eventSource.emit(event_types.APP_READY);
     } catch (_e) { /* noop */ }
     console.log(`${LOG_PREFIX} third-party extension phase done in ${Date.now() - extT0}ms (window.Mvu=${!!window.Mvu})`);
 

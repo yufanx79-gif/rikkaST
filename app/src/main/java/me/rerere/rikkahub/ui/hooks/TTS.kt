@@ -2,7 +2,6 @@ package me.rerere.rikkahub.ui.hooks
 
 import android.content.Context
 import android.util.Log
-import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -13,20 +12,33 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.launch
-import me.rerere.tts.model.PlaybackState
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getSelectedTTSProvider
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.utils.stripMarkdown
-import me.rerere.tts.model.TTSResponse
+import me.rerere.tts.controller.TtsController
+import me.rerere.tts.model.PlaybackState
 import me.rerere.tts.provider.TTSManager
 import me.rerere.tts.provider.TTSProviderSetting
-import me.rerere.tts.controller.TtsController
 import org.koin.compose.koinInject
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
 private const val TAG = "TTS"
+
+/**
+ * 剥离 ST-iPhonie 等酒馆扩展专用多媒体/协议标签（`<tts>`、`<pic>`、`<bgm>`、`<sfx>`、`<phone>`），
+ * 确保上游原生 TTS 通道只朗读角色实际可见的文本，不把 `<tts>角色|情绪|英文台词</tts>` 原文读出来。
+ */
+internal val ST_IPHONIE_PROTOCOL_TAGS_RE = Regex(
+    """<(tts|pic|bgm|sfx|phone)\b[^>]*>[\s\S]*?</\1>""",
+    RegexOption.IGNORE_CASE,
+)
+
+internal fun stripStIphonieProtocolTagsForNativeTts(raw: String): String {
+    if (!raw.contains('<')) return raw
+    return raw.replace(ST_IPHONIE_PROTOCOL_TAGS_RE, "").trim()
+}
 
 /**
  * Composable function to remember and manage custom TTS state.
@@ -57,9 +69,14 @@ fun rememberCustomTtsState(): CustomTtsState {
         onDispose { }
     }
 
-    // Cleanup resources when the state is disposed
+    // 注册双通道音频仲裁回调：当小手机（ST-iPhonie）开始播放语音时，自动停止原生 TTS 通道；
+    // 反之当原生 TTS 开始朗读时，也会自动停止小手机语音，确保两个通道彻底隔离、绝不抢占冲突。
     DisposableEffect(ttsState) {
+        TavernRuntimeManager.nativeTtsStopper = { ttsState.stop() }
         onDispose {
+            if (TavernRuntimeManager.nativeTtsStopper != null) {
+                TavernRuntimeManager.nativeTtsStopper = null
+            }
             ttsState.cleanup()
         }
     }
@@ -126,7 +143,7 @@ private class CustomTtsStateImpl(
 ) : CustomTtsState, KoinComponent {
 
     private val ttsManager by inject<TTSManager>()
-    private val controller by lazy { me.rerere.tts.controller.TtsController(context, ttsManager) }
+    private val controller by lazy { TtsController(context, ttsManager) }
 
     private val scope = CoroutineScope(Dispatchers.Main)
     private var currentJob: Job? = null
@@ -143,8 +160,13 @@ private class CustomTtsStateImpl(
     }
 
     override fun speak(text: String, flushCalled: Boolean) {
-        val processed = text.stripMarkdown()
-        controller.speak(processed, flushCalled)
+        // Channel A (Native TTS) 启动前先通知 Channel B (ST-iPhonie) 停止播放，防止双声道叠加冲突
+        TavernRuntimeManager.stopStIphonieTts("native_tts_speak")
+        val cleanedProtocol = stripStIphonieProtocolTagsForNativeTts(text)
+        val processed = cleanedProtocol.stripMarkdown()
+        if (processed.isNotBlank()) {
+            controller.speak(processed, flushCalled)
+        }
     }
 
     override fun stop() {

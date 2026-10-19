@@ -11,21 +11,21 @@ import java.util.Base64
 import kotlin.uuid.Uuid
 
 /**
- * 立绘文件仓库：`filesDir/sprites/<assistantId>/<label>.(png|jpg|webp|gif)`。
+ * 立绘与角色内嵌图片仓库：`filesDir/sprites/<assistantId>/<label_or_name>.(png|jpg|webp|gif)`
+ * 以及 `filesDir/charx_assets/<assistantId>/...`。
  *
- * 对齐 SillyTavern Character Expressions 的「按角色的立绘文件夹 + 文件名 = 标签」约定
- * （官方 `validateExpressionSpriteName`：`^label(?:[-.].*?)?$`），
- * 每个助手一套立绘，标签用 [ExpressionLabels.ALL] 的 28 个 GoEmotions 标签匹配。
- *
- * 来源：
- * - A：V3 角色卡 `data.assets` 里的内嵌图片（data URI）→ [syncFromCardAssets]；
- * - B：设置页手动多选图片 → [importFromUri]（按文件名推断标签）。
- *
- * 存储即文件：不做数据库迁移、不写进 Settings，导入/导出角色卡不受影响。
+ * 兼容：
+ * - A：SillyTavern 标准 28 个 GoEmotions 表情标签（[ExpressionLabels.ALL]）；
+ * - B：中文/自定义立绘与 CG 资产名（如 `织乃_zcw_2`、`小夜_立绘`、`制服`、`cg_1` 等）：
+ *   [syncFromCardAssets] 不再丢弃非 GoEmotions 名称的 `data:image/...` 资产，而是同时写入
+ *   `sprites/<assistantId>/<safeName>.<ext>` 与 `charx_assets/<assistantId>/<safeName>.<ext>`；
+ * - C：[resolveAnySpriteOrAssetFile] 支持按完整相对路径、URL 解码文件名、无后缀 stem 跨扩展名（png/webp/jpg/jpeg/gif）
+ *   查找角色立绘与 CG 图片。
  */
 object SpriteRepository {
 
     private const val SPRITE_ROOT = "sprites"
+    private const val CHARX_ROOT = "charx_assets"
 
     /** 支持的文件扩展名（png/jpg/webp/gif；官方立绘常见格式） */
     val SUPPORTED_EXTENSIONS: Set<String> = setOf("png", "jpg", "jpeg", "webp", "gif")
@@ -33,6 +33,10 @@ object SpriteRepository {
     /** 该助手的立绘目录（不存在时创建） */
     fun spriteDir(context: Context, assistantId: Uuid): File =
         File(File(context.filesDir, SPRITE_ROOT), assistantId.toString()).apply { mkdirs() }
+
+    /** 该助手的 charx 资产目录（不存在时创建） */
+    fun charxAssetDir(context: Context, assistantId: Uuid): File =
+        File(File(context.filesDir, CHARX_ROOT), assistantId.toString()).apply { mkdirs() }
 
     /** 仅查询目录（不创建） */
     private fun existingDir(context: Context, assistantId: Uuid): File =
@@ -56,14 +60,90 @@ object SpriteRepository {
         val dir = existingDir(context, assistantId)
         if (!dir.isDirectory) return null
         val normalized = label.trim().lowercase()
-        return listOf("png", "jpg", "jpeg", "webp", "gif")
+        val exact = listOf("png", "jpg", "jpeg", "webp", "gif")
             .map { File(dir, "$normalized.$it") }
             .firstOrNull { it.isFile }
+        if (exact != null) return exact
+        return resolveAnySpriteOrAssetFile(context, assistantId, label)
+    }
+
+    /**
+     * 按任意名称或路径查找该助手（或全部助手）的立绘/CG 资产文件：
+     * 支持 URL 编码的中文名（如 `%E7%BB%87%E4%B9%83_zcw_2.png`）、无扩展名 stem（如 `织乃_zcw_2`）、
+     * 以及扩展名不一致（如请求 `.png` 但实际文件为 `.webp` 或 `.jpg`）。
+     */
+    fun resolveAnySpriteOrAssetFile(
+        context: Context,
+        assistantId: Uuid?,
+        rawNameOrPath: String,
+    ): File? {
+        val decoded = runCatching { Uri.decode(rawNameOrPath) }.getOrDefault(rawNameOrPath)
+            .substringBefore('?')
+            .substringBefore('#')
+            .replace('\\', '/')
+            .trim()
+            .removePrefix("embeded://")
+            .removePrefix("embedded://")
+            .removePrefix("ccdefault:")
+            .trimStart('/')
+        if (decoded.isBlank()) return null
+
+        val baseName = decoded.substringAfterLast('/')
+        val stem = if (baseName.contains('.')) baseName.substringBeforeLast('.') else baseName
+        val safeStem = sanitizeAssetStem(stem)
+
+        fun searchInDir(dir: File): File? {
+            if (!dir.isDirectory) return null
+            // 1) 精确相对路径
+            val relCandidate = runCatching { File(dir, decoded).canonicalFile }.getOrNull()
+            val dirCanonical = runCatching { dir.canonicalFile.path }.getOrNull()
+            if (relCandidate != null && dirCanonical != null &&
+                relCandidate.path.startsWith(dirCanonical + File.separator) &&
+                relCandidate.isFile
+            ) {
+                return relCandidate
+            }
+            // 2) 直接子文件精确名或同 stem 跨扩展名
+            for (ext in listOf("png", "webp", "jpg", "jpeg", "gif")) {
+                File(dir, "$stem.$ext").takeIf { it.isFile }?.let { return it }
+                if (safeStem != stem) {
+                    File(dir, "$safeStem.$ext").takeIf { it.isFile }?.let { return it }
+                }
+            }
+            // 3) 递归扫描子目录（针对 .charx 解压出的 assets/other/image/... 结构）
+            return dir.walkTopDown()
+                .maxDepth(5)
+                .firstOrNull { f ->
+                    if (!f.isFile || f.extension.lowercase() !in SUPPORTED_EXTENSIONS) return@firstOrNull false
+                    val fName = f.name
+                    val fStem = f.nameWithoutExtension
+                    fName.equals(baseName, ignoreCase = true) ||
+                        fStem.equals(stem, ignoreCase = true) ||
+                        fStem.equals(safeStem, ignoreCase = true)
+                }
+        }
+
+        if (assistantId != null) {
+            searchInDir(File(File(context.filesDir, CHARX_ROOT), assistantId.toString()))?.let { return it }
+            searchInDir(File(File(context.filesDir, SPRITE_ROOT), assistantId.toString()))?.let { return it }
+        }
+
+        // 回退扫描所有助手的 charx_assets 与 sprites 目录，以及 tavern-user/images
+        listOf(
+            File(context.filesDir, CHARX_ROOT),
+            File(context.filesDir, SPRITE_ROOT),
+            File(File(context.filesDir, "tavern-user"), "images"),
+        ).forEach { root ->
+            if (root.isDirectory) {
+                searchInDir(root)?.let { return it }
+            }
+        }
+        return null
     }
 
     /**
      * 手动导入单张图片：按 [labelHint]（显式标签）或文件名推断标签。
-     * @return 导入后的标签；文件名无法匹配 28 标签时返回 null（调用方提示用户）
+     * @return 导入后的标签；文件名无法匹配 28 标签时返回自定义名称
      */
     suspend fun importFromUri(
         context: Context,
@@ -74,6 +154,7 @@ object SpriteRepository {
         val displayName = queryDisplayName(context, uri) ?: uri.lastPathSegment.orEmpty()
         val label = labelHint?.let { ExpressionLabels.matchLabel(it) }
             ?: ExpressionLabels.labelFromFileName(displayName)
+            ?: sanitizeAssetStem(displayName.substringBeforeLast('.')).takeIf { it.isNotBlank() }
             ?: return@withContext null
         val ext = resolveExtension(displayName, context.contentResolver.getType(uri)) ?: "png"
         val bytes = runCatching {
@@ -91,15 +172,20 @@ object SpriteRepository {
             if (!dir.isDirectory) return@withContext false
             val normalized = label.trim().lowercase()
             val removed = dir.listFiles().orEmpty()
-                .filter { ExpressionLabels.labelFromFileName(it.name) == normalized }
+                .filter {
+                    ExpressionLabels.labelFromFileName(it.name) == normalized ||
+                        it.nameWithoutExtension.equals(normalized, ignoreCase = true)
+                }
                 .count { it.delete() }
             removed > 0
         }
 
     /**
-     * 来源 A：V3 角色卡 assets 同步（仅处理 `data:image/...;base64,` 内嵌资源）。
-     * 外链（http/ccdefault/asset://）暂不落盘 —— 不引入网络下载依赖（本批范围）。
-     * @return 成功落盘的标签列表
+     * 来源 A：V3 角色卡 assets 同步（处理 `data:image/...;base64,` 内嵌资源）。
+     * 同时落盘：
+     * 1) GoEmotions 28 标签立绘（若匹配）；
+     * 2) 角色卡自定义名称立绘/CG（如 `织乃_zcw_2`），同时写入 `sprites/<id>/` 与 `charx_assets/<id>/`！
+     * @return 成功落盘的标签/名称列表
      */
     suspend fun syncFromCardAssets(
         context: Context,
@@ -108,17 +194,32 @@ object SpriteRepository {
     ): List<String> = withContext(Dispatchers.IO) {
         if (assets.isEmpty()) return@withContext emptyList()
         val imported = linkedSetOf<String>()
+        val charxDir = charxAssetDir(context, assistantId)
         for (asset in assets) {
-            val label = ExpressionLabels.labelFromFileName(asset.name) ?: continue
             val decoded = decodeDataUri(asset.uri) ?: continue
             val ext = decoded.second
                 ?: asset.ext.lowercase().takeIf { it in SUPPORTED_EXTENSIONS }
                 ?: "png"
-            writeSprite(context, assistantId, label, decoded.first, ext)
-            imported += label
+            val label = ExpressionLabels.labelFromFileName(asset.name)
+            if (label != null) {
+                writeSprite(context, assistantId, label, decoded.first, ext)
+                imported += label
+            }
+            val rawStem = asset.name.substringAfterLast('/').substringBeforeLast('.').ifBlank { asset.name }
+            val safeName = sanitizeAssetStem(rawStem)
+            if (safeName.isNotBlank()) {
+                writeSpriteByExactStem(context, assistantId, safeName, decoded.first, ext)
+                runCatching { File(charxDir, "$safeName.$ext").writeBytes(decoded.first) }
+                imported += safeName
+            }
         }
         imported.toList()
     }
+
+    internal fun sanitizeAssetStem(raw: String): String =
+        raw.trim()
+            .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1F]"), "_")
+            .trim('.', ' ')
 
     // ==================== 内部实现 ====================
 
@@ -131,11 +232,22 @@ object SpriteRepository {
     ) {
         val dir = spriteDir(context, assistantId)
         val safeExt = ext.lowercase().takeIf { it in SUPPORTED_EXTENSIONS } ?: "png"
-        // 一个标签只保留一份文件：先清掉同标签其它扩展名，避免 resolveFile 命中旧图
         dir.listFiles().orEmpty()
             .filter { ExpressionLabels.labelFromFileName(it.name) == label && it.extension.lowercase() != safeExt }
             .forEach { it.delete() }
         File(dir, "$label.$safeExt").writeBytes(bytes)
+    }
+
+    private fun writeSpriteByExactStem(
+        context: Context,
+        assistantId: Uuid,
+        safeStem: String,
+        bytes: ByteArray,
+        ext: String,
+    ) {
+        val dir = spriteDir(context, assistantId)
+        val safeExt = ext.lowercase().takeIf { it in SUPPORTED_EXTENSIONS } ?: "png"
+        File(dir, "$safeStem.$safeExt").writeBytes(bytes)
     }
 
     private fun resolveExtension(displayName: String, mime: String?): String? {
@@ -159,7 +271,6 @@ object SpriteRepository {
 
     /**
      * `data:image/png;base64,xxxx` → (bytes, ext)；非 data URI / 非 base64 返回 null。
-     * 与 JS 侧 `atob` 等价（java.util.Base64，minSdk 26 可用，且为纯 JVM 可单测实现）。
      */
     fun decodeDataUri(uri: String): Pair<ByteArray, String?>? {
         if (!uri.startsWith("data:", ignoreCase = true)) return null

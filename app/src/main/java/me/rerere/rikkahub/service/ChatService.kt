@@ -559,14 +559,22 @@ class ChatService(
         dispatchNextQueuedMessage(conversationId)
     }
 
-    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
-        if (content.isEmptyInputMessage()) return
+    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true): Boolean {
+        if (content.isEmptyInputMessage()) return false
         val session = sessionManager.getOrCreate(conversationId)
         synchronized(session) {
-            if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
+            // [Bug B 修复] 用户显式点击发送时总是恢复队列（resume），避免上一轮网络/工具异常触发 pause() 后
+            // 队列非空导致 messages.isEmpty() 为 false、新消息被静默困在暂停队列中无法发出。
+            session.messageQueue.resume()
             session.messageQueue.enqueue(content, answer)
+            val activeJob = session.getJob()
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[send-diag] ChatService.sendMessage conv=$conversationId queued=${session.messageQueue.state.value.messages.size} activeJob=${activeJob != null} answer=$answer",
+            )
             dispatchNextQueuedMessage(conversationId)
         }
+        return true
     }
 
     /** Enqueue immediately; the result belongs to this item even after edits or later turns. */
@@ -591,8 +599,14 @@ class ChatService(
     private fun dispatchNextQueuedMessage(conversationId: Uuid): Job? {
         val session = sessionManager.get(conversationId) ?: return null
         synchronized(session) {
-            // A pending tool approval is still part of the current turn.
-            if (session.getJob() != null || session.state.value.currentMessages.any { message ->
+            val activeJob = session.getJob()
+            if (activeJob != null) {
+                return null
+            }
+            // [Bug B 修复] 仅在当前没有排队用户消息待覆盖、或最后一条消息确实处于待审批暂停且队列已暂停时才阻止自动调度；
+            // 当用户主动发送新消息（paused == false）且无活跃生成任务时，必须允许进入 sendQueuedMessage，
+            // 由 sendQueuedMessage 首行 finishInterruptedPendingTools(conversationId) 清理残留未决工具，避免死锁。
+            if (session.messageQueue.state.value.paused && session.state.value.currentMessages.any { message ->
                     message.parts.any { it is UIMessagePart.Tool && it.isPending }
                 }) return null
             val next = session.messageQueue.takeNext() ?: return null
@@ -605,28 +619,42 @@ class ChatService(
         val conversationId = session.id
         val content = queued.parts
         val answer = queued.answer
+        session.isExecutingSendTurn = answer
         val job = launchGenerationJob(
             conversationId = conversationId,
             keepAliveInBackground = answer,
         ) {
+            session.isExecutingSendTurn = answer
             try {
+                if (!session.isInitialized) {
+                    initializeConversation(conversationId)
+                }
                 finishInterruptedPendingTools(conversationId)
 
                 val currentConversation = session.state.value
                 val settings = settingsStore.settingsFlow.first()
                 val assistant = settings.getAssistantById(currentConversation.assistantId)
                     ?: settings.getCurrentAssistant()
-                val processedContent = preprocessUserInputParts(content, assistant)
+                val processedContent = withContext(Dispatchers.Default) {
+                    preprocessUserInputParts(content, assistant, settings, currentConversation.modeInjectionIds)
+                }
 
-                // 添加消息到列表
-                val newConversation = currentConversation.copy(
-                    messageNodes = currentConversation.messageNodes + UIMessage(
-                        role = MessageRole.USER,
-                        parts = processedContent,
-                    ).toMessageNode(),
+                // 添加消息到列表并先行同步更新内存态（让 UI 与滚动立即感知新消息，不等 SQLite/FTS I/O）
+                val userMsg = UIMessage(
+                    role = MessageRole.USER,
+                    parts = processedContent,
                 )
-                saveConversation(conversationId, newConversation)
+                val newConversation = currentConversation.copy(
+                    messageNodes = currentConversation.messageNodes + userMsg.toMessageNode(),
+                )
+                updateConversation(conversationId, newConversation, checkFiles = false)
                 session.submittingMessage = null
+                saveConversation(conversationId, newConversation)
+                TavernRuntimeManager.recordSendDiagnostic(
+                    stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED,
+                    conversationId = conversationId.toString(),
+                    detail = "userMsgId=${userMsg.id} nodes=${newConversation.messageNodes.size} answer=$answer",
+                )
 
                 // 酒馆事件桥：用户消息已写入 → 通知 JS 运行时（MVU/脚本）
                 if (TavernRuntimeManager.activeConversationId == conversationId.toString()) {
@@ -637,6 +665,7 @@ class ChatService(
                 }
 
                 // 开始补全
+                session.isExecutingSendTurn = false
                 if (answer) {
                     handleMessageComplete(conversationId)
                 }
@@ -655,11 +684,26 @@ class ChatService(
                 // The ordinary autoplay collector must not read a late voice reply again.
                 if (queued.reply == null) _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
+                session.isExecutingSendTurn = false
                 queued.reply?.completeExceptionally(e)
                 e.printStackTrace()
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    TavernRuntimeManager.recordSendDiagnostic(
+                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                        conversationId = conversationId.toString(),
+                        detail = "status=CANCELLED_IN_SEND_TURN reason=${e.message}",
+                    )
+                    throw e
+                }
                 session.messageQueue.pause()
+                TavernRuntimeManager.recordSendDiagnostic(
+                    stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                    conversationId = conversationId.toString(),
+                    detail = "status=FAILED_IN_SEND_TURN error=${e.javaClass.simpleName}:${e.message}",
+                )
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
+            } finally {
+                session.isExecutingSendTurn = false
             }
         }
         job.invokeOnCompletion { cause ->
@@ -687,66 +731,77 @@ class ChatService(
         if (content.isEmptyInputMessage()) return
 
         val session = sessionManager.getOrCreate(conversationId)
-        val previousJob = session.getJob()
-        previousJob?.cancel()
-
-        val job = appScope.launch {
-            try {
-                runCatching { previousJob?.join() }
-                finishInterruptedPendingTools(conversationId)
-
-                val currentConversation = session.state.value
-                // 官方：/send 应用 USER_INPUT 正则，/sendas 应用 SLASH_COMMAND 正则（本地无 SLASH_COMMAND placement，映射 ASSISTANT scope），/sys 不应用
-                val scope = when (role) {
-                    MessageRole.USER -> AssistantAffectScope.USER
-                    MessageRole.ASSISTANT -> AssistantAffectScope.ASSISTANT
-                    else -> null
-                }
-                val processedContent = if (scope != null) {
-                    val settings = settingsStore.settingsFlow.first()
-                    val assistant = settings.getAssistantById(currentConversation.assistantId)
-                        ?: settings.getCurrentAssistant()
-                    content.map { part ->
-                        if (part is UIMessagePart.Text) {
-                            part.copy(
-                                            text = part.text
-                                                .replaceRegexes(assistant, scope, visual = false)
-                                                .getStRegexed(mergeActiveRegexScripts(settings, assistant),
-                                                    if (role == MessageRole.USER) RegexPlacement.USER_INPUT else RegexPlacement.SLASH_COMMAND,
-                                                    isPrompt = true,
-                                                )
-                                        )
-                        } else {
-                            part
-                        }
+        synchronized(session) {
+            val currentConversation = session.state.value
+            val scope = when (role) {
+                MessageRole.USER -> AssistantAffectScope.USER
+                MessageRole.ASSISTANT -> AssistantAffectScope.ASSISTANT
+                else -> null
+            }
+            val settings = settingsStore.settingsFlow.value
+            val assistant = settings.getAssistantById(currentConversation.assistantId)
+                ?: settings.getCurrentAssistant()
+            val processedContent = if (scope != null) {
+                val activeScripts = mergeActiveRegexScripts(settings, assistant, currentConversation.modeInjectionIds)
+                content.map { part ->
+                    if (part is UIMessagePart.Text) {
+                        part.copy(
+                            text = part.text
+                                .replaceRegexes(assistant, scope, visual = false)
+                                .getStRegexed(
+                                    activeScripts,
+                                    if (role == MessageRole.USER) RegexPlacement.USER_INPUT else RegexPlacement.SLASH_COMMAND,
+                                    isPrompt = false,
+                                )
+                        )
+                    } else {
+                        part
                     }
-                } else {
-                    content
                 }
-                val node = UIMessage(
-                    role = role,
-                    parts = processedContent,
-                    name = name,
-                ).toMessageNode()
-                val messageNodes = if (at == null) {
-                    currentConversation.messageNodes + node
-                } else {
-                    // 官方 at 语义：非负按索引插入，负数从末尾往前（-1 = 最后一条之前），越界安全截断
-                    val index = when {
-                        at < 0 -> (currentConversation.messageNodes.size + at).coerceIn(0, currentConversation.messageNodes.size)
-                        else -> at.coerceIn(0, currentConversation.messageNodes.size)
+            } else {
+                content
+            }
+            val node = UIMessage(
+                role = role,
+                parts = processedContent,
+                name = name,
+            ).toMessageNode()
+            val messageNodes = if (at == null) {
+                currentConversation.messageNodes + node
+            } else {
+                val index = when {
+                    at < 0 -> (currentConversation.messageNodes.size + at).coerceIn(0, currentConversation.messageNodes.size)
+                    else -> at.coerceIn(0, currentConversation.messageNodes.size)
+                }
+                currentConversation.messageNodes.toMutableList().apply { add(index, node) }
+            }
+            val newConversation = currentConversation.copy(messageNodes = messageNodes)
+            // [问题2核心修复] 同步更新内存 session.state 且绝不占用 session.setJob(job)：
+            // 预设开场白之后的消息面板按钮常执行 `/send <text> | /trigger`，
+            // 若 insertMessage 异步挂到 session.setJob(job)，紧随其后的 `/trigger` (triggerGeneration)
+            // 会立即执行 previousJob?.cancel() 把尚未落地的 /send 取消掉，导致消息丢失并卡死！
+            updateConversation(conversationId, newConversation, checkFiles = false)
+            TavernRuntimeManager.recordSendDiagnostic(
+                stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED,
+                conversationId = conversationId.toString(),
+                detail = "insertMessage role=$role nodes=${newConversation.messageNodes.size}",
+            )
+            appScope.launch(Dispatchers.IO) {
+                try {
+                    saveConversation(conversationId, newConversation)
+                    if (role == MessageRole.USER && TavernRuntimeManager.activeConversationId == conversationId.toString()) {
+                        TavernRuntimeManager.fireEvent(
+                            "message_sent",
+                            "{\"args\":[${newConversation.currentMessages.lastIndex}]}",
+                        )
                     }
-                    currentConversation.messageNodes.toMutableList().apply { add(index, node) }
+                    _generationDoneFlow.emit(conversationId)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
                 }
-                val newConversation = currentConversation.copy(messageNodes = messageNodes)
-                saveConversation(conversationId, newConversation)
-                _generationDoneFlow.emit(conversationId)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
             }
         }
-        session.setJob(job)
     }
 
     /**
@@ -754,6 +809,13 @@ class ChatService(
      */
     fun triggerGeneration(conversationId: Uuid, generationType: GenerationType = GenerationType.NORMAL) {
         val session = sessionManager.getOrCreate(conversationId)
+        if (session.isExecutingSendTurn && generationType == GenerationType.NORMAL) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[trigger] triggerGeneration coalesced into active sendQueuedMessage turn conv=$conversationId",
+            )
+            return
+        }
         val previousJob = session.getJob()
         previousJob?.cancel()
         // [v244 BUGFIX D2] /trigger 真机取证点：确认「命令到达宿主 → 生成任务真的被排上」。
@@ -910,17 +972,36 @@ class ChatService(
             cp in 0x1FA70..0x1FAFF || cp in 0x2600..0x27BF || cp in 0x2B00..0x2BFF
     }
 
-    private fun preprocessUserInputParts(parts: List<UIMessagePart>, assistant: Assistant): List<UIMessagePart> {
+    private fun preprocessUserInputParts(
+        parts: List<UIMessagePart>,
+        assistant: Assistant,
+        settings: Settings? = null,
+        conversationModeInjectionIds: Set<Uuid> = emptySet(),
+    ): List<UIMessagePart> {
+        val activeStRegex = if (settings != null) {
+            mergeActiveRegexScripts(settings, assistant, conversationModeInjectionIds)
+                .filter { !it.promptOnly }
+        } else {
+            emptyList()
+        }
         return parts.map { part ->
             when (part) {
                 is UIMessagePart.Text -> {
-                    part.copy(
-                        text = part.text.replaceRegexes(
-                            assistant = assistant,
-                            scope = AssistantAffectScope.USER,
-                            visual = false
-                        )
+                    val afterLegacy = part.text.replaceRegexes(
+                        assistant = assistant,
+                        scope = AssistantAffectScope.USER,
+                        visual = false
                     )
+                    val afterSt = if (activeStRegex.isNotEmpty()) {
+                        afterLegacy.getStRegexed(
+                            scripts = activeStRegex,
+                            placement = RegexPlacement.USER_INPUT,
+                            isPrompt = false,
+                        )
+                    } else {
+                        afterLegacy
+                    }
+                    part.copy(text = afterSt)
                 }
 
                 else -> part
@@ -1456,8 +1537,15 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
         val initialConversation = getConversationFlow(conversationId).value
         val assistant = settings.getAssistantById(initialConversation.assistantId)
             ?: settings.getCurrentAssistant()
-        val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
+        val model = assistant.chatModelId?.let { settings.findModelById(it) }
+            ?: settings.findModelById(settings.chatModelId)
+            ?: settings.getCurrentChatModel()
             ?: throw IllegalStateException("No chat model selected")
+        TavernRuntimeManager.recordSendDiagnostic(
+            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_5_GENERATION_STARTED,
+            conversationId = conversationId.toString(),
+            detail = "model=${model.modelId} assistant=${assistant.id} type=$generationType msgs=${initialConversation.currentMessages.size}",
+        )
 
         val senderName = if (assistant.useAssistantAvatar) {
             assistant.name.ifEmpty { context.getString(R.string.assistant_page_default_assistant) }
@@ -1639,7 +1727,9 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
                     is GenerationChunk.Messages -> {
                         val updatedConversation = getConversationFlow(conversationId).value
                             .updateCurrentMessages(chunk.messages)
-                        updateConversation(conversationId, updatedConversation)
+                        // [Bug C 修复] 流式逐 token 更新仅追加/刷新当前消息内容，不会删除历史附件，
+                        // 跳过 checkFilesDelete 全会话节点扫描，消除长对话流式输出时的主线程 GC 与掉帧。
+                        updateConversation(conversationId, updatedConversation, checkFiles = false)
 
                         // 前台时停止前台 Service（用户切回来了）
                         if (isForeground.value) {
@@ -1659,8 +1749,20 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
         }.onFailure {
             // 兜底取消 Live Update 通知（生成开始前失败时 onCompletion 不会执行）
             appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null))
-            if (it is CancellationException) throw it
+            if (it is CancellationException) {
+                TavernRuntimeManager.recordSendDiagnostic(
+                    stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                    conversationId = conversationId.toString(),
+                    detail = "status=CANCELLED reason=${it.message}",
+                )
+                throw it
+            }
             sessionManager.get(conversationId)?.messageQueue?.pause()
+            TavernRuntimeManager.recordSendDiagnostic(
+                stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                conversationId = conversationId.toString(),
+                detail = "status=FAILED error=${it.javaClass.simpleName}:${it.message}",
+            )
 
             // 取消前台服务
             stopGenerationForeground()
@@ -1671,6 +1773,11 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
             Logging.log(TAG, it.stackTraceToString())
         }.onSuccess {
             val finalConversation = getConversationFlow(conversationId).value
+            TavernRuntimeManager.recordSendDiagnostic(
+                stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                conversationId = conversationId.toString(),
+                detail = "status=SUCCESS nodes=${finalConversation.messageNodes.size}",
+            )
 
             sessionManager.launchWithSession(conversationId) {
                 generateTitle(conversationId, finalConversation)
@@ -2199,10 +2306,16 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
 
     // ---- 对话状态更新 ----
 
-    private fun updateConversation(conversationId: Uuid, conversation: Conversation) {
+    private fun updateConversation(
+        conversationId: Uuid,
+        conversation: Conversation,
+        checkFiles: Boolean = true,
+    ) {
         if (conversation.id != conversationId) return
         val session = sessionManager.getOrCreate(conversationId)
-        checkFilesDelete(conversation, session.state.value)
+        if (checkFiles) {
+            checkFilesDelete(conversation, session.state.value)
+        }
         session.updateConversation(conversation)
     }
 
@@ -2299,18 +2412,22 @@ mergeActiveRegexScripts(settings, assistant, conversation?.modeInjectionIds.orEm
     }
 
     suspend fun saveConversation(conversationId: Uuid, conversation: Conversation) {
-        val exists = conversationRepo.existsConversationById(conversation.id)
-        if (!exists && conversation.title.isBlank() && conversation.messageNodes.isEmpty()) {
-            return // 新会话且为空时不保存
+        val updatedConversation = conversation.copy()
+        // 先同步刷新内存状态，确保 UI 列表和后续逻辑无需等待磁盘 I/O 即可读取最新消息
+        if (updatedConversation.title.isNotBlank() || updatedConversation.messageNodes.isNotEmpty()) {
+            updateConversation(conversationId, updatedConversation)
         }
 
-        val updatedConversation = conversation.copy()
-        updateConversation(conversationId, updatedConversation)
-
-        if (!exists) {
-            conversationRepo.insertConversation(updatedConversation)
-        } else {
-            conversationRepo.updateConversation(updatedConversation)
+        withContext(Dispatchers.IO) {
+            val exists = conversationRepo.existsConversationById(updatedConversation.id)
+            if (!exists && updatedConversation.title.isBlank() && updatedConversation.messageNodes.isEmpty()) {
+                return@withContext // 新会话且为空时不保存
+            }
+            if (!exists) {
+                conversationRepo.insertConversation(updatedConversation)
+            } else {
+                conversationRepo.updateConversation(updatedConversation)
+            }
         }
 
         // 删除消息或切换分支也可能解除工具审批阻塞，保存成功后重新检查队列。

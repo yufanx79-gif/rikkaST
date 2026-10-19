@@ -8,6 +8,7 @@ const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.S
 
 export let selected_group = null;
 export let groups = [];
+export let is_group_generating = false;
 
 try {
     window.addEventListener('rikka-st-refresh', () => {
@@ -15,6 +16,7 @@ try {
             const c = st();
             if (Array.isArray(c.groups)) groups = c.groups;
             if (c.selected_group !== undefined) selected_group = c.selected_group;
+            if (typeof c.is_group_generating === 'boolean') is_group_generating = c.is_group_generating;
         } catch (_e) { /* noop */ }
     });
 } catch (_e) { /* noop */ }

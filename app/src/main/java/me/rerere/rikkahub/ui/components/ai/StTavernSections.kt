@@ -635,10 +635,15 @@ internal fun togglePresetGroupForAssistant(
     } else {
         current.modeInjections
     }
-    val groupIds = groupEntries.map { it.id }.toSet()
+    val allGroupIds = groupEntries.map { it.id }.toSet()
+    val activeGroupIds = updatedModeInjections
+        .filter { it.presetGroup == groupName && it.enabled }
+        .map { it.id }
+        .toSet()
+        .ifEmpty { allGroupIds }
     val updatedAssistants = current.assistants.map { a ->
         if (a.id == assistantId) {
-            val newIds = if (enable) a.modeInjectionIds + groupIds else a.modeInjectionIds - groupIds
+            val newIds = if (enable) (a.modeInjectionIds - allGroupIds) + activeGroupIds else a.modeInjectionIds - allGroupIds
             a.copy(modeInjectionIds = newIds)
         } else {
             a
@@ -740,12 +745,15 @@ internal fun PresetManagementSection(
         ) {
             grouped.forEach { (name, entries) ->
                 item(key = "preset:$name") {
+                    val activeEntries = entries.filter { it.enabled }.ifEmpty { entries }
+                    val allActiveChecked = activeEntries.isNotEmpty() && activeEntries.all { entryChecked(it) }
+                    val anyChecked = entries.any { entryChecked(it) }
                     PresetRow(
                         title = name,
                         entries = entries,
                         expanded = expanded.contains(name),
-                        checked = entries.isNotEmpty() && entries.all { entryChecked(it) },
-                        partial = entries.any { entryChecked(it) } && !entries.all { entryChecked(it) },
+                        checked = allActiveChecked,
+                        partial = anyChecked && !allActiveChecked,
                         onToggle = { c ->
                             if (onToggleGroup != null) {
                                 // 由 onToggleGroup 单次原子完成组内全关条目启用联动与 modeInjectionIds 绑定，避免双回调竞态

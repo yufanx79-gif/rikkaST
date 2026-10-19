@@ -114,12 +114,62 @@ export async function loadWorldInfo(name) {
     return r;
 }
 
-export async function saveWorldInfo() {}
-export async function updateWorldInfoList() {}
-export async function deleteWorldInfo() {}
-export async function createNewWorldInfo(name) { return { name: name || '', entries: {} }; }
-export function createWorldInfoEntry() { return {}; }
-export function deleteWorldInfoEntry() {}
+export async function saveWorldInfo(name, data, immediately = false) {
+    void immediately;
+    if (!name || !data || typeof data !== 'object') return false;
+    try {
+        const c = st();
+        if (typeof c.saveWorldInfo === 'function') {
+            return await c.saveWorldInfo(name, data, immediately);
+        }
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.createOrReplaceLorebook === 'function') {
+            const entriesObj = (data.entries && typeof data.entries === 'object') ? data.entries : {};
+            const entriesArr = Object.values(entriesObj).filter((e) => e && typeof e === 'object');
+            return Boolean(window.RikkaBridge.createOrReplaceLorebook(String(name), JSON.stringify(entriesArr)));
+        }
+    } catch (_e) { /* noop */ }
+    return false;
+}
+export async function updateWorldInfoList() {
+    try { __refreshWorldInfoData(); } catch (_e) { /* noop */ }
+}
+export async function deleteWorldInfo(name) {
+    if (!name) return false;
+    try {
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.deleteLorebook === 'function') {
+            return Boolean(window.RikkaBridge.deleteLorebook(String(name)));
+        }
+    } catch (_e) { /* noop */ }
+    return false;
+}
+export async function createNewWorldInfo(name) {
+    const book = { name: String(name || ''), entries: {} };
+    if (name) await saveWorldInfo(name, book, true);
+    return book;
+}
+export function createWorldInfoEntry(name, data) {
+    void name;
+    const entry = JSON.parse(JSON.stringify(newWorldInfoEntryTemplate));
+    if (data && typeof data === 'object') {
+        if (!data.entries || typeof data.entries !== 'object') data.entries = {};
+        const existingUids = Object.keys(data.entries).map((k) => Number(k)).filter((n) => Number.isFinite(n));
+        const nextUid = existingUids.length > 0 ? Math.max(...existingUids) + 1 : 0;
+        entry.uid = nextUid;
+        data.entries[String(nextUid)] = entry;
+    } else {
+        entry.uid = 0;
+    }
+    return entry;
+}
+export async function deleteWorldInfoEntry(data, uid) {
+    if (!data || typeof data !== 'object' || !data.entries) return false;
+    const key = String(uid);
+    if (Object.prototype.hasOwnProperty.call(data.entries, key)) {
+        delete data.entries[key];
+        return true;
+    }
+    return false;
+}
 export function setWIOriginalDataValue() {}
 export function reloadEditor() {}
 export function setWorldInfoButtonClass() {}
@@ -236,7 +286,6 @@ export const newWorldInfoEntryTemplate = {
     disable: false,
     excludeRecursion: false,
     preventRecursion: false,
-    delayUntilRecursion: false,
     probability: 100,
     useProbability: true,
     depth: DEFAULT_DEPTH,
@@ -264,3 +313,69 @@ export const newWorldInfoEntryTemplate = {
     delay: null,
     triggers: [],
 };
+
+export const originalWIDataKeyMap = {
+    key: 'keys',
+    keysecondary: 'secondary_keys',
+    comment: 'comment',
+    content: 'content',
+    constant: 'constant',
+    selective: 'selective',
+    order: 'insertion_order',
+    position: 'position',
+    disable: 'enabled',
+    excludeRecursion: 'exclude_recursion',
+    preventRecursion: 'prevent_recursion',
+    delayUntilRecursion: 'extensions.delay_until_recursion',
+    probability: 'extensions.probability',
+    useProbability: 'extensions.use_probability',
+    depth: 'extensions.depth',
+    group: 'group',
+    groupOverride: 'group_override',
+    groupWeight: 'extensions.group_weight',
+    scanDepth: 'extensions.scan_depth',
+    caseSensitive: 'extensions.case_sensitive',
+    matchWholeWords: 'extensions.match_whole_words',
+    useGroupScoring: 'extensions.use_group_scoring',
+    automationId: 'extensions.automation_id',
+    role: 'extensions.role',
+    outletName: 'extensions.outlet_name',
+    sticky: 'extensions.sticky',
+    cooldown: 'extensions.cooldown',
+    delay: 'extensions.delay',
+    triggers: 'triggers',
+    characterFilter: 'extensions.character_filter',
+};
+
+export function updateWorldInfoSettings(settings, selected) {
+    try {
+        if (Array.isArray(selected)) {
+            selected_world_info = selected.slice();
+            if (world_info && typeof world_info === 'object') {
+                world_info.globalSelect = selected.slice();
+            }
+        }
+        if (settings && typeof settings === 'object' && settings.world_info && typeof settings.world_info === 'object') {
+            world_info = settings.world_info;
+        }
+    } catch (_e) { /* noop */ }
+}
+
+export async function onWorldInfoChange(eventOrOptions, worldName) {
+    try {
+        const name = typeof worldName === 'string' ? worldName : (typeof eventOrOptions === 'string' ? eventOrOptions : '');
+        const state = (eventOrOptions && typeof eventOrOptions === 'object' && 'state' in eventOrOptions) ? Boolean(eventOrOptions.state) : undefined;
+        if (name) {
+            const set = new Set(Array.isArray(selected_world_info) ? selected_world_info : []);
+            if (state === true) set.add(name);
+            else if (state === false) set.delete(name);
+            else if (set.has(name)) set.delete(name);
+            else set.add(name);
+            selected_world_info = Array.from(set);
+            if (world_info && typeof world_info === 'object') {
+                world_info.globalSelect = selected_world_info.slice();
+            }
+        }
+        await updateWorldInfoList();
+    } catch (_e) { /* noop */ }
+}

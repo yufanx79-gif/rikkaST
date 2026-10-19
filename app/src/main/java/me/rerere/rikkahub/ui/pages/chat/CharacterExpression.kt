@@ -68,8 +68,9 @@ fun CharacterExpressionHost(vm: ChatVM, setting: Settings, conversation: Convers
                 withContext(Dispatchers.Default) {
                     val host = buildChatSlashHost(context, vm, null, vm.inputState, null)
                     aiQrs.forEach { qm ->
-                        if (qm.content.trim().startsWith("/")) {
-                            me.rerere.rikkahub.data.st.script.StSlashExecutor.execute(qm.content.trim(), host)
+                        val c = qm.content.trim()
+                        if (c.startsWith("/") || c.lineSequence().any { it.trim().startsWith("/") }) {
+                            me.rerere.rikkahub.data.st.script.StSlashExecutor.execute(c, host)
                         }
                     }
                 }

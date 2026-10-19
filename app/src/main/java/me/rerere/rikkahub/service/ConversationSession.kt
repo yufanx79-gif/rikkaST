@@ -34,6 +34,9 @@ class ConversationSession(
     private val metadataMutex = Mutex()
     @Volatile
     private var initialized = false
+    val isInitialized: Boolean get() = initialized
+    @Volatile
+    var isExecutingSendTurn: Boolean = false
     val messageQueue = MessageQueue()
 
     // 页面切换和 SSE 重连只加载一次；活跃 session 的内存状态始终优先。
@@ -135,7 +138,14 @@ class ConversationSession(
         job?.start()
     }
 
-    fun getJob(): Job? = _generationJob.value
+    fun getJob(): Job? {
+        val current = _generationJob.value ?: return null
+        if (current.isCompleted) {
+            _generationJob.compareAndSet(current, null)
+            return _generationJob.value
+        }
+        return current
+    }
 
     @Synchronized
     fun cancelJobs(): List<Job> = activeJobs.toList().also { jobs ->

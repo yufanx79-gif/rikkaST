@@ -1,5 +1,8 @@
 package me.rerere.rikkahub.ui.pages.extensions
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -14,6 +17,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -26,18 +30,25 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Add01
 import me.rerere.hugeicons.stroke.Delete01
+import me.rerere.hugeicons.stroke.FileImport
+import me.rerere.hugeicons.stroke.Share03
 import me.rerere.hugeicons.stroke.Zap
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.model.QuickMessage
@@ -45,6 +56,7 @@ import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.ItemAction
 import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
+import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
@@ -52,16 +64,70 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun QuickMessagesPage(vm: QuickMessagesVM = koinViewModel()) {
     val settings = vm.settings.collectAsStateWithLifecycle().value
+    val context = LocalContext.current
+    val toaster = LocalToaster.current
+    val scope = rememberCoroutineScope()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<QuickMessage?>(null) }
     var deleteTarget by remember { mutableStateOf<QuickMessage?>(null) }
+
+    val importJsonLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val text = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
+                }.getOrNull()
+            }.orEmpty()
+            val addedCount = vm.importQuickMessagesFromJson(text)
+            if (addedCount > 0) {
+                toaster.show("成功导入 $addedCount 条快捷消息（已自动绑定到助手）")
+            } else {
+                toaster.show("导入失败：未识别到有效的快捷消息或 ST Quick Reply JSON")
+            }
+        }
+    }
+
+    val exportJsonLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri: Uri? ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val jsonText = vm.exportQuickMessagesToJson()
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(jsonText.toByteArray(Charsets.UTF_8))
+                    }
+                    true
+                }.getOrDefault(false)
+            }
+            if (ok) {
+                toaster.show("已导出 ${settings.quickMessages.size} 条快捷消息 JSON")
+            } else {
+                toaster.show("导出快捷消息失败")
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             LargeFlexibleTopAppBar(
                 title = { Text(stringResource(R.string.assistant_page_quick_messages)) },
                 navigationIcon = { BackButton() },
+                actions = {
+                    IconButton(onClick = { importJsonLauncher.launch(arrayOf("application/json", "*/*")) }) {
+                        Icon(HugeIcons.FileImport, contentDescription = "导入快捷消息 JSON")
+                    }
+                    if (settings.quickMessages.isNotEmpty()) {
+                        IconButton(onClick = { exportJsonLauncher.launch("quick_replies_export.json") }) {
+                            Icon(HugeIcons.Share03, contentDescription = "导出快捷消息 JSON")
+                        }
+                    }
+                },
                 scrollBehavior = scrollBehavior,
                 colors = CustomColors.topBarColors,
             )
@@ -104,6 +170,13 @@ fun QuickMessagesPage(vm: QuickMessagesVM = koinViewModel()) {
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        TextButton(onClick = { importJsonLauncher.launch(arrayOf("application/json", "*/*")) }) {
+                            Icon(HugeIcons.FileImport, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Text(
+                                text = "导入快捷消息 JSON（兼容酒馆 Quick Reply v2）",
+                                modifier = Modifier.padding(start = 6.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -194,6 +267,14 @@ private fun QuickMessageCard(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
                     )
+                    if (quickMessage.setName.isNotBlank() && quickMessage.setName != "Default") {
+                        Text(
+                            text = "[${quickMessage.setName}]",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.padding(start = 6.dp),
+                        )
+                    }
                     if (quickMessage.autoExecute) {
                         Text(
                             text = stringResource(R.string.quick_messages_page_auto_execute_badge),

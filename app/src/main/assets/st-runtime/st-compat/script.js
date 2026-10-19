@@ -1,4 +1,5 @@
 import * as shimInject from '../shims/inject-shims.js';
+import { MessageFormatter } from './message-formatter.js';
 /**
  * rikkaST st-compat: script.js
  * ============================================================
@@ -26,6 +27,8 @@ export let extension_settings = {};
 export let user_avatar = '';
 export let online_status = 'no_connection';
 export let is_send_press = false;
+export let streamingProcessor = null;
+export let externalAbortController = null;
 export let isChatSaving = false;
 export let main_api = 'openai';
 export let settings = {};
@@ -44,6 +47,7 @@ function __refresh() {
         this_chid = (typeof c.characterId === 'number') ? c.characterId : 0;
         if (c.chatMetadata && typeof c.chatMetadata === 'object') chat_metadata = c.chatMetadata;
         if (c.extensionSettings && typeof c.extensionSettings === 'object') extension_settings = c.extensionSettings;
+        if (c.streamingProcessor !== undefined) streamingProcessor = c.streamingProcessor;
     } catch (_e) { /* noop */ }
 }
 __refresh();
@@ -172,7 +176,16 @@ export function countOccurrences(str, needle) {
 }
 
 // ---------------------------------------------------------------- 显示 / DOM 类（P0 no-op）
-export function messageFormatting(mes) { return String(mes == null ? '' : mes); }
+export const messageFormatter = MessageFormatter;
+export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, sanitizerOverrides = {}, isReasoning = false) {
+    try {
+        const c = st();
+        if (c && typeof c.messageFormatting === 'function') {
+            return c.messageFormatting(mes, ch_name, isSystem, isUser, messageId, sanitizerOverrides, isReasoning);
+        }
+    } catch (_e) { /* noop */ }
+    return MessageFormatter.format(mes, ch_name, isSystem, isUser, messageId, sanitizerOverrides, isReasoning);
+}
 export const updateMessageBlock = fwd('updateMessageBlock', () => {});
 export const addOneMessage = () => {};
 export const printMessages = () => {};
@@ -238,7 +251,56 @@ export function getSlideToggleOptions() {
 // ================================================================
 
 /** ST `CLIENT_VERSION`。rikkaST 的 RikkaBridge.getVersion() 就是 "1.18.0"，保持一致。 */
-export const CLIENT_VERSION = '1.18.0';
+export const CLIENT_VERSION = '1.19.0';
+
+export function extractMessageFromData(data, activeApi = main_api) {
+    void activeApi;
+    if (!data || typeof data !== 'object') return '';
+    if (Array.isArray(data.choices) && data.choices[0]) {
+        const ch = data.choices[0];
+        if (ch.message && typeof ch.message.content === 'string') return ch.message.content;
+        if (typeof ch.text === 'string') return ch.text;
+        if (ch.delta && typeof ch.delta.content === 'string') return ch.delta.content;
+    }
+    if (Array.isArray(data.content)) {
+        return data.content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
+    }
+    if (Array.isArray(data.candidates) && data.candidates[0]?.content?.parts) {
+        return data.candidates[0].content.parts.filter((p) => p && !p.thought).map((p) => p.text || '').join('');
+    }
+    return String(data.mes ?? data.content ?? data.response ?? '');
+}
+
+export async function deleteMessage(messageId, swipeId = undefined, confirm = false, { deleteToolCalls = false } = {}) {
+    void swipeId; void confirm;
+    try {
+        const c = st();
+        if (c && typeof c.deleteMessage === 'function') {
+            return await c.deleteMessage(messageId, swipeId, confirm, { deleteToolCalls });
+        }
+        const arr = c.chat || chat;
+        const idx = Number(messageId);
+        if (!Array.isArray(arr) || !Number.isInteger(idx) || idx < 0 || idx >= arr.length) return;
+        const target = arr[idx];
+        arr.splice(idx, 1);
+        if (deleteToolCalls && target && Array.isArray(target.extra?.tool_invocations)) {
+            const ids = new Set(target.extra.tool_invocations.map((t) => t?.id).filter(Boolean));
+            if (ids.size > 0) {
+                for (let i = arr.length - 1; i >= 0; i--) {
+                    if (arr[i]?.extra?.tool_call_id && ids.has(arr[i].extra.tool_call_id)) {
+                        arr.splice(i, 1);
+                    }
+                }
+            }
+        }
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.updateChatMessages === 'function') {
+            window.RikkaBridge.updateChatMessages(JSON.stringify(arr));
+        }
+        if (c.eventSource && typeof c.eventSource.emit === 'function') {
+            await c.eventSource.emit(event_types.MESSAGE_DELETED || 'message_deleted', idx);
+        }
+    } catch (_e) { /* noop */ }
+}
 
 /** ST `settingsReady`：ST 里是「设置加载完成」的 Promise；rikkaST 启动即已就绪。 */
 export const settingsReady = Promise.resolve();
@@ -346,3 +408,61 @@ export const updateEditArrowClasses = () => {};
 export const scrollOnMediaLoad = () => {};
 export const isMessageSwipeable = () => true;
 export const isSwipingAllowed = () => true;
+
+export function setCharacterId(id) {
+    this_chid = (id === undefined || id === null) ? undefined : Number(id);
+    try {
+        const c = st();
+        if (c && typeof c === 'object') c.characterId = this_chid;
+    } catch (_e) { /* noop */ }
+}
+
+export function setCharacterName(name) {
+    name2 = String(name ?? '');
+    try {
+        const c = st();
+        if (c && typeof c === 'object') c.name2 = name2;
+    } catch (_e) { /* noop */ }
+}
+
+export function setExternalAbortController(controller) {
+    externalAbortController = controller || null;
+    try {
+        const c = st();
+        if (c && typeof c.setExternalAbortController === 'function') c.setExternalAbortController(controller);
+    } catch (_e) { /* noop */ }
+}
+
+export function setSendButtonState(value) {
+    is_send_press = Boolean(value);
+    try {
+        const c = st();
+        if (c && typeof c === 'object') c.is_send_press = is_send_press;
+    } catch (_e) { /* noop */ }
+}
+
+export async function callPopup(text, type = 'text', inputValue = '', popupOptions = {}) {
+    try {
+        const c = st();
+        if (c && typeof c.callPopup === 'function') return await c.callPopup(text, type, inputValue, popupOptions);
+        if (c && typeof c.callGenericPopup === 'function') return await c.callGenericPopup(text, type, inputValue, popupOptions);
+    } catch (_e) { /* noop */ }
+    return type === 'input' ? String(inputValue ?? '') : true;
+}
+
+export async function processCommands(commandText) {
+    const cmd = String(commandText ?? '').trim();
+    if (!cmd) return '';
+    try {
+        const c = st();
+        if (c && typeof c.executeSlashCommandsWithOptions === 'function') {
+            return await c.executeSlashCommandsWithOptions(cmd);
+        }
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.triggerSlash === 'function') {
+            return window.RikkaBridge.triggerSlash(cmd);
+        }
+    } catch (_e) { /* noop */ }
+    return '';
+}
+
+export const doNavbarIconClick = () => {};

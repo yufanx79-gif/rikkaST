@@ -198,14 +198,17 @@ object MacroEngine {
         while (q < inner.length && inner[q].isWhitespace()) q++
         if (q >= inner.length) return null
 
-        // 注释宏 {{// ...}}
+        // 注释宏 {{// ...}}；对齐 ST 1.19.0 MacroCstWalker.js:194-206：
+        // 若首参以 '/' 开头（如 {{///}} 或 {{////}}），标记为 closingBlock 以支持 {{//}}...{{///}} 多行作用域注释。
         if (inner.startsWith("//", q)) {
             val args = parseArgs(inner, (q + 2).coerceAtMost(inner.length), innerAbsStart)
+            val isClosingComment = !flags.closingBlock && args.firstOrNull()?.text?.startsWith("/") == true
+            val effectiveFlags = if (isClosingComment) flags.copy(closingBlock = true) else flags
             return ScannedMacro(
                 startOffset = macroStart,
                 endOffset = macroEnd,
                 inner = inner,
-                flags = flags,
+                flags = effectiveFlags,
                 isVariable = false,
                 name = "//",
                 args = args,
@@ -400,10 +403,10 @@ object MacroEngine {
             }
         }
 
-        // 未配对的 closing → 保留原文
+        // 未配对的 closing → 保留原文（但未配对的 {{///}} 仍作为普通注释宏求值为空串）
         for (i in macros.indices) {
             val m = macros[i]
-            if (!m.isVariable && m.flags.closingBlock && !matched[i]) {
+            if (!m.isVariable && m.flags.closingBlock && !matched[i] && m.name != "//") {
                 m.keepRaw = true
             }
         }
@@ -433,6 +436,9 @@ object MacroEngine {
     /** 对齐 ST #canAcceptScopedContent */
     private fun canAcceptScoped(m: ScannedMacro): Boolean {
         if (m.isVariable) return false
+        if (m.name == "//") {
+            return m.args.isEmpty() || (m.args.size == 1 && m.args[0].text.isEmpty())
+        }
         val def = MacroRegistry.getPrimaryMacro(m.name) ?: return true // 未知宏允许
         if (def.list) return false
         val newCount = m.args.size + 1
@@ -468,7 +474,7 @@ object MacroEngine {
                 i++
                 continue
             }
-            if (!m.isVariable && m.flags.closingBlock) {
+            if (!m.isVariable && m.flags.closingBlock && m.name != "//") {
                 // 未配对的 close（keepRaw 已覆盖此情形，这里为防御）
                 sb.append(text, start, m.endOffset + 1)
                 cursor = m.endOffset + 1
