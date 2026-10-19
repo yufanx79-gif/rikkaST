@@ -1,11 +1,11 @@
 {
   "version": "2.5.6",
-  "publishedAt": "2026-10-19T00:00:00Z",
+  "publishedAt": "2026-10-20T00:00:00Z",
   "changelog": "rikkaST 2.5.6-public：新增聊天页常驻小手机/通用悬浮窗、双通道独立语音、三种性能降低方案、第三方扩展与快速回复导入导出、内置 Node 本地伴生服务；修复小手机二次白屏、设置页空白、离线加载慢、长图比例变形、发送卡顿与返回闪退等问题；全面升级 SillyTavern 1.19.0 兼容底座。",
   "downloads": [
     {
-      "name": "rikkaST-2.5.6-public.apk",
-      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.6-public/rikkaST-2.5.6-public.apk",
+      "name": "rikkaST-2.5.6-public-20261020.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.6-public-20261020/rikkaST-2.5.6-public-20261020.apk",
       "size": "60,529,475 bytes (约 60.5 MB)"
     }
   ]
