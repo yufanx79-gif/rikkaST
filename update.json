@@ -6,7 +6,7 @@
   "publishedAt": "2026-10-26T00:00:00Z",
   "artifactStatus": "READY",
   "targetArtifactName": "rikkaST-2.5.10-public-20261026.apk",
-  "changelog": "1. 数据库升级到 Room v33：修复旧版 v29/v30/v31/v32 数据升级时 MemoryEntity 多出索引导致 Room TableInfo 校验失败的问题；新增 v32→v33 修复迁移，安装新版不会丢失聊天记录、角色卡或设置。\n2. 修复从 -4/2.5.6 等 v29 备份导入时迁移失败的问题；旧 settings.json、聊天数据库、世界书与角色卡均可继续导入。\n3. 保留并整合 2.5.9 的完整能力：SPreset 预设全兼容、TavernHelper/酒馆助手脚本导入、备份恢复稳定性、消息气泡闪烁修复、ST 正则与运行时兼容增强。\n4. 升级提示：请直接覆盖安装，不要卸载或清除应用数据；首次启动会执行数据库迁移，可能稍慢。",
+  "changelog": "1. 数据库升级到 Room v33：修复旧版 v29/v30/v31/v32 数据升级时 MemoryEntity 多出索引导致 Room TableInfo 校验失败的问题；新增 v32→v33 修复迁移，安装新版不会丢失聊天记录、角色卡或设置。\n2. 修复从 2.5.6 等旧版 v29 备份导入时迁移失败的问题；旧 settings.json、聊天数据库、世界书与角色卡均可继续导入。\n3. 保留并整合 2.5.9 的完整能力：SPreset 预设全兼容、TavernHelper/酒馆助手脚本导入、备份恢复稳定性、消息气泡闪烁修复、ST 正则与运行时兼容增强。\n4. 升级提示：请直接覆盖安装，不要卸载或清除应用数据；首次启动会执行数据库迁移，可能稍慢。",
   "downloads": [
     {
       "name": "rikkaST-2.5.10-public-20261026.apk",
