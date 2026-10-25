@@ -15,6 +15,13 @@
 -dontwarn java.beans.ConstructorProperties
 -dontwarn java.beans.Transient
 
+# SnakeYAML's JavaBean introspection references java.beans, which is unavailable on Android.
+-dontwarn java.beans.BeanInfo
+-dontwarn java.beans.FeatureDescriptor
+-dontwarn java.beans.IntrospectionException
+-dontwarn java.beans.Introspector
+-dontwarn java.beans.PropertyDescriptor
+
 # re2j has optional references that are unavailable on Android.
 -dontwarn com.google.re2j.**
 
@@ -30,10 +37,8 @@
 # Keep JlatexMath
 -keep class org.scilab.forge.jlatexmath.** { *; }
 
-# Chaquopy bridge — 所有方法通过Python反射调用，R8不能删
+# rikkaST keep rules
 -keep class me.rerere.rikkahub.data.ai.python.PythonBridge { *; }
 -keep class me.rerere.rikkahub.data.ai.python.JsBridge { *; }
-
-# 本地 Compose 自定义组件依赖
 -keep class androidx.compose.animation.** { *; }
 -keep class androidx.compose.runtime.** { *; }

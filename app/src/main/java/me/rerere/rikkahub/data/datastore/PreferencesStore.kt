@@ -16,24 +16,33 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.retryWhen
+import kotlinx.coroutines.launch
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.Transient
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.asr.ASRProviderSetting
+import me.rerere.mediagen.provider.MediaGenerationProviderSetting
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_COMPRESS_PROMPT
@@ -41,18 +50,16 @@ import me.rerere.rikkahub.data.ai.prompts.DEFAULT_OCR_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_SUGGESTION_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TITLE_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TRANSLATION_PROMPT
-import me.rerere.rikkahub.data.ai.prompts.LEARNING_MODE_PROMPT
-import me.rerere.asr.ASRProviderSetting
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV3Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
-import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
+import me.rerere.rikkahub.data.datastore.migration.migrateProviderQuotaQuery
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AuthorNotePosition
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.GroupChat
-import me.rerere.rikkahub.data.model.InjectionPosition
 import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.Persona
 import me.rerere.rikkahub.data.model.PromptInjection
@@ -62,18 +69,20 @@ import me.rerere.rikkahub.data.model.parseAuthorNotePosition
 import me.rerere.rikkahub.data.st.expressions.ExpressionClassifier
 import me.rerere.rikkahub.data.st.expressions.ExpressionLabels
 import me.rerere.rikkahub.data.st.regex.RegexScript
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.tokenizer.TokenizerMode
 import me.rerere.rikkahub.data.sync.s3.S3Config
 import me.rerere.rikkahub.ui.theme.CustomTheme
 import me.rerere.rikkahub.ui.theme.PresetThemes
 import me.rerere.rikkahub.utils.JsonInstant
-import me.rerere.rikkahub.utils.toMutableStateFlow
+import me.rerere.rikkahub.utils.jsonPrimitiveOrNull
 import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchServiceOptions
 import me.rerere.tts.provider.TTSProviderSetting
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import java.io.File
+import java.util.UUID
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.Uuid
 
@@ -83,6 +92,327 @@ private const val SETTINGS_STORE_NAME = "settings"
 
 // 读取失败时的最大重试次数
 private const val READ_MAX_RETRIES = 3
+
+private val SUPPORTED_PROVIDER_TYPES = setOf("openai", "google", "claude", "chatgpt", "grok")
+private val SUPPORTED_MODEL_TYPES = setOf("CHAT", "IMAGE", "EMBEDDING")
+private val SUPPORTED_MODALITIES = setOf("TEXT", "IMAGE")
+private val SUPPORTED_ABILITIES = setOf("TOOL", "REASONING")
+private val SUPPORTED_BUILTIN_TOOLS = setOf("search", "url_context", "image_generation")
+
+private fun deterministicUuid(seed: String): Uuid {
+    val jvmUuid = UUID.nameUUIDFromBytes(seed.toByteArray(Charsets.UTF_8))
+    return Uuid.parse(jvmUuid.toString())
+}
+
+private fun parseUuidOrNull(raw: String?): Uuid? {
+    val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return runCatching { Uuid.parse(trimmed) }.getOrNull()
+}
+
+private fun parseUuidOrDefault(raw: String?, fallback: Uuid): Uuid =
+    parseUuidOrNull(raw) ?: fallback
+
+/**
+ * 清洗并修复单个 [Model] JSON 对象：
+ * - 缺失或非法的 UUID `id` 使用基于 `modelId`/`displayName` 的确定性 UUID 修复；
+ * - 未知枚举值（`type` / `inputModalities` / `outputModalities` / `abilities` / `tools`）自动收敛为安全合法值；
+ * - 损坏的嵌套 `providerOverwrite` 被隔离降级为 `null`，绝不连带丢弃该模型或所属提供商。
+ */
+internal fun sanitizeModelJsonObject(
+    obj: JsonObject,
+    index: Int = 0,
+    onDiagnostic: ((String) -> Unit)? = null,
+): JsonObject {
+    val map = LinkedHashMap<String, JsonElement>()
+    for ((k, v) in obj) {
+        if (v !is JsonNull) {
+            map[k] = v
+        }
+    }
+    val modelId = (map["modelId"] as? JsonPrimitive)?.contentOrNull?.trim()
+        ?: (map["name"] as? JsonPrimitive)?.contentOrNull?.trim()
+        ?: ""
+    val displayName = (map["displayName"] as? JsonPrimitive)?.contentOrNull?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: modelId
+    map["modelId"] = JsonPrimitive(modelId)
+    map["displayName"] = JsonPrimitive(displayName)
+
+    val rawId = (map["id"] as? JsonPrimitive)?.contentOrNull
+    val validId = parseUuidOrNull(rawId) ?: deterministicUuid("model:$modelId:$displayName:$index")
+    map["id"] = JsonPrimitive(validId.toString())
+
+    val rawType = (map["type"] as? JsonPrimitive)?.contentOrNull?.trim()?.uppercase()
+    map["type"] = JsonPrimitive(if (rawType in SUPPORTED_MODEL_TYPES) rawType!! else "CHAT")
+
+    (map["inputModalities"] as? JsonArray)?.let { arr ->
+        val filtered = arr.mapNotNull { el ->
+            val s = (el as? JsonPrimitive)?.contentOrNull?.trim()?.uppercase()
+            if (s in SUPPORTED_MODALITIES) JsonPrimitive(s!!) else null
+        }
+        map["inputModalities"] = JsonArray(filtered.ifEmpty { listOf(JsonPrimitive("TEXT")) })
+    } ?: map.remove("inputModalities")
+
+    (map["outputModalities"] as? JsonArray)?.let { arr ->
+        val filtered = arr.mapNotNull { el ->
+            val s = (el as? JsonPrimitive)?.contentOrNull?.trim()?.uppercase()
+            if (s in SUPPORTED_MODALITIES) JsonPrimitive(s!!) else null
+        }
+        map["outputModalities"] = JsonArray(filtered.ifEmpty { listOf(JsonPrimitive("TEXT")) })
+    } ?: map.remove("outputModalities")
+
+    (map["abilities"] as? JsonArray)?.let { arr ->
+        val filtered = arr.mapNotNull { el ->
+            val s = (el as? JsonPrimitive)?.contentOrNull?.trim()?.uppercase()
+            if (s in SUPPORTED_ABILITIES) JsonPrimitive(s!!) else null
+        }
+        map["abilities"] = JsonArray(filtered)
+    } ?: map.remove("abilities")
+
+    (map["tools"] as? JsonArray)?.let { arr ->
+        val filtered = arr.mapNotNull { el ->
+            val s = (el as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()
+            when {
+                s in SUPPORTED_BUILTIN_TOOLS -> JsonPrimitive(s!!)
+                el is JsonObject -> {
+                    val t = (el["type"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()
+                    if (t in SUPPORTED_BUILTIN_TOOLS) JsonObject(mapOf("type" to JsonPrimitive(t!!))) else null
+                }
+                else -> null
+            }
+        }
+        map["tools"] = JsonArray(filtered)
+    } ?: map.remove("tools")
+
+    val overwriteEl = map["providerOverwrite"]
+    if (overwriteEl != null) {
+        val sanitizedOverwrite = (overwriteEl as? JsonObject)?.let {
+            sanitizeProviderJsonObject(it, index = index, onDiagnostic = onDiagnostic)
+        }
+        if (sanitizedOverwrite != null) {
+            val canDecodeOverwrite = runCatching {
+                JsonInstant.decodeFromJsonElement(ProviderSetting.serializer(), sanitizedOverwrite)
+            }.isSuccess
+            if (canDecodeOverwrite) {
+                map["providerOverwrite"] = sanitizedOverwrite
+            } else {
+                map.remove("providerOverwrite")
+                onDiagnostic?.invoke("[providers] dropped malformed providerOverwrite on model index=$index")
+            }
+        } else {
+            map.remove("providerOverwrite")
+            onDiagnostic?.invoke("[providers] dropped non-object providerOverwrite on model index=$index")
+        }
+    }
+
+    return JsonObject(map)
+}
+
+internal fun sanitizeProviderJsonObject(
+    rawObj: JsonObject,
+    index: Int = 0,
+    onDiagnostic: ((String) -> Unit)? = null,
+): JsonObject? {
+    val migratedObj = migrateProviderQuotaQuery(rawObj) as? JsonObject ?: rawObj
+    val map = LinkedHashMap<String, JsonElement>()
+    for ((k, v) in migratedObj) {
+        if (v !is JsonNull) {
+            map[k] = v
+        }
+    }
+
+    val rawType = (map["type"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()
+    val resolvedType = when {
+        rawType in SUPPORTED_PROVIDER_TYPES -> rawType!!
+        rawType == "anthropic" -> "claude"
+        rawType == "gemini" || rawType == "vertex" || rawType == "vertexai" -> "google"
+        rawType == "openai-compatible" || rawType == "custom" -> "openai"
+        rawType == null -> when {
+            "vertexAI" in map || "serviceAccountEmail" in map || "projectId" in map -> "google"
+            "promptCaching" in map || "promptCacheTtl" in map -> "claude"
+            "credential" in map -> "chatgpt"
+            "baseUrl" in map || "apiKey" in map || "models" in map -> "openai"
+            else -> null
+        }
+        else -> null
+    }
+    if (resolvedType == null) {
+        onDiagnostic?.invoke("[providers] skipped provider at index=$index: unsupported type='${rawType ?: "missing"}'")
+        return null
+    }
+    map["type"] = JsonPrimitive(resolvedType)
+
+    val name = (map["name"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+        ?: resolvedType.replaceFirstChar { it.uppercase() }
+    map["name"] = JsonPrimitive(name)
+
+    val rawId = (map["id"] as? JsonPrimitive)?.contentOrNull
+    val validId = parseUuidOrNull(rawId) ?: deterministicUuid("provider:$resolvedType:$name:$index")
+    map["id"] = JsonPrimitive(validId.toString())
+
+    val rawModels = map["models"]
+    if (rawModels is JsonArray) {
+        val validModels = ArrayList<JsonElement>(rawModels.size)
+        rawModels.forEachIndexed { mIdx, mEl ->
+            val mObj = mEl as? JsonObject
+            if (mObj == null) {
+                onDiagnostic?.invoke("[providers] skipped non-object model at providerIndex=$index modelIndex=$mIdx")
+                return@forEachIndexed
+            }
+            val sanitizedModel = sanitizeModelJsonObject(mObj, mIdx, onDiagnostic)
+            val decodedModel = runCatching {
+                JsonInstant.decodeFromJsonElement(Model.serializer(), sanitizedModel)
+            }.onFailure { err ->
+                onDiagnostic?.invoke(
+                    "[providers] skipped malformed model at providerIndex=$index modelIndex=$mIdx error=${err.javaClass.simpleName}"
+                )
+            }.getOrNull()
+            if (decodedModel != null) {
+                validModels.add(sanitizedModel)
+            }
+        }
+        map["models"] = JsonArray(validModels)
+    } else if (rawModels != null) {
+        map.remove("models")
+    }
+
+    if (resolvedType == "claude") {
+        val rawTtl = (map["promptCacheTtl"] as? JsonPrimitive)?.contentOrNull?.trim()
+        if (rawTtl != null && rawTtl != "5m" && rawTtl != "1h") {
+            map["promptCacheTtl"] = JsonPrimitive("5m")
+        }
+    }
+
+    if (map["customHeaders"] !is JsonArray) {
+        map.remove("customHeaders")
+    }
+    if (map["quotaQuery"] != null && map["quotaQuery"] !is JsonObject) {
+        map.remove("quotaQuery")
+    }
+
+    return JsonObject(map)
+}
+
+/**
+ * 逐条容错解码提供商列表（Task C 核心根因修复）：
+ * - 先幂等执行 `migrateProviderQuotaQuery`（兼容升级前未跑完 V5 迁移或备份导入的旧 `balanceOption` 字段）；
+ * - 逐元素独立解码 `ProviderSetting` 与其内部 `models`：单条损坏、未知 discriminator、非法 UUID 或损坏的 `providerOverwrite`
+ *   只跳过故障项并记录脱敏分类日志（绝不打印 `apiKey` / `accessToken` / `privateKey`），其余合法提供商 100% 保留。
+ */
+internal fun sanitizeProviderLogSummary(message: String): String {
+    return message
+        .replace(Regex("(apiKey|accessToken|refreshToken|idToken|privateKey|secretKey|jwt|password)\\s*[:=]\\s*[^,\\s}\\]]+", RegexOption.IGNORE_CASE), "$1=***")
+        .replace(Regex("Bearer\\s+[A-Za-z0-9._\\-]+", RegexOption.IGNORE_CASE), "Bearer ***")
+        .replace(Regex("sk-[A-Za-z0-9._\\-]{6,}"), "sk-***")
+}
+
+internal fun sanitizeProviderLogSummary(
+    rawObj: JsonObject,
+    index: Int,
+    reason: String,
+): String {
+    val rawType = (rawObj["type"] as? JsonPrimitive)?.contentOrNull?.trim() ?: "missing"
+    val rawId = (rawObj["id"] as? JsonPrimitive)?.contentOrNull?.trim() ?: "missing"
+    val rawName = (rawObj["name"] as? JsonPrimitive)?.contentOrNull?.trim() ?: "unnamed"
+    val redactedKeys = rawObj.keys.filter { key ->
+        val lower = key.lowercase()
+        lower.contains("key") || lower.contains("token") || lower.contains("secret") ||
+            lower.contains("password") || lower.contains("credential") || lower.contains("jwt")
+    }.sorted()
+    val redactedSummary = if (redactedKeys.isEmpty()) "none" else redactedKeys.joinToString(",") { "$it=<REDACTED>" }
+    return "[providers] index=$index type=$rawType id=$rawId name=$rawName reason=$reason redacted=[$redactedSummary]"
+}
+
+internal fun decodeProvidersResilient(
+    rawJson: String?,
+    json: Json = JsonInstant,
+    onCorruptBackup: ((String) -> Unit)? = null,
+    onDiagnostic: ((String) -> Unit)? = null,
+): List<ProviderSetting> {
+    val text = rawJson?.trim().orEmpty()
+    if (text.isEmpty() || text == "[]") return emptyList()
+
+    val logDiag: (String) -> Unit = { msg ->
+        val safeMsg = sanitizeProviderLogSummary(msg)
+        onDiagnostic?.invoke(safeMsg)
+        runCatching { Log.w(TAG, safeMsg) }
+        runCatching { TavernRuntimeManager.appendLog("warn", safeMsg) }
+    }
+
+    val root = runCatching { json.parseToJsonElement(text) }.getOrElse { err ->
+        onCorruptBackup?.invoke(text)
+        logDiag("[providers] top-level JSON parse failed: category=${err.javaClass.simpleName}")
+        return emptyList()
+    }
+    val array = root as? JsonArray ?: run {
+        onCorruptBackup?.invoke(text)
+        logDiag("[providers] top-level JSON is not an array: actual=${root::class.simpleName}")
+        return emptyList()
+    }
+
+    val result = ArrayList<ProviderSetting>(array.size)
+    var skippedCount = 0
+    array.forEachIndexed { index, element ->
+        val obj = element as? JsonObject
+        if (obj == null) {
+            skippedCount++
+            logDiag("[providers] skipped non-object provider record at index=$index")
+            return@forEachIndexed
+        }
+        val sanitized = sanitizeProviderJsonObject(obj, index, logDiag)
+        if (sanitized == null) {
+            skippedCount++
+            logDiag(sanitizeProviderLogSummary(obj, index, "unsupported_or_malformed_object"))
+            return@forEachIndexed
+        }
+        val decoded = runCatching {
+            json.decodeFromJsonElement(ProviderSetting.serializer(), sanitized)
+        }.onFailure { err ->
+            skippedCount++
+            logDiag(sanitizeProviderLogSummary(obj, index, "decode_${err.javaClass.simpleName}"))
+        }.getOrNull()
+        if (decoded != null) {
+            result.add(decoded)
+        }
+    }
+    if (skippedCount > 0) {
+        onCorruptBackup?.invoke(text)
+        logDiag("[providers] resilient decode summary: total=${array.size} valid=${result.size} skipped=$skippedCount")
+    }
+    return result
+}
+
+private inline fun <reified T> decodeListResilient(
+    rawJson: String?,
+    fieldName: String,
+    json: Json = JsonInstant,
+): List<T> {
+    val text = rawJson?.trim().orEmpty()
+    if (text.isEmpty() || text == "[]") return emptyList()
+    runCatching { return json.decodeFromString<List<T>>(text) }
+    val arr = runCatching { json.parseToJsonElement(text) as? JsonArray }.getOrNull() ?: return emptyList()
+    val out = ArrayList<T>(arr.size)
+    arr.forEachIndexed { idx, el ->
+        runCatching {
+            out.add(json.decodeFromString<T>(el.toString()))
+        }.onFailure { err ->
+            runCatching {
+                Log.w(TAG, "[$fieldName] skipped malformed element at index=$idx (${err.javaClass.simpleName})")
+            }
+        }
+    }
+    return out
+}
+
+private inline fun <reified T> decodeObjectOrDefault(
+    rawJson: String?,
+    defaultValue: T,
+    json: Json = JsonInstant,
+): T {
+    val text = rawJson?.trim().orEmpty()
+    if (text.isEmpty()) return defaultValue
+    return runCatching { json.decodeFromString<T>(text) }.getOrDefault(defaultValue)
+}
 
 @Volatile
 private var settingsDataStore: DataStore<Preferences>? = null
@@ -110,7 +440,8 @@ private fun createSettingsDataStore(context: Context): DataStore<Preferences> {
             PreferenceStoreV1Migration(),
             PreferenceStoreV2Migration(),
             PreferenceStoreV3Migration(),
-            PreferenceStoreV4Migration()
+            PreferenceStoreV4Migration(),
+            PreferenceStoreV5Migration(),
         ),
         produceFile = { file },
     )
@@ -148,6 +479,9 @@ class SettingsStore(
         val TITLE_PROMPT = stringPreferencesKey("title_prompt")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
         val TRANSLATE_THINKING_BUDGET = intPreferencesKey("translate_thinking_budget")
+        val TRANSLATE_TARGET_LANGUAGE = stringPreferencesKey("translate_target_language")
+        val UPLOAD_S3_CONFIG = stringPreferencesKey("upload_s3_config")
+        val MEDIA_GENERATION_PROVIDERS = stringPreferencesKey("media_generation_providers")
         val SUGGESTION_PROMPT = stringPreferencesKey("suggestion_prompt")
         val OCR_MODEL = stringPreferencesKey("ocr_model")
         val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
@@ -158,6 +492,7 @@ class SettingsStore(
 
         // 提供商
         val PROVIDERS = stringPreferencesKey("providers")
+        val PROVIDERS_CORRUPT_BACKUP = stringPreferencesKey("providers_corrupt_backup")
 
         // 助手
         val SELECT_ASSISTANT = stringPreferencesKey("select_assistant")
@@ -196,17 +531,14 @@ class SettingsStore(
 
         // 提示词注入
         val MODE_INJECTIONS = stringPreferencesKey("mode_injections")
-        // [第6轮 D1 方案 A] 「提示词注入」独立通道的存储键（与 mode_injections 完全隔离）
         val PROMPT_INJECTIONS = stringPreferencesKey("prompt_injections")
-        // [第6轮 D3] 酒馆预设原始 JSON 无损透传：{"预设名": <原始 root JSON>}
         val TAVERN_PRESETS = stringPreferencesKey("tavern_presets")
         val TAVERN_GLOBAL_SCRIPTS = stringPreferencesKey("tavern_global_scripts")
         val TAVERN_GLOBAL_SCRIPTS_ENABLED = booleanPreferencesKey("tavern_global_scripts_enabled")
         val TAVERN_PRESET_SCRIPTS = stringPreferencesKey("tavern_preset_scripts")
         val TAVERN_THIRD_PARTY_DISABLED = stringPreferencesKey("tavern_third_party_disabled")
         val TAVERN_EXTENSION_SETTINGS = stringPreferencesKey("tavern_extension_settings")
-val LOREBOOKS = stringPreferencesKey("lorebooks")
-        // ST 正则脚本（全字段对齐酒馆 RegexScriptData，可直接导入/导出 ST JSON）
+        val LOREBOOKS = stringPreferencesKey("lorebooks")
         val REGEX_SCRIPTS = stringPreferencesKey("regex_scripts")
         val WORLD_INFO_BUDGET = intPreferencesKey("world_info_budget")
         val WORLD_INFO_BUDGET_CAP = intPreferencesKey("world_info_budget_cap")
@@ -219,12 +551,9 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         val WORLD_INFO_OVERFLOW_ALERT = booleanPreferencesKey("world_info_overflow_alert")
         val WORLD_INFO_USE_GROUP_SCORING = booleanPreferencesKey("world_info_use_group_scoring")
         val QUICK_MESSAGES = stringPreferencesKey("quick_messages")
-        // 宏引擎变量（酒馆 Macro 2.0 变量持久化）
         val MACRO_GLOBAL_VARIABLES = stringPreferencesKey("macro_global_variables")
         val MACRO_CHAT_VARIABLES = stringPreferencesKey("macro_chat_variables")
-        // DeepSeek 前缀缓存优化（动态上下文移至请求末尾，最大化缓存命中）
         val DEEPSEEK_CACHE_OPTIMIZATION = booleanPreferencesKey("deepseek_cache_optimization")
-        // EJS 提示词模板渲染（ST-Prompt-Template 语义）
         val TAVERN_EJS_RENDERING = booleanPreferencesKey("tavern_ejs_rendering")
 
         // 备份提醒
@@ -239,9 +568,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         // 赞助提醒
         val SPONSOR_ALERT_DISMISSED_AT = intPreferencesKey("sponsor_alert_dismissed_at")
 
-        // Custom HTTP API
-
-        // 人设 & 导演备注（补全）
+        // 人设 & 导演备注
         val PERSONAS = stringPreferencesKey("personas")
         val ACTIVE_PERSONA_ID = stringPreferencesKey("active_persona_id")
         val AUTHOR_NOTE = stringPreferencesKey("author_note")
@@ -252,139 +579,141 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         val AUTHOR_NOTE_INTERVAL = intPreferencesKey("author_note_interval")
         val GROUP_CHATS = stringPreferencesKey("group_chats")
 
-        // [v240 W3] Character Expressions（立绘）：总开关 / 分类方式 / 兜底标签
+        // [v240 W3] Character Expressions（立绘）
         val EXPRESSION_ENABLED = booleanPreferencesKey("expression_enabled")
         val EXPRESSION_CLASSIFIER = stringPreferencesKey("expression_classifier")
         val EXPRESSION_FALLBACK_LABEL = stringPreferencesKey("expression_fallback_label")
 
-        // [v240 W5] 真 tokenizer 模式（cl100k / o200k / off；世界书预算 + 上下文估算）
+        // [v240 W5] 真 tokenizer 模式
         val TOKENIZER_MODE = stringPreferencesKey("tokenizer_mode")
 
-        // Uses the same DataStore singleton without starting settings flows or requiring Koin.
-        internal suspend fun restoreBeforeInitialization(context: Context, settings: Settings) {
+        internal suspend fun restoreBeforeInitialization(
+            context: Context,
+            settings: Settings,
+            launchCount: Int = settings.launchCount,
+        ) {
             require(!settings.init) { "Cannot restore uninitialized settings" }
-            persistSettings(context.settingsStore, settings)
+            persistSettings(context.settingsStore, settings.copy(launchCount = launchCount))
         }
 
         private suspend fun persistSettings(dataStore: DataStore<Preferences>, settings: Settings) {
-        dataStore.edit { preferences ->
-            preferences[DYNAMIC_COLOR] = settings.dynamicColor
-            preferences[ENABLE_WEB_SEARCH] = settings.enableWebSearch
-            preferences[THEME_ID] = settings.themeId
-            preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
-            preferences[DEVELOPER_MODE] = settings.developerMode
-            preferences[DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
-            preferences[MESSAGE_STYLE] = encodeMessageStyle(settings.messageStyle)
+            dataStore.edit { preferences ->
+                preferences[DYNAMIC_COLOR] = settings.dynamicColor
+                preferences[ENABLE_WEB_SEARCH] = settings.enableWebSearch
+                preferences[THEME_ID] = settings.themeId
+                preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
+                preferences[DEVELOPER_MODE] = settings.developerMode
+                preferences[DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
+                preferences[MESSAGE_STYLE] = encodeMessageStyle(settings.messageStyle)
 
-            preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
-            preferences[SELECT_MODEL] = settings.chatModelId.toString()
-            preferences[FAST_MODEL] = settings.fastModelId.toString()
-            preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
-            settings.titleModelId?.let {
-                preferences[TITLE_MODEL] = it.toString()
-            } ?: preferences.remove(TITLE_MODEL)
-            preferences[TRANSLATE_MODEL] = settings.translateModeId.toString()
-            preferences[ENABLE_SUGGESTION] = settings.enableSuggestion
-            preferences[DEEPSEEK_CACHE_OPTIMIZATION] = settings.deepseekCacheOptimization
-            preferences[TAVERN_EJS_RENDERING] = settings.tavernEjsRendering
-            settings.suggestionModelId?.let {
-                preferences[SUGGESTION_MODEL] = it.toString()
-            } ?: preferences.remove(SUGGESTION_MODEL)
-            preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
-            preferences[TITLE_PROMPT] = settings.titlePrompt
-            preferences[TRANSLATION_PROMPT] = settings.translatePrompt
-            preferences[TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
-            preferences[SUGGESTION_PROMPT] = settings.suggestionPrompt
-            preferences[OCR_MODEL] = settings.ocrModelId.toString()
-            preferences[OCR_PROMPT] = settings.ocrPrompt
-            preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
-            preferences[COMPRESS_PROMPT] = settings.compressPrompt
-            settings.embeddingModelId?.let {
-                preferences[EMBEDDING_MODEL] = it.toString()
-            } ?: preferences.remove(EMBEDDING_MODEL)
-            preferences[KB_INJECTION_SETTINGS] = JsonInstant.encodeToString(settings.kbInjectionSettings)
+                preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
+                preferences[SELECT_MODEL] = settings.chatModelId.toString()
+                preferences[FAST_MODEL] = settings.fastModelId.toString()
+                preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
+                settings.titleModelId?.let {
+                    preferences[TITLE_MODEL] = it.toString()
+                } ?: preferences.remove(TITLE_MODEL)
+                preferences[TRANSLATE_MODEL] = settings.translateModeId.toString()
+                preferences[ENABLE_SUGGESTION] = settings.enableSuggestion
+                preferences[DEEPSEEK_CACHE_OPTIMIZATION] = settings.deepseekCacheOptimization
+                preferences[TAVERN_EJS_RENDERING] = settings.tavernEjsRendering
+                settings.suggestionModelId?.let {
+                    preferences[SUGGESTION_MODEL] = it.toString()
+                } ?: preferences.remove(SUGGESTION_MODEL)
+                preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
+                preferences[TITLE_PROMPT] = settings.titlePrompt
+                preferences[TRANSLATION_PROMPT] = settings.translatePrompt
+                preferences[TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
+                preferences[TRANSLATE_TARGET_LANGUAGE] = settings.translateTargetLanguage
+                preferences[SUGGESTION_PROMPT] = settings.suggestionPrompt
+                preferences[OCR_MODEL] = settings.ocrModelId.toString()
+                preferences[OCR_PROMPT] = settings.ocrPrompt
+                preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
+                preferences[COMPRESS_PROMPT] = settings.compressPrompt
+                settings.embeddingModelId?.let {
+                    preferences[EMBEDDING_MODEL] = it.toString()
+                } ?: preferences.remove(EMBEDDING_MODEL)
+                preferences[KB_INJECTION_SETTINGS] = JsonInstant.encodeToString(settings.kbInjectionSettings)
 
-            preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
+                preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
 
-            preferences[ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
-            preferences[SELECT_ASSISTANT] = settings.assistantId.toString()
-            preferences[ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
+                preferences[ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
+                preferences[SELECT_ASSISTANT] = settings.assistantId.toString()
+                preferences[ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
 
-            preferences[SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
-            preferences[SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
-            preferences[SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, settings.searchServices.size - 1)
+                preferences[SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
+                preferences[SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
+                preferences[SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, (settings.searchServices.size - 1).coerceAtLeast(0))
 
-            preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
-            preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
-            preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
-            preferences[TTS_PROVIDERS] = JsonInstant.encodeToString(settings.ttsProviders)
-            settings.selectedTTSProviderId?.let {
-                preferences[SELECTED_TTS_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_TTS_PROVIDER)
-            preferences[DEFAULT_TTS_PLAYBACK_SPEED] = settings.defaultTTSPlaybackSpeed.coerceIn(0.5f, 2.0f)
-            preferences[ASR_PROVIDERS] = JsonInstant.encodeToString(settings.asrProviders)
-            settings.selectedASRProviderId?.let {
-                preferences[SELECTED_ASR_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_ASR_PROVIDER)
-            preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
-            preferences[PROMPT_INJECTIONS] = JsonInstant.encodeToString(settings.promptInjections)
-            preferences[TAVERN_PRESETS] = settings.tavernPresets
-            preferences[TAVERN_GLOBAL_SCRIPTS] = settings.tavernGlobalScripts
-            preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] = settings.tavernGlobalScriptsEnabled
-            preferences[TAVERN_PRESET_SCRIPTS] = settings.tavernPresetScripts
-            preferences[TAVERN_THIRD_PARTY_DISABLED] = JsonInstant.encodeToString(settings.tavernThirdPartyDisabled)
-            preferences[TAVERN_EXTENSION_SETTINGS] = settings.tavernExtensionSettings
-            preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
-            preferences[REGEX_SCRIPTS] = JsonInstant.encodeToString(settings.regexScripts)
-            preferences[WORLD_INFO_BUDGET] = settings.worldInfoBudget
-            preferences[WORLD_INFO_BUDGET_CAP] = settings.worldInfoBudgetCap
-            preferences[WORLD_INFO_MIN_ACTIVATIONS] = settings.worldInfoMinActivations
-            preferences[WORLD_INFO_MIN_ACTIVATIONS_DEPTH_MAX] = settings.worldInfoMinActivationsDepthMax
-            preferences[WORLD_INFO_RECURSIVE] = settings.worldInfoRecursive
-            preferences[WORLD_INFO_MAX_RECURSION_STEPS] = settings.worldInfoMaxRecursionSteps
-            preferences[WORLD_INFO_DEPTH] = settings.worldInfoDepth
-            preferences[WORLD_INFO_CHARACTER_STRATEGY] = settings.worldInfoCharacterStrategy
-            preferences[WORLD_INFO_OVERFLOW_ALERT] = settings.worldInfoOverflowAlert
-            preferences[WORLD_INFO_USE_GROUP_SCORING] = settings.worldInfoUseGroupScoring
-            preferences[QUICK_MESSAGES] = JsonInstant.encodeToString(settings.quickMessages)
-            preferences[WEB_SERVER_ENABLED] = settings.webServerEnabled
-            preferences[WEB_SERVER_PORT] = settings.webServerPort
-            preferences[WEB_SERVER_JWT_ENABLED] = settings.webServerJwtEnabled
-            preferences[WEB_SERVER_ACCESS_PASSWORD] = settings.webServerAccessPassword
-            preferences[WEB_SERVER_LOCALHOST_ONLY] = settings.webServerLocalhostOnly
-            preferences[GITHUB_TOKEN] = settings.githubToken
-            preferences[BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
-            preferences[LAUNCH_COUNT] = settings.launchCount
-            preferences[SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
-            preferences[PERSONAS] = JsonInstant.encodeToString(settings.personas)
-            settings.activePersonaId?.let { preferences[ACTIVE_PERSONA_ID] = it.toString() }
-                ?: preferences.remove(ACTIVE_PERSONA_ID)
-            preferences[AUTHOR_NOTE] = settings.authorNote
-            preferences[AUTHOR_NOTE_ENABLED] = settings.authorNoteEnabled
-            preferences[AUTHOR_NOTE_POSITION] = settings.authorNotePosition.name
-            preferences[AUTHOR_NOTE_DEPTH] = settings.authorNoteDepth
-            preferences[AUTHOR_NOTE_ROLE] = settings.authorNoteRole.name
-            preferences[AUTHOR_NOTE_INTERVAL] = settings.authorNoteInterval
-            preferences[EXPRESSION_ENABLED] = settings.expressionEnabled
-            preferences[EXPRESSION_CLASSIFIER] = settings.expressionClassifier.name.lowercase()
-            preferences[EXPRESSION_FALLBACK_LABEL] = settings.expressionFallbackLabel
-            preferences[TOKENIZER_MODE] = when (settings.tokenizerMode) {
-                TokenizerMode.OFF -> "off"
-                TokenizerMode.CL100K -> "cl100k"
-                TokenizerMode.O200K -> "o200k"
+                preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
+                preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
+                preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
+                preferences[UPLOAD_S3_CONFIG] = JsonInstant.encodeToString(settings.uploadS3Config)
+                preferences[MEDIA_GENERATION_PROVIDERS] = JsonInstant.encodeToString(settings.mediaGenerationProviders)
+                preferences[TTS_PROVIDERS] = JsonInstant.encodeToString(settings.ttsProviders)
+                preferences[SELECTED_TTS_PROVIDER] = settings.selectedTTSProviderId.toString()
+                preferences[DEFAULT_TTS_PLAYBACK_SPEED] = settings.defaultTTSPlaybackSpeed.coerceIn(0.5f, 2.0f)
+                preferences[ASR_PROVIDERS] = JsonInstant.encodeToString(settings.asrProviders)
+                settings.selectedASRProviderId?.let {
+                    preferences[SELECTED_ASR_PROVIDER] = it.toString()
+                } ?: preferences.remove(SELECTED_ASR_PROVIDER)
+                preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+                preferences[PROMPT_INJECTIONS] = JsonInstant.encodeToString(settings.promptInjections)
+                preferences[TAVERN_PRESETS] = settings.tavernPresets
+                preferences[TAVERN_GLOBAL_SCRIPTS] = settings.tavernGlobalScripts
+                preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] = settings.tavernGlobalScriptsEnabled
+                preferences[TAVERN_PRESET_SCRIPTS] = settings.tavernPresetScripts
+                preferences[TAVERN_THIRD_PARTY_DISABLED] = JsonInstant.encodeToString(settings.tavernThirdPartyDisabled)
+                preferences[TAVERN_EXTENSION_SETTINGS] = settings.tavernExtensionSettings
+                preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
+                preferences[REGEX_SCRIPTS] = JsonInstant.encodeToString(settings.regexScripts)
+                preferences[WORLD_INFO_BUDGET] = settings.worldInfoBudget
+                preferences[WORLD_INFO_BUDGET_CAP] = settings.worldInfoBudgetCap
+                preferences[WORLD_INFO_MIN_ACTIVATIONS] = settings.worldInfoMinActivations
+                preferences[WORLD_INFO_MIN_ACTIVATIONS_DEPTH_MAX] = settings.worldInfoMinActivationsDepthMax
+                preferences[WORLD_INFO_RECURSIVE] = settings.worldInfoRecursive
+                preferences[WORLD_INFO_MAX_RECURSION_STEPS] = settings.worldInfoMaxRecursionSteps
+                preferences[WORLD_INFO_DEPTH] = settings.worldInfoDepth
+                preferences[WORLD_INFO_CHARACTER_STRATEGY] = settings.worldInfoCharacterStrategy
+                preferences[WORLD_INFO_OVERFLOW_ALERT] = settings.worldInfoOverflowAlert
+                preferences[WORLD_INFO_USE_GROUP_SCORING] = settings.worldInfoUseGroupScoring
+                preferences[QUICK_MESSAGES] = JsonInstant.encodeToString(settings.quickMessages)
+                preferences[WEB_SERVER_ENABLED] = settings.webServerEnabled
+                preferences[WEB_SERVER_PORT] = settings.webServerPort
+                preferences[WEB_SERVER_JWT_ENABLED] = settings.webServerJwtEnabled
+                preferences[WEB_SERVER_ACCESS_PASSWORD] = settings.webServerAccessPassword
+                preferences[WEB_SERVER_LOCALHOST_ONLY] = settings.webServerLocalhostOnly
+                preferences[GITHUB_TOKEN] = settings.githubToken
+                preferences[BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
+                preferences[LAUNCH_COUNT] = settings.launchCount
+                preferences[SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
+                preferences[PERSONAS] = JsonInstant.encodeToString(settings.personas)
+                settings.activePersonaId?.let { preferences[ACTIVE_PERSONA_ID] = it.toString() }
+                    ?: preferences.remove(ACTIVE_PERSONA_ID)
+                preferences[AUTHOR_NOTE] = settings.authorNote
+                preferences[AUTHOR_NOTE_ENABLED] = settings.authorNoteEnabled
+                preferences[AUTHOR_NOTE_POSITION] = settings.authorNotePosition.name
+                preferences[AUTHOR_NOTE_DEPTH] = settings.authorNoteDepth
+                preferences[AUTHOR_NOTE_ROLE] = settings.authorNoteRole.name
+                preferences[AUTHOR_NOTE_INTERVAL] = settings.authorNoteInterval
+                preferences[EXPRESSION_ENABLED] = settings.expressionEnabled
+                preferences[EXPRESSION_CLASSIFIER] = settings.expressionClassifier.name.lowercase()
+                preferences[EXPRESSION_FALLBACK_LABEL] = settings.expressionFallbackLabel
+                preferences[TOKENIZER_MODE] = when (settings.tokenizerMode) {
+                    TokenizerMode.OFF -> "off"
+                    TokenizerMode.CL100K -> "cl100k"
+                    TokenizerMode.O200K -> "o200k"
+                }
+                preferences[GROUP_CHATS] = JsonInstant.encodeToString(settings.groupChats)
+                preferences[MACRO_GLOBAL_VARIABLES] = JsonInstant.encodeToString(settings.macroGlobalVariables)
+                preferences[MACRO_CHAT_VARIABLES] = JsonInstant.encodeToString(settings.macroChatVariables)
+                preferences[NETWORK_SETTING] = JsonInstant.encodeToString(settings.networkSetting)
             }
-            preferences[GROUP_CHATS] = JsonInstant.encodeToString(settings.groupChats)
-            preferences[MACRO_GLOBAL_VARIABLES] = JsonInstant.encodeToString(settings.macroGlobalVariables)
-            preferences[MACRO_CHAT_VARIABLES] = JsonInstant.encodeToString(settings.macroChatVariables)
-            preferences[NETWORK_SETTING] = JsonInstant.encodeToString(settings.networkSetting)
-        }
         }
     }
 
     private val dataStore = context.settingsStore
 
-    // 读取失败时绝不能回退为空配置, 否则默认值会被当成用户数据写回, 覆盖全部设置
-    // 偶发 IO 错误重试, 仍失败则向上抛出 (文件损坏由 corruptionHandler 处理)
     val settingsFlowRaw = dataStore.data
         .retryWhen { cause, attempt ->
             val shouldRetry = cause is IOException && cause !is CorruptionException && attempt < READ_MAX_RETRIES
@@ -395,85 +724,76 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             shouldRetry
         }.map { preferences ->
             Settings(
-                favoriteModels = preferences[FAVORITE_MODELS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                chatModelId = preferences[SELECT_MODEL]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_AUTO_MODEL_ID,
-                fastModelId = preferences[FAST_MODEL]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_AUTO_MODEL_ID,
+                favoriteModels = decodeListResilient<Uuid>(preferences[FAVORITE_MODELS], "favoriteModels"),
+                chatModelId = parseUuidOrDefault(preferences[SELECT_MODEL], DEFAULT_AUTO_MODEL_ID),
+                fastModelId = parseUuidOrDefault(preferences[FAST_MODEL], DEFAULT_AUTO_MODEL_ID),
                 fastModelReasoningLevel = preferences[FAST_MODEL_REASONING_LEVEL]
                     ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
                     ?: ReasoningLevel.AUTO,
-                titleModelId = preferences[TITLE_MODEL]?.let { runCatching { Uuid.parse(it) }.getOrNull() },
-                translateModeId = preferences[TRANSLATE_MODEL]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_AUTO_MODEL_ID,
+                titleModelId = parseUuidOrNull(preferences[TITLE_MODEL]),
+                translateModeId = parseUuidOrDefault(preferences[TRANSLATE_MODEL], DEFAULT_AUTO_MODEL_ID),
                 enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
                 deepseekCacheOptimization = preferences[DEEPSEEK_CACHE_OPTIMIZATION] ?: true,
                 tavernEjsRendering = preferences[TAVERN_EJS_RENDERING] ?: true,
-                suggestionModelId = preferences[SUGGESTION_MODEL]?.let { Uuid.parse(it) },
-                imageGenerationModelId = preferences[IMAGE_GENERATION_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
+                suggestionModelId = parseUuidOrNull(preferences[SUGGESTION_MODEL]),
+                imageGenerationModelId = parseUuidOrDefault(preferences[IMAGE_GENERATION_MODEL], Uuid.random()),
                 titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
                 translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
                 translateThinkingBudget = preferences[TRANSLATE_THINKING_BUDGET] ?: 0,
+                translateTargetLanguage = preferences[TRANSLATE_TARGET_LANGUAGE] ?: "zh-CN",
                 suggestionPrompt = preferences[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
-                ocrModelId = preferences[OCR_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
+                ocrModelId = parseUuidOrDefault(preferences[OCR_MODEL], Uuid.random()),
                 ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
-                compressModelId = preferences[COMPRESS_MODEL]?.let { Uuid.parse(it) } ?: DEFAULT_AUTO_MODEL_ID,
+                compressModelId = parseUuidOrDefault(preferences[COMPRESS_MODEL], DEFAULT_AUTO_MODEL_ID),
                 compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
-                embeddingModelId = preferences[EMBEDDING_MODEL]?.let { runCatching { Uuid.parse(it) }.getOrNull() },
-                kbInjectionSettings = preferences[KB_INJECTION_SETTINGS]?.let {
-                    runCatching { JsonInstant.decodeFromString<KbInjectionSettings>(it) }.getOrDefault(KbInjectionSettings())
-                } ?: KbInjectionSettings(),
-                assistantId = preferences[SELECT_ASSISTANT]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_ASSISTANT_ID,
-                assistantTags = preferences[ASSISTANT_TAGS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                providers = JsonInstant.decodeFromString(preferences[PROVIDERS] ?: "[]"),
-                assistants = JsonInstant.decodeFromString(preferences[ASSISTANTS] ?: "[]"),
+                embeddingModelId = parseUuidOrNull(preferences[EMBEDDING_MODEL]),
+                kbInjectionSettings = decodeObjectOrDefault(preferences[KB_INJECTION_SETTINGS], KbInjectionSettings()),
+                assistantId = parseUuidOrDefault(preferences[SELECT_ASSISTANT], DEFAULT_ASSISTANT_ID),
+                assistantTags = decodeListResilient<Tag>(preferences[ASSISTANT_TAGS], "assistantTags"),
+                providers = decodeProvidersResilient(
+                    rawJson = preferences[PROVIDERS],
+                    onCorruptBackup = { corruptRaw ->
+                        if (preferences[PROVIDERS_CORRUPT_BACKUP].isNullOrEmpty() && corruptRaw.isNotEmpty()) {
+                            scope.launch(Dispatchers.IO) {
+                                runCatching {
+                                    dataStore.edit { editPrefs ->
+                                        if (editPrefs[PROVIDERS_CORRUPT_BACKUP].isNullOrEmpty()) {
+                                            editPrefs[PROVIDERS_CORRUPT_BACKUP] = corruptRaw
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                ),
+                assistants = decodeListResilient<Assistant>(preferences[ASSISTANTS], "assistants"),
                 dynamicColor = preferences[DYNAMIC_COLOR] != false,
                 enableWebSearch = preferences[ENABLE_WEB_SEARCH] != false,
                 themeId = preferences[THEME_ID] ?: PresetThemes[0].id,
-                customThemes = preferences[CUSTOM_THEMES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
+                customThemes = decodeListResilient<CustomTheme>(preferences[CUSTOM_THEMES], "customThemes"),
                 developerMode = preferences[DEVELOPER_MODE] == true,
-                displaySetting = JsonInstant.decodeFromString(preferences[DISPLAY_SETTING] ?: "{}"),
+                displaySetting = decodeObjectOrDefault(preferences[DISPLAY_SETTING], DisplaySetting()),
                 messageStyle = decodeMessageStyle(preferences[MESSAGE_STYLE]),
-                networkSetting = JsonInstant.decodeFromString(preferences[NETWORK_SETTING] ?: "{}"),
-                searchServices = preferences[SEARCH_SERVICES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: listOf(SearchServiceOptions.DEFAULT),
-                searchCommonOptions = preferences[SEARCH_COMMON]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: SearchCommonOptions(),
+                networkSetting = decodeObjectOrDefault(preferences[NETWORK_SETTING], NetworkSetting()),
+                searchServices = decodeListResilient<SearchServiceOptions>(preferences[SEARCH_SERVICES], "searchServices")
+                    .ifEmpty { listOf(SearchServiceOptions.DEFAULT) },
+                searchCommonOptions = decodeObjectOrDefault(preferences[SEARCH_COMMON], SearchCommonOptions()),
                 searchServiceSelected = preferences[SEARCH_SELECTED] ?: 0,
-                mcpServers = preferences[MCP_SERVERS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                webDavConfig = preferences[WEBDAV_CONFIG]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: WebDavConfig(),
-                s3Config = preferences[S3_CONFIG]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: S3Config(),
-                ttsProviders = preferences[TTS_PROVIDERS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                selectedTTSProviderId = preferences[SELECTED_TTS_PROVIDER]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_SYSTEM_TTS_ID,
+                mcpServers = decodeListResilient<McpServerConfig>(preferences[MCP_SERVERS], "mcpServers"),
+                webDavConfig = decodeObjectOrDefault(preferences[WEBDAV_CONFIG], WebDavConfig()),
+                s3Config = decodeObjectOrDefault(preferences[S3_CONFIG], S3Config()),
+                uploadS3Config = decodeObjectOrDefault(preferences[UPLOAD_S3_CONFIG], S3Config()),
+                mediaGenerationProviders = decodeListResilient<MediaGenerationProviderSetting>(
+                    preferences[MEDIA_GENERATION_PROVIDERS],
+                    "mediaGenerationProviders",
+                ),
+                ttsProviders = decodeListResilient<TTSProviderSetting>(preferences[TTS_PROVIDERS], "ttsProviders"),
+                selectedTTSProviderId = parseUuidOrDefault(preferences[SELECTED_TTS_PROVIDER], DEFAULT_SYSTEM_TTS_ID),
                 defaultTTSPlaybackSpeed = preferences[DEFAULT_TTS_PLAYBACK_SPEED]?.coerceIn(0.5f, 2.0f) ?: 1.0f,
-                asrProviders = preferences[ASR_PROVIDERS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                selectedASRProviderId = preferences[SELECTED_ASR_PROVIDER]?.let { Uuid.parse(it) },
-                modeInjections = preferences[MODE_INJECTIONS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                promptInjections = preferences[PROMPT_INJECTIONS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
+                asrProviders = decodeListResilient<ASRProviderSetting>(preferences[ASR_PROVIDERS], "asrProviders"),
+                selectedASRProviderId = parseUuidOrNull(preferences[SELECTED_ASR_PROVIDER]),
+                modeInjections = decodeListResilient<PromptInjection.ModeInjection>(preferences[MODE_INJECTIONS], "modeInjections"),
+                promptInjections = decodeListResilient<PromptInjection.ModeInjection>(preferences[PROMPT_INJECTIONS], "promptInjections"),
                 tavernPresets = preferences[TAVERN_PRESETS] ?: "{}",
                 tavernGlobalScripts = preferences[TAVERN_GLOBAL_SCRIPTS] ?: "[]",
                 tavernGlobalScriptsEnabled = preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] ?: true,
@@ -482,13 +802,8 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                     runCatching { JsonInstant.decodeFromString<Set<String>>(it) }.getOrDefault(emptySet())
                 } ?: emptySet(),
                 tavernExtensionSettings = preferences[TAVERN_EXTENSION_SETTINGS] ?: "{}",
-                lorebooks = preferences[LOREBOOKS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                regexScripts = preferences[REGEX_SCRIPTS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                // 官方 world_info_budget：世界书预算 = 上下文 token 的百分比（0-100，官方默认 25）
+                lorebooks = decodeListResilient<Lorebook>(preferences[LOREBOOKS], "lorebooks"),
+                regexScripts = decodeListResilient<RegexScript>(preferences[REGEX_SCRIPTS], "regexScripts"),
                 worldInfoBudget = preferences[WORLD_INFO_BUDGET]?.coerceIn(0, 100) ?: 25,
                 worldInfoBudgetCap = preferences[WORLD_INFO_BUDGET_CAP] ?: 0,
                 worldInfoMinActivations = preferences[WORLD_INFO_MIN_ACTIVATIONS] ?: 0,
@@ -499,42 +814,34 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
                 worldInfoCharacterStrategy = preferences[WORLD_INFO_CHARACTER_STRATEGY] ?: 1,
                 worldInfoOverflowAlert = preferences[WORLD_INFO_OVERFLOW_ALERT] ?: false,
                 worldInfoUseGroupScoring = preferences[WORLD_INFO_USE_GROUP_SCORING] ?: false,
-                quickMessages = preferences[QUICK_MESSAGES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
+                quickMessages = decodeListResilient<QuickMessage>(preferences[QUICK_MESSAGES], "quickMessages"),
                 webServerEnabled = preferences[WEB_SERVER_ENABLED] == true,
                 webServerPort = preferences[WEB_SERVER_PORT] ?: 8080,
                 webServerJwtEnabled = preferences[WEB_SERVER_JWT_ENABLED] == true,
                 webServerAccessPassword = preferences[WEB_SERVER_ACCESS_PASSWORD] ?: "",
                 webServerLocalhostOnly = preferences[WEB_SERVER_LOCALHOST_ONLY] == true,
-                backupReminderConfig = preferences[BACKUP_REMINDER_CONFIG]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: BackupReminderConfig(),
+                backupReminderConfig = decodeObjectOrDefault(preferences[BACKUP_REMINDER_CONFIG], BackupReminderConfig()),
                 githubToken = preferences[GITHUB_TOKEN] ?: "",
                 launchCount = preferences[LAUNCH_COUNT] ?: 0,
                 sponsorAlertDismissedAt = preferences[SPONSOR_ALERT_DISMISSED_AT] ?: 0,
-                personas = preferences[PERSONAS]?.let { JsonInstant.decodeFromString(it) } ?: DEFAULT_PERSONAS,
-                activePersonaId = preferences[ACTIVE_PERSONA_ID]?.let { Uuid.parse(it) },
+                personas = decodeListResilient<Persona>(preferences[PERSONAS], "personas").ifEmpty { DEFAULT_PERSONAS },
+                activePersonaId = parseUuidOrNull(preferences[ACTIVE_PERSONA_ID]),
                 authorNote = preferences[AUTHOR_NOTE] ?: "",
                 authorNoteEnabled = preferences[AUTHOR_NOTE_ENABLED] ?: false,
                 authorNotePosition = parseAuthorNotePosition(preferences[AUTHOR_NOTE_POSITION]),
                 authorNoteDepth = preferences[AUTHOR_NOTE_DEPTH] ?: 4,
-                authorNoteRole = preferences[AUTHOR_NOTE_ROLE]?.let { MessageRole.valueOf(it) } ?: MessageRole.SYSTEM,
+                authorNoteRole = preferences[AUTHOR_NOTE_ROLE]?.let {
+                    runCatching { MessageRole.valueOf(it) }.getOrNull()
+                } ?: MessageRole.SYSTEM,
                 authorNoteInterval = preferences[AUTHOR_NOTE_INTERVAL] ?: 1,
-                // [v240 W3] 立绘：默认关闭；分类方式默认 llm（rikkaST 天然客户端模型）；兜底默认 joy
                 expressionEnabled = preferences[EXPRESSION_ENABLED] ?: false,
                 expressionClassifier = ExpressionClassifier.parse(preferences[EXPRESSION_CLASSIFIER]),
                 expressionFallbackLabel = preferences[EXPRESSION_FALLBACK_LABEL]
                     ?.takeIf { it.isNotBlank() } ?: ExpressionLabels.DEFAULT_FALLBACK,
-                // [v240 W5] 词表缺失/关闭时自动回退启发式估算
                 tokenizerMode = TokenizerMode.parse(preferences[TOKENIZER_MODE]),
-                groupChats = preferences[GROUP_CHATS]?.let { JsonInstant.decodeFromString(it) } ?: emptyList(),
-                macroGlobalVariables = preferences[MACRO_GLOBAL_VARIABLES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyMap(),
-                macroChatVariables = preferences[MACRO_CHAT_VARIABLES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyMap(),
+                groupChats = decodeListResilient<GroupChat>(preferences[GROUP_CHATS], "groupChats"),
+                macroGlobalVariables = decodeObjectOrDefault(preferences[MACRO_GLOBAL_VARIABLES], emptyMap()),
+                macroChatVariables = decodeObjectOrDefault(preferences[MACRO_CHAT_VARIABLES], emptyMap()),
             )
         }
         .map {
@@ -573,10 +880,7 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             )
         }
         .map { settings ->
-            // 去重并清理无效引用
             val validMcpServerIds = settings.mcpServers.map { it.id }.toSet()
-            // [第6轮 D1] 两通道共用一套 modeInjectionIds ⇒ 校验集合必须是并集，
-            // 否则新通道的条目会被当成「悬空引用」在启动时被静默清掉。
             val validModeInjectionIds =
                 (settings.modeInjections + settings.promptInjections).map { it.id }.toSet()
             val validLorebookIds = settings.lorebooks.map { it.id }.toSet()
@@ -584,35 +888,19 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             val asrProviders = settings.asrProviders.distinctBy { it.id }
             settings.copy(
                 providers = settings.providers.distinctBy { it.id }.map { provider ->
-                    when (provider) {
-                        is ProviderSetting.OpenAI -> provider.copy(
-                            models = provider.models.distinctBy { model -> model.id }
-                        )
-
-                        is ProviderSetting.Google -> provider.copy(
-                            models = provider.models.distinctBy { model -> model.id }
-                        )
-
-                        is ProviderSetting.Claude -> provider.copy(
-                            models = provider.models.distinctBy { model -> model.id }
-                        )
-                    }
+                    provider.copyProvider(models = provider.models.distinctBy { model -> model.id })
                 },
                 assistants = settings.assistants.distinctBy { it.id }.map { assistant ->
                     assistant.copy(
-                        // 过滤掉不存在的 MCP 服务器 ID
                         mcpServers = assistant.mcpServers.filter { serverId ->
                             serverId in validMcpServerIds
                         }.toSet(),
-                        // 过滤掉不存在的模式注入 ID
                         modeInjectionIds = assistant.modeInjectionIds.filter { id ->
                             id in validModeInjectionIds
                         }.toSet(),
-                        // 过滤掉不存在的 Lorebook ID
                         lorebookIds = assistant.lorebookIds.filter { id ->
                             id in validLorebookIds
                         }.toSet(),
-                        // 过滤掉不存在的快捷消息 ID
                         quickMessageIds = assistant.quickMessageIds.filter { id ->
                             id in validQuickMessageIds
                         }.toSet()
@@ -634,50 +922,32 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             )
         }
         .onEach {
-            get<PebbleEngine>().templateCache.invalidateAll()
+            runCatching { get<PebbleEngine>().templateCache.invalidateAll() }
         }
 
-    // [v222 R2-P0] 「设置开关卡顿」的首要根因（jank-recon 实证，notes/recon-switch-jank-20261004.md §2）：
-    // `dataStore.data` 的 collector 跑在 Main（AppScope = SupervisorJob() + Dispatchers.Main），
-    // 上面这条链里有 ~30 个 JsonInstant.decodeFromString + 3 段 map + distinctUntilChanged 深比较，
-    // 每次写回都在主线程跑完 → 动画期间掉帧（thumb 走「左 中 右」）。
-    // 修法：把上游（解码/比较）整体挪到 Default，**不动任何动画时长**。
-    //
-    /**
-     * [v229 A4/P0-2] DataStore **旧回声**门控 =「本地权威值 + 落盘确认」。
-     *
-     * 真机根因（v227/v228 两轮「松手后自己滑 / 开关弹回」都落在这里）：
-     *   `settingsFlow.value = next`（乐观写）之后，`dataStore.data` 仍会把**更早那笔写的旧快照**
-     *   解码后推给同一个 `settingsFlow` —— 上一笔的发射晚于这一笔的本地写到达，UI 刚设的值被拉回；
-     *   滑块连续拖动时表现为「松手后数值自己慢慢挪」。
-     *
-     * 结构（对齐 Kelivo 的「内存权威 + 落盘只写不读回」，但不改冷启动语义）：
-     *   1. 每笔本地写在 [settingsFlow] 生效的同时，把该值记给 [SettingsEchoGate]（权威值）；
-     *   2. collector 只在「上游发射 == 权威值」(= 我们这笔已落盘并被确认) 或「无待确认写」时才回灌；
-     *   3. 其余发射一律判定为**旧回声**并丢弃（[SettingsEchoGate.droppedCount] 计数供真机取证）；
-     *   4. 写入口唯一（本类 update/patchKey 是 DataStore 的**唯一写者**，已核查）-> 待确认值必然被
-     *      自己那笔写的发射确认，不会永久卡住；没有待确认写时（冷启动/外部导入）照常回灌。
-     */
-
-    /** [v229 A4] 上游回灌闸门（纯逻辑在 [SettingsEchoGate]，可单测）。 */
     private val echoGate = SettingsEchoGate()
 
-    /**
-     * 本地写入口（`update()` 与 `patchKey()` 唯一共用）：先立权威值，再改内存 flow。
-     * 顺序不能反 —— 必须先让 gate 记下权威值，否则 collector 可能先看到本笔的 echo 而误判。
-     */
     private fun markLocalWrite(next: Settings) {
         echoGate.mark(next)
         settingsFlow.value = next
     }
+
     val settingsFlow = MutableStateFlow(Settings.dummy())
+    val launchCountFlow: Flow<Int> = settingsFlowRaw.map { it.launchCount }
+    suspend fun awaitLoaded(): Settings = settingsFlow.first { !it.init }
+    suspend fun selectAssistant(assistantId: Uuid) { updateAssistant(assistantId) }
 
     init {
         scope.launch {
             settingsFlowRaw
                 .flowOn(Dispatchers.Default)
                 .distinctUntilChanged()
-                .catch { t -> Log.e(TAG, "settingsFlow collect failed: ${t.message}", t) }
+                .catch { t ->
+                    Log.e(TAG, "settingsFlow collect failed: ${t.javaClass.simpleName}: ${t.message}")
+                    if (settingsFlow.value.init) {
+                        settingsFlow.value = Settings().normalized()
+                    }
+                }
                 .collect { incoming ->
                     if (echoGate.accept(incoming)) {
                         settingsFlow.value = incoming
@@ -692,130 +962,15 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
     }
 
     suspend fun update(settings: Settings) {
-        if(settings.init) {
+        if (settings.init) {
             Log.w(TAG, "Cannot update dummy settings")
             TavernRuntimeManager.appendLog("warn", "[settings] update rejected: dummy (init=true)")
             return
         }
         val previous = settingsFlow.value
         markLocalWrite(settings)
-        // [v227 N1] ST 宿主事件 SETTINGS_UPDATED（ST events.js:30；真源在 script.js:8110 发，无载荷）。
-        // 差分门控：只有真的变了才发 —— 无脑发会让扩展在每次无关写入时重跑一遍设置迁移
-        // （ST-Prompt-Template 与 power-user.js:2713 都用 once(SETTINGS_UPDATED) 等它）。
-        // 单点发射：SettingsStore.update 是唯一全量设置写入口。
-        // [v228 S2] 差分门控抽成公共函数（settingsEventsFor）：全量 update() 与窄写回 patchKey() 共用一处判据。
         fireSettingsEvents(previous, settings)
-        dataStore.edit { preferences ->
-            preferences[DYNAMIC_COLOR] = settings.dynamicColor
-            preferences[ENABLE_WEB_SEARCH] = settings.enableWebSearch
-            preferences[THEME_ID] = settings.themeId
-            preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
-            preferences[DEVELOPER_MODE] = settings.developerMode
-            preferences[DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
-            preferences[MESSAGE_STYLE] = encodeMessageStyle(settings.messageStyle)
-
-            preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
-            preferences[SELECT_MODEL] = settings.chatModelId.toString()
-            preferences[FAST_MODEL] = settings.fastModelId.toString()
-            preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
-            settings.titleModelId?.let {
-                preferences[TITLE_MODEL] = it.toString()
-            } ?: preferences.remove(TITLE_MODEL)
-            preferences[TRANSLATE_MODEL] = settings.translateModeId.toString()
-            preferences[ENABLE_SUGGESTION] = settings.enableSuggestion
-            preferences[DEEPSEEK_CACHE_OPTIMIZATION] = settings.deepseekCacheOptimization
-            preferences[TAVERN_EJS_RENDERING] = settings.tavernEjsRendering
-            settings.suggestionModelId?.let {
-                preferences[SUGGESTION_MODEL] = it.toString()
-            } ?: preferences.remove(SUGGESTION_MODEL)
-            preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
-            preferences[TITLE_PROMPT] = settings.titlePrompt
-            preferences[TRANSLATION_PROMPT] = settings.translatePrompt
-            preferences[TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
-            preferences[SUGGESTION_PROMPT] = settings.suggestionPrompt
-            preferences[OCR_MODEL] = settings.ocrModelId.toString()
-            preferences[OCR_PROMPT] = settings.ocrPrompt
-            preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
-            preferences[COMPRESS_PROMPT] = settings.compressPrompt
-            settings.embeddingModelId?.let {
-                preferences[EMBEDDING_MODEL] = it.toString()
-            } ?: preferences.remove(EMBEDDING_MODEL)
-            preferences[KB_INJECTION_SETTINGS] = JsonInstant.encodeToString(settings.kbInjectionSettings)
-
-            preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
-
-            preferences[ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
-            preferences[SELECT_ASSISTANT] = settings.assistantId.toString()
-            preferences[ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
-
-            preferences[SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
-            preferences[SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
-            preferences[SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, settings.searchServices.size - 1)
-
-            preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
-            preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
-            preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
-            preferences[TTS_PROVIDERS] = JsonInstant.encodeToString(settings.ttsProviders)
-            settings.selectedTTSProviderId?.let {
-                preferences[SELECTED_TTS_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_TTS_PROVIDER)
-            preferences[DEFAULT_TTS_PLAYBACK_SPEED] = settings.defaultTTSPlaybackSpeed.coerceIn(0.5f, 2.0f)
-            preferences[ASR_PROVIDERS] = JsonInstant.encodeToString(settings.asrProviders)
-            settings.selectedASRProviderId?.let {
-                preferences[SELECTED_ASR_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_ASR_PROVIDER)
-            preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
-            preferences[PROMPT_INJECTIONS] = JsonInstant.encodeToString(settings.promptInjections)
-            preferences[TAVERN_PRESETS] = settings.tavernPresets
-            preferences[TAVERN_GLOBAL_SCRIPTS] = settings.tavernGlobalScripts
-            preferences[TAVERN_GLOBAL_SCRIPTS_ENABLED] = settings.tavernGlobalScriptsEnabled
-            preferences[TAVERN_PRESET_SCRIPTS] = settings.tavernPresetScripts
-            preferences[TAVERN_THIRD_PARTY_DISABLED] = JsonInstant.encodeToString(settings.tavernThirdPartyDisabled)
-            preferences[TAVERN_EXTENSION_SETTINGS] = settings.tavernExtensionSettings
-            preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
-            preferences[REGEX_SCRIPTS] = JsonInstant.encodeToString(settings.regexScripts)
-            preferences[WORLD_INFO_BUDGET] = settings.worldInfoBudget
-            preferences[WORLD_INFO_BUDGET_CAP] = settings.worldInfoBudgetCap
-            preferences[WORLD_INFO_MIN_ACTIVATIONS] = settings.worldInfoMinActivations
-            preferences[WORLD_INFO_MIN_ACTIVATIONS_DEPTH_MAX] = settings.worldInfoMinActivationsDepthMax
-            preferences[WORLD_INFO_RECURSIVE] = settings.worldInfoRecursive
-            preferences[WORLD_INFO_MAX_RECURSION_STEPS] = settings.worldInfoMaxRecursionSteps
-            preferences[WORLD_INFO_DEPTH] = settings.worldInfoDepth
-            preferences[WORLD_INFO_CHARACTER_STRATEGY] = settings.worldInfoCharacterStrategy
-            preferences[WORLD_INFO_OVERFLOW_ALERT] = settings.worldInfoOverflowAlert
-            preferences[WORLD_INFO_USE_GROUP_SCORING] = settings.worldInfoUseGroupScoring
-            preferences[QUICK_MESSAGES] = JsonInstant.encodeToString(settings.quickMessages)
-            preferences[WEB_SERVER_ENABLED] = settings.webServerEnabled
-            preferences[WEB_SERVER_PORT] = settings.webServerPort
-            preferences[WEB_SERVER_JWT_ENABLED] = settings.webServerJwtEnabled
-            preferences[WEB_SERVER_ACCESS_PASSWORD] = settings.webServerAccessPassword
-            preferences[WEB_SERVER_LOCALHOST_ONLY] = settings.webServerLocalhostOnly
-            preferences[GITHUB_TOKEN] = settings.githubToken
-            preferences[BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
-            preferences[LAUNCH_COUNT] = settings.launchCount
-            preferences[SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
-            preferences[PERSONAS] = JsonInstant.encodeToString(settings.personas)
-            settings.activePersonaId?.let { preferences[ACTIVE_PERSONA_ID] = it.toString() }
-                ?: preferences.remove(ACTIVE_PERSONA_ID)
-            preferences[AUTHOR_NOTE] = settings.authorNote
-            preferences[AUTHOR_NOTE_ENABLED] = settings.authorNoteEnabled
-            preferences[AUTHOR_NOTE_POSITION] = settings.authorNotePosition.name
-            preferences[AUTHOR_NOTE_DEPTH] = settings.authorNoteDepth
-            preferences[AUTHOR_NOTE_ROLE] = settings.authorNoteRole.name
-            preferences[AUTHOR_NOTE_INTERVAL] = settings.authorNoteInterval
-            preferences[EXPRESSION_ENABLED] = settings.expressionEnabled
-            preferences[EXPRESSION_CLASSIFIER] = settings.expressionClassifier.name.lowercase()
-            preferences[EXPRESSION_FALLBACK_LABEL] = settings.expressionFallbackLabel
-            preferences[TOKENIZER_MODE] = when (settings.tokenizerMode) {
-                TokenizerMode.OFF -> "off"
-                TokenizerMode.CL100K -> "cl100k"
-                TokenizerMode.O200K -> "o200k"
-            }
-            preferences[GROUP_CHATS] = JsonInstant.encodeToString(settings.groupChats)
-            preferences[MACRO_GLOBAL_VARIABLES] = JsonInstant.encodeToString(settings.macroGlobalVariables)
-            preferences[MACRO_CHAT_VARIABLES] = JsonInstant.encodeToString(settings.macroChatVariables)
-            preferences[NETWORK_SETTING] = JsonInstant.encodeToString(settings.networkSetting)
-        }
+        persistSettings(dataStore, settings)
     }
 
     suspend fun update(fn: (Settings) -> Settings) {
@@ -827,21 +982,8 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         update(fn(settingsFlow.value))
     }
 
-    /**
-     * [v227 D4] 窄写回：只改一个 key，且把变换作用在 settingsFlow 的**当前**值上。
-     *
-     * ## 为什么需要它（v226 真机反馈「开关不丝滑 / 开关卡动」的结构性来源）
-     * 设置页旧路径是 `vm.updateSettings(settings.copy(displaySetting = ...))`：
-     * 1. `settings` 是**组合期捕获**的值 —— 连点两个开关时第二次点击用的还是旧快照，
-     *    会把第一次的改动**回滚**（真机表现：开关弹回去 / 跳一下）；
-     * 2. `update()` 会把 ~80 个 key 全部重写一遍（含多次 JSON 编码 + 整文件重写），
-     *    每次点击都在 IO 上制造一大坨无谓写盘，并让 DataStore 再发一次全量事件。
-     *
-     * 窄写回：① 变换基于 `settingsFlow.value`（当前值，CAS 语义，不丢并发改动）
-     * ② 只写这一个 key（写盘量 80 -> 1）。UI 侧仍是乐观更新（先改内存 flow，再落盘）。
-     */
     private suspend fun patchKey(
-        key: androidx.datastore.preferences.core.Preferences.Key<String>,
+        key: Preferences.Key<String>,
         transform: (Settings) -> Settings,
         encode: (Settings) -> String,
     ): Boolean {
@@ -855,8 +997,6 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
         if (next == current) return false
         markLocalWrite(next)
         settingsFlow.value = next
-        // [v228 S2] 窄写回同样要发事件（v227 N1 只覆盖了全量 update() -> patchKey 是漏口）。
-        // 差分门控与 update() 完全同一处判据：调用 settingsEventsFor(previous, next)。
         fireSettingsEvents(current, next)
         dataStore.edit { preferences ->
             preferences[key] = encode(next)
@@ -880,15 +1020,6 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             encode = { encodeMessageStyle(it.messageStyle) },
         )
 
-    /**
-     * [v228 S2] 设置变更 -> ST 事件的唯一发射点（`update()` 全量写回与 `patchKey()` 窄写回共用）。
-     *
-     * 只做两件事：① 取判据（[settingsEventsFor]，纯函数，可单测）；② 逐个交给
-     * [TavernRuntimeManager.fireEvent]（Kotlin -> JS，developerMode 下写 `[event]` 日志）。
-     *
-     * ⚠️ 发射点在 **`settingsFlow.value` 已更新之后**：监听方从 `settings_updated` 回调里读设置时
-     * 必须拿到新值（v227 注释里的老规矩）。差分用的 `previous` 由调用方在更新前抓好。
-     */
     private fun fireSettingsEvents(previous: Settings, next: Settings) {
         for (name in settingsEventsFor(previous, next)) {
             TavernRuntimeManager.fireEvent(name)
@@ -903,6 +1034,12 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
             preferences[LAUNCH_COUNT] = count
         }
         return count
+    }
+
+    suspend fun setLaunchCount(count: Int) {
+        dataStore.edit { preferences ->
+            preferences[LAUNCH_COUNT] = count
+        }
     }
 
     suspend fun updateAssistant(assistantId: Uuid) {
@@ -992,152 +1129,6 @@ val LOREBOOKS = stringPreferencesKey("lorebooks")
 }
 
 @Serializable
-data class Settings(
-    @Transient
-    val init: Boolean = false,
-    val dynamicColor: Boolean = true,
-    val enableWebSearch: Boolean = true, // 全局网络搜索开关
-    val themeId: String = PresetThemes[0].id,
-    val customThemes: List<CustomTheme> = emptyList(),
-    val developerMode: Boolean = false,
-    val displaySetting: DisplaySetting = DisplaySetting(),
-    // [v222 R5] 消息样式（全局唯一；气泡 + 输入栏，A5）。R1-(2) 的模糊强度模块与
-    // 本页 blurStrength 是同一份数据。
-    val messageStyle: MessageStyleSetting = MessageStyleSetting(),
-    val networkSetting: NetworkSetting = NetworkSetting(),
-    val favoriteModels: List<Uuid> = emptyList(),
-    val chatModelId: Uuid = Uuid.random(),
-    val fastModelId: Uuid = Uuid.random(),
-    val fastModelReasoningLevel: ReasoningLevel = ReasoningLevel.AUTO,
-    val titleModelId: Uuid? = null,
-    val imageGenerationModelId: Uuid = Uuid.random(),
-    val titlePrompt: String = DEFAULT_TITLE_PROMPT,
-    val translateModeId: Uuid = Uuid.random(),
-    val translatePrompt: String = DEFAULT_TRANSLATION_PROMPT,
-    val translateThinkingBudget: Int = 0,
-    val enableSuggestion: Boolean = true,
-    val suggestionModelId: Uuid? = null,
-    val suggestionPrompt: String = DEFAULT_SUGGESTION_PROMPT,
-    val ocrModelId: Uuid = Uuid.random(),
-    val ocrPrompt: String = DEFAULT_OCR_PROMPT,
-    val compressModelId: Uuid = Uuid.random(),
-    val compressPrompt: String = DEFAULT_COMPRESS_PROMPT,
-    val embeddingModelId: Uuid? = null, // 全局embedding模型（null=使用chatModelId）
-    val kbInjectionSettings: KbInjectionSettings = KbInjectionSettings(),
-    val assistantId: Uuid = DEFAULT_ASSISTANT_ID,
-    val providers: List<ProviderSetting> = DEFAULT_PROVIDERS,
-    val assistants: List<Assistant> = DEFAULT_ASSISTANTS,
-    val assistantTags: List<Tag> = emptyList(),
-    val searchServices: List<SearchServiceOptions> = listOf(SearchServiceOptions.DEFAULT),
-    val searchCommonOptions: SearchCommonOptions = SearchCommonOptions(),
-    val searchServiceSelected: Int = 0,
-    val mcpServers: List<McpServerConfig> = emptyList(),
-    val webDavConfig: WebDavConfig = WebDavConfig(),
-    val s3Config: S3Config = S3Config(),
-    val ttsProviders: List<TTSProviderSetting> = DEFAULT_TTS_PROVIDERS,
-    val selectedTTSProviderId: Uuid = DEFAULT_SYSTEM_TTS_ID,
-    val defaultTTSPlaybackSpeed: Float = 1.0f,
-    val asrProviders: List<ASRProviderSetting> = emptyList(),
-    val selectedASRProviderId: Uuid? = null,
-    val modeInjections: List<PromptInjection.ModeInjection> = DEFAULT_MODE_INJECTIONS,
-    // [第6轮 D1 方案 A] 「提示词注入」独立通道。
-    //   老 settings.modeInjections 语义**不变** = 「预设仓」（带 presetGroup 的预设条目 +
-    //   历史未分组条目，老数据一行都不动）；这里是新通道自己的存储，只放 presetGroup == null 的条目。
-    //   启用集**不新增字段**：Assistant.modeInjectionIds / Conversation.modeInjectionIds 继续共用
-    //   （UUID 天然唯一，两通道混装安全）—— 见 PromptInjectionTransformer 的并集。
-    val promptInjections: List<PromptInjection.ModeInjection> = emptyList(),
-    // [第6轮 D3] 酒馆预设原始 JSON 无损透传：{"预设名": <原始 root JSON>}。
-    //   动机：实测 ST 预设 root 还有 44 个字段（temperature / new_chat_prompt / scenario_format /
-    //   personality_format / wi_format / impersonation_prompt / continue_nudge_prompt …）以及
-    //   extensions.SPreset（第三方扩展配置）；本轮不逐个映射，但**一行都不许丢**，
-    //   以后想补解析可以直接从这里取。范式对齐既有 tavernGlobalScripts / tavernPresetScripts。
-    val tavernPresets: String = "{}",
-    val lorebooks: List<Lorebook> = emptyList(),
-    val regexScripts: List<RegexScript> = emptyList(),   // ST 正则脚本（酒馆导出 JSON 兼容）
-    // B6: JSR 酒馆助手脚本源（global / preset；character 来自角色卡 extensionsRaw，无需存储）
-    val tavernGlobalScripts: String = "[]", // 全局脚本（JSON 数组字符串，无损透传）
-    val tavernGlobalScriptsEnabled: Boolean = true, // 全局脚本总开关（对齐 JSR script.enabled.global）
-    val tavernPresetScripts: String = "{}", // 预设脚本（JSON 对象：{"预设组名": [script, ...]}）
-    val tavernThirdPartyDisabled: Set<String> = emptySet(), // 被禁用的第三方扩展（文件夹名集合）
-    val tavernExtensionSettings: String = "{}", // 第三方扩展设置（extension_settings 非 variables 部分，JSON 字符串）
-    val worldInfoBudget: Int = 25,                  // 官方 world_info_budget：世界书预算 = 上下文 token 的百分比（官方默认 25%）
-    val worldInfoBudgetCap: Int = 0,                // 官方 world_info_budget_cap：预算绝对 token 上限（0=不限制，官方默认 0）
-    val worldInfoMinActivations: Int = 0,           // 世界书最少激活数（0=关闭，酒馆 min_activations）
-    val worldInfoMinActivationsDepthMax: Int = 0,   // 官方 world_info_min_activations_depth_max：min_activations 最大扫描深度（0=不限制）
-    val worldInfoRecursive: Boolean = false,        // 递归扫描（酒馆 world_info_recursive）
-    val worldInfoMaxRecursionSteps: Int = 0,            // 官方 world_info_max_recursion_steps：总扫描轮数上限（0=不限制，官方默认0）
-    val worldInfoDepth: Int = 2,                    // 官方 world_info_depth：条目未设置扫描深度时的默认值（官方默认2）
-    val worldInfoCharacterStrategy: Int = 1,        // 官方 world_info_character_strategy：0=均匀 1=角色卡优先 2=全局优先
-    val worldInfoOverflowAlert: Boolean = false,    // 官方 world_info_overflow_alert：预算溢出时提示
-    val worldInfoUseGroupScoring: Boolean = false,  // 官方 world_info_use_group_scoring：组评分全局默认        // 递归最大层数（0=不限制，酒馆 max_recursion_steps）
-    val deepseekCacheOptimization: Boolean = true,  // DeepSeek 缓存优化：动态上下文（日期/记忆）移至请求末尾，最大化前缀缓存命中
-    val tavernEjsRendering: Boolean = true,         // EJS 提示词模板渲染（ST-Prompt-Template）：发送前对 <% %> 模板执行渲染
-    val quickMessages: List<QuickMessage> = emptyList(),
-    val personas: List<Persona> = DEFAULT_PERSONAS,
-    val activePersonaId: Uuid? = null,             // 当前激活的 Persona
-    val authorNote: String = "",                    // Author's Note 内容
-    val authorNoteEnabled: Boolean = false,         // Author's Note 总开关
-    val authorNotePosition: AuthorNotePosition = AuthorNotePosition.IN_CHAT,
-    val authorNoteDepth: Int = 4,                   // Author's Note 插入深度
-    val authorNoteRole: MessageRole = MessageRole.SYSTEM, // 注入角色（官方默认 SYSTEM）
-    val authorNoteInterval: Int = 1,                // 官方语义：1=每次注入，0=关闭，N=每N条用户消息注入一次
-    // [v240 W3] Character Expressions（表情立绘）：默认关闭（设置页打开后，给角色放好立绘才会显示）
-    val expressionEnabled: Boolean = false,                                  // 立绘总开关
-    val expressionClassifier: ExpressionClassifier = ExpressionClassifier.LLM, // 分类方式：llm / none
-    val expressionFallbackLabel: String = ExpressionLabels.DEFAULT_FALLBACK, // 分类失败/无立绘时的兜底标签（官方默认 joy）
-    // [v240 W5] 世界书预算 / 上下文估算的真 tokenizer（默认 cl100k；off 或词表缺失回退启发式）
-    val tokenizerMode: TokenizerMode = TokenizerMode.CL100K,
-    val groupChats: List<GroupChat> = emptyList(),   // 群聊列表
-    val macroGlobalVariables: Map<String, String> = emptyMap(),        // 宏引擎全局变量（跨对话持久）
-    val macroChatVariables: Map<String, Map<String, String>> = emptyMap(), // 宏引擎会话变量（conversationId → 变量）
-    val webServerEnabled: Boolean = false,
-    val webServerPort: Int = 8080,
-    val webServerJwtEnabled: Boolean = false,
-    val webServerAccessPassword: String = "",
-    val webServerLocalhostOnly: Boolean = false,
-    val backupReminderConfig: BackupReminderConfig = BackupReminderConfig(),
-    val githubToken: String = "",
-    val launchCount: Int = 0,
-    val sponsorAlertDismissedAt: Int = 0,
-) {
-    companion object {
-        // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
-        fun dummy() = Settings(init = true)
-    }
-}
-
-@Serializable
-data class NetworkSetting(
-    val userAgent: String = "",
-    val proxyUrl: String = "",
-    val proxyUsername: String = "",
-    val proxyPassword: String = "",
-    val enableAutoRetry: Boolean = true,
-)
-
-@Serializable
-enum class ChatFontFamily {
-    @SerialName("default")
-    DEFAULT,
-    @SerialName("serif")
-    SERIF,
-    @SerialName("monospace")
-    MONOSPACE,
-
-    @SerialName("custom")
-    CUSTOM,
-}
-
-@Serializable
-enum class BackgroundEffectType {
-    @SerialName("blur")
-    BLUR,
-
-    @SerialName("glass")
-    GLASS,
-}
-
-@Serializable
 enum class WebViewPerfMode {
     @SerialName("hibernate_pool")
     HIBERNATE_POOL,
@@ -1182,8 +1173,6 @@ data class DisplaySetting(
     val sendOnEnter: Boolean = false,
     val enableAutoScroll: Boolean = true,
     val enableLatexRendering: Boolean = false,
-    // [v222 R1] 兼容旧值：仅作「迁移读取 + 回滚镜像」用，UI 的真源是
-    // Settings.messageStyle.style（ON <-> style != DEFAULT）。默认 true 对齐 A6「气泡模糊默认开」。
     val enableBlurEffect: Boolean = true,
     val backgroundEffectType: BackgroundEffectType = BackgroundEffectType.BLUR,
     val chatFontFamily: ChatFontFamily = ChatFontFamily.DEFAULT,
@@ -1191,13 +1180,15 @@ data class DisplaySetting(
     val chatCustomFontName: String = "",
     val enableVolumeKeyScroll: Boolean = false,
     val volumeKeyScrollRatio: Float = 1.0f,
+    val conversationSortOrder: ConversationSortOrder = ConversationSortOrder.UPDATE_TIME,
     val enableTextColor: Boolean = true,
-    val quoteColor: String = "",  // empty = theme-follow, otherwise hex like "#E18A24"
-    val italicsColor: String = "",  // empty = default (#919191), otherwise hex
-    val autoEmbedOnImport: Boolean = true,  // 导入后自动向量化
-    val embeddingEnabled: Boolean = true,   // 向量搜索总开关（关则仅使用FTS5文本搜索）
-    val enableWebViewPerfReduction: Boolean = false, // 性能降低开关（开启后显示三种 WebView 降载方案）
-    val webViewPerfMode: WebViewPerfMode = WebViewPerfMode.HIBERNATE_POOL, // 性能降低方案：1=休眠方案 2=全视觉静默方案 3=历史楼层转图片方案
+    val quoteColor: String = "",
+    val italicsColor: String = "",
+    val autoEmbedOnImport: Boolean = true,
+    val embeddingEnabled: Boolean = true,
+    val voiceModeListenWhileReplying: Boolean = false,
+    val enableWebViewPerfReduction: Boolean = false,
+    val webViewPerfMode: WebViewPerfMode = WebViewPerfMode.HIBERNATE_POOL,
 )
 
 @Serializable
@@ -1209,162 +1200,4 @@ data class KbInjectionSettings(
     val useHybridSearch: Boolean = true,
     val useQueryRewrite: Boolean = true,
     val enableDedup: Boolean = true,
-)
-
-@Serializable
-data class WebDavConfig(
-    val url: String = "",
-    val username: String = "",
-    val password: String = "",
-    val path: String = "rikkahub_backups",
-    val items: List<BackupItem> = listOf(
-        BackupItem.DATABASE,
-        BackupItem.FILES
-    ),
-) {
-    @Serializable
-    enum class BackupItem {
-        DATABASE,
-        FILES,
-    }
-}
-
-@Serializable
-data class BackupReminderConfig(
-    val enabled: Boolean = false,
-    val intervalDays: Int = 7,
-    val lastBackupTime: Long = 0L,
-)
-
-fun Settings.isNotConfigured() = providers.all { it.models.isEmpty() }
-
-fun Settings.findModelById(uuid: Uuid?, fallback: Uuid? = null): Model? {
-    if (uuid == null && fallback == null) return null
-    return uuid?.let { this.providers.findModelById(it) }
-        ?: fallback?.let { this.providers.findModelById(it) }
-}
-
-fun List<ProviderSetting>.findModelById(uuid: Uuid): Model? {
-    this.forEach { setting ->
-        setting.models.forEach { model ->
-            if (model.id == uuid) {
-                return model
-            }
-        }
-    }
-    return null
-}
-
-fun Settings.getCurrentChatModel(): Model? {
-    val assistantModelId = this.getCurrentAssistant().chatModelId
-    return assistantModelId?.let { findModelById(it) }
-        ?: findModelById(this.chatModelId)
-}
-
-fun Settings.getCurrentAssistant(): Assistant {
-    return this.assistants.find { it.id == assistantId } ?: this.assistants.first()
-}
-
-fun Settings.getAssistantById(id: Uuid): Assistant? {
-    return this.assistants.find { it.id == id }
-}
-
-fun Settings.getQuickMessagesOfAssistant(assistant: Assistant) =
-    quickMessages.filter {
-        it.setEnabled && !it.hidden && (it.id in assistant.quickMessageIds || it.setName.isNotBlank())
-    }
-
-fun Settings.getSelectedTTSProvider(): TTSProviderSetting? {
-    return selectedTTSProviderId?.let { id ->
-        ttsProviders.find { it.id == id }
-    } ?: ttsProviders.firstOrNull()
-}
-
-fun Settings.getSelectedASRProvider(): ASRProviderSetting? {
-    return selectedASRProviderId?.let { id ->
-        asrProviders.find { it.id == id }
-    } ?: asrProviders.firstOrNull()
-}
-
-fun Model.findProvider(providers: List<ProviderSetting>, checkOverwrite: Boolean = true): ProviderSetting? {
-    val provider = findModelProviderFromList(providers) ?: return null
-    val providerOverwrite = this.providerOverwrite
-    if (checkOverwrite && providerOverwrite != null) {
-        return providerOverwrite.copyProvider(models = emptyList())
-    }
-    return provider
-}
-
-private fun Model.findModelProviderFromList(providers: List<ProviderSetting>): ProviderSetting? {
-    providers.forEach { setting ->
-        setting.models.forEach { model ->
-            if (model.id == this.id) {
-                return setting
-            }
-        }
-    }
-    return null
-}
-
-internal val DEFAULT_ASSISTANT_ID = Uuid.parse("0950e2dc-9bd5-4801-afa3-aa887aa36b4e")
-internal val DEFAULT_ASSISTANTS = listOf(
-    Assistant(
-        id = DEFAULT_ASSISTANT_ID,
-        name = "",
-        systemPrompt = ""
-    ),
-    Assistant(
-        id = Uuid.parse("3d47790c-c415-4b90-9388-751128adb0a0"),
-        name = "",
-        systemPrompt = """
-            You are a helpful assistant, called {{char}}, based on model {{model_name}}.
-
-            ## Info
-            - Date: {{cur_date}}
-            - Locale: {{locale}}
-            - Timezone: {{timezone}}
-            - Device Info: {{device_info}}
-            - System Version: {{system_version}}
-            - User Nickname: {{user}}
-
-            ## Hint
-            - If the user does not specify a language, reply in the user's primary language.
-            - Remember to use Markdown syntax for formatting, and use latex for mathematical expressions.
-        """.trimIndent()
-    ),
-)
-
-val DEFAULT_SYSTEM_TTS_ID = Uuid.parse("026a01a2-c3a0-4fd5-8075-80e03bdef200")
-private val DEFAULT_TTS_PROVIDERS = listOf(
-    TTSProviderSetting.SystemTTS(
-        id = DEFAULT_SYSTEM_TTS_ID,
-        name = "",
-    ),
-    TTSProviderSetting.OpenAI(
-        id = Uuid.parse("e36b22ef-ca82-40ab-9e70-60cad861911c"),
-        name = "AiHubMix",
-        baseUrl = "https://aihubmix.com/v1",
-        model = "gpt-4o-mini-tts",
-        voice = "alloy",
-    )
-)
-
-internal val DEFAULT_ASSISTANTS_IDS = DEFAULT_ASSISTANTS.map { it.id }
-
-val DEFAULT_MODE_INJECTIONS = listOf(
-    PromptInjection.ModeInjection(
-        id = Uuid.parse("b87eaf16-f5cd-4ac1-9e4f-b11ae3a61d74"),
-        content = LEARNING_MODE_PROMPT,
-        position = InjectionPosition.AFTER_SYSTEM_PROMPT,
-        name = "Learning Mode"
-    )
-)
-
-val DEFAULT_PERSONAS = listOf(
-    Persona(
-        id = Uuid.parse("c0010000-0000-0000-0000-000000000001"),
-        name = "Default",
-        description = "",
-        enabled = false,
-    )
 )

@@ -31,7 +31,8 @@ fun createSearchTools(settings: Settings): Set<Tool> {
                     If a date or primary source is missing, or sources conflict, run another focused search
                     or use scrape_web to verify the most relevant source before answering.
                     Generate focused keywords and run multiple searches if needed.
-                    ${if (settings.deepseekCacheOptimization) "Today's date is provided in the latest context reminder." else "Today is ${LocalDate.now().toLocalString(true)}."}
+                    Today is ${LocalDate.now().toLocalString(true)}.
+
                     Response format:
                     - retrievedAt is the local retrieval time, never a publication date
                     - items[].id (short id), index, title, url, publishedDate (if supplied), highlights (if supplied), text

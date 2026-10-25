@@ -444,3 +444,27 @@ export const settingsToUpdate = {
     seed: [-1, 'seed'],
     n: [1, 'n'],
 };
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export class IdentifierNotFoundError extends Error { constructor(identifier) { super(`Identifier ${identifier} not found.`); this.name = 'IdentifierNotFoundError'; } }
+export const MINIMAX_ENDPOINT = { GLOBAL: 'global', CN: 'cn' };
+export const SILICONFLOW_ENDPOINT = { GLOBAL: 'global', CN: 'cn' };
+export class TokenHandler { constructor(countTokenAsyncFn) { this.countTokenAsyncFn = countTokenAsyncFn; this.counts = { start_chat: 0, prompt: 0, bias: 0, nudge: 0, jailbreak: 0, impersonate: 0, examples: 0, conversation: 0 }; } getCounts() { return this.counts; } resetCounts() { Object.keys(this.counts).forEach((k) => { this.counts[k] = 0; }); } }
+export const ZAI_ENDPOINT = { COMMON: 'common', CODING: 'coding' };
+export const custom_prompt_post_processing_types = { NONE: '', CLAUDE: 'claude', MERGE: 'merge', MERGE_TOOLS: 'merge_tools', SEMI: 'semi', SEMI_TOOLS: 'semi_tools', STRICT: 'strict', STRICT_TOOLS: 'strict_tools', SINGLE: 'single' };
+export function formatWorldInfo(..._args) { return null; }
+export function getChatCompletionPreset(..._args) { return null; }
+export function getPromptPosition(..._args) { return null; }
+export function getPromptRole(..._args) { return null; }
+export function initOpenAI(..._args) { return null; }
+export function isAudioInliningSupported(..._args) { return null; }
+export function isReasoningSignatureSupported(..._args) { return null; }
+export function isVideoInliningSupported(..._args) { return null; }
+export function loadOpenAISettings(..._args) { return null; }
+export function loadProxyPresets(..._args) { return null; }
+export const model_list = [];
+export const openai_messages_count = 0;
+export const reasoning_effort_types = { auto: 'auto', low: 'low', medium: 'medium', high: 'high', min: 'min', max: 'max' };
+export let selected_proxy = '';
+export const tool_reasoning_modes = { DISABLED: 'disabled', SINCE_LAST_USER: 'since_last_user', ACTIVE_CHAIN: 'active_chain' };
+export const verbosity_levels = { auto: 'auto', low: 'low', medium: 'medium', high: 'high' };

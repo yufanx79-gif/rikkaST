@@ -1,4 +1,4 @@
-import katex from '../katex.mjs';
+import katex from './katex.mjs';
 
 /* eslint-disable */
 /* -*- Mode: JavaScript; indent-tabs-mode:nil; js-indent-level: 2 -*- */

@@ -56,7 +56,7 @@ class XAITTSProvider : TTSProvider<TTSProviderSetting.XAI> {
             )
         }
 
-        val audioData = response.body!!.bytes()
+        val audioData = response.body.bytes()
 
         emit(
             AudioChunk(

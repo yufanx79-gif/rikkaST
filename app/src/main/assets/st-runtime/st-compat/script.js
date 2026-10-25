@@ -12,8 +12,15 @@ import { MessageFormatter } from './message-formatter.js';
  * - 纯 DOM / 后端行为（消息节点重绘、生图等）在 P0 为 no-op（不抛错），P1 再逐步接线。
  */
 
-const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
-const host = () => (window.__rikkaSt || {});
+const rootWin = () => (typeof window !== 'undefined' ? window : globalThis);
+const st = () => {
+    const w = rootWin();
+    return (w && w.SillyTavern && typeof w.SillyTavern.getContext === 'function') ? w.SillyTavern.getContext() : {};
+};
+const host = () => {
+    const w = rootWin();
+    return (w && w.__rikkaSt) || {};
+};
 
 // ---------------------------------------------------------------- live 会话数据
 export let chat = [];
@@ -115,7 +122,20 @@ export const generate = fwd('generate', () => Promise.resolve(''));
 export const generateRaw = fwd('generateRaw', () => Promise.resolve(''));
 export const generateQuietPrompt = fwd('generateQuietPrompt', () => Promise.resolve(''));
 export const Generate = generate;
-export const stopGeneration = fwd('stopGeneration', () => {});
+export const stopGeneration = fwd('stopGeneration', () => {
+    try {
+        if (externalAbortController && typeof externalAbortController.abort === 'function') {
+            externalAbortController.abort();
+        }
+    } catch (_e) { /* noop */ }
+    try {
+        const w = rootWin();
+        if (w && w.RikkaBridge && typeof w.RikkaBridge.stopGeneration === 'function') {
+            w.RikkaBridge.stopGeneration();
+        }
+    } catch (_e) { /* noop */ }
+    return true;
+});
 export const clearChat = fwd('clearChat', () => {});
 
 // ---------------------------------------------------------------- 扩展提示（同步写本地表并转发至宿主/shimInject）
@@ -162,7 +182,24 @@ export function getOneCharacter(avatar) {
     const list = characters || [];
     return list.find((c) => c && (c.avatar === avatar || c.name === avatar)) || list[0] || {};
 }
-export const getThumbnailUrl = () => '';
+export function getThumbnailUrl(type = 'avatar', file = '') {
+    try {
+        const c = st();
+        if (c && typeof c.getThumbnailUrl === 'function') {
+            return c.getThumbnailUrl(type, file);
+        }
+        const f = String(file || '').trim();
+        if (f.startsWith('http://') || f.startsWith('https://') || f.startsWith('data:') || f.startsWith('blob:')) {
+            return f;
+        }
+        const cleanType = encodeURIComponent(String(type || 'avatar'));
+        const effectiveFile = f || (characters && characters[this_chid] && characters[this_chid].avatar) || '';
+        if (!effectiveFile) return default_avatar;
+        return `https://appassets.androidplatform.net/thumbnail?type=${cleanType}&file=${encodeURIComponent(effectiveFile)}`;
+    } catch (_e) {
+        return '';
+    }
+}
 export const getPastCharacterChats = () => Promise.resolve([]);
 export const getUserAvatar = () => user_avatar || '';
 export const getMaxContextSize = () => max_context;
@@ -466,3 +503,134 @@ export async function processCommands(commandText) {
 }
 
 export const doNavbarIconClick = () => {};
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export const ANIMATION_DURATION_DEFAULT = 125;
+export const CONNECT_API_MAP = {};
+export const DEFAULT_PRINT_TIMEOUT = 100;
+export const DEFAULT_SAVE_EDIT_TIMEOUT = 1000;
+export const UNIQUE_APIS = [];
+export let abortStatusCheck = typeof AbortController !== 'undefined' ? new AbortController() : { abort() {}, signal: {} };
+export let active_character = '';
+export let active_group = '';
+export let animation_duration = 125;
+export let animation_easing = 'ease-in-out';
+export function appendImageToMessage(..._args) { return null; }
+export function buildAvatarList(..._args) { return null; }
+export function cancelStatusCheck(..._args) { return null; }
+export function cancelTtsPlay(..._args) { return null; }
+export function changeMainAPI(..._args) { return null; }
+export const charDragDropHandler = {};
+export const characterGroupOverlay = {};
+export function characterToEntity(..._args) { return null; }
+export const chatDragDropHandler = {};
+export const chatElement = {};
+export function clearItemizedPrompts() {}
+export async function closeCurrentChat(..._args) { return null; }
+export function closeMessageEditor(..._args) { return null; }
+export const converter = {};
+export function createLazyFields(..._args) { return null; }
+export function createModelIcon(..._args) { return null; }
+export async function createOrEditCharacter(..._args) { return null; }
+export function createRawPrompt(..._args) { return null; }
+export const create_save = {};
+export async function deleteCharacterChatByName(..._args) { return null; }
+export async function deleteItemizedPrompts() {}
+export async function deleteSwipe(..._args) { return null; }
+export function displayOnlineStatus(..._args) { return null; }
+export async function displayPastChats(..._args) { return null; }
+export let displayVersion = 'SillyTavern 1.19.0';
+export async function doNewChat(..._args) { return null; }
+export async function duplicateCharacter(..._args) { return null; }
+export function ensureMessageMediaIsArray(..._args) { return null; }
+export const entitiesFilter = {};
+export function extractJsonFromData(..._args) { return null; }
+export function extractMessageBias(..._args) { return null; }
+export function findItemizedPromptSet() { return null; }
+export function formatCharacterAvatar(..._args) { return null; }
+export async function generateRawData(..._args) { return null; }
+export function getCharacterAvatar(..._args) { return null; }
+export function getCharacterCardFieldsLazy(..._args) { return null; }
+export function getCharacterSource(..._args) { return null; }
+export async function getChatsFromFiles(..._args) { return null; }
+export function getEntitiesList(..._args) { return null; }
+export async function getExtensionPrompt(..._args) { return null; }
+export function getExtensionPromptMaxDepth(..._args) { return null; }
+export function getFirstDisplayedMessageId(..._args) { return null; }
+export function getGenerateUrl(..._args) { return null; }
+export function getGeneratingApi(..._args) { return null; }
+export function getGeneratingModel(..._args) { return null; }
+export function getMediaDisplay(..._args) { return null; }
+export function getMediaIndex(..._args) { return null; }
+export function getOverswipeBehavior(..._args) { return null; }
+export async function getSettings(..._args) { return null; }
+export function getSystemMessageByType() { return null; }
+export async function getUserAvatars() { return []; }
+export function groupToEntity(..._args) { return null; }
+export async function handleDeleteCharacter(..._args) { return null; }
+export async function importCharacterChat(..._args) { return null; }
+export const itemizedParams = {};
+export const itemizedPrompts = [];
+export const koboldai_setting_names = [];
+export const koboldai_settings = {};
+export const lastSwipeInfo = {};
+export async function loadItemizedPrompts() {}
+export let menu_type = '';
+export const mesForShowdownParse = {};
+export async function messageEdit(..._args) { return null; }
+export async function newAssistantChat(..._args) { return null; }
+export const novelai_setting_names = [];
+export const novelai_settings = {};
+export async function openCharacterChat(..._args) { return null; }
+export async function pingServer(..._args) { return null; }
+export async function processDroppedFiles(..._args) { return null; }
+export async function promptItemize() {}
+export let recentSwipes = 0;
+export const reloadChatMutex = {};
+export async function reloadCurrentChatUnsafe(..._args) { return null; }
+export function removeDepthPrompts(..._args) { return null; }
+export function removeMacros(..._args) { return null; }
+export async function renameCharacter(..._args) { return null; }
+export async function renameChat(..._args) { return null; }
+export async function renameGroupOrCharacterChat(..._args) { return null; }
+export function renderTemplate(tpl = '') { return String(tpl ?? ''); }
+export async function replaceCurrentChat(..._args) { return null; }
+export function replaceItemizedPromptText() {}
+export function resetChatState(..._args) { return null; }
+export function resultCheckStatus(..._args) { return null; }
+export async function saveItemizedPrompts() {}
+export async function saveReply(..._args) { return null; }
+export function selectRightMenuWithAnimation(..._args) { return null; }
+export function select_rm_info(..._args) { return null; }
+export let selected_button = '';
+export async function sendGenerationRequest(..._args) { return null; }
+export async function sendMessageAsUser(..._args) { return null; }
+export async function sendStreamingRequest(..._args) { return null; }
+export function sendSystemMessage(type, text, extra = {}) { void type; void extra; return text || ''; }
+export async function sendTextareaMessage(..._args) { return null; }
+export function setActiveCharacter(..._args) { return null; }
+export function setActiveGroup(..._args) { return null; }
+export function setAnimationDuration(..._args) { return null; }
+export async function setCharacterSettingsOverrides(..._args) { return null; }
+export function setEditedMessageId(..._args) { return null; }
+export function setGenerationParamsFromPreset(..._args) { return null; }
+export function setMenuType(..._args) { return null; }
+export function setOnlineStatus(..._args) { return null; }
+export async function setScenarioOverride(..._args) { return null; }
+export async function setUserAvatar() {}
+export function shouldAutoContinue(..._args) { return null; }
+export async function showMoreMessages(..._args) { return null; }
+export function startStatusLoading(..._args) { return null; }
+export function stopStatusLoading(..._args) { return null; }
+export async function swipe(..._args) { return null; }
+export let swipeState = 'none';
+export async function swipe_left(..._args) { return null; }
+export async function swipe_right(..._args) { return null; }
+export let swipesHidden = false;
+export const system_messages = {};
+export function tagToEntity(..._args) { return null; }
+export const talkativeness_default = 0.5;
+export const token = {};
+export function triggerAutoContinue(..._args) { return null; }
+export function updateMessageElement(..._args) { return null; }
+export async function updateRemoteChatName(..._args) { return null; }

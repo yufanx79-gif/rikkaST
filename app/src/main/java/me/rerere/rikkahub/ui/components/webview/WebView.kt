@@ -49,6 +49,18 @@ internal class MyWebChromeClient(private val state: WebViewState) : WebChromeCli
 }
 
 internal class MyWebViewClient(private val state: WebViewState) : WebViewClient() {
+    override fun shouldOverrideUrlLoading(
+        view: WebView,
+        request: WebResourceRequest
+    ): Boolean {
+        val scheme = request.url?.scheme?.lowercase().orEmpty()
+        if (scheme == "file" || scheme == "content" || scheme == "javascript") {
+            Log.w(TAG, "Blocked disallowed navigation scheme in WebView: ${request.url}")
+            return true
+        }
+        return super.shouldOverrideUrlLoading(view, request)
+    }
+
     override fun shouldInterceptRequest(
         view: WebView,
         request: WebResourceRequest
@@ -124,7 +136,8 @@ fun WebView(
 
                     settings.javaScriptEnabled = true // Enable JavaScript
                     settings.domStorageEnabled = true
-                    settings.allowContentAccess = true
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
                     settings.apply(state.settings)
 
                     // Use the created clients

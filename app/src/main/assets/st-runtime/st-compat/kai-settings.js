@@ -23,3 +23,14 @@ export function getKoboldSettings() {
 export function formatKoboldUrl(url) {
     return String(url || '').trim().replace(/\/+$/, '');
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export async function generateKoboldWithStreaming(..._args) { return null; }
+export function getKoboldGenerationData(..._args) { return null; }
+export async function getStatusKobold(..._args) { return null; }
+export function initKoboldSettings(..._args) { return null; }
+export const kai_flags = { can_use_tokenization: false, can_use_stop_sequence: false, can_use_streaming: false, can_use_default_badwordsids: false, can_use_mirostat: false, can_use_grammar: false, can_use_min_p: false };
+export const koboldai_setting_names = [];
+export const koboldai_settings = {};
+export function loadKoboldSettings(..._args) { return null; }
+export function setKoboldFlags(..._args) { return null; }

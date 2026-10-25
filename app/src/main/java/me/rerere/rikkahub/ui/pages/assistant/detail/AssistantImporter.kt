@@ -103,7 +103,21 @@ private fun SillyTavernImporter(
         uri?.let { importFile(context, uri, onImport, filesManager, toaster, scope) { isLoading = it } }
     }
 
+    val unifiedCardPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let { importFile(context, uri, onImport, filesManager, toaster, scope) { isLoading = it } }
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(
+            onClick = { unifiedCardPickerLauncher.launch(arrayOf("*/*")) },
+            enabled = !isLoading
+        ) {
+            AutoAIIcon(name = "tavern", modifier = Modifier.padding(end = 8.dp))
+            Text(if (isLoading) stringResource(R.string.assistant_importer_importing)
+                 else "一键导入角色卡 (.png / .json / .charx / .byaf)")
+        }
         OutlinedButton(
             onClick = { pngPickerLauncher.launch(arrayOf("image/png")) },
             enabled = !isLoading
@@ -320,11 +334,13 @@ internal fun parseV2Card(context: Context?, json: JsonObject, background: String
     val assistant = Assistant(
         name = name,
         avatar = if (avatarUri != null) Avatar.Image(avatarUri) else Avatar.Dummy,
+        useAssistantAvatar = avatarUri != null,
         systemPrompt = systemPrompt,
         presetMessages = presetMessages,
         background = background,
         tavernData = tavData,
     )
+    ensureAssistantAvatarAlias(context, assistant.id, avatarUri)
 
     return materializeCardAssetsAndRewrites(context, assistant, lorebooks)
 }
@@ -352,9 +368,18 @@ internal fun materializeCardAssetsAndRewrites(
         val decoded = me.rerere.rikkahub.data.st.expressions.SpriteRepository.decodeDataUri(asset.uri)
         val ext = (decoded?.second ?: asset.ext.lowercase().takeIf { it.isNotBlank() } ?: "png").lowercase()
         val fileName = if (safeStem.isNotBlank()) "$safeStem.$ext" else continue
+        if (decoded == null && !asset.uri.startsWith("data:", ignoreCase = true)) {
+            val existingFile = charxBaseDir?.let { java.io.File(it, fileName) }
+            if (existingFile == null || !existingFile.isFile) {
+                continue
+            }
+        }
         if (decoded != null) {
             if (charxBaseDir != null) {
                 runCatching { java.io.File(charxBaseDir, fileName).writeBytes(decoded.first) }
+                if (asset.type.equals("icon", ignoreCase = true) || rawName.equals("icon", ignoreCase = true) || rawName.equals("main", ignoreCase = true)) {
+                    runCatching { java.io.File(charxBaseDir, "${assistant.id}.png").writeBytes(decoded.first) }
+                }
             }
             if (spriteBaseDir != null) {
                 runCatching { java.io.File(spriteBaseDir, fileName).writeBytes(decoded.first) }
@@ -362,10 +387,8 @@ internal fun materializeCardAssetsAndRewrites(
         }
         val targetUrl = if (charxBaseDir != null) {
             "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$fileName"
-        } else if (asset.uri.startsWith("data:", ignoreCase = true)) {
-            asset.uri
         } else {
-            "https://appassets.androidplatform.net/charx_assets/${assistant.id}/$fileName"
+            asset.uri
         }
         if (rawName.isNotBlank()) {
             uriRewriteMap["embeded://$rawName"] = targetUrl
@@ -466,11 +489,13 @@ internal fun parseV3Card(context: Context?, json: JsonObject, background: String
     val assistant = Assistant(
         name = name,
         avatar = if (avatarUri != null) Avatar.Image(avatarUri) else Avatar.Dummy,
+        useAssistantAvatar = avatarUri != null,
         systemPrompt = systemPrompt,
         presetMessages = presetMessages,
         background = background,
         tavernData = tavData,
     )
+    ensureAssistantAvatarAlias(context, assistant.id, avatarUri)
 
     return materializeCardAssetsAndRewrites(context, assistant, lorebooks)
 }
@@ -558,7 +583,7 @@ private fun parseEntriesArray(arr: kotlinx.serialization.json.JsonArray): List<T
                 comment = e["comment"]?.jsonPrimitive?.contentOrNull ?: "",
                 content = e["content"]?.jsonPrimitive?.contentOrNull ?: "",
                 constant = e["constant"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
-                selective = e["selective"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
+                selective = e["selective"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true,
                 selectiveLogic = e["selectiveLogic"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
                 group = e["group"]?.jsonPrimitive?.contentOrNull ?: "",
                 position = parseEntryPosition(e),
@@ -587,7 +612,7 @@ private fun parseEntriesArray(arr: kotlinx.serialization.json.JsonArray): List<T
                 groupOverride = e["group_override"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
                 delay = e["delay"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
                 useProbability = e["useProbability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
-                    ?: e["use_probability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
+                    ?: e["use_probability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true,
                 extensionsRaw = e["extensions"]?.toString() ?: "",
             ), e)
         } catch (_: Exception) { null }
@@ -605,7 +630,7 @@ private fun parseEntriesMap(obj: JsonObject): List<TavernBookEntry> {
                 comment = e["comment"]?.jsonPrimitive?.contentOrNull ?: "",
                 content = e["content"]?.jsonPrimitive?.contentOrNull ?: "",
                 constant = e["constant"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
-                selective = e["selective"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
+                selective = e["selective"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true,
                 selectiveLogic = e["selectiveLogic"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
                 group = e["group"]?.jsonPrimitive?.contentOrNull ?: "",
                 position = parseEntryPosition(e),
@@ -634,7 +659,7 @@ private fun parseEntriesMap(obj: JsonObject): List<TavernBookEntry> {
                 groupOverride = e["group_override"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
                 delay = e["delay"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
                 useProbability = e["useProbability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
-                    ?: e["use_probability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
+                    ?: e["use_probability"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true,
                 extensionsRaw = e["extensions"]?.toString() ?: "",
             ), e)
         } catch (_: Exception) { null }
@@ -1284,7 +1309,28 @@ internal fun parseCharxBytes(
     val updatedLorebooks = lorebooks.map { lb ->
         lb.copy(entries = lb.entries.map { it.copy(content = rewriteCharxText(it.content)) })
     }
+    val iconEntryBytes = zipAssets.entries.firstOrNull { (k, _) ->
+        k.contains("icon", ignoreCase = true) || k.substringAfterLast('/').startsWith("main.", ignoreCase = true)
+    }?.value ?: zipAssets.entries.firstOrNull { (k, _) ->
+        val ext = k.substringAfterLast('.', "").lowercase()
+        ext in setOf("png", "jpg", "jpeg", "webp", "gif")
+    }?.value
+    var charxAvatarUri: String? = (assistant.avatar as? Avatar.Image)?.url
+    if (iconEntryBytes != null) {
+        if (charxBaseDir != null) {
+            val aliasFile = java.io.File(charxBaseDir, "${assistant.id}.png")
+            runCatching { aliasFile.writeBytes(iconEntryBytes) }
+            if (charxAvatarUri == null) {
+                charxAvatarUri = android.net.Uri.fromFile(aliasFile).toString()
+            }
+        } else if (charxAvatarUri == null) {
+            val b64 = java.util.Base64.getEncoder().encodeToString(iconEntryBytes)
+            charxAvatarUri = "data:image/png;base64,$b64"
+        }
+    }
     val updatedAssistant = assistant.copy(
+        avatar = if (charxAvatarUri != null) Avatar.Image(charxAvatarUri) else assistant.avatar,
+        useAssistantAvatar = charxAvatarUri != null || assistant.useAssistantAvatar,
         systemPrompt = rewriteCharxText(assistant.systemPrompt),
         presetMessages = updatedPresetMessages,
         tavernData = updatedTav,
@@ -1370,4 +1416,33 @@ internal fun parseByafBytes(
         })
     }
     return parseCardJson(v2Json, null, null, context)
+}
+
+
+internal fun ensureAssistantAvatarAlias(
+    context: Context?,
+    assistantId: Uuid,
+    avatarUri: String?,
+) {
+    if (context == null || avatarUri.isNullOrBlank()) return
+    runCatching {
+        val charxDir = java.io.File(context.filesDir, "charx_assets/$assistantId").apply { mkdirs() }
+        val targetFile = java.io.File(charxDir, "$assistantId.png")
+        val bytes = when {
+            avatarUri.startsWith("data:", ignoreCase = true) ->
+                me.rerere.rikkahub.data.st.expressions.SpriteRepository.decodeDataUri(avatarUri)?.first
+            avatarUri.startsWith("file:", ignoreCase = true) -> {
+                val path = Uri.parse(avatarUri).path
+                if (!path.isNullOrBlank()) java.io.File(path).takeIf { it.isFile }?.readBytes() else null
+            }
+            else -> {
+                val parsed = Uri.parse(avatarUri)
+                val localFile = parsed.path?.let { java.io.File(it) }?.takeIf { it.isFile }
+                localFile?.readBytes() ?: context.contentResolver.openInputStream(parsed)?.use { it.readBytes() }
+            }
+        }
+        if (bytes != null && bytes.isNotEmpty()) {
+            targetFile.writeBytes(bytes)
+        }
+    }
 }

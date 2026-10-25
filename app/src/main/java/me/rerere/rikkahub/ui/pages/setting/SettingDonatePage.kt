@@ -13,25 +13,30 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.CircularWavyProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.data.api.SponsorAPI
+import me.rerere.rikkahub.data.remote.SponsorAPI
 import me.rerere.rikkahub.data.model.Sponsor
+import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
-import me.rerere.rikkahub.ui.components.ui.PageScaffold
+import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.UiState
 import me.rerere.rikkahub.utils.onError
 import me.rerere.rikkahub.utils.onLoading
@@ -41,9 +46,23 @@ import org.koin.compose.koinInject
 
 @Composable
 fun SettingDonatePage() {
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
-    PageScaffold(
-        title = stringResource(R.string.donate_page_title),
+    Scaffold(
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = {
+                    Text(text = stringResource(R.string.donate_page_title))
+                },
+                navigationIcon = {
+                    BackButton()
+                },
+                scrollBehavior = scrollBehavior,
+                colors = CustomColors.topBarColors,
+            )
+        },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = CustomColors.topBarColors.containerColor,
     ) { paddings ->
         Column(
             modifier = Modifier

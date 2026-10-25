@@ -119,16 +119,33 @@ fun setCardScriptEnabled(extensionsRaw: String?, scriptId: String, enabled: Bool
     if (extensionsRaw.isNullOrBlank() || scriptId.isBlank()) return null
     return try {
         val root = Json.parseToJsonElement(extensionsRaw) as? JsonObject ?: return null
-        val helper = root["tavern_helper"] as? JsonObject ?: return null
+        val helper = TavernScriptCompat.tavernHelper(root) ?: return null
         val scripts = helper["scripts"] as? JsonArray ?: return null
-        val (newList, found) = updateEnabledInItems(scripts.toList(), scriptId, enabled)
+        val (newList, found) = TavernScriptCompat.updateEnabled(scripts.toList(), scriptId, enabled)
         if (!found) return null
+        // 写回统一落到新字段 tavern_helper；旧 TavernHelper_* 字段保留不动，便于无损回滚/再导出。
         root.withField("tavern_helper", helper.withField("scripts", JsonArray(newList))).toString()
     } catch (_: Exception) {
         null
     }
 }
 
+/**
+ * 卡内脚本开关（完整助手版，推荐 UI 使用）：
+ * 先通过 [TavernScriptCompat.cardExtensions] 合并 `extensionsRaw` 与旧
+ * `TavernCharacterData.extensions: Map<String,String>`，因此旧版本持久化、`extensionsRaw` 为空的卡
+ * 也能正常显示并写回开关；写回结果统一落到新字段 `tavern_helper`，旧字段保留做无损回滚。
+ */
+fun setCardScriptEnabled(assistant: Assistant?, scriptId: String, enabled: Boolean): String? {
+    if (scriptId.isBlank()) return null
+    val root = TavernScriptCompat.cardExtensions(assistant)
+    if (root.isEmpty()) return null
+    val helper = TavernScriptCompat.tavernHelper(root) ?: return null
+    val scripts = helper["scripts"] as? JsonArray ?: return null
+    val (newList, found) = TavernScriptCompat.updateEnabled(scripts.toList(), scriptId, enabled)
+    if (!found) return null
+    return root.withField("tavern_helper", helper.withField("scripts", JsonArray(newList))).toString()
+}
 /** 全局脚本开关：返回新的全局脚本 JSON；未找到返回 null。 */
 fun setGlobalScriptEnabled(globalJson: String?, scriptId: String, enabled: Boolean): String? {
     if (scriptId.isBlank()) return null
@@ -165,7 +182,7 @@ fun appendGlobalScripts(globalJson: String?, imported: List<JsonElement>): Pair<
         .mapNotNull { (it as? JsonObject)?.str("id")?.takeIf { s -> s.isNotBlank() } }
         .toSet()
     var added = 0
-    imported.forEach { el ->
+    TavernScriptCompat.normalizeScripts(imported).forEach { el ->
         val obj = el as? JsonObject ?: return@forEach
         val id = obj.str("id")
         if (id.isNotBlank() && id in existingIds) return@forEach
@@ -203,7 +220,7 @@ fun mergePresetScripts(
         mutable.remove(group)
         return JsonObject(mutable).toString()
     }
-    return root.withField(group, JsonArray(scripts)).toString()
+    return root.withField(group, JsonArray(TavernScriptCompat.normalizeScripts(scripts))).toString()
 }
 
 /** 预设重命名或删除时，同步迁移或清理 `tavernPresetScripts` 中的分组键。 */
@@ -235,20 +252,7 @@ fun renameOrRemovePresetScriptsGroup(
 fun extractScriptsFromJson(text: String): List<JsonElement> {
     if (text.isBlank()) return emptyList()
     return try {
-        when (val el = Json.parseToJsonElement(text)) {
-            is JsonArray -> el.toList()
-            is JsonObject -> {
-                val helperScripts = (el["tavern_helper"] as? JsonObject)?.get("scripts") as? JsonArray
-                val directScripts = el["scripts"] as? JsonArray
-                when {
-                    helperScripts != null -> helperScripts.toList()
-                    directScripts != null -> directScripts.toList()
-                    el["type"] != null -> listOf(el)
-                    else -> emptyList()
-                }
-            }
-            else -> emptyList()
-        }
+        TavernScriptCompat.extractScripts(Json.parseToJsonElement(text))
     } catch (_: Exception) {
         emptyList()
     }
@@ -258,26 +262,14 @@ fun extractScriptsFromJson(text: String): List<JsonElement> {
 // 内部工具
 // ============================================================
 
-private fun cardHelper(assistant: Assistant?): JsonObject? {
-    val raw = assistant?.tavernData?.extensionsRaw ?: return null
-    if (raw.isBlank()) return null
-    return try {
-        val root = Json.parseToJsonElement(raw) as? JsonObject ?: return null
-        root["tavern_helper"] as? JsonObject
-    } catch (_: Exception) {
-        null
-    }
-}
+private fun cardHelper(assistant: Assistant?): JsonObject? =
+    TavernScriptCompat.tavernHelper(TavernScriptCompat.cardExtensions(assistant))
 
 /** 解析脚本数组：兼容 `[...]` 与 `{"scripts":[...]}` 两种形态。 */
 private fun parseScriptItems(json: String?): List<JsonElement> {
     if (json.isNullOrBlank()) return emptyList()
     return try {
-        when (val el = Json.parseToJsonElement(json)) {
-            is JsonArray -> el.toList()
-            is JsonObject -> (el["scripts"] as? JsonArray)?.toList().orEmpty()
-            else -> emptyList()
-        }
+        TavernScriptCompat.extractScripts(Json.parseToJsonElement(json))
     } catch (_: Exception) {
         emptyList()
     }
@@ -304,7 +296,7 @@ private fun parsePresetBucketsRaw(json: String?): Map<String, List<JsonElement>>
 private fun flattenTree(items: List<JsonElement>): List<JsonObject> {
     val out = mutableListOf<JsonObject>()
     fun take(item: JsonElement) {
-        val obj = item as? JsonObject ?: return
+        val obj = TavernScriptCompat.normalizeScript(item) as? JsonObject ?: return
         when (obj.str("type")) {
             "folder" -> (obj["scripts"] as? JsonArray)?.forEach { take(it) }
             else -> out += obj
@@ -331,23 +323,7 @@ private fun updateEnabledInItems(
     items: List<JsonElement>,
     scriptId: String,
     enabled: Boolean,
-): Pair<List<JsonElement>, Boolean> {
-    var found = false
-    fun update(item: JsonElement): JsonElement {
-        val obj = item as? JsonObject ?: return item
-        if (obj.str("type") == "folder") {
-            val inner = obj["scripts"] as? JsonArray ?: return obj
-            return obj.withField("scripts", JsonArray(inner.map { update(it) }))
-        }
-        if (obj.str("id") == scriptId) {
-            found = true
-            return obj.withField("enabled", JsonPrimitive(enabled))
-        }
-        return obj
-    }
-    val newItems = items.map { update(it) }
-    return newItems to found
-}
+): Pair<List<JsonElement>, Boolean> = TavernScriptCompat.updateEnabled(items, scriptId, enabled)
 
 private fun JsonObject.withField(key: String, value: JsonElement): JsonObject {
     val map = toMutableMap()
@@ -1184,7 +1160,8 @@ fun buildWorldNamesJson(settings: Settings?, assistant: Assistant?): String {
     // ② 角色绑定的主世界书（data.extensions.world）+ 卡内嵌书名：算可用，也并入全局启用（ST 行为）
     val tav = assistant?.tavernData
     val embeddedBook = tav?.embeddedBook
-    val worldName = extractWorldName(tav?.extensionsRaw)
+    val worldName = (TavernScriptCompat.cardExtensions(assistant)["world"] as? JsonPrimitive)
+        ?.contentOrNull?.takeIf { it.isNotBlank() }
     if (tav != null) {
         worldName?.let { if (it.isNotBlank()) { names.add(it); selected.add(it) } }
         embeddedBook?.name?.takeIf { it.isNotBlank() }?.let { names.add(it); selected.add(it) }
@@ -1222,10 +1199,14 @@ fun buildWorldNamesJson(settings: Settings?, assistant: Assistant?): String {
 fun buildCharacterJson(assistant: Assistant?): String {
     val tav = assistant?.tavernData ?: return "{}"
     val name = tav.name.ifBlank { assistant?.name ?: "" }
-    val world = extractWorldName(tav.extensionsRaw)
-    // data.extensions 是 ST 真源位置（world / tavern_helper / regex_scripts 都挂在这里）
-    val extensionMap = parseExtensionsObject(tav.extensionsRaw).toMutableMap()
+    // data.extensions 是 ST 真源位置（world / tavern_helper / regex_scripts 都挂在这里）。
+    // 走兼容层：旧持久化 Map、旧 TavernHelper_scripts、旧 ScriptTree 都要能还原给 JSR 自身 UI。
+    val extensionMap = TavernScriptCompat.cardExtensions(assistant).toMutableMap()
+    val world = (extensionMap["world"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
     if (world != null) extensionMap["world"] = JsonPrimitive(world)
+    TavernScriptCompat.tavernHelper(JsonObject(extensionMap))?.let { helper ->
+        extensionMap["tavern_helper"] = helper
+    }
     val extensions = JsonObject(extensionMap)
 
     val tagsArray = buildJsonArray { tav.tags.forEach { add(JsonPrimitive(it)) } }
@@ -1327,3 +1308,4 @@ fun updateWorldNameInExtensionsRaw(extensionsRaw: String?, worldName: String?): 
     }
     return JsonObject(map).toString()
 }
+

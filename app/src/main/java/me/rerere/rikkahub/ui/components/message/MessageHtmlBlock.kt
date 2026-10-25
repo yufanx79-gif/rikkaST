@@ -78,7 +78,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.produceState
+import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Refresh03
 import me.rerere.rikkahub.data.datastore.WebViewPerfMode
+import me.rerere.rikkahub.data.st.runtime.RikkaWebChromeClient
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
@@ -159,84 +165,165 @@ private fun findBalancedTagEnd(text: String, tagStart: Int, tagName: String): In
 }
 
 /**
- * 扫描文本中的所有顶层 HTML 复合块区间 `[start, endExclusive)`（合并相邻的 `<!-- -->`/`<style>`/`<script>`/`<div>` 等标签）。
+ * 扫描文本中的所有顶层 HTML 节点区间 `IntRange`（自动跳过非 HTML 代码围栏如 ```xml ... ```）。
  */
-private fun findInteractiveHtmlSpans(content: String): List<Pair<Int, Int>> {
-    val rawSpans = mutableListOf<Pair<Int, Int>>()
+internal fun findTopLevelHtmlNodes(content: String): List<IntRange> {
+    if (content.length < 16 || !content.contains('<')) return emptyList()
+    val excludedFences = NON_HTML_CODE_FENCE_RE.findAll(content).map { it.range }.toList()
+    fun isExcluded(pos: Int): Boolean = excludedFences.any { pos in it }
 
-    // 1. 先识别 ```html ... ``` 围栏块
+    val nodes = mutableListOf<IntRange>()
     for (m in FENCED_HTML_BLOCK_RE.findAll(content)) {
+        if (isExcluded(m.range.first)) continue
         val inner = m.groupValues[1]
-        if (looksLikeInteractiveHtml(inner)) {
-            rawSpans += m.range.first to (m.range.last + 1)
+        if (shouldRenderAsHtmlPanel(inner)) {
+            nodes += m.range
         }
     }
 
-    // 2. 扫描顶层 <style>/<script>/<div>/<section>/<main>/<article>/<details>/<form> 连续复合块
     val tagStartRe = Regex(
-        """<!--[\s\S]*?-->|<(style|script|div|section|main|article|details|form)\b[^>]*>""",
+        """<!--[\s\S]*?-->|<(style|script|div|section|main|article|details|form|table|aside|header|footer|svg|canvas|iframe)\b[^>]*>""",
         RegexOption.IGNORE_CASE,
     )
     var idx = 0
     while (idx < content.length) {
-        if (rawSpans.any { idx in it.first until it.second }) {
-            idx = rawSpans.first { idx in it.first until it.second }.second
+        if (isExcluded(idx)) {
+            idx = excludedFences.first { idx in it }.last + 1
+            continue
+        }
+        if (nodes.any { idx in it }) {
+            idx = nodes.first { idx in it }.last + 1
             continue
         }
         val m = tagStartRe.find(content, idx) ?: break
-        if (rawSpans.any { m.range.first in it.first until it.second }) {
+        if (isExcluded(m.range.first) || nodes.any { m.range.first in it }) {
             idx = m.range.last + 1
             continue
         }
         val blockStart = m.range.first
-        var blockEnd = if (m.value.startsWith("<!--")) {
+        val blockEnd = if (m.value.startsWith("<!--")) {
             m.range.last + 1
         } else {
             val tag = m.groupValues[1].lowercase()
             val end = findBalancedTagEnd(content, m.range.first, tag)
             if (end > m.range.first) end else (m.range.last + 1)
         }
-
-        // 继续吸收紧随其后（仅隔空白）的配套 <style> / <script> 块（如 <style> 后紧跟 <div> 和 <script>），
-        // 但若当前块已包含独立容器（div/section/main/article/details/form）且下一个顶层块也是另一个独立容器，则不合并，
-        // 确保同一消息内的多张独立 CG 卡片各自拥有独立 WebView DOM，防止 getElementById / querySelector('img') 互相串台只显示第一张图！
-        var hasContentContainer = !m.value.startsWith("<!--") &&
-            m.groupValues[1].lowercase() in setOf("div", "section", "main", "article", "details", "form")
-        while (blockEnd < content.length) {
-            var wsEnd = blockEnd
-            while (wsEnd < content.length && content[wsEnd].isWhitespace()) wsEnd++
-            val nextMatch = tagStartRe.find(content, wsEnd)
-            if (nextMatch == null || nextMatch.range.first != wsEnd) break
-            if (!nextMatch.value.startsWith("<!--")) {
-                val nextTag = nextMatch.groupValues[1].lowercase()
-                val nextIsContainer = nextTag in setOf("div", "section", "main", "article", "details", "form")
-                if (hasContentContainer && nextIsContainer) {
-                    break
-                }
-                if (nextIsContainer) {
-                    hasContentContainer = true
-                }
-            }
-            val nextEnd = if (nextMatch.value.startsWith("<!--")) {
-                nextMatch.range.last + 1
-            } else {
-                val nextTag = nextMatch.groupValues[1].lowercase()
-                val balanced = findBalancedTagEnd(content, nextMatch.range.first, nextTag)
-                if (balanced > nextMatch.range.first) balanced else break
-            }
-            blockEnd = nextEnd
-        }
-
-        val candidate = content.substring(blockStart, blockEnd)
-        if (looksLikeInteractiveHtml(candidate)) {
-            rawSpans += blockStart to blockEnd
+        if (blockEnd > blockStart) {
+            nodes += blockStart until blockEnd
             idx = blockEnd
         } else {
             idx = m.range.last + 1
         }
     }
+    return nodes.sortedBy { it.first }
+}
 
-    return rawSpans.sortedBy { it.first }
+private fun isStyleNode(content: String, range: IntRange): Boolean =
+    content.substring(range).trimStart().startsWith("<style", ignoreCase = true)
+
+private fun isScriptNode(content: String, range: IntRange): Boolean =
+    content.substring(range).trimStart().startsWith("<script", ignoreCase = true)
+
+private fun isCommentNode(content: String, range: IntRange): Boolean =
+    content.substring(range).trimStart().startsWith("<!--")
+
+private fun isContainerNode(content: String, range: IntRange): Boolean {
+    val s = content.substring(range).trimStart()
+    if (s.startsWith("```")) return true
+    return !isStyleNode(content, range) && !isScriptNode(content, range) && !isCommentNode(content, range)
+}
+
+private fun hasLaterContainerInContinuousCluster(
+    content: String,
+    nodes: List<IntRange>,
+    startIndex: Int,
+): Boolean {
+    for (i in startIndex until nodes.size) {
+        val prevEnd = nodes[i - 1].last + 1
+        val curStart = nodes[i].first
+        if (curStart > prevEnd && content.substring(prevEnd, curStart).isNotBlank()) {
+            return false
+        }
+        if (isContainerNode(content, nodes[i])) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * 将顶层 HTML 节点按语义聚合为独立面板区间：
+ * 1. 若两个节点之间存在非空白 Markdown 文本，断开为不同组；
+ * 2. 若当前组已包含容器节点（`seenContainer == true`），且遇到新的 `<style>` 节点，同时后方紧跟另一个容器节点
+ *    （如 `36cf5ad94fc2908e.png` 中的 `<style>...post-card...</style><div class="post-card">...</div>`），
+ *    在 `<style>` 之前切分，防止 `<style>` 被前一个面板吞噬；
+ * 3. 若当前组已包含容器节点且下一个节点也是独立容器节点（中间无 `<style>`），同样切分，保证多张独立卡片各自拥有独立面板。
+ */
+internal fun groupTopLevelHtmlNodes(
+    content: String,
+    nodes: List<IntRange>,
+): List<IntRange> {
+    if (nodes.isEmpty()) return emptyList()
+    val groups = mutableListOf<IntRange>()
+    var start = -1
+    var end = -1
+    var seenContainer = false
+
+    fun flush() {
+        if (start >= 0 && end > start) {
+            groups += start until end
+        }
+        start = -1
+        end = -1
+        seenContainer = false
+    }
+
+    nodes.forEachIndexed { index, node ->
+        if (end >= 0 && node.first > end && content.substring(end, node.first).isNotBlank()) {
+            flush()
+        }
+        val isStyle = isStyleNode(content, node)
+        val isContainer = isContainerNode(content, node)
+        val hasLaterContainer = hasLaterContainerInContinuousCluster(content, nodes, index + 1)
+
+        if (start < 0) {
+            start = node.first
+            end = node.last + 1
+            seenContainer = isContainer
+        } else if (isStyle && seenContainer && hasLaterContainer) {
+            flush()
+            start = node.first
+            end = node.last + 1
+            seenContainer = false
+        } else if (isContainer && seenContainer) {
+            flush()
+            start = node.first
+            end = node.last + 1
+            seenContainer = true
+        } else {
+            end = node.last + 1
+            if (isContainer) seenContainer = true
+        }
+    }
+    flush()
+    return groups
+}
+
+/**
+ * 扫描文本中的所有顶层 HTML 复合块区间 `[start, endExclusive)`（合并相邻的 `<!-- -->`/`<style>`/`<script>`/`<div>` 等标签）。
+ */
+private fun findInteractiveHtmlSpans(content: String): List<Pair<Int, Int>> {
+    val nodes = findTopLevelHtmlNodes(content)
+    val groups = groupTopLevelHtmlNodes(content, nodes)
+    return groups.mapNotNull { range ->
+        val candidate = content.substring(range).trim()
+        val unwrapped = FENCED_HTML_BLOCK_RE.matchEntire(candidate)?.groupValues?.getOrNull(1)?.trim() ?: candidate
+        if (shouldRenderAsHtmlPanel(unwrapped)) {
+            range.first to (range.last + 1)
+        } else {
+            null
+        }
+    }
 }
 
 /**
@@ -244,7 +331,7 @@ private fun findInteractiveHtmlSpans(content: String): List<Pair<Int, Int>> {
  */
 fun splitMixedMessagePieces(content: String): List<MixedContentPiece> {
     val trimmed = content.trim()
-    if (!looksLikeInteractiveHtml(trimmed)) {
+    if (!shouldRenderAsHtmlPanel(trimmed)) {
         return listOf(MixedContentPiece.MarkdownBody(content, 0))
     }
     if (
@@ -295,7 +382,7 @@ fun splitMixedMessagePieces(content: String): List<MixedContentPiece> {
     if (firstTag != null && firstTag.range.first > 40) {
         val leadingMd = content.substring(0, firstTag.range.first).trim()
         val trailingHtml = content.substring(firstTag.range.first).trim()
-        if (leadingMd.isNotEmpty() && looksLikeInteractiveHtml(trailingHtml)) {
+        if (leadingMd.isNotEmpty() && shouldRenderAsHtmlPanel(trailingHtml)) {
             return listOf(
                 MixedContentPiece.MarkdownBody(leadingMd, 0),
                 MixedContentPiece.HtmlPanel(
@@ -408,7 +495,20 @@ internal object TavernPanelLoadScheduler {
     }
 
     fun cancel(key: String) {
-        markDone(key)
+        synchronized(lock) {
+            val active = activeRequest
+            if (active != null && active.key == key) {
+                active.gate.cancel()
+                active.done.complete(Unit)
+            }
+            val idx = pendingQueue.indexOfFirst { it.key == key }
+            if (idx >= 0) {
+                val removed = pendingQueue.removeAt(idx)
+                removed.gate.cancel()
+                removed.done.complete(Unit)
+                publishSnapshotLocked()
+            }
+        }
     }
 
     internal fun resetForTest() {
@@ -493,16 +593,19 @@ internal object TavernPanelLoadScheduler {
  */
 internal object ActivePanelWebViewPool {
     const val MAX_ACTIVE_PANEL_WEBVIEWS = 3
+    const val LIVE_QUIESCENT_MAX_ACTIVE_WEBVIEWS = 4
+    const val DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS = 6
     private val lock = Any()
     private val lruKeys = java.util.LinkedHashSet<String>()
     private val _activeKeysFlow = MutableStateFlow<Set<String>>(emptySet())
     val activeKeysFlow: StateFlow<Set<String>> = _activeKeysFlow.asStateFlow()
 
-    fun acquire(key: String) {
+    fun acquire(key: String, maxActive: Int = MAX_ACTIVE_PANEL_WEBVIEWS) {
+        val limit = maxActive.coerceAtLeast(1)
         synchronized(lock) {
             lruKeys.remove(key)
             lruKeys.add(key)
-            while (lruKeys.size > MAX_ACTIVE_PANEL_WEBVIEWS) {
+            while (lruKeys.size > limit) {
                 val oldest = lruKeys.iterator()
                 if (!oldest.hasNext()) break
                 val evicted = oldest.next()
@@ -511,7 +614,7 @@ internal object ActivePanelWebViewPool {
                 runCatching {
                     TavernRuntimeManager.appendLog(
                         "info",
-                        "[panel-pool] evicted oldest panel WebView key=$evicted (active=${lruKeys.size}/$MAX_ACTIVE_PANEL_WEBVIEWS)",
+                        "[panel-pool] evicted oldest panel WebView key=$evicted (active=${lruKeys.size}/$limit)",
                     )
                 }
             }
@@ -537,11 +640,16 @@ internal object ActivePanelWebViewPool {
         }
     }
 
-    internal fun resetForTest() {
+    fun clearAll() {
         synchronized(lock) {
             lruKeys.clear()
             _activeKeysFlow.value = emptySet()
         }
+        DetachedPanelWebViewCache.clearAll()
+    }
+
+    internal fun resetForTest() {
+        clearAll()
     }
 }
 
@@ -626,6 +734,23 @@ internal object DetachedPanelWebViewCache {
             }
         }
     }
+
+    fun clearAll() {
+        val removedList = synchronized(lock) {
+            val all = map.values.toList()
+            map.clear()
+            all
+        }
+        if (removedList.isEmpty()) return
+        Handler(Looper.getMainLooper()).post {
+            removedList.forEach { removed ->
+                runCatching {
+                    (removed.container.parent as? ViewGroup)?.removeView(removed.container)
+                    removed.mountState.release()
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -674,11 +799,23 @@ internal fun PanelHibernatedPlaceholderCard(
 /**
  * 面板分步加载期间的显式动态占位提示卡片（展示具体面板名称、当前阶段与「优先加载」插队按钮）。
  */
+data class PanelDiagnostic(
+    val messageKey: String?,
+    val panelTitle: String,
+    val stage: String,
+    val mounted: Boolean,
+    val heightDp: Int,
+    val retries: Int,
+    val lastError: String?,
+)
+
 @Composable
 internal fun PanelLoadingPlaceholderCard(
     stage: PanelLoadStage,
     panelTitle: String,
     onPrioritize: (() -> Unit)? = null,
+    onReload: (() -> Unit)? = null,
+    errorText: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val statusText = when (stage) {
@@ -735,11 +872,26 @@ internal fun PanelLoadingPlaceholderCard(
                     )
                 }
             }
-            if (stage is PanelLoadStage.Queued && stage.position > 1 && onPrioritize != null) {
-                TextButton(onClick = onPrioritize) {
-                    Text("优先加载", style = MaterialTheme.typography.labelSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (stage is PanelLoadStage.Queued && stage.position > 1 && onPrioritize != null) {
+                    TextButton(onClick = onPrioritize) {
+                        Text("优先加载", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+                if (onReload != null) {
+                    TextButton(onClick = onReload) {
+                        Text("重载面板", style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
+        }
+        if (!errorText.isNullOrBlank()) {
+            Text(
+                text = "错误：$errorText",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            )
         }
     }
 }
@@ -781,6 +933,28 @@ fun looksLikeInteractiveHtml(text: String): Boolean {
 }
 
 /**
+ * 识别静态结构化 HTML 卡片片段（如 `<div class="post-card">...</div>`，即使不含 `<script>` 且 `<style>` 位于相邻块或内联属性中）。
+ * 先剥离非 HTML 代码围栏（如 ```xml ... ```），防止 XML/代码片段误判为 HTML 面板。
+ */
+fun looksLikeHtmlFragment(text: String): Boolean {
+    if (text.length < 24) return false
+    val cleaned = if (text.contains("```")) NON_HTML_CODE_FENCE_RE.replace(text, "") else text
+    val unwrapped = FENCED_HTML_BLOCK_RE.matchEntire(cleaned.trim())?.groupValues?.getOrNull(1)?.trim() ?: cleaned.trim()
+    if (unwrapped.length < 24) return false
+    val hasOpen = Regex("<(div|section|article|main|aside|header|footer|table|details|form|svg)\\b[^>]*>", RegexOption.IGNORE_CASE).containsMatchIn(unwrapped)
+    val hasClose = Regex("</(div|section|article|main|aside|header|footer|table|details|form|svg)>", RegexOption.IGNORE_CASE).containsMatchIn(unwrapped)
+    if (!hasOpen || !hasClose) return false
+    val hasClassOrStyle = Regex("\\b(?:class|style|id)\\s*=\\s*['\"][^'\"]+['\"]", RegexOption.IGNORE_CASE).containsMatchIn(unwrapped)
+    if (hasClassOrStyle) return true
+    val closeCount = Regex("</[a-zA-Z][a-zA-Z0-9_-]*>").findAll(unwrapped).count()
+    return closeCount >= 2
+}
+
+fun shouldRenderAsHtmlPanel(text: String): Boolean =
+    looksLikeInteractiveHtml(text) || looksLikeHtmlFragment(text)
+
+
+/**
  * 计算 HTML 面板在 GPU 硬件加速纹理限制下的安全显示高度（dp）与是否启用内部滚动。
  */
 internal fun computePanelHeightConstraint(
@@ -811,9 +985,16 @@ fun MessageHtmlBlock(
     val displaySetting = LocalSettings.current.displaySetting
     val perfEnabled = displaySetting.enableWebViewPerfReduction
     val perfMode = displaySetting.webViewPerfMode
+    val useBoundedWebViewPool = true
     val useHibernatePool = perfEnabled && perfMode == WebViewPerfMode.HIBERNATE_POOL
     val useLiveQuiescent = !perfEnabled || perfMode == WebViewPerfMode.LIVE_QUIESCENT
     val useHistoricalSnapshot = perfEnabled && perfMode == WebViewPerfMode.HISTORICAL_SNAPSHOT_IMAGE
+    val maxActivePoolSize = when {
+        !perfEnabled -> ActivePanelWebViewPool.DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS
+        useHibernatePool -> ActivePanelWebViewPool.MAX_ACTIVE_PANEL_WEBVIEWS
+        useLiveQuiescent -> ActivePanelWebViewPool.LIVE_QUIESCENT_MAX_ACTIVE_WEBVIEWS
+        else -> ActivePanelWebViewPool.MAX_ACTIVE_PANEL_WEBVIEWS
+    }
     val screenHeightDp = configuration.screenHeightDp.coerceAtLeast(480)
     val minHeightDp = 48
     val gpuSafeMaxDp = minOf(1600, (4096f / density.density.coerceAtLeast(1f)).toInt()).coerceAtLeast(480)
@@ -884,8 +1065,8 @@ fun MessageHtmlBlock(
         mutableStateOf(PanelSnapshotStore.getMemory(snapshotCompositeKey))
     }
 
-    LaunchedEffect(snapshotCompositeKey) {
-        if (snapshotEntry == null && snapshotCompositeKey != null) {
+    LaunchedEffect(snapshotCompositeKey, useHistoricalSnapshot) {
+        if (useHistoricalSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
             val loaded = PanelSnapshotStore.loadFromDiskIfNeeded(
                 context = context,
                 compositeKey = snapshotCompositeKey,
@@ -921,13 +1102,16 @@ fun MessageHtmlBlock(
 
     val activePoolKeys by ActivePanelWebViewPool.activeKeysFlow.collectAsState()
 
-    LaunchedEffect(effectiveQueueKey, useHibernatePool) {
+    LaunchedEffect(effectiveQueueKey, useBoundedWebViewPool, maxActivePoolSize) {
         if (!slotGranted) {
             val req = TavernPanelLoadScheduler.enqueue(effectiveQueueKey, panelTitle, prioritize = false)
             req.gate.await()
         }
-        if (useHibernatePool) {
-            ActivePanelWebViewPool.acquire(effectiveQueueKey)
+        kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+            if (!ctx[Job]?.isActive.let { it ?: true } || mountState.isDisposed) return@LaunchedEffect
+        }
+        if (useBoundedWebViewPool) {
+            ActivePanelWebViewPool.acquire(effectiveQueueKey, maxActive = maxActivePoolSize)
         }
         slotGranted = true
         if (!mountState.mounted) {
@@ -937,10 +1121,10 @@ fun MessageHtmlBlock(
         }
     }
 
-    DisposableEffect(effectiveQueueKey, useHibernatePool) {
+    DisposableEffect(effectiveQueueKey, useBoundedWebViewPool) {
         onDispose {
             TavernPanelLoadScheduler.cancel(effectiveQueueKey)
-            if (useHibernatePool) {
+            if (useBoundedWebViewPool) {
                 ActivePanelWebViewPool.release(effectiveQueueKey)
             }
         }
@@ -991,18 +1175,18 @@ fun MessageHtmlBlock(
         return
     }
 
-    val isHibernated = useHibernatePool && slotGranted && effectiveQueueKey !in activePoolKeys
+    val isHibernated = (useHibernatePool || (useBoundedWebViewPool && isHistoricalFloor)) && slotGranted && effectiveQueueKey !in activePoolKeys
     val isPanelVisiblyReady = slotGranted && !isHibernated && mountState.mounted && heightDp > 0
 
     // 面板完成渲染后：
     // 1. 始终在后台预捕获一张等比例高清快照存入 PanelSnapshotStore（无论当前处于方案一、二还是三），
     //    这样用户在偏好设置里切换到方案三时直接秒切静态图，完全无需重新渲染 WebView！
     // 2. 若开启方案二（全视觉保活+静默降频），自动静默后台轮询定时器。
-    LaunchedEffect(isPanelVisiblyReady, heightDp, useLiveQuiescent, isHistoricalFloor) {
+    LaunchedEffect(isPanelVisiblyReady, heightDp, useLiveQuiescent, useHistoricalSnapshot, isHistoricalFloor) {
         if (!isPanelVisiblyReady || heightDp <= 0) return@LaunchedEffect
         delay(420L)
         if (!mountState.isDisposed && mountState.mounted) {
-            if (snapshotEntry == null && snapshotCompositeKey != null) {
+            if (useHistoricalSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
                 val captured = PanelSnapshotStore.captureFromWebView(
                     context = context,
                     compositeKey = snapshotCompositeKey,
@@ -1011,6 +1195,9 @@ fun MessageHtmlBlock(
                 )
                 if (captured != null) {
                     snapshotEntry = captured
+                    if (isHistoricalFloor) {
+                        ActivePanelWebViewPool.release(effectiveQueueKey)
+                    }
                 }
             }
             if (useLiveQuiescent && (perfEnabled || isHistoricalFloor)) {
@@ -1031,15 +1218,21 @@ fun MessageHtmlBlock(
                 panelTitle = panelTitle,
                 onWakeUp = {
                     stage = PanelLoadStage.LoadingWebView(panelTitle)
-                    ActivePanelWebViewPool.acquire(effectiveQueueKey)
+                    ActivePanelWebViewPool.acquire(effectiveQueueKey, maxActive = maxActivePoolSize)
                 },
             )
         } else if (!isPanelVisiblyReady) {
             PanelLoadingPlaceholderCard(
                 stage = stage,
                 panelTitle = panelTitle,
+                errorText = mountState.lastError,
                 onPrioritize = {
                     TavernPanelLoadScheduler.enqueue(effectiveQueueKey, panelTitle, prioritize = true)
+                },
+                onReload = {
+                    PanelHeightCache.invalidateForMessage(messageKey)
+                    DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
+                    mountState.reloadNow()
                 },
             )
         }
@@ -1080,9 +1273,19 @@ fun MessageHtmlBlock(
                             isVerticalScrollBarEnabled = false
                             isFocusable = false
                             isFocusableInTouchMode = false
+                            var firstInteractionLogged = false
                             setOnTouchListener { v, event ->
                                 if (event.action == MotionEvent.ACTION_DOWN) {
                                     ActivePanelWebViewPool.touch(effectiveQueueKey)
+                                    if (!firstInteractionLogged) {
+                                        firstInteractionLogged = true
+                                        TavernRuntimeManager.recordWebViewBootStage(
+                                            hostType = "panel",
+                                            hostId = messageKey ?: "anon",
+                                            stage = "first_interaction",
+                                            detail = "action=ACTION_DOWN",
+                                        )
+                                    }
                                 }
                                 if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_UP) {
                                     val wv = v as? WebView
@@ -1104,7 +1307,43 @@ fun MessageHtmlBlock(
                                 }
                                 false
                             }
+                            webChromeClient = RikkaWebChromeClient(
+                                context = ctx,
+                                sourceTag = "panel:${messageKey ?: "anon"}",
+                                onConsoleError = { errMsg ->
+                                    mountState.lastError = errMsg
+                                },
+                            )
                             webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView,
+                                    request: WebResourceRequest,
+                                ): Boolean {
+                                    val targetUrl = request.url?.toString()?.trim().orEmpty()
+                                    if (targetUrl.startsWith("https://appassets.androidplatform.net", ignoreCase = true) ||
+                                        targetUrl.equals("about:blank", ignoreCase = true)
+                                    ) {
+                                        return false
+                                    }
+                                    if (request.isForMainFrame &&
+                                        (targetUrl.startsWith("http://", ignoreCase = true) || targetUrl.startsWith("https://", ignoreCase = true)) &&
+                                        request.hasGesture()
+                                    ) {
+                                        runCatching {
+                                            val intent = android.content.Intent(
+                                                android.content.Intent.ACTION_VIEW,
+                                                request.url,
+                                            ).apply {
+                                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            ctx.startActivity(intent)
+                                        }
+                                        return true
+                                    }
+                                    TavernRuntimeManager.appendLog("warn", "[panel] blocked top-level navigation to $targetUrl")
+                                    return true
+                                }
+
                                 override fun shouldInterceptRequest(
                                     view: WebView,
                                     request: WebResourceRequest,
@@ -1115,19 +1354,44 @@ fun MessageHtmlBlock(
                                 override fun onPageFinished(view: WebView, url: String) {
                                     if (mountState.isDisposed || rendererGoneHandled.get()) return
                                     stage = PanelLoadStage.MountingDom(panelTitle)
-                                    mountState.onPageReady()
+                                    TavernRuntimeManager.recordWebViewBootStage(
+                                        hostType = "panel",
+                                        hostId = messageKey ?: "anon",
+                                        stage = "dom_content_loaded",
+                                        detail = "url=$url (onPageFinished != runtime_ready)",
+                                    )
                                     view.evaluateJavascript("typeof window.__rikkaPanelMount") { r ->
                                         if (mountState.isDisposed || rendererGoneHandled.get()) return@evaluateJavascript
                                         val ok = r != null && r.contains("function")
                                         if (ok) {
-                                            TavernRuntimeManager.appendLog("debug", "[panel] page ready (runtime ok) key=$messageKey url=$url")
+                                            TavernRuntimeManager.recordWebViewBootStage(
+                                                hostType = "panel",
+                                                hostId = messageKey ?: "anon",
+                                                stage = "runtime_ready",
+                                                detail = "url=$url",
+                                            )
+                                            mountState.onPageReady()
                                             mountState.tryMountIfNeeded()
                                         } else {
-                                            TavernRuntimeManager.appendLog(
-                                                "warn",
-                                                "[panel] page finished but runtime missing (typeof=$r) key=$messageKey url=$url — asset intercept miss?",
-                                            )
-                                            mountState.onRuntimeMissing()
+                                            // ES module script may still be linking asynchronously after onPageFinished;
+                                            // re-probe once after 220ms if onPanelRuntimeReady() has not fired yet.
+                                            mountState.scheduleReadyProbe(220L) {
+                                                if (mountState.isDisposed || rendererGoneHandled.get() || mountState.mounted) return@scheduleReadyProbe
+                                                view.evaluateJavascript("typeof window.__rikkaPanelMount") { r2 ->
+                                                    if (mountState.isDisposed || rendererGoneHandled.get() || mountState.mounted) return@evaluateJavascript
+                                                    val ok2 = r2 != null && r2.contains("function")
+                                                    if (ok2) {
+                                                        mountState.onPageReady()
+                                                        mountState.tryMountIfNeeded()
+                                                    } else {
+                                                        TavernRuntimeManager.appendLog(
+                                                            "warn",
+                                                            "[panel] page finished but runtime missing (typeof=$r2) key=$messageKey url=$url — module link error or asset miss",
+                                                        )
+                                                        mountState.onRuntimeMissing()
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1199,6 +1463,18 @@ fun MessageHtmlBlock(
                             mountState.attach(this)
                             mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
                             TavernRuntimeManager.registerAuxWebView(this, "panel")
+                            TavernRuntimeManager.recordWebViewBootStage(
+                                hostType = "panel",
+                                hostId = messageKey ?: "anon",
+                                stage = "webview_create",
+                                detail = "created panel WebView",
+                            )
+                            TavernRuntimeManager.recordWebViewBootStage(
+                                hostType = "panel",
+                                hostId = messageKey ?: "anon",
+                                stage = "first_navigation",
+                                detail = "url=${TavernRuntimeManager.BASE_URL}panel.html",
+                            )
                             loadUrl(TavernRuntimeManager.BASE_URL + "panel.html")
                         }
                         PanelScrollBridge(ctx).apply {
@@ -1219,7 +1495,7 @@ fun MessageHtmlBlock(
                     },
                     onRelease = { container ->
                         TavernPanelLoadScheduler.markDone(effectiveQueueKey)
-                        if (useHibernatePool && effectiveQueueKey !in activePoolKeys) {
+                        if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys) {
                             DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
                             mountState.release()
                         } else if (mountState.mounted && !mountState.isDisposed) {
@@ -1229,6 +1505,65 @@ fun MessageHtmlBlock(
                         }
                     },
                 )
+                if (isPanelVisiblyReady) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp, end = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (!mountState.lastError.isNullOrBlank()) {
+                            Text(
+                                text = "面板资源或脚本异常，可点右侧重载",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                            )
+                        } else {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                        Surface(
+                            onClick = {
+                                PanelHeightCache.invalidateForMessage(messageKey)
+                                DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
+                                mountState.reloadNow()
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (!mountState.lastError.isNullOrBlank()) {
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.55f)
+                            },
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = HugeIcons.Refresh03,
+                                    contentDescription = "重载面板",
+                                    modifier = Modifier.size(13.dp),
+                                    tint = if (!mountState.lastError.isNullOrBlank()) {
+                                        MaterialTheme.colorScheme.onErrorContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                )
+                                Text(
+                                    text = "重载面板",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (!mountState.lastError.isNullOrBlank()) {
+                                        MaterialTheme.colorScheme.onErrorContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1240,6 +1575,21 @@ fun MessageHtmlBlock(
  * - 否则直接走原生 [MarkdownBlock]。
  */
 @Composable
+internal fun rememberAfterMarkdownHtml(content: String): String {
+    val formatterVersion by TavernRuntimeManager.messageFormatterVersionFlow.collectAsState()
+    val hasHooks = TavernRuntimeManager.hasMessageFormatterHooks
+    if (!hasHooks || content.isEmpty() || !shouldInvokeWebViewMessageFormatter(content)) {
+        return content
+    }
+    val out by produceState(initialValue = content, content, formatterVersion, hasHooks) {
+        value = withContext(Dispatchers.Default) {
+            TavernRuntimeManager.runMessageFormatterStageAsync("afterMarkdown", content, "", false)
+        }
+    }
+    return out
+}
+
+@Composable
 internal fun StTextContent(
     content: String,
     loading: Boolean,
@@ -1248,8 +1598,9 @@ internal fun StTextContent(
     modifier: Modifier = Modifier,
     isHistoricalFloor: Boolean = false,
 ) {
-    if (!loading && looksLikeInteractiveHtml(content)) {
-        val pieces = remember(content) { splitMixedMessagePieces(content) }
+    val html = if (!loading) rememberAfterMarkdownHtml(content) else content
+    if (!loading && shouldRenderAsHtmlPanel(html)) {
+        val pieces = remember(html) { splitMixedMessagePieces(html) }
         Column(
             modifier = modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1471,9 +1822,55 @@ internal class PanelMountState {
     var isDisposed: Boolean = false
         private set
 
-    private companion object {
+    internal companion object {
         const val MAX_PAGE_LOAD_RETRIES = 3
+        const val STREAMING_REMOUNT_COALESCE_MS = 48L
         val SCRIPT_TAG_RE = Regex("<script[\\s>]", RegexOption.IGNORE_CASE)
+    }
+    private val mainHandler = Handler(Looper.getMainLooper())
+    internal var clockMsProvider: () -> Long = {
+        runCatching { android.os.SystemClock.uptimeMillis() }.getOrDefault(0L)
+    }
+    private var lastRemountTimestampMs: Long = -STREAMING_REMOUNT_COALESCE_MS
+    private var coalescedRemountScheduled: Boolean = false
+    private var pendingReadyProbeRunnable: Runnable? = null
+    private val coalescedRemountRunnable = Runnable {
+        coalescedRemountScheduled = false
+        if (!isDisposed) {
+            lastRemountTimestampMs = clockMsProvider()
+            tryMount()
+        }
+    }
+
+    fun scheduleReadyProbe(delayMs: Long = 220L, probe: () -> Unit) {
+        cancelReadyProbe()
+        if (isDisposed || pageReady || mounted) return
+        val r = Runnable {
+            pendingReadyProbeRunnable = null
+            if (!isDisposed && !pageReady && !mounted) {
+                probe()
+            }
+        }
+        pendingReadyProbeRunnable = r
+        runCatching { mainHandler.postDelayed(r, delayMs) }
+    }
+
+    fun cancelReadyProbe() {
+        pendingReadyProbeRunnable?.let { r ->
+            pendingReadyProbeRunnable = null
+            runCatching { mainHandler.removeCallbacks(r) }
+        }
+    }
+
+    fun flushPendingRemount() {
+        if (coalescedRemountScheduled) {
+            coalescedRemountScheduled = false
+            runCatching { mainHandler.removeCallbacks(coalescedRemountRunnable) }
+        }
+        if (!isDisposed && pageReady && pendingHtml != null && pendingHtml != mountedHtml) {
+            lastRemountTimestampMs = clockMsProvider()
+            tryMount()
+        }
     }
 
     private var everMounted = false
@@ -1485,6 +1882,28 @@ internal class PanelMountState {
         private set
     var mountedHtml by mutableStateOf<String?>(null)
         private set
+    var lastError by mutableStateOf<String?>(null)
+
+    fun reloadNow() {
+        if (isDisposed) return
+        cancelReadyProbe()
+        if (coalescedRemountScheduled) {
+            coalescedRemountScheduled = false
+            runCatching { mainHandler.removeCallbacks(coalescedRemountRunnable) }
+        }
+        val wv = webView ?: return
+        lastError = null
+        pageLoadRetries = 0
+        pageReady = false
+        everMounted = false
+        mountedHtml = null
+        appliedForeground = null
+        appliedKey = null
+        appliedViewportPx = 0
+        runCatching {
+            wv.loadUrl(TavernRuntimeManager.BASE_URL + "panel.html")
+        }
+    }
 
     fun decideUpdateAction(html: String, reloadGen: Int = lastReloadGen): PanelUpdateAction {
         val prev = mountedHtml
@@ -1541,6 +1960,7 @@ internal class PanelMountState {
 
     fun onPageReady() {
         if (isDisposed) return
+        cancelReadyProbe()
         pageReady = true
         tryMount()
     }
@@ -1587,7 +2007,7 @@ internal class PanelMountState {
     val mounted: Boolean get() = mountedHtml != null
 
     fun onRuntimeMissing(): Boolean {
-        if (isDisposed) return false
+        if (isDisposed || pageReady || mounted) return false
         val wv = webView ?: return false
         if (pageLoadRetries >= MAX_PAGE_LOAD_RETRIES) {
             TavernRuntimeManager.appendLog(
@@ -1638,15 +2058,38 @@ internal class PanelMountState {
 
     fun submit(html: String, foregroundHex: String?, messageKey: String? = null, viewportPx: Int = 0) {
         if (isDisposed) return
+        val isIdentical = html == pendingHtml && foregroundHex == pendingForeground && messageKey == pendingKey
         pendingHtml = html
         pendingHtmlHash = html.hashCode()
         pendingForeground = foregroundHex
         pendingKey = messageKey
         if (viewportPx > 0) pendingViewportPx = viewportPx
+        if (isIdentical && mounted) return
+        if (everMounted && pageReady) {
+            val now = clockMsProvider()
+            val elapsed = now - lastRemountTimestampMs
+            if (elapsed in 0 until STREAMING_REMOUNT_COALESCE_MS) {
+                if (!coalescedRemountScheduled) {
+                    coalescedRemountScheduled = true
+                    runCatching { mainHandler.postDelayed(coalescedRemountRunnable, STREAMING_REMOUNT_COALESCE_MS - elapsed) }
+                }
+                return
+            }
+            lastRemountTimestampMs = now
+        }
+        if (coalescedRemountScheduled) {
+            coalescedRemountScheduled = false
+            runCatching { mainHandler.removeCallbacks(coalescedRemountRunnable) }
+        }
         tryMount()
     }
 
     fun onRendererGone() {
+        cancelReadyProbe()
+        if (coalescedRemountScheduled) {
+            coalescedRemountScheduled = false
+            runCatching { mainHandler.removeCallbacks(coalescedRemountRunnable) }
+        }
         webView = null
         pageReady = false
         everMounted = false
@@ -1658,6 +2101,9 @@ internal class PanelMountState {
 
     fun release() {
         isDisposed = true
+        cancelReadyProbe()
+        coalescedRemountScheduled = false
+        runCatching { mainHandler.removeCallbacks(coalescedRemountRunnable) }
         webView?.let { wv ->
             webView = null
             pageReady = false
@@ -1776,11 +2222,38 @@ private class PanelBridge(
     private val mountState: PanelMountState,
     private val onHeight: (Int) -> Unit,
 ) {
+    private var firstMountLogged = false
+
+    @JavascriptInterface
+    fun onPanelRuntimeReady() {
+        if (mountState.isDisposed) return
+        handler.post {
+            if (mountState.isDisposed) return@post
+            TavernRuntimeManager.recordWebViewBootStage(
+                hostType = "panel",
+                hostId = mountState.currentPendingKey().ifEmpty { "anon" },
+                stage = "runtime_ready",
+                detail = "source=onPanelRuntimeReady",
+            )
+            mountState.onPageReady()
+            mountState.tryMountIfNeeded()
+        }
+    }
+
     @JavascriptInterface
     fun panelResize(height: Int) {
         if (mountState.isDisposed) return
         handler.post {
             if (mountState.isDisposed) return@post
+            if (height > 0 && !firstMountLogged) {
+                firstMountLogged = true
+                TavernRuntimeManager.recordWebViewBootStage(
+                    hostType = "panel",
+                    hostId = mountState.currentPendingKey().ifEmpty { "anon" },
+                    stage = "first_panel_mount",
+                    detail = "height=${height}dp",
+                )
+            }
             TavernRuntimeManager.appendLog("debug", "[panel] resize h=$height")
             onHeight(height.coerceIn(0, 2_000_000))
         }
@@ -1801,6 +2274,11 @@ private class PanelBridge(
     @JavascriptInterface
     fun onPanelError(message: String) {
         if (mountState.isDisposed) return
+        handler.post {
+            if (!mountState.isDisposed) {
+                mountState.lastError = message
+            }
+        }
         TavernRuntimeManager.appendLog("error", "[panel] $message")
     }
 }

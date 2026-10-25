@@ -106,7 +106,7 @@ class GeminiTTSProvider : TTSProvider<TTSProviderSetting.Gemini> {
             )
         }
 
-        val responseJson = response.body!!.string()
+        val responseJson = response.body.string()
         val geminiResponse = json.decodeFromString<GeminiTTSResponse>(responseJson)
 
         if (geminiResponse.candidates.isEmpty() ||

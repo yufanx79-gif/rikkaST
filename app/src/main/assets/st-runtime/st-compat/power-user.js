@@ -184,3 +184,31 @@ export function getTokenizerModel() {
     } catch (_e) { /* noop */ }
     return '';
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export const MAX_CONTEXT_DEFAULT = 8192;
+export const MAX_RESPONSE_DEFAULT = 2048;
+export function addEphemeralStoppingString(..._args) { return null; }
+export function applyStylePins(..._args) { return null; }
+export const chat_styles = { DEFAULT: 0, BUBBLES: 1, DOCUMENT: 2 };
+export function collapseNewlines(..._args) { return null; }
+export let context_presets = [];
+export function fixMarkdown(..._args) { return null; }
+export function forceCharacterEditorTokenize(..._args) { return null; }
+export function fuzzySearchCharacters(..._args) { return null; }
+export function fuzzySearchGroups(..._args) { return null; }
+export function fuzzySearchPersonas(..._args) { return null; }
+export function fuzzySearchTags(..._args) { return null; }
+export function fuzzySearchWorldInfo(..._args) { return null; }
+export function generatedTextFiltered(..._args) { return null; }
+export function getCustomStoppingStrings(..._args) { return null; }
+export function getThemeObject(..._args) { return null; }
+export function loadMovingUIState(..._args) { return null; }
+export function performFuzzySearch(..._args) { return null; }
+export function playMessageSound(..._args) { return null; }
+export function registerDebugFunction(..._args) { return null; }
+export function renderStoryString(..._args) { return null; }
+export function resetMovableStyles(..._args) { return null; }
+export const send_on_enter_options = { DISABLED: -1, AUTO: 0, ENABLED: 1 };
+export function sortEntitiesList(..._args) { return null; }
+export const toastPositionClasses = ['toast-top-left', 'toast-top-center', 'toast-top-right', 'toast-bottom-left', 'toast-bottom-center', 'toast-bottom-right'];

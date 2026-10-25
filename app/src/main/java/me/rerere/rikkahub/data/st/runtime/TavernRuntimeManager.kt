@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -805,7 +806,254 @@ object TavernRuntimeManager {
     val isStIphonieSpeaking: Boolean
         get() = _stIphonieTtsStateFlow.value.playing || _stIphonieTtsStateFlow.value.phase == "playing"
 
+    private val _isBootReadyFlow = MutableStateFlow(false)
+    val isBootReadyFlow: StateFlow<Boolean> get() = _isBootReadyFlow
+    val isBootReady: Boolean get() = _isBootReadyFlow.value
+
+    @Volatile private var webviewCreateAtMs: Long = 0L
+    @Volatile private var indexFirstByteAtMs: Long = 0L
+    @Volatile private var pageFinishedAtMs: Long = 0L
+    @Volatile private var bootCompleteAtMs: Long = 0L
+
+    data class WebViewBootRecord(
+        val seq: Long,
+        val hostType: String,
+        val hostId: String,
+        val stage: String,
+        val detail: String,
+        val timestampMs: Long = System.currentTimeMillis(),
+    )
+
+    private val bootRecordSeq = AtomicLong(0)
+    private val bootRecords = ConcurrentLinkedQueue<WebViewBootRecord>()
+    private const val MAX_BOOT_RECORDS = 240
+
+    fun recordWebViewBootStage(
+        hostType: String,
+        hostId: String,
+        stage: String,
+        detail: String = "",
+    ): WebViewBootRecord {
+        val rec = WebViewBootRecord(
+            seq = bootRecordSeq.incrementAndGet(),
+            hostType = hostType,
+            hostId = hostId,
+            stage = stage,
+            detail = detail,
+        )
+        bootRecords.offer(rec)
+        while (bootRecords.size > MAX_BOOT_RECORDS) {
+            bootRecords.poll()
+        }
+        appendLog(
+            "info",
+            "[webview-boot][#${rec.seq}][$hostType:$hostId][$stage] $detail",
+        )
+        return rec
+    }
+
+    fun getWebViewBootRecords(hostType: String? = null): List<WebViewBootRecord> {
+        val all = bootRecords.toList()
+        return if (hostType == null) all else all.filter { it.hostType == hostType }
+    }
+
+    fun clearWebViewBootRecords() {
+        bootRecords.clear()
+    }
+
+    /** 由 UI 层（ChatPage / ChatVM）注入：停止当前会话生成（响应 JS 侧 SillyTavern.getContext().stopGeneration）。 */
+    @Volatile
+    var generationStopper: (() -> Boolean)? = null
+
+    fun cancelAllPendingOperations(reason: String = "manual") {
+        cancelAllChatCompletions()
+        val hookKeys = pendingGenHooks.keys.toList()
+        hookKeys.forEach { seq ->
+            pendingGenHooks.remove(seq)?.cancel()
+        }
+        val slashKeys = pendingSlash.keys.toList()
+        slashKeys.forEach { seq ->
+            pendingSlash.remove(seq)?.cancel()
+        }
+        val ejsKeys = pendingEjs.keys.toList()
+        ejsKeys.forEach { seq ->
+            pendingEjs.remove(seq)?.cancel()
+        }
+        val macroKeys = pendingMacros.keys.toList()
+        macroKeys.forEach { seq ->
+            pendingMacros.remove(seq)?.cancel()
+        }
+        val fmtKeys = pendingFormatterStages.keys.toList()
+        fmtKeys.forEach { seq ->
+            pendingFormatterStages.remove(seq)?.cancel()
+        }
+        val filterKeys = pendingFilterEvals.keys.toList()
+        filterKeys.forEach { seq ->
+            pendingFilterEvals.remove(seq)?.cancel()
+        }
+        val proxyKeys = activeProxyHttpJobs.keys.toList()
+        proxyKeys.forEach { id -> abortProxyHttpRequest(id) }
+        val imgKeys = activeJsImageGenJobs.keys.toList()
+        imgKeys.forEach { id -> cancelJsImageGeneration(id) }
+        eval("window.__rikkaAbortActiveGeneration && window.__rikkaAbortActiveGeneration(${JSONObject.quote(reason)});")
+        appendLog(
+            "info",
+            "[cancel] cancelAllPendingOperations reason=$reason genHooks=${hookKeys.size} slash=${slashKeys.size} ejs=${ejsKeys.size}",
+        )
+    }
+
+    fun dispatchStopGeneration(): Boolean {
+        cancelAllPendingOperations("js_stopGeneration")
+        val stopper = generationStopper
+        val ok = if (stopper != null) {
+            runCatching { stopper.invoke() }.getOrDefault(false)
+        } else {
+            false
+        }
+        appendLog("info", "[cancel] dispatchStopGeneration from JS bridge: stopperWired=${stopper != null} ok=$ok")
+        return ok
+    }
+
+    private val floatingHiddenTargetsByConv = ConcurrentHashMap<String, MutableSet<String>>()
+    private val _floatingHiddenVersionFlow = MutableStateFlow(0L)
+    val floatingHiddenVersionFlow: StateFlow<Long> get() = _floatingHiddenVersionFlow
+
+    @Volatile
+    private var pendingFloatingAttachment: Pair<java.lang.ref.WeakReference<android.view.ViewGroup>, String>? = null
+
+    @Volatile
+    internal var lastAttachedFloatingTarget: String? = null
+
+    private val activeProxyHttpJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+    private val activeProxyHttpCalls = ConcurrentHashMap<String, java.net.HttpURLConnection>()
+    private val activeJsImageGenJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /** 可选宿主生图钩子（请求 JSON -> Base64 PNG 字符串或抛异常）；未注入时自动从 SettingsStore + ProviderManager 解析。 */
+    @Volatile
+    var imageGenerationHook: (suspend (String) -> String)? = null
+
+    @Volatile
+    var imageGenerationStatusSupplier: (() -> String)? = null
+
+    @Volatile
+    var webViewFileChooserLauncher: ((mimeTypes: Array<String>, allowMultiple: Boolean, callback: android.webkit.ValueCallback<Array<Uri>>) -> Boolean)? = null
+
+    data class WebViewJsDialogEvent(
+        val type: String, // "alert" | "confirm" | "prompt"
+        val message: String,
+        val defaultValue: String = "",
+        val onConfirm: (String?) -> Unit,
+        val onCancel: () -> Unit,
+    )
+
+    private val _webViewJsDialogFlow = MutableStateFlow<WebViewJsDialogEvent?>(null)
+    val webViewJsDialogFlow: StateFlow<WebViewJsDialogEvent?> get() = _webViewJsDialogFlow
+
+    fun dismissWebViewJsDialog() {
+        _webViewJsDialogFlow.value = null
+    }
+
+    fun requestWebViewFileChooser(
+        callback: android.webkit.ValueCallback<Array<Uri>>,
+        mimeTypes: Array<String>,
+        allowMultiple: Boolean,
+    ): Boolean {
+        val launcher = webViewFileChooserLauncher ?: return false
+        return runCatching { launcher(mimeTypes, allowMultiple, callback) }.getOrDefault(false)
+    }
+
+    fun dispatchWebViewJsAlert(message: String, result: android.webkit.JsResult?): Boolean {
+        if (result == null) return false
+        _webViewJsDialogFlow.value = WebViewJsDialogEvent(
+            type = "alert",
+            message = message,
+            onConfirm = {
+                _webViewJsDialogFlow.value = null
+                runCatching { result.confirm() }
+            },
+            onCancel = {
+                _webViewJsDialogFlow.value = null
+                runCatching { result.confirm() }
+            },
+        )
+        return true
+    }
+
+    fun dispatchWebViewJsConfirm(message: String, result: android.webkit.JsResult?): Boolean {
+        if (result == null) return false
+        _webViewJsDialogFlow.value = WebViewJsDialogEvent(
+            type = "confirm",
+            message = message,
+            onConfirm = {
+                _webViewJsDialogFlow.value = null
+                runCatching { result.confirm() }
+            },
+            onCancel = {
+                _webViewJsDialogFlow.value = null
+                runCatching { result.cancel() }
+            },
+        )
+        return true
+    }
+
+    fun dispatchWebViewJsPrompt(
+        message: String,
+        defaultValue: String,
+        result: android.webkit.JsPromptResult?,
+    ): Boolean {
+        if (result == null) return false
+        _webViewJsDialogFlow.value = WebViewJsDialogEvent(
+            type = "prompt",
+            message = message,
+            defaultValue = defaultValue,
+            onConfirm = { input ->
+                _webViewJsDialogFlow.value = null
+                runCatching { result.confirm(input ?: defaultValue) }
+            },
+            onCancel = {
+                _webViewJsDialogFlow.value = null
+                runCatching { result.cancel() }
+            },
+        )
+        return true
+    }
+
+    fun isFloatingTargetHidden(conversationId: String?, target: String): Boolean {
+        val convKey = conversationId?.takeIf { it.isNotBlank() } ?: activeConversationId ?: "default"
+        val set = floatingHiddenTargetsByConv[convKey] ?: return false
+        return target in set || "all" in set
+    }
+
+    fun hideFloatingTargetForCurrentChat(target: String = "card") {
+        val convKey = activeConversationId?.takeIf { it.isNotBlank() } ?: "default"
+        val set = floatingHiddenTargetsByConv.getOrPut(convKey) { ConcurrentHashMap.newKeySet() }
+        set.add(target.ifBlank { "card" })
+        _floatingHiddenVersionFlow.value = _floatingHiddenVersionFlow.value + 1L
+        dismissFloatingWindow()
+    }
+
+    fun clearHiddenFloatingTargetsForCurrentChat() {
+        val convKey = activeConversationId?.takeIf { it.isNotBlank() } ?: "default"
+        floatingHiddenTargetsByConv.remove(convKey)
+        _floatingHiddenVersionFlow.value = _floatingHiddenVersionFlow.value + 1L
+    }
+
+    fun closeFloatingWindowFromJs(target: String = "", hideForCurrentChat: Boolean = false): Boolean {
+        mainHandler.post {
+            if (hideForCurrentChat) {
+                hideFloatingTargetForCurrentChat(target.ifBlank { _requestedFloatingTargetFlow.value ?: "card" })
+            } else {
+                dismissFloatingWindow()
+            }
+        }
+        return true
+    }
+
     fun requestOpenFloatingWindow(target: String = "iphonie") {
+        if (isFloatingTargetHidden(activeConversationId, target)) {
+            appendLog("info", "[floating] skipped opening hidden target='$target' for conv=$activeConversationId")
+            return
+        }
         _requestedFloatingTargetFlow.value = target
     }
 
@@ -843,27 +1091,46 @@ object TavernRuntimeManager {
      * 将常驻主运行时 WebView 挂载到可视悬浮窗容器（零二次白屏、零 IndexedDB 锁冲突、100% 保持小手机与卡脚本实时状态）。
      */
     fun attachHostWebViewToContainer(container: android.view.ViewGroup, target: String) {
+        pendingFloatingAttachment = java.lang.ref.WeakReference(container) to target
         ensureStarted(container.context)
         val wv = webView ?: return
         runCatching {
-            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
             wv.setBackgroundColor(android.graphics.Color.parseColor("#121318"))
+            wv.visibility = android.view.View.VISIBLE
             wv.isFocusable = true
             wv.isFocusableInTouchMode = true
-            container.addView(
-                wv,
-                android.view.ViewGroup.LayoutParams(
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                ),
-            )
-            val escaped = JSONObject.quote(target)
-            wv.evaluateJavascript(
-                "window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped);",
-                null,
-            )
+            val parentChanged = wv.parent !== container
+            if (parentChanged) {
+                (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                container.addView(
+                    wv,
+                    android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            }
+            if (pageReady && (parentChanged || lastAttachedFloatingTarget != target)) {
+                lastAttachedFloatingTarget = target
+                val escaped = JSONObject.quote(target)
+                wv.evaluateJavascript(
+                    "window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped, false);",
+                    null,
+                )
+            }
         }.onFailure { e ->
             appendLog("error", "[floating] attachHostWebViewToContainer failed: ${e.message}")
+        }
+    }
+
+    private fun flushPendingFloatingAttachment() {
+        val pending = pendingFloatingAttachment ?: return
+        val container = pending.first.get() ?: return
+        val target = pending.second
+        mainHandler.post {
+            if (pendingFloatingAttachment?.first?.get() === container) {
+                attachHostWebViewToContainer(container, target)
+            }
         }
     }
 
@@ -871,6 +1138,10 @@ object TavernRuntimeManager {
      * 从可视悬浮窗容器安全摘除常驻主运行时 WebView（不销毁实例，继续在后台保持小手机语音与脚本运行）。
      */
     fun detachHostWebViewFromContainer(container: android.view.ViewGroup) {
+        if (pendingFloatingAttachment?.first?.get() === container) {
+            pendingFloatingAttachment = null
+        }
+        lastAttachedFloatingTarget = null
         val wv = webView ?: return
         runCatching {
             wv.evaluateJavascript("window.__rikkaCloseFloatingStage && window.__rikkaCloseFloatingStage();", null)
@@ -886,6 +1157,37 @@ object TavernRuntimeManager {
     /** 处理 JS 侧生命周期事件（由桥回调触发）。 */
     fun handleJsLifecycleEvent(name: String, payloadJson: String = "{}") {
         when (name) {
+            "runtime_imported" -> {
+                recordWebViewBootStage("host-runtime", "main", "runtime_imported", payloadJson)
+            }
+            "script_ready" -> {
+                recordWebViewBootStage("host-runtime", "main", "script_ready", payloadJson)
+            }
+            "panel_ready" -> {
+                recordWebViewBootStage("panel", "aux", "panel_ready", payloadJson)
+            }
+            "ext_settings_loaded" -> {
+                recordWebViewBootStage("ext-settings", "aux", "ext_settings_loaded", payloadJson)
+            }
+            "boot_complete" -> {
+                _isBootReadyFlow.value = true
+                bootCompleteAtMs = System.currentTimeMillis()
+                recordWebViewBootStage("host-runtime", "main", "boot_complete", payloadJson)
+                val totalMs = if (webviewCreateAtMs > 0L) (bootCompleteAtMs - webviewCreateAtMs) else -1L
+                val firstByteMs = if (webviewCreateAtMs > 0L && indexFirstByteAtMs > 0L) (indexFirstByteAtMs - webviewCreateAtMs) else -1L
+                val domMs = if (webviewCreateAtMs > 0L && pageFinishedAtMs > 0L) (pageFinishedAtMs - webviewCreateAtMs) else -1L
+                appendLog(
+                    "info",
+                    "[perf] webview boot_complete: total=${totalMs}ms index_first_byte=${firstByteMs}ms dom_ready=${domMs}ms payload=$payloadJson",
+                )
+                flushPendingFloatingAttachment()
+            }
+            "close_floating_window" -> runCatching {
+                val obj = JSONObject(payloadJson)
+                val target = obj.optString("target", "")
+                val hideForChat = obj.optBoolean("hideForChat", false)
+                closeFloatingWindowFromJs(target, hideForChat)
+            }
             "mvu_ready" -> isMvuActive = true
             "mvu_error" -> isMvuActive = false
             "iphonie_tts_state" -> runCatching {
@@ -994,6 +1296,8 @@ object TavernRuntimeManager {
     @SuppressLint("SetJavaScriptEnabled")
     private fun createWebView(context: Context) {
         appContext = context
+        webviewCreateAtMs = System.currentTimeMillis()
+        _isBootReadyFlow.value = false
         val wv = WebView(context)
         // [P1-2] 离屏主运行时 WebView 永不需要输入焦点，禁止其抢夺软键盘焦点
         wv.isFocusable = false
@@ -1015,7 +1319,10 @@ object TavernRuntimeManager {
 
             override fun onPageFinished(view: WebView, url: String) {
                 pageReady = true
-                appendLog("info", "运行时页面就绪: $url")
+                pageFinishedAtMs = System.currentTimeMillis()
+                recordWebViewBootStage("host-runtime", "main", "dom_content_loaded", "url=$url (onPageFinished != runtime_ready)")
+                appendLog("info", "运行时页面 DOM 就绪 (等待 ESM boot_complete): $url")
+                flushPendingFloatingAttachment()
                 fireEvent("app_ready", "{}")
                 // 若是渲染器崩溃后的自愈重建，补发一次 active_conversation_changed 恢复当前会话脚本与 MVU
                 val activeConv = activeConversationId
@@ -1062,8 +1369,12 @@ object TavernRuntimeManager {
                 return true
             }
         }
+        wv.webChromeClient = RikkaWebChromeClient(context, sourceTag = "host-runtime")
         wv.addJavascriptInterface(TavernJsBridge(), "RikkaBridge")
         webView = wv
+        recordWebViewBootStage("host-runtime", "main", "webview_create", "created offscreen host WebView")
+        flushPendingFloatingAttachment()
+        recordWebViewBootStage("host-runtime", "main", "first_navigation", "url=${BASE_URL}index.html")
         wv.loadUrl("${BASE_URL}index.html")
     }
 
@@ -1115,6 +1426,21 @@ object TavernRuntimeManager {
             if (resolved != null) {
                 return openFileResponse(resolved) ?: notFound()
             }
+            return notFound()
+        }
+        // 0.3) [Req 3] ST `/thumbnail` 角色头像缩略图端点（如 `/thumbnail?type=avatar&file=xxx.png`）
+        if (path == "/thumbnail") {
+            val ctx = appContext ?: return notFound()
+            val fileParam = uri.getQueryParameter("file")?.trim().orEmpty()
+            if (fileParam.isNotEmpty()) {
+                resolveLocalCharacterAssetFile(ctx, "characters/$fileParam")?.let {
+                    return openFileResponse(it) ?: notFound()
+                }
+            }
+            resolveActiveAssistantAvatarFile(ctx)?.let {
+                return openFileResponse(it) ?: notFound()
+            }
+            openAsset("icons/tavern.png")?.let { return it }
             return notFound()
         }
         // 0.5) [v228 S1] ST `/version` 端点
@@ -1221,7 +1547,27 @@ object TavernRuntimeManager {
                 }
             }
         }
+        // 4) 若请求为 /characters/<id>.png 或当前角色头像别名，回退解析当前助手的 Avatar.Image
+        if (clean.startsWith("characters/") || queryTarget.endsWith(".png", ignoreCase = true)) {
+            resolveActiveAssistantAvatarFile(ctx, explicitAssistantId ?: activeAst?.id)?.let { return it }
+        }
         return null
+    }
+
+    internal fun resolveActiveAssistantAvatarFile(
+        ctx: Context,
+        targetAssistantId: kotlin.uuid.Uuid? = activeAssistant?.id,
+    ): File? {
+        val id = targetAssistantId ?: return null
+        val aliasFile = File(ctx.filesDir, "charx_assets/$id/$id.png")
+        if (aliasFile.isFile && aliasFile.length() > 0L) return aliasFile
+        val ast = activeAssistant?.takeIf { it.id == id } ?: return null
+        val avatarUrl = (ast.avatar as? me.rerere.rikkahub.data.model.Avatar.Image)?.url ?: return null
+        me.rerere.rikkahub.ui.pages.assistant.detail.ensureAssistantAvatarAlias(ctx, id, avatarUrl)
+        if (aliasFile.isFile && aliasFile.length() > 0L) return aliasFile
+        val parsed = runCatching { Uri.parse(avatarUrl) }.getOrNull()
+        val directFile = parsed?.path?.let { File(it) }?.takeIf { it.isFile }
+        return directFile
     }
 
     /**
@@ -1260,20 +1606,39 @@ object TavernRuntimeManager {
         return null
     }
 
+    internal fun assetHeaders(assetPath: String, contentLength: Long? = null): Map<String, String> {
+        val lower = assetPath.lowercase(Locale.ROOT)
+        val cacheControl = when {
+            lower.contains("/vendor/") || lower.contains("/katex/") || lower.contains("/mvu/") ||
+                lower.endsWith(".woff2") || lower.endsWith(".woff") || lower.endsWith(".ttf") ->
+                "public, max-age=31536000, immutable"
+            else ->
+                "public, max-age=3600"
+        }
+        val headers = LinkedHashMap<String, String>(4)
+        headers["Access-Control-Allow-Origin"] = "*"
+        headers["Cache-Control"] = cacheControl
+        if (contentLength != null && contentLength >= 0L) {
+            headers["Content-Length"] = contentLength.toString()
+        }
+        return headers
+    }
+
     /** 打开本地资产（命中返回 200 响应，未命中返回 null）。 */
     private fun openAsset(assetPath: String): WebResourceResponse? {
         val ctx = appContext ?: return null
         return try {
+            if (assetPath.endsWith("index.html") && indexFirstByteAtMs == 0L) {
+                indexFirstByteAtMs = System.currentTimeMillis()
+            }
+            val length = runCatching { ctx.assets.openFd(assetPath).use { it.length } }.getOrNull()
             val stream = ctx.assets.open(assetPath)
             WebResourceResponse(
                 mimeOf(assetPath),
                 null,
                 200,
                 "OK",
-                mapOf(
-                    "Access-Control-Allow-Origin" to "*",
-                    "Cache-Control" to "no-cache",
-                ),
+                assetHeaders(assetPath, length),
                 stream,
             )
         } catch (_: Exception) {
@@ -1300,16 +1665,14 @@ object TavernRuntimeManager {
     /** 打开文件系统文件（命中返回 200 响应，未命中返回 null）。 */
     private fun openFileResponse(file: File): WebResourceResponse? {
         return try {
+            val len = file.length().takeIf { it >= 0L }
             val stream = FileInputStream(file)
             WebResourceResponse(
                 mimeOf(file.name),
                 null,
                 200,
                 "OK",
-                mapOf(
-                    "Access-Control-Allow-Origin" to "*",
-                    "Cache-Control" to "no-cache",
-                ),
+                assetHeaders(file.name, len),
                 stream,
             )
         } catch (_: Exception) {
@@ -1683,7 +2046,15 @@ object TavernRuntimeManager {
     }
 
     fun setActiveConversation(conversationId: String?) {
+        val previous = activeConversationId
         activeConversationId = conversationId
+        if (previous != null && previous != conversationId) {
+            runCatching {
+                me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.resetForTest()
+                me.rerere.rikkahub.ui.components.message.ActivePanelWebViewPool.clearAll()
+                me.rerere.rikkahub.ui.components.message.DetachedPanelWebViewCache.clearAll()
+            }
+        }
         fireEvent(
             "active_conversation_changed",
             buildJsonObject { put("conversation_id", conversationId ?: "") }.toString(),
@@ -1882,6 +2253,422 @@ object TavernRuntimeManager {
     fun logs(): List<String> = logs.toList()
 
     fun clearLogs() = logs.clear()
+
+    internal const val MAX_PROXY_REDIRECTS = 5
+    internal const val MAX_PROXY_RESPONSE_BYTES = 15 * 1024 * 1024 // 15 MB cap
+
+    private val SENSITIVE_REDIRECT_HEADERS = setOf(
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+    )
+
+    internal fun isBlockedIpv4Bytes(b0: Int, b1: Int, b2: Int, b3: Int): Boolean {
+        if (b0 == 0) return true // 0.0.0.0/8
+        if (b0 == 10) return true // 10.0.0.0/8
+        if (b0 == 100 && b1 in 64..127) return true // 100.64.0.0/10 CGNAT
+        if (b0 == 127) return true // 127.0.0.0/8 loopback
+        if (b0 == 169 && b1 == 254) return true // 169.254.0.0/16 link-local & cloud metadata
+        if (b0 == 172 && b1 in 16..31) return true // 172.16.0.0/12
+        if (b0 == 192 && b1 == 0 && (b2 == 0 || b2 == 2)) return true
+        if (b0 == 192 && b1 == 168) return true // 192.168.0.0/16
+        if (b0 == 198 && (b1 == 18 || b1 == 19)) return true
+        if (b0 == 198 && b1 == 51 && b2 == 100) return true
+        if (b0 == 203 && b1 == 0 && b2 == 113) return true
+        if (b0 >= 224) return true // multicast / reserved
+        return false
+    }
+
+    internal fun isBlockedProxyInetAddress(addr: java.net.InetAddress): Boolean {
+        if (
+            addr.isAnyLocalAddress ||
+            addr.isLoopbackAddress ||
+            addr.isLinkLocalAddress ||
+            addr.isSiteLocalAddress ||
+            addr.isMulticastAddress
+        ) {
+            return true
+        }
+        val raw = addr.address ?: return true
+        if (raw.size == 4) {
+            return isBlockedIpv4Bytes(
+                raw[0].toInt() and 0xff,
+                raw[1].toInt() and 0xff,
+                raw[2].toInt() and 0xff,
+                raw[3].toInt() and 0xff,
+            )
+        }
+        if (raw.size == 16) {
+            val b0 = raw[0].toInt() and 0xff
+            val b1 = raw[1].toInt() and 0xff
+            // fc00::/7 Unique Local Address (ULA) or fe80::/10 Link-Local or ff00::/8 Multicast
+            if ((b0 and 0xfe) == 0xfc || (b0 == 0xfe && (b1 and 0xc0) == 0x80) || b0 == 0xff) {
+                return true
+            }
+            // IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), or NAT64 (64:ff9b::a.b.c.d)
+            val isV4Mapped = (0 until 10).all { raw[it].toInt() == 0 } &&
+                ((raw[10].toInt() == 0 && raw[11].toInt() == 0) ||
+                    ((raw[10].toInt() and 0xff) == 0xff && (raw[11].toInt() and 0xff) == 0xff))
+            val isNat64 = (raw[0].toInt() and 0xff) == 0x00 && (raw[1].toInt() and 0xff) == 0x64 &&
+                (raw[2].toInt() and 0xff) == 0xff && (raw[3].toInt() and 0xff) == 0x9b &&
+                (4 until 12).all { raw[it].toInt() == 0 }
+            if (isV4Mapped || isNat64) {
+                return isBlockedIpv4Bytes(
+                    raw[12].toInt() and 0xff,
+                    raw[13].toInt() and 0xff,
+                    raw[14].toInt() and 0xff,
+                    raw[15].toInt() and 0xff,
+                )
+            }
+        }
+        return false
+    }
+
+    internal fun validateProxyTargetUrl(rawUrl: String, resolveDns: Boolean = true): java.net.URI {
+        val trimmed = rawUrl.trim()
+        require(trimmed.isNotEmpty()) { "Proxy target URL cannot be empty" }
+        val uri = java.net.URI(trimmed)
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        require(scheme == "http" || scheme == "https") { "Unsupported proxy protocol: $scheme" }
+        require(uri.rawUserInfo.isNullOrEmpty() && uri.userInfo.isNullOrEmpty()) {
+            "Embedded credentials in proxy URL are forbidden"
+        }
+        val rawHost = uri.host?.trim()?.lowercase()?.trimEnd('.')?.removePrefix("[")?.removeSuffix("]").orEmpty()
+        require(rawHost.isNotEmpty()) { "Proxy target URL is missing host" }
+        require(
+            rawHost != "localhost" &&
+                !rawHost.endsWith(".localhost") &&
+                rawHost != "local" &&
+                !rawHost.endsWith(".local") &&
+                !rawHost.endsWith(".internal") &&
+                rawHost != "metadata" &&
+                rawHost != "metadata.google.internal" &&
+                rawHost != "instance-data"
+        ) {
+            "Proxy target host is forbidden: $rawHost"
+        }
+        if (Regex("""^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*$""", RegexOption.IGNORE_CASE).matches(rawHost)) {
+            val parts = rawHost.split('.')
+            require(parts.size == 4 && parts.none { it.startsWith("0x", ignoreCase = true) || (it.length > 1 && it.startsWith("0")) }) {
+                "Non-standard IPv4 literal encoding is forbidden: $rawHost"
+            }
+            val nums = parts.map { it.toIntOrNull() ?: -1 }
+            require(nums.all { it in 0..255 } && !isBlockedIpv4Bytes(nums[0], nums[1], nums[2], nums[3])) {
+                "Private, loopback, or reserved IPv4 address is forbidden: $rawHost"
+            }
+        }
+        if (resolveDns) {
+            val addresses = java.net.InetAddress.getAllByName(rawHost)
+            require(addresses.isNotEmpty()) { "Unable to resolve proxy target host: $rawHost" }
+            for (addr in addresses) {
+                require(!isBlockedProxyInetAddress(addr)) {
+                    "Proxy target resolved to forbidden private/loopback/link-local address: $rawHost"
+                }
+            }
+        }
+        return uri
+    }
+
+    private fun readBoundedProxyBytes(stream: java.io.InputStream?, maxBytes: Int = MAX_PROXY_RESPONSE_BYTES): ByteArray {
+        if (stream == null) return ByteArray(0)
+        stream.use { input ->
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            var total = 0
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > maxBytes) {
+                    throw IllegalArgumentException("Proxy response exceeds maximum allowed size ($maxBytes bytes)")
+                }
+                out.write(buf, 0, n)
+            }
+            return out.toByteArray()
+        }
+    }
+
+    internal fun abortProxyHttpRequest(reqId: String) {
+        activeProxyHttpJobs.remove(reqId)?.cancel()
+        runCatching { activeProxyHttpCalls.remove(reqId)?.disconnect() }
+    }
+
+    internal fun dispatchProxyHttpRequestAsync(
+        reqId: String,
+        method: String,
+        targetUrl: String,
+        headersJson: String,
+        body: String,
+    ) {
+        val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun emitProxyCallbackOnce(payloadJson: String) {
+            if (settled.compareAndSet(false, true)) {
+                eval(
+                    "window.__rikkaProxyHttpCallback && window.__rikkaProxyHttpCallback(" +
+                        JSONObject.quote(reqId) + "," +
+                        JSONObject.quote(payloadJson) + ");",
+                )
+            }
+        }
+
+        val job = runtimeScope.launch(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
+            try {
+                var currentUri = validateProxyTargetUrl(targetUrl, resolveDns = true)
+                var currentMethod = method.uppercase().ifBlank { "GET" }
+                var currentBody = body
+                val initialHeaders = linkedMapOf<String, String>()
+                runCatching {
+                    val hdrs = JSONObject(headersJson.ifBlank { "{}" })
+                    val keys = hdrs.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val lower = k.lowercase()
+                        if (lower == "host" || lower == "origin" || lower == "referer" || lower.startsWith("x-csrf")) continue
+                        initialHeaders[k] = hdrs.optString(k, "")
+                    }
+                }
+                var activeHeaders = initialHeaders.toMutableMap()
+                var redirects = 0
+
+                while (true) {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    conn?.disconnect()
+                    val opened = (currentUri.toURL().openConnection() as java.net.HttpURLConnection).apply {
+                        requestMethod = currentMethod
+                        connectTimeout = 20_000
+                        readTimeout = 90_000
+                        instanceFollowRedirects = false
+                    }
+                    conn = opened
+                    activeProxyHttpCalls[reqId] = opened
+                    for ((k, v) in activeHeaders) {
+                        opened.setRequestProperty(k, v)
+                    }
+                    if (currentMethod == "POST" || currentMethod == "PUT" || currentMethod == "PATCH") {
+                        opened.doOutput = true
+                        opened.outputStream.use { os ->
+                            os.write(currentBody.toByteArray(Charsets.UTF_8))
+                        }
+                    }
+                    val status = opened.responseCode
+                    if (status in listOf(301, 302, 303, 307, 308)) {
+                        val location = opened.getHeaderField("Location")?.trim().orEmpty()
+                        if (location.isEmpty()) break
+                        redirects++
+                        require(redirects <= MAX_PROXY_REDIRECTS) {
+                            "Proxy target exceeded maximum redirects ($MAX_PROXY_REDIRECTS)"
+                        }
+                        val nextResolved = currentUri.resolve(location).toString()
+                        val nextUri = validateProxyTargetUrl(nextResolved, resolveDns = true)
+                        val sameOrigin = nextUri.scheme.equals(currentUri.scheme, ignoreCase = true) &&
+                            nextUri.host.equals(currentUri.host, ignoreCase = true) &&
+                            nextUri.port == currentUri.port
+                        if (!sameOrigin) {
+                            val iter = activeHeaders.keys.iterator()
+                            while (iter.hasNext()) {
+                                if (iter.next().lowercase() in SENSITIVE_REDIRECT_HEADERS) {
+                                    iter.remove()
+                                }
+                            }
+                        }
+                        if (status == 303 || ((status == 301 || status == 302) && currentMethod == "POST")) {
+                            currentMethod = "GET"
+                            currentBody = ""
+                        }
+                        currentUri = nextUri
+                        continue
+                    }
+
+                    val declaredLen = opened.contentLengthLong
+                    require(declaredLen <= MAX_PROXY_RESPONSE_BYTES) {
+                        "Proxy response Content-Length ($declaredLen) exceeds maximum allowed size ($MAX_PROXY_RESPONSE_BYTES bytes)"
+                    }
+                    val stream = if (status in 200..299) opened.inputStream else (opened.errorStream ?: opened.inputStream)
+                    val bytes = readBoundedProxyBytes(stream, MAX_PROXY_RESPONSE_BYTES)
+                    val contentType = opened.contentType ?: "application/octet-stream"
+                    val respHeaders = JSONObject().apply {
+                        put("Content-Type", contentType)
+                    }
+                    val b64 = java.util.Base64.getEncoder().encodeToString(bytes)
+                    val respJson = JSONObject().apply {
+                        put("status", status)
+                        put("headers", respHeaders)
+                        put("bodyBase64", b64)
+                    }.toString()
+                    emitProxyCallbackOnce(respJson)
+                    break
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                val respJson = JSONObject().put("aborted", true).toString()
+                emitProxyCallbackOnce(respJson)
+                throw e
+            } catch (e: Throwable) {
+                val safeMsg = me.rerere.rikkahub.ui.pages.imggen.classifyImageGenerationError(e)
+                appendLog("warn", "[proxy] request failed reqId=$reqId error=$safeMsg")
+                val respJson = JSONObject().apply {
+                    put("networkError", true)
+                    put("error", safeMsg)
+                }.toString()
+                emitProxyCallbackOnce(respJson)
+            } finally {
+                activeProxyHttpJobs.remove(reqId)
+                activeProxyHttpCalls.remove(reqId)
+                runCatching { conn?.disconnect() }
+            }
+        }
+        activeProxyHttpJobs[reqId] = job
+    }
+
+    internal fun queryImageGenerationStatusJson(): String {
+        imageGenerationStatusSupplier?.invoke()?.takeIf { it.isNotBlank() }?.let { return it }
+        return runCatching {
+            val settingsStore = org.koin.java.KoinJavaComponent.get<me.rerere.rikkahub.data.datastore.SettingsStore>(
+                me.rerere.rikkahub.data.datastore.SettingsStore::class.java
+            )
+            val settings = settingsStore.settingsFlow.value
+            val enabledProviders = settings.providers.filter { it.enabled }
+            val imgModels = enabledProviders.flatMap { it.models }
+                .filter { it.type == me.rerere.ai.provider.ModelType.IMAGE || it.modelId.contains("image", ignoreCase = true) || it.modelId.contains("dall-e", ignoreCase = true) || it.modelId.contains("flux", ignoreCase = true) }
+            val selected = enabledProviders.flatMap { it.models }.firstOrNull { it.id == settings.imageGenerationModelId }
+                ?: imgModels.firstOrNull()
+            val provider = selected?.let { m -> enabledProviders.firstOrNull { p -> m in p.models } }
+            val hasValidAuth = when (provider) {
+                is me.rerere.ai.provider.ProviderSetting.ApiKey -> provider.apiKey.isNotBlank()
+                is me.rerere.ai.provider.ProviderSetting.Account -> provider.credential != null
+                null -> false
+            }
+            JSONObject().apply {
+                put("configured", selected != null && hasValidAuth)
+                put("modelId", selected?.modelId ?: "gpt-image-1")
+                put("providerName", provider?.name ?: "")
+                val arr = org.json.JSONArray()
+                (imgModels.map { it.modelId } + listOfNotNull(selected?.modelId)).distinct().forEach { arr.put(it) }
+                put("models", arr)
+            }.toString()
+        }.getOrElse {
+            JSONObject().put("configured", false).put("modelId", "gpt-image-1").toString()
+        }
+    }
+
+    internal fun cancelJsImageGeneration(reqId: String) {
+        activeJsImageGenJobs.remove(reqId)?.cancel()
+    }
+
+    internal fun dispatchJsImageGenerationAsync(reqId: String, bodyJson: String) {
+        val job = runtimeScope.launch(Dispatchers.IO) {
+            try {
+                val customHook = imageGenerationHook
+                if (customHook != null) {
+                    val b64 = me.rerere.rikkahub.ui.pages.imggen.extractValidImageBase64(customHook(bodyJson))
+                    val respJson = JSONObject().apply {
+                        put("ok", true)
+                        put("status", 200)
+                        put("b64_json", b64)
+                        put("format", "png")
+                    }.toString()
+                    eval(
+                        "window.__rikkaImgGenCallback && window.__rikkaImgGenCallback(" +
+                            JSONObject.quote(reqId) + "," +
+                            JSONObject.quote(respJson) + ");",
+                    )
+                    return@launch
+                }
+
+                val bodyObj = JSONObject(bodyJson.ifBlank { "{}" })
+                val prompt = bodyObj.optString("prompt", "").trim()
+                if (prompt.isEmpty()) {
+                    throw IllegalArgumentException("请先填写生图提示词（prompt 不能为空）")
+                }
+                val requestedSize = me.rerere.rikkahub.ui.pages.imggen.normalizeImageGenSize(bodyObj.optString("size", "1024x1024"))
+                val requestedModelId = bodyObj.optString("model", "").trim()
+
+                val settingsStore = org.koin.java.KoinJavaComponent.get<me.rerere.rikkahub.data.datastore.SettingsStore>(
+                    me.rerere.rikkahub.data.datastore.SettingsStore::class.java
+                )
+                val providerManager = org.koin.java.KoinJavaComponent.get<me.rerere.ai.provider.ProviderManager>(
+                    me.rerere.ai.provider.ProviderManager::class.java
+                )
+                val settings = settingsStore.awaitLoaded()
+                val enabledProviders = settings.providers.filter { it.enabled }
+                val allModels = enabledProviders.flatMap { p -> p.models.map { it to p } }
+                val matchedPair = allModels.firstOrNull { (m, _) ->
+                    requestedModelId.isNotEmpty() && (m.modelId.equals(requestedModelId, ignoreCase = true) || m.displayName.equals(requestedModelId, ignoreCase = true))
+                } ?: allModels.firstOrNull { (m, _) -> m.id == settings.imageGenerationModelId }
+                    ?: allModels.firstOrNull { (m, _) -> m.type == me.rerere.ai.provider.ModelType.IMAGE }
+                    ?: throw IllegalStateException("No model selected")
+
+                val (model, provider) = matchedPair
+                if (provider is me.rerere.ai.provider.ProviderSetting.ApiKey && provider.apiKey.isBlank()) {
+                    throw IllegalStateException("Missing API key")
+                }
+
+                val params = me.rerere.ai.provider.ImageGenerationParams(
+                    model = model,
+                    prompt = prompt,
+                    numOfImages = 1,
+                    size = requestedSize,
+                    customHeaders = model.customHeaders,
+                    customBody = model.customBodies,
+                )
+                var finalB64: String? = null
+                providerManager.getProviderByType(provider)
+                    .generateImage(provider, params)
+                    .collect { item ->
+                        if (!item.partial && item.data.isNotBlank()) {
+                            finalB64 = me.rerere.rikkahub.ui.pages.imggen.extractValidImageBase64(item.data)
+                        }
+                    }
+                val validB64 = finalB64 ?: throw IllegalArgumentException("Malformed image payload: empty image data")
+                val respJson = JSONObject().apply {
+                    put("ok", true)
+                    put("status", 200)
+                    put("b64_json", validB64)
+                    put("format", "png")
+                }.toString()
+                eval(
+                    "window.__rikkaImgGenCallback && window.__rikkaImgGenCallback(" +
+                        JSONObject.quote(reqId) + "," +
+                        JSONObject.quote(respJson) + ");",
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                val respJson = JSONObject().put("aborted", true).toString()
+                eval(
+                    "window.__rikkaImgGenCallback && window.__rikkaImgGenCallback(" +
+                        JSONObject.quote(reqId) + "," +
+                        JSONObject.quote(respJson) + ");",
+                )
+                throw e
+            } catch (e: Throwable) {
+                val classified = me.rerere.rikkahub.ui.pages.imggen.classifyImageGenerationError(e)
+                val status = when {
+                    classified.contains("401") -> 401
+                    classified.contains("403") -> 403
+                    classified.contains("429") -> 429
+                    classified.contains("超时") -> 504
+                    else -> 400
+                }
+                appendLog("warn", "[imggen-js] failed reqId=$reqId status=$status msg=$classified")
+                val respJson = JSONObject().apply {
+                    put("ok", false)
+                    put("status", status)
+                    put("error", classified)
+                }.toString()
+                eval(
+                    "window.__rikkaImgGenCallback && window.__rikkaImgGenCallback(" +
+                        JSONObject.quote(reqId) + "," +
+                        JSONObject.quote(respJson) + ");",
+                )
+            } finally {
+                activeJsImageGenJobs.remove(reqId)
+            }
+        }
+        activeJsImageGenJobs[reqId] = job
+    }
 
     // ==================== JS 桥 ====================
 
@@ -2183,12 +2970,25 @@ object TavernRuntimeManager {
          * JS 侧聊天记录内容变更（swipes / swipe_id / mes / is_system / name）回写宿主。
          */
         @JavascriptInterface
-        fun updateChatMessages(jsonText: String) {
-            try {
-                chatUpdater?.invoke(jsonText)
+        fun updateChatMessages(jsonText: String): Boolean {
+            return try {
+                val updater = chatUpdater
+                if (updater == null) {
+                    appendLog("warn", "[chat] updateChatMessages: chatUpdater not wired")
+                    false
+                } else {
+                    updater.invoke(jsonText)
+                    true
+                }
             } catch (e: Exception) {
                 appendLog("error", "[chat] updateChatMessages failed: ${e.message}")
+                false
             }
+        }
+
+        @JavascriptInterface
+        fun closeFloatingWindow(target: String, hideForChat: Boolean): Boolean {
+            return closeFloatingWindowFromJs(target, hideForChat)
         }
 
         /** [v214] JSR/面板世界书写回：entriesJson = [{uid,disable},...] 整本书补丁。 */
@@ -2199,6 +2999,10 @@ object TavernRuntimeManager {
         /** [v214] 面板表单发送：把文本作为普通用户消息发送。 */
         @JavascriptInterface
         fun sendUserMessage(text: String): Boolean = dispatchUserMessage(text)
+
+        /** JS `SillyTavern.getContext().stopGeneration()` / `stopGeneration()` 宿主桥。 */
+        @JavascriptInterface
+        fun stopGeneration(): Boolean = dispatchStopGeneration()
 
         /**
          * [v243 BUGFIX A2] JS `createChatMessages` 的宿主桥：把楼层**插入**当前会话（不触发生成）。
@@ -2451,10 +3255,10 @@ object TavernRuntimeManager {
             TavernRuntimeManager.startChatCompletionStream(reqId, bodyJson)
         }
 
-        /** SSE 流结束（JS 侧 `finally` 也调一次，保证 GC）。 */
+        /** SSE 流结束或主动取消（真正取消底层协程 Job 并释放连接）。 */
         @JavascriptInterface
         fun chatCompletionCancel(reqId: String?) {
-            TavernRuntimeManager.appendLog("debug", "[a1] client cancelled reqId=$reqId")
+            TavernRuntimeManager.cancelChatCompletionStream(reqId)
         }
 
         /** 通道自检（真机取证用）。 */
@@ -2583,7 +3387,416 @@ object TavernRuntimeManager {
         fun nodePluginHttpAbort(reqId: String) {
             TavernNodeServiceManager.abortPluginHttpRequest(reqId)
         }
+
+        @JavascriptInterface
+        fun proxyHttpRequestAsync(
+            reqId: String,
+            method: String,
+            targetUrl: String,
+            headersJson: String,
+            body: String,
+        ) {
+            dispatchProxyHttpRequestAsync(reqId, method, targetUrl, headersJson, body)
+        }
+
+        @JavascriptInterface
+        fun proxyHttpAbort(reqId: String) {
+            abortProxyHttpRequest(reqId)
+        }
+
+        @JavascriptInterface
+        fun getImageGenerationStatusJson(): String {
+            return queryImageGenerationStatusJson()
+        }
+
+        @JavascriptInterface
+        fun generateImageFromJsAsync(reqId: String, bodyJson: String) {
+            dispatchJsImageGenerationAsync(reqId, bodyJson)
+        }
+
+        @JavascriptInterface
+        fun cancelImageGenerationFromJs(reqId: String) {
+            cancelJsImageGeneration(reqId)
+        }
+
+        /**
+         * [ST 1.19 P0] JS `substituteParams` / `substituteParamsExtended` 同步宏桥：
+         * 直接调用 Kotlin 原生 `MacroEngine.evaluate`，支持全部 82+ 具名宏与 `TavernVariableStore` 读写。
+         */
+        @JavascriptInterface
+        fun substituteParams(text: String, contextJson: String = "{}"): String {
+            return evaluateMacrosFromJs(text, contextJson)
+        }
+
+        /**
+         * [ST 1.19 P0] JS `getWorldInfoPrompt` 同步世界书扫描桥（只读，不修改粘性/冷却状态）。
+         */
+        @JavascriptInterface
+        fun getWorldInfoPrompt(
+            chatJson: String,
+            maxContext: Int,
+            isDryRun: Boolean,
+            globalScanDataJson: String,
+        ): String {
+            return evaluateWorldInfoFromJs(
+                chatJson = chatJson,
+                maxContext = maxContext,
+                isDryRun = isDryRun,
+                globalScanDataJson = globalScanDataJson,
+            )
+        }
+
+        /**
+         * [ST 1.19 P0] JS `checkWorldInfo` 同步世界书激活检查桥（返回完整 8 键 + found + allActivatedEntries JSON）。
+         */
+        @JavascriptInterface
+        fun checkWorldInfo(
+            chatJson: String,
+            maxContext: Int,
+            isDryRun: Boolean,
+            globalScanDataJson: String,
+        ): String {
+            return evaluateWorldInfoFromJs(
+                chatJson = chatJson,
+                maxContext = maxContext,
+                isDryRun = isDryRun,
+                globalScanDataJson = globalScanDataJson,
+            )
+        }
     }
+
+    /**
+     * 供 JS 桥与单元测试直接调用的同步宏展开实现。
+     */
+    internal fun evaluateMacrosFromJs(text: String, contextJson: String = "{}"): String {
+        if (text.isEmpty() || (!text.contains("{{") && !text.contains("<USER>", ignoreCase = true) && !text.contains("<CHAR>", ignoreCase = true) && !text.contains("<BOT>", ignoreCase = true))) {
+            return text
+        }
+        return runCatching {
+            me.rerere.rikkahub.data.st.macro.MacroDefinitions.registerAll()
+            val ctxObj = runCatching { JSONObject(contextJson.ifBlank { "{}" }) }.getOrNull()
+            val ast = activeAssistant
+            val tav = ast?.tavernData
+            val userName = ctxObj?.optString("name1", "")?.takeIf { it.isNotEmpty() } ?: "User"
+            val charName = ctxObj?.optString("name2", "")?.takeIf { it.isNotEmpty() }
+                ?: tav?.nickname?.takeIf { it.isNotBlank() }
+                ?: ast?.name?.takeIf { it.isNotBlank() }
+                ?: "Assistant"
+            val groupName = ctxObj?.optString("group", "")?.takeIf { it.isNotEmpty() } ?: ""
+            val originalText = ctxObj?.optString("original", "")
+            val convId = activeConversationId
+            val localStore = object : me.rerere.rikkahub.data.st.macro.MacroVariableStore {
+                private val key = convId ?: "__st_js_local__"
+                override fun get(name: String): String? = TavernVariableStore.macroGet(key, name)
+                override fun has(name: String): Boolean = TavernVariableStore.macroHas(key, name)
+                override fun set(name: String, value: String) = TavernVariableStore.macroSet(key, name, value)
+                override fun del(name: String) = TavernVariableStore.macroDelete(key, name)
+                override fun inc(name: String): String = TavernVariableStore.macroInc(key, name)
+                override fun dec(name: String): String = TavernVariableStore.macroDec(key, name)
+                override fun add(name: String, value: String) { TavernVariableStore.macroAdd(key, name, value) }
+                override fun getAtKey(name: String, key: String): String? =
+                    me.rerere.rikkahub.data.st.macro.MacroVarKeyOps.getAtKey(TavernVariableStore.macroGet(this.key, name), key)
+                override fun setAtKey(name: String, key: String, value: String) {
+                    val next = me.rerere.rikkahub.data.st.macro.MacroVarKeyOps.setAtKey(TavernVariableStore.macroGet(this.key, name), key, value)
+                    TavernVariableStore.macroSet(this.key, name, next)
+                }
+            }
+            val globalStore = object : me.rerere.rikkahub.data.st.macro.MacroVariableStore {
+                override fun get(name: String): String? = TavernVariableStore.macroGet(null, name)
+                override fun has(name: String): Boolean = TavernVariableStore.macroHas(null, name)
+                override fun set(name: String, value: String) = TavernVariableStore.macroSet(null, name, value)
+                override fun del(name: String) = TavernVariableStore.macroDelete(null, name)
+                override fun inc(name: String): String = TavernVariableStore.macroInc(null, name)
+                override fun dec(name: String): String = TavernVariableStore.macroDec(null, name)
+                override fun add(name: String, value: String) { TavernVariableStore.macroAdd(null, name, value) }
+                override fun getAtKey(name: String, key: String): String? =
+                    me.rerere.rikkahub.data.st.macro.MacroVarKeyOps.getAtKey(TavernVariableStore.macroGet(null, name), key)
+                override fun setAtKey(name: String, key: String, value: String) {
+                    val next = me.rerere.rikkahub.data.st.macro.MacroVarKeyOps.setAtKey(TavernVariableStore.macroGet(null, name), key, value)
+                    TavernVariableStore.macroSet(null, name, next)
+                }
+            }
+            val dynMacros = LinkedHashMap<String, me.rerere.rikkahub.data.st.macro.DynamicMacro>()
+            for ((mName, entry) in macrosRegistry.get()) {
+                val lower = mName.lowercase()
+                if (me.rerere.rikkahub.data.st.macro.MacroRegistry.hasMacro(lower)) continue
+                if (entry.first != "function") {
+                    dynMacros[lower] = me.rerere.rikkahub.data.st.macro.DynamicMacro.Value(entry.second)
+                }
+            }
+            val chatMessages = runCatching {
+                val rawChat = chatJsonSupplier?.invoke().orEmpty()
+                if (rawChat.isBlank() || rawChat == "[]") emptyList()
+                else {
+                    val arr = org.json.JSONArray(rawChat)
+                    (0 until arr.length()).mapNotNull { idx ->
+                        val o = arr.optJSONObject(idx) ?: return@mapNotNull null
+                        me.rerere.rikkahub.data.st.macro.MacroChatMessage(
+                            text = o.optString("mes", ""),
+                            isUser = o.optBoolean("is_user", false),
+                            isSystem = o.optBoolean("is_system", false),
+                            currentSwipeId = o.optInt("swipe_id", 0) + 1,
+                        )
+                    }
+                }
+            }.getOrDefault(emptyList())
+            val env = me.rerere.rikkahub.data.st.macro.MacroEnv(
+                names = me.rerere.rikkahub.data.st.macro.MacroEnv.Names(
+                    user = userName,
+                    char = charName,
+                    group = groupName,
+                    groupNotMuted = groupName,
+                    notChar = userName,
+                ),
+                character = me.rerere.rikkahub.data.st.macro.MacroEnv.CharacterInfo(
+                    charPrompt = tav?.systemPrompt.orEmpty(),
+                    charInstruction = tav?.postHistoryInstructions.orEmpty(),
+                    description = tav?.description.orEmpty(),
+                    personality = tav?.personality.orEmpty(),
+                    scenario = tav?.scenario.orEmpty(),
+                    mesExamplesRaw = tav?.mesExample.orEmpty(),
+                    version = tav?.characterVersion.orEmpty(),
+                    charDepthPrompt = tav?.depthPrompt.orEmpty(),
+                    creatorNotes = tav?.creatorNotes.orEmpty(),
+                    firstMessage = tav?.firstMessage.orEmpty(),
+                    alternateGreetings = tav?.alternateGreetings.orEmpty(),
+                ),
+                system = me.rerere.rikkahub.data.st.macro.MacroEnv.SystemInfo(
+                    model = currentModelIdSupplier?.invoke().orEmpty(),
+                    chatIdHash = convId?.let { me.rerere.rikkahub.data.st.macro.MacroHash.getStringHash(it) },
+                    maxContextTokens = 32768,
+                    maxResponseTokens = ast?.maxTokens ?: 2048,
+                    syspromptEnabled = ast?.systemPrompt?.isNotBlank() == true,
+                    syspromptContent = ast?.systemPrompt.orEmpty(),
+                ),
+                variables = me.rerere.rikkahub.data.st.macro.VariableStores(
+                    local = localStore,
+                    global = globalStore,
+                ),
+                chat = chatMessages,
+                dynamicMacros = dynMacros,
+                outlets = me.rerere.rikkahub.data.ai.transformers.WorldInfoOutlets.snapshot(convId),
+                originalFn = originalText?.let { orig -> { orig } },
+            )
+            me.rerere.rikkahub.data.st.macro.MacroEngine.evaluate(text, env)
+        }.getOrDefault(text)
+    }
+
+    /**
+     * 供 JS `getWorldInfoPrompt` / `checkWorldInfo` 调用的只读世界书扫描桥。
+     */
+    internal fun evaluateWorldInfoFromJs(
+        chatJson: String,
+        maxContext: Int,
+        isDryRun: Boolean,
+        globalScanDataJson: String,
+    ): String {
+        voidIsDryRun(isDryRun)
+        return runCatching {
+            val chatLines = mutableListOf<String>()
+            runCatching {
+                val arr = org.json.JSONArray(chatJson.ifBlank { "[]" })
+                for (i in 0 until arr.length()) {
+                    when (val el = arr.opt(i)) {
+                        is String -> if (el.isNotBlank()) chatLines += el
+                        is JSONObject -> {
+                            val mes = el.optString("mes", el.optString("content", ""))
+                            if (mes.isNotBlank()) chatLines += mes
+                        }
+                    }
+                }
+            }
+            if (chatLines.isEmpty()) {
+                runCatching {
+                    val fallbackChat = chatJsonSupplier?.invoke().orEmpty()
+                    val arr = org.json.JSONArray(fallbackChat.ifBlank { "[]" })
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val mes = o.optString("mes", "")
+                        if (mes.isNotBlank()) chatLines += mes
+                    }
+                }
+            }
+            val scanCorpus = chatLines.asReversed().joinToString("\n")
+            val beforeParts = mutableListOf<String>()
+            val afterParts = mutableListOf<String>()
+            val anBeforeParts = mutableListOf<String>()
+            val anAfterParts = mutableListOf<String>()
+            val emParts = org.json.JSONArray()
+            val depthParts = org.json.JSONArray()
+            val outletParts = org.json.JSONArray()
+            val activatedEntries = org.json.JSONArray()
+
+            // Collect candidate entries from embedded book and active lorebooks via tavernLorebookSupplier
+            val bookJsons = mutableListOf<JSONObject>()
+            val namesRaw = worldNamesSupplier?.invoke().orEmpty()
+            val worldNamesToScan = linkedSetOf<String>()
+            runCatching {
+                val wnObj = JSONObject(namesRaw.ifBlank { "{}" })
+                val sel = wnObj.optJSONArray("selected_world_info")
+                if (sel != null) {
+                    for (i in 0 until sel.length()) {
+                        sel.optString(i, "").takeIf { it.isNotBlank() }?.let { worldNamesToScan += it }
+                    }
+                }
+            }
+            for (wName in worldNamesToScan) {
+                val rawBook = tavernLorebookSupplier?.invoke(wName).orEmpty()
+                runCatching {
+                    val obj = JSONObject(rawBook)
+                    if (obj.has("entries")) bookJsons += obj
+                }
+            }
+            // Fallback to default lorebook supplier ("")
+            if (bookJsons.isEmpty()) {
+                val rawDefault = tavernLorebookSupplier?.invoke("").orEmpty()
+                runCatching {
+                    val obj = JSONObject(rawDefault)
+                    if (obj.has("entries")) bookJsons += obj
+                }
+            }
+
+            fun matchesEntry(entryObj: JSONObject, corpus: String): Boolean {
+                if (entryObj.optBoolean("disable", false) || !entryObj.optBoolean("enabled", true)) return false
+                if (entryObj.optBoolean("constant", false)) return true
+                val keysArr = entryObj.optJSONArray("key") ?: entryObj.optJSONArray("keys") ?: return false
+                val caseSensitive = entryObj.optBoolean("caseSensitive", false)
+                val primaryHits = (0 until keysArr.length()).mapNotNull { keysArr.optString(it, "").takeIf { k -> k.isNotBlank() } }
+                if (primaryHits.isEmpty()) return false
+                val primaryMatched = primaryHits.any { k ->
+                    if (k.startsWith("/") && k.lastIndexOf('/') > 0) {
+                        val lastSlash = k.lastIndexOf('/')
+                        val pat = k.substring(1, lastSlash)
+                        val flags = k.substring(lastSlash + 1)
+                        val opts = mutableSetOf<RegexOption>()
+                        if ('i' in flags || !caseSensitive) opts += RegexOption.IGNORE_CASE
+                        runCatching { Regex(pat, opts).containsMatchIn(corpus) }.getOrDefault(false)
+                    } else {
+                        corpus.contains(k, ignoreCase = !caseSensitive)
+                    }
+                }
+                if (!primaryMatched) return false
+                val secArr = entryObj.optJSONArray("keysecondary") ?: entryObj.optJSONArray("secondary_keys")
+                val secKeys = if (secArr != null) {
+                    (0 until secArr.length()).mapNotNull { secArr.optString(it, "").takeIf { k -> k.isNotBlank() } }
+                } else emptyList()
+                if (!entryObj.optBoolean("selective", true) || secKeys.isEmpty()) return true
+                val logic = entryObj.optInt("selectiveLogic", entryObj.optInt("selective_logic", 0))
+                return when (logic) {
+                    1 -> !secKeys.all { k -> corpus.contains(k, ignoreCase = !caseSensitive) } // NOT_ALL
+                    2 -> secKeys.none { k -> corpus.contains(k, ignoreCase = !caseSensitive) } // NOT_ANY
+                    3 -> secKeys.all { k -> corpus.contains(k, ignoreCase = !caseSensitive) }  // AND_ALL
+                    else -> secKeys.any { k -> corpus.contains(k, ignoreCase = !caseSensitive) } // AND_ANY (0)
+                }
+            }
+
+            // Also inspect activeAssistant.tavernData.embeddedBook if bookJsons is empty
+            val embeddedEntries = activeAssistant?.tavernData?.embeddedBook?.entries.orEmpty()
+            for (eb in embeddedEntries) {
+                if (eb.disable) continue
+                val entryJson = JSONObject().apply {
+                    put("uid", eb.id)
+                    put("comment", eb.comment)
+                    put("content", eb.content)
+                    put("constant", eb.constant)
+                    put("selective", eb.selective)
+                    put("selectiveLogic", eb.selectiveLogic)
+                    put("position", eb.position)
+                    put("order", eb.priority)
+                    put("depth", eb.depth)
+                    put("outletName", eb.outletName)
+                    put("caseSensitive", eb.caseSensitive)
+                    put("key", org.json.JSONArray(eb.keys))
+                    put("keysecondary", org.json.JSONArray(eb.secondaryKeys))
+                }
+                if (matchesEntry(entryJson, scanCorpus)) {
+                    activatedEntries.put(entryJson)
+                    when (eb.position) {
+                        0 -> beforeParts += eb.content
+                        1 -> afterParts += eb.content
+                        2 -> anBeforeParts += eb.content
+                        3 -> anAfterParts += eb.content
+                        4 -> depthParts.put(JSONObject().put("depth", eb.depth).put("content", eb.content))
+                        5, 6 -> emParts.put(eb.content)
+                        7 -> outletParts.put(JSONObject().put("outletName", eb.outletName).put("content", eb.content))
+                        else -> afterParts += eb.content
+                    }
+                }
+            }
+
+            for (bookObj in bookJsons) {
+                val entriesNode = bookObj.opt("entries")
+                val entryList = mutableListOf<JSONObject>()
+                when (entriesNode) {
+                    is JSONObject -> {
+                        val keys = entriesNode.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            entriesNode.optJSONObject(k)?.let { entryList += it }
+                        }
+                    }
+                    is org.json.JSONArray -> {
+                        for (i in 0 until entriesNode.length()) {
+                            entriesNode.optJSONObject(i)?.let { entryList += it }
+                        }
+                    }
+                }
+                for (eObj in entryList) {
+                    if (matchesEntry(eObj, scanCorpus)) {
+                        val content = eObj.optString("content", "")
+                        if (content.isBlank()) continue
+                        activatedEntries.put(eObj)
+                        when (eObj.optInt("position", 0)) {
+                            0 -> beforeParts += content
+                            1 -> afterParts += content
+                            2 -> anBeforeParts += content
+                            3 -> anAfterParts += content
+                            4 -> depthParts.put(JSONObject().put("depth", eObj.optInt("depth", 4)).put("content", content))
+                            5, 6 -> emParts.put(content)
+                            7 -> outletParts.put(JSONObject().put("outletName", eObj.optString("outletName", "")).put("content", content))
+                            else -> beforeParts += content
+                        }
+                    }
+                }
+            }
+
+            val beforeStr = beforeParts.joinToString("\n")
+            val afterStr = afterParts.joinToString("\n")
+            val combined = listOf(beforeStr, afterStr).filter { it.isNotBlank() }.joinToString("\n")
+            val budget = if (maxContext > 0) (maxContext / 4).coerceAtLeast(256) else 1024
+            JSONObject().apply {
+                put("found", activatedEntries.length() > 0)
+                put("worldInfoString", combined)
+                put("worldInfoBefore", beforeStr)
+                put("worldInfoAfter", afterStr)
+                put("worldInfoExamples", emParts)
+                put("worldInfoDepth", depthParts)
+                put("anBefore", anBeforeParts.joinToString("\n"))
+                put("anAfter", anAfterParts.joinToString("\n"))
+                put("outletEntries", outletParts)
+                put("allActivatedEntries", activatedEntries)
+                put("budget", budget)
+                put("budgetRemaining", (budget - combined.length / 4).coerceAtLeast(0))
+            }.toString()
+        }.getOrElse {
+            JSONObject().apply {
+                put("found", false)
+                put("worldInfoString", "")
+                put("worldInfoBefore", "")
+                put("worldInfoAfter", "")
+                put("worldInfoExamples", org.json.JSONArray())
+                put("worldInfoDepth", org.json.JSONArray())
+                put("anBefore", "")
+                put("anAfter", "")
+                put("outletEntries", org.json.JSONArray())
+                put("allActivatedEntries", org.json.JSONArray())
+                put("budget", 0)
+                put("budgetRemaining", 0)
+            }.toString()
+        }
+    }
+
+    private fun voidIsDryRun(@Suppress("UNUSED_PARAMETER") isDryRun: Boolean) = Unit
 
     // ==================== [v229 A1] /api/backends/chat-completions/{status,generate} ====================
 
@@ -2632,7 +3845,7 @@ object TavernRuntimeManager {
             "[a1] /generate start id=$id stream=$isStreaming model=${model.ifBlank { "-" }} msgs=${req.messages.size}",
         )
 
-        runtimeScope.launch {
+        val job = runtimeScope.launch {
             val buffer = StringBuilder()
             var failed = false
             try {
@@ -2678,8 +3891,32 @@ object TavernRuntimeManager {
             if (!isStreaming && !failed) {
                 emitChatSse(id, TavernChatCompletionsApi.fullCompletion(streamId, model, buffer.toString()))
             }
+            chatCompletionJobs.remove(id)
             finishChatCompletion(id, ok = !failed)
             appendLog("debug", "[a1] /generate done id=$id chars=${buffer.length} ok=${!failed}")
+        }
+        chatCompletionJobs[id] = job
+    }
+
+    private val chatCompletionJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    fun cancelChatCompletionStream(reqId: String?) {
+        val id = reqId?.trim().orEmpty()
+        if (id.isEmpty()) return
+        val job = chatCompletionJobs.remove(id)
+        if (job != null) {
+            job.cancel()
+            finishChatCompletion(id, ok = false)
+            appendLog("info", "[a1] cancelled active chatCompletion job reqId=$id")
+        } else {
+            appendLog("debug", "[a1] client cancelled completed/unknown reqId=$id")
+        }
+    }
+
+    fun cancelAllChatCompletions() {
+        val ids = chatCompletionJobs.keys.toList()
+        for (id in ids) {
+            cancelChatCompletionStream(id)
         }
     }
 

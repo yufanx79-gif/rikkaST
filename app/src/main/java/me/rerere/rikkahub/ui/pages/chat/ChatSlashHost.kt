@@ -1822,6 +1822,7 @@ internal fun buildChatSlashHost(
                             is me.rerere.ai.provider.ProviderSetting.OpenAI -> targetProvider.baseUrl
                             is me.rerere.ai.provider.ProviderSetting.Google -> targetProvider.baseUrl
                             is me.rerere.ai.provider.ProviderSetting.Claude -> targetProvider.baseUrl
+                            is me.rerere.ai.provider.ProviderSetting.Account -> ""
                         }
                     } else {
                         val normalizedUrl = newUrl.trimEnd('/')
@@ -1833,6 +1834,7 @@ internal fun buildChatSlashHost(
                                             is me.rerere.ai.provider.ProviderSetting.OpenAI -> p.copy(baseUrl = normalizedUrl)
                                             is me.rerere.ai.provider.ProviderSetting.Google -> p.copy(baseUrl = normalizedUrl)
                                             is me.rerere.ai.provider.ProviderSetting.Claude -> p.copy(baseUrl = normalizedUrl)
+                                            is me.rerere.ai.provider.ProviderSetting.Account -> p
                                         }
                                     } else p
                                 }

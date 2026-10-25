@@ -1,6 +1,9 @@
 /**
  * rikkaST st-compat: macros/engine/MacroEngine.js
+ * 对齐 SillyTavern 1.19.0 MacroEngine，支持前置/后置处理器与 RikkaBridge.substituteParams / MacroRegistry 求值。
  */
+import { MacroRegistry } from './MacroRegistry.js';
+
 const preProcessors = [];
 const postProcessors = [];
 
@@ -29,11 +32,20 @@ export const MacroEngine = {
             try { out = String(p.handler(out, env) ?? out); } catch (_e) { /* noop */ }
         }
         try {
-            const st = (typeof window !== 'undefined' && window.SillyTavern && window.SillyTavern.getContext)
-                ? window.SillyTavern.getContext()
-                : null;
-            if (st && typeof st.substituteParams === 'function') {
-                out = st.substituteParams(out);
+            if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.substituteParams === 'function') {
+                out = String(window.RikkaBridge.substituteParams(out, JSON.stringify(env || {})) ?? out);
+            } else if (typeof window !== 'undefined' && window.SillyTavern && window.SillyTavern.getContext) {
+                const st = window.SillyTavern.getContext();
+                if (st && typeof st.substituteParams === 'function') {
+                    out = st.substituteParams(out);
+                }
+            } else if (out.includes('{{')) {
+                out = out.replace(/\{\{\s*([a-zA-Z0-9_/-]+)(?:::([^}]*))?\s*\}\}/g, (m, name, rawArgs) => {
+                    const entry = MacroRegistry.getMacro(name) || MacroRegistry.getMacro(String(name).toLowerCase());
+                    if (!entry || typeof entry.handler !== 'function') return m;
+                    const unnamedArgs = rawArgs !== undefined ? String(rawArgs).split('::') : [];
+                    return String(entry.handler({ name, unnamedArgs, list: unnamedArgs, env }) ?? '');
+                });
             }
         } catch (_e) { /* noop */ }
         for (const p of postProcessors) {

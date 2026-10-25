@@ -1,5 +1,3 @@
 package me.rerere.rikkahub.data.api
 
-interface RikkaHubAPI {
-
-}
+typealias RikkaHubAPI = me.rerere.rikkahub.data.remote.RikkaHubAPI

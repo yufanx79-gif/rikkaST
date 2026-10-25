@@ -1,0 +1,11 @@
+{
+  "version": "1.19.0",
+  "slashCommandModuleCount": 27,
+  "explicitUnsupportedMediaCommands": [
+    "speak",
+    "imagine",
+    "imagine-comfy-workflow",
+    "imagine-source",
+    "imagine-style"
+  ]
+}

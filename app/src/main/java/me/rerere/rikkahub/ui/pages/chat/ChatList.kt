@@ -44,6 +44,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
@@ -61,15 +62,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalScrollCaptureInProgress
@@ -79,6 +85,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceAtLeast
 import androidx.compose.ui.zIndex
@@ -93,15 +100,15 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
+import me.rerere.rikkahub.data.model.withConversation
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.ui.components.message.ChatMessage
 import me.rerere.rikkahub.ui.components.ui.ErrorCardsDisplay
-import me.rerere.rikkahub.ui.components.ui.ListSelectableItem
-import me.rerere.rikkahub.ui.components.ui.RabbitLoadingIndicator
-import me.rerere.rikkahub.ui.components.ui.Tooltip
 import me.rerere.rikkahub.ui.hooks.ImeLazyListAutoScroller
 import me.rerere.rikkahub.ui.theme.ChatFontProvider
 import me.rerere.rikkahub.utils.plus
+import me.rerere.ui.components.ListSelectableItem
+import me.rerere.ui.components.Tooltip
 import kotlin.math.roundToInt
 import kotlin.uuid.Uuid
 
@@ -130,6 +137,7 @@ fun ChatList(
     onDelete: (UIMessage) -> Unit = {},
     onDeleteSwipe: ((MessageNode) -> Unit)? = null,
     onUpdateMessage: (MessageNode) -> Unit = {},
+    onToggleHidden: ((MessageNode) -> Unit)? = null,
     onClickSuggestion: (String) -> Unit = {},
     onTranslate: ((UIMessage, java.util.Locale) -> Unit)? = null,
     onClearTranslation: (UIMessage) -> Unit = {},
@@ -137,7 +145,6 @@ fun ChatList(
     onToolApproval: ((toolCallId: String, approved: Boolean, reason: String) -> Unit)? = null,
     onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
     onToggleFavorite: ((MessageNode) -> Unit)? = null,
-    onToggleHidden: ((MessageNode) -> Unit)? = null,
     onConversationSystemPromptChange: ((String?) -> Unit)? = null,
 ) {
     AnimatedContent(
@@ -176,6 +183,7 @@ fun ChatList(
                 onDelete = onDelete,
                 onDeleteSwipe = onDeleteSwipe,
                 onUpdateMessage = onUpdateMessage,
+                onToggleHidden = onToggleHidden,
                 onClickSuggestion = onClickSuggestion,
                 onTranslate = onTranslate,
                 onClearTranslation = onClearTranslation,
@@ -183,12 +191,30 @@ fun ChatList(
                 onToolApproval = onToolApproval,
                 onToolAnswer = onToolAnswer,
                 onToggleFavorite = onToggleFavorite,
-                onToggleHidden = onToggleHidden,
                 onConversationSystemPromptChange = onConversationSystemPromptChange,
             )
         }
     }
 }
+
+// 顶部渐隐：消息滚到标题栏下面时逐渐透明，从状态栏一直淡出到标题栏下沿之外，保证标题可读。
+// 让内容自己变透明而不是盖一层背景色，背景图和动态渐变背景才不会被盖住。
+private fun Modifier.topFadingEdge(height: Dp): Modifier = this
+    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+    .drawWithCache {
+        val fadeHeight = height.toPx()
+        val brush = Brush.verticalGradient(
+            0f to Color.Transparent,
+            0.6f to Color.Black.copy(alpha = 0.15f),
+            1f to Color.Black,
+            startY = 0f,
+            endY = fadeHeight,
+        )
+        onDrawWithContent {
+            drawContent()
+            drawRect(brush, size = Size(size.width, fadeHeight), blendMode = BlendMode.DstIn)
+        }
+    }
 
 @Composable
 private fun ChatListNormal(
@@ -203,13 +229,14 @@ private fun ChatListNormal(
     onDismissError: (Uuid) -> Unit,
     onClearAllErrors: () -> Unit,
     onRegenerate: (UIMessage) -> Unit,
-    onImpersonate: ((UIMessage) -> Unit)? = null,
+    onImpersonate: ((UIMessage) -> Unit)?,
     onEdit: (UIMessage) -> Unit,
     onForkMessage: (UIMessage) -> Unit,
-    onCreateCheckpointMessage: ((UIMessage) -> Unit)? = null,
+    onCreateCheckpointMessage: ((UIMessage) -> Unit)?,
     onDelete: (UIMessage) -> Unit,
-    onDeleteSwipe: ((MessageNode) -> Unit)? = null,
+    onDeleteSwipe: ((MessageNode) -> Unit)?,
     onUpdateMessage: (MessageNode) -> Unit,
+    onToggleHidden: ((MessageNode) -> Unit)?,
     onClickSuggestion: (String) -> Unit,
     onTranslate: ((UIMessage, java.util.Locale) -> Unit)?,
     onClearTranslation: (UIMessage) -> Unit,
@@ -217,7 +244,6 @@ private fun ChatListNormal(
     onToolApproval: ((toolCallId: String, approved: Boolean, reason: String) -> Unit)? = null,
     onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
     onToggleFavorite: ((MessageNode) -> Unit)? = null,
-    onToggleHidden: ((MessageNode) -> Unit)? = null,
     onConversationSystemPromptChange: ((String?) -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
@@ -230,10 +256,11 @@ private fun ChatListNormal(
     DisposableEffect(Unit) {
         val listener: (Boolean) -> Boolean = { isVolumeUp ->
             if (settings.displaySetting.enableVolumeKeyScroll) {
-                val bottomPaddingPx = with(density) {
-                    (32.dp + innerPadding.calculateBottomPadding()).toPx()
+                // 列表视口包含标题栏和输入区遮住的部分，翻页时只按可见区域计算
+                val coveredPx = with(density) {
+                    (innerPadding.calculateTopPadding() + 32.dp + innerPadding.calculateBottomPadding()).toPx()
                 }
-                val scrollAmount = (state.layoutInfo.viewportSize.height - bottomPaddingPx) *
+                val scrollAmount = (state.layoutInfo.viewportSize.height - coveredPx) *
                     settings.displaySetting.volumeKeyScrollRatio
                 scope.launch { state.scrollBy(if (isVolumeUp) -scrollAmount else scrollAmount) }
                 true
@@ -262,18 +289,15 @@ private fun ChatListNormal(
     // 自动跟随键盘滚动
     ImeLazyListAutoScroller(lazyListState = state)
 
-    // 对话大小警告对话框
-    val sizeInfo = rememberConversationSizeInfo(conversation)
-    var showSizeWarningDialog by rememberSaveable(conversation.id) { mutableStateOf(true) }
-    if (sizeInfo.showWarning && showSizeWarningDialog) {
-        ConversationSizeWarningDialog(
-            sizeInfo = sizeInfo,
-            onDismiss = { showSizeWarningDialog = false }
-        )
-    }
-
-    val assistant = remember(settings.assistants, conversation.assistantId) {
-        settings.getAssistantById(conversation.assistantId)
+    val assistant = remember(
+        settings.assistants,
+        conversation.assistantId,
+        conversation.config,
+        conversation.modeInjectionIds,
+        conversation.lorebookIds,
+    ) {
+        // 工作区等配置在会话开始后以会话上固定的为准
+        settings.getAssistantById(conversation.assistantId)?.withConversation(conversation)
     }
     val modelById = remember(settings.providers) {
         settings.providers
@@ -316,13 +340,17 @@ private fun ChatListNormal(
         ChatFontProvider(displaySetting = settings.displaySetting) {
             LazyColumn(
                 state = state,
-                contentPadding = PaddingValues(16.dp) + PaddingValues(bottom = 32.dp + innerPadding.calculateBottomPadding()),
+                // 顶部留白放进 contentPadding，让消息可以滚动到透明标题栏下面
+                contentPadding = PaddingValues(16.dp) + PaddingValues(
+                    top = innerPadding.calculateTopPadding(),
+                    bottom = 32.dp + innerPadding.calculateBottomPadding(),
+                ),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier
                     .fillMaxSize()
-                    .hazeSource(state = hazeState)
-                    .padding(top = innerPadding.calculateTopPadding()),
+                    .topFadingEdge(innerPadding.calculateTopPadding() + 24.dp)
+                    .hazeSource(state = hazeState),
             ) {
             itemsIndexed(
                 items = conversation.messageNodes,
@@ -343,32 +371,34 @@ private fun ChatListNormal(
                     ) {
                         ChatMessage(
                             node = node,
-                            model = node.currentMessage.modelId?.let(modelById::get),
+                            model = node.currentMessage.modelId?.let(modelById::get)
+                                ?: node.currentMessage.snapshotModel(),
                             assistant = assistant,
                             loading = loading && index == lastMessageIndex,
-                            lastMessage = index == lastMessageIndex,
-                            messageDepth = (lastMessageIndex - index).coerceAtLeast(0),
-                            messageIndex = index,
                             onRegenerate = {
                                 onRegenerate(node.currentMessage)
                             },
-                            onImpersonate = onImpersonate?.let { { it(node.currentMessage) } },
+                            onImpersonate = onImpersonate?.let { callback -> { callback(node.currentMessage) } },
                             onEdit = {
                                 onEdit(node.currentMessage)
                             },
                             onFork = {
                                 onForkMessage(node.currentMessage)
                             },
-                            onCreateCheckpoint = onCreateCheckpointMessage?.let { { it(node.currentMessage) } },
                             onDelete = {
                                 onDelete(node.currentMessage)
                             },
-                            onDeleteSwipe = onDeleteSwipe?.let { { it(node) } },
+                            onDeleteSwipe = onDeleteSwipe?.let { callback -> { callback(node) } },
+                            onCreateCheckpoint = onCreateCheckpointMessage?.let { callback -> { callback(node.currentMessage) } },
+                            onToggleHidden = onToggleHidden?.let { callback -> { callback(node) } },
                             onShare = {
-                                selecting = true  // 使用 CoroutineScope 延迟状态更新
+                                selecting = true
                                 selectedItems.clear()
-                                selectedItems.addAll(conversation.messageNodes.map { it.id }
-                                    .subList(0, conversation.messageNodes.indexOf(node) + 1))
+                                val currentNodes = conversationUpdated.messageNodes
+                                val idx = currentNodes.indexOfFirst { it.id == node.id }
+                                if (idx >= 0) {
+                                    selectedItems.addAll(currentNodes.subList(0, idx + 1).map { it.id })
+                                }
                             },
                             onUpdate = {
                                 onUpdateMessage(it)
@@ -377,13 +407,13 @@ private fun ChatListNormal(
                             onToggleFavorite = {
                                 onToggleFavorite?.invoke(node)
                             },
-                            onToggleHidden = {
-                                onToggleHidden?.invoke(node)
-                            },
                             onTranslate = onTranslate,
                             onClearTranslation = onClearTranslation,
                             onToolApproval = onToolApproval,
                             onToolAnswer = onToolAnswer,
+                            lastMessage = index == lastMessageIndex,
+                            messageDepth = (lastMessageIndex - index).coerceAtLeast(0),
+                            messageIndex = index,
                         )
                     }
                 }
@@ -405,7 +435,7 @@ private fun ChatListNormal(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        RabbitLoadingIndicator(
+                        ContainedLoadingIndicator(
                             modifier = Modifier.size(28.dp)
                         )
                         AnimatedVisibility(

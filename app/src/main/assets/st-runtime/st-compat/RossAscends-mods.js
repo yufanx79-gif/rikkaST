@@ -20,3 +20,13 @@ export function getMessageTimeStamp(timestamp) {
         return '';
     }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export async function RA_CountCharTokens() { return 0; }
+export const autoFitSendTextAreaDebounced = () => {};
+export function dragElement() {}
+export function getParsedUA() { return typeof navigator !== 'undefined' ? navigator.userAgent : ''; }
+export function humanizeGenTime(ms = 0) { return `${Math.max(0, Number(ms) || 0)}ms`; }
+export function humanizedDateTime() { return new Date().toISOString().replace(/[:.]/g, '-'); }
+export async function initMovingUI() {}
+export function initRossMods() {}

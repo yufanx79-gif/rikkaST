@@ -1,0 +1,61 @@
+{
+  "version": "1.19.0",
+  "fixtures": [
+    {
+      "input": "{{char}}",
+      "context": {
+        "name2": "Chisa"
+      },
+      "expected": "Chisa"
+    },
+    {
+      "input": "{{user}}",
+      "context": {
+        "name1": "Rikka"
+      },
+      "expected": "Rikka"
+    },
+    {
+      "input": "{{time}}",
+      "nonEmpty": true
+    },
+    {
+      "input": "{{date}}",
+      "nonEmpty": true
+    },
+    {
+      "input": "{{random::a::b}}",
+      "oneOf": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "input": "{{pick::a::b}}",
+      "oneOf": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "input": "{{setvar::x::1}}{{getvar::x}}",
+      "expected": "1"
+    },
+    {
+      "input": "{{if 1}}yes{{else}}no{{/if}}",
+      "expected": "yes"
+    },
+    {
+      "input": "{{// comment}}",
+      "expected": ""
+    },
+    {
+      "input": "{{///}}",
+      "expected": ""
+    },
+    {
+      "input": "{{setvarkey::obj::a::42}}{{getvarkey::obj::a}}",
+      "expected": "42"
+    }
+  ]
+}

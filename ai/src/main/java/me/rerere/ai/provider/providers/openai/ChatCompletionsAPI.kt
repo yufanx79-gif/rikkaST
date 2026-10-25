@@ -69,7 +69,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
+import me.rerere.common.http.sse.newEventSource
 import kotlin.time.Clock
 
 private const val TAG = "ChatCompletionsAPI"
@@ -213,7 +213,7 @@ class ChatCompletionsAPI(
             }
         }
 
-        val eventSource = EventSources.createFactory(client).newEventSource(request, listener)
+        val eventSource = client.newEventSource(request, listener)
 
         awaitClose {
             println("[awaitClose] 关闭eventSource ")

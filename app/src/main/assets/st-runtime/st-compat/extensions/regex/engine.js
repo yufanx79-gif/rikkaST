@@ -14,8 +14,16 @@
 import { characters, saveSettingsDebounced, substituteParams, substituteParamsExtended, this_chid } from '../../../script.js';
 import { extension_settings, writeExtensionField } from '../../extensions.js';
 import { getPresetManager } from '../../preset-manager.js';
-import { regexFromString } from '../../utils.js';
+import {
+    extractInlineRegexFlags,
+    isLikelyCatastrophicRegex,
+    regexFromString,
+    replaceCompatString,
+    stripUnmatchedBoundaryWrappers,
+} from '../../utils.js';
 import { lodash } from '../../../lib.js';
+
+export { extractInlineRegexFlags, isLikelyCatastrophicRegex, replaceCompatString, stripUnmatchedBoundaryWrappers };
 
 /** @enum {number} Regex scripts types（顺序即优先级） */
 export const SCRIPT_TYPES = {
@@ -38,31 +46,39 @@ export class RegexProvider {
     }
 
     /**
-     * Gets a regex instance by its string representation.
+     * Gets a regex instance by its string representation and optional flags/scriptOptions.
      * @param {string} regexString The regex string to retrieve
+     * @param {string} [flags=''] Optional explicit regex flags
+     * @param {string} [scriptOptions=''] Optional script options key
      * @returns {RegExp?} Compiled regex or null if invalid
      */
-    get(regexString) {
-        const isCached = this._cache.has(regexString);
+    get(regexString, flags = '', scriptOptions = '') {
+        const cacheKey = (flags || scriptOptions)
+            ? `${regexString}\u0000${flags}\u0000${scriptOptions}`
+            : String(regexString);
+        const isCached = this._cache.has(cacheKey);
         const regex = isCached
-            ? this._cache.get(regexString)
-            : regexFromString(regexString);
+            ? this._cache.get(cacheKey)
+            : regexFromString(regexString, flags);
 
         if (!regex) {
             return null;
         }
+        if (regex._isCatastrophic === undefined) {
+            regex._isCatastrophic = isCatastrophicRegexPattern(regexString);
+        }
 
         if (isCached) {
             // LRU: Move to end by re-inserting
-            this._cache.delete(regexString);
-            this._cache.set(regexString, regex);
+            this._cache.delete(cacheKey);
+            this._cache.set(cacheKey, regex);
         } else {
             // Evict oldest if at capacity
             if (this._cache.size >= this._maxSize) {
                 const firstKey = this._cache.keys().next().value;
                 this._cache.delete(firstKey);
             }
-            this._cache.set(regexString, regex);
+            this._cache.set(cacheKey, regex);
         }
 
         // Reset lastIndex for global/sticky regexes
@@ -338,7 +354,7 @@ export function getRegexedString(rawString, placement, { characterOverride, isMa
             // Script applies to Generate and input is Generate
             (script.promptOnly && isPrompt) ||
             // Script applies to all cases when neither "only"s are true, but there's no need to do it when `isMarkdown`, the as source (chat history) should already be changed beforehand
-            (!script.markdownOnly && !script.promptOnly && !isMarkdown && !isPrompt)
+            (!script.markdownOnly && !script.promptOnly)
         ) {
             if (isEdit && !script.runOnEdit) {
                 console.debug(`getRegexedString: Skipping script ${script.scriptName} because it does not run on edit`);
@@ -375,13 +391,15 @@ export function getRegexedString(rawString, placement, { characterOverride, isMa
  * @returns {string} The new string
  */
 export function runRegexScript(regexScript, rawString, { characterOverride } = {}) {
-    let newString = rawString;
-    if (!regexScript || !!(regexScript.disabled) || !regexScript?.findRegex || !rawString) {
+    let newString = typeof rawString === 'string' && rawString.includes('\r')
+        ? rawString.replace(/\r\n?/g, '\n')
+        : rawString;
+    if (!regexScript || !!(regexScript.disabled) || !regexScript?.findRegex || !newString) {
         return newString;
     }
 
     const getRegexString = () => {
-        switch (Number(regexScript.substituteRegex)) {
+        switch (Number(regexScript.substituteRegex || 0)) {
             case substitute_find_regex.NONE:
                 return regexScript.findRegex;
             case substitute_find_regex.RAW:
@@ -394,37 +412,46 @@ export function runRegexScript(regexScript, rawString, { characterOverride } = {
         }
     };
     const regexString = getRegexString();
-    const findRegex = RegexProvider.instance.get(regexString);
+    const scriptOptionsKey = `${Number(regexScript.substituteRegex || 0)}:${Boolean(regexScript.markdownOnly)}:${Boolean(regexScript.promptOnly)}`;
+    const findRegex = RegexProvider.instance.get(regexString, '', scriptOptionsKey);
 
     // The user skill issued. Return with nothing.
     if (!findRegex) {
         return newString;
     }
+    if (findRegex._isCatastrophic && newString.length >= MIN_CATASTROPHIC_INPUT_CHARS) {
+        console.warn(`[regex] skipped potentially catastrophic regex on input (${newString.length} chars): ${regexString}`);
+        return newString;
+    }
 
-    // Run replacement. Currently does not support the Overlay strategy
-    newString = rawString.replace(findRegex, function (match) {
+    // Run replacement. Single-pass token replacement supporting $$, $&, {{match}}, $0..$99, and $<name>
+    newString = newString.replace(findRegex, function (fullMatch) {
         const args = [...arguments];
-        const replaceString = String(regexScript.replaceString == null ? '' : regexScript.replaceString).replace(/{{match}}/gi, '$0');
-        const replaceWithGroups = replaceString.replaceAll(/\$(\d+)|\$<([^>]+)>/g, (_, num, groupName) => {
-            if (num) {
-                // Handle numbered capture groups ($1, $2, etc.)
-                match = args[Number(num)];
-            } else if (groupName) {
-                // Handle named capture groups ($<name>)
-                const groups = args[args.length - 1];
-                match = groups && typeof groups === 'object' && groups[groupName];
-            }
-
-            // No match found - return the empty string
-            if (!match) {
-                return '';
-            }
-
-            // Remove trim strings from the match
-            const filteredMatch = filterString(match, regexScript.trimStrings || [], { characterOverride });
-
-            return filteredMatch;
-        });
+        const hasNamedGroups = typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null;
+        const offsetArgIdx = hasNamedGroups ? args.length - 3 : args.length - 2;
+        const groupsObj = hasNamedGroups ? args[args.length - 1] : null;
+        const rawReplace = String(regexScript.replaceString == null ? '' : regexScript.replaceString);
+        const replaceWithGroups = rawReplace.replaceAll(
+            /\{\{match\}\}|\$\$|\$&|\$(\d+)|\$<([^>]+)>/gi,
+            (token, num, groupName) => {
+                if (token === '$$') {
+                    return '$';
+                }
+                let target = undefined;
+                if (token === '$&' || token.toLowerCase() === '{{match}}') {
+                    target = fullMatch;
+                } else if (num !== undefined) {
+                    const idx = Number(num);
+                    target = idx === 0 ? fullMatch : (idx >= 1 && idx < offsetArgIdx ? args[idx] : undefined);
+                } else if (groupName !== undefined) {
+                    target = groupsObj ? groupsObj[groupName] : undefined;
+                }
+                if (target === undefined || target === null || target === '') {
+                    return '';
+                }
+                return filterString(String(target), regexScript.trimStrings || [], { characterOverride });
+            },
+        );
 
         // Substitute at the end
         return substituteParams(replaceWithGroups);
@@ -448,4 +475,18 @@ function filterString(rawString, trimStrings, { characterOverride } = {}) {
     });
 
     return finalString;
+}
+
+export const MIN_CATASTROPHIC_INPUT_CHARS = 16;
+export const MAX_CATASTROPHIC_INPUT_CHARS = 4096;
+
+/**
+ * Detects nested quantifiers and overlapping alternations inside repeated groups
+ * (e.g. /(a+)+b/, /((a+))+b/, /(a|aa)+b/, /([a-z]+|[a-z0-9]+)+!/, /(a+){1,50}b/)
+ * that can trigger exponential catastrophic backtracking on non-matching inputs.
+ * @param {string} pattern
+ * @returns {boolean}
+ */
+export function isCatastrophicRegexPattern(pattern) {
+    return isLikelyCatastrophicRegex(pattern);
 }

@@ -7,12 +7,12 @@ import androidx.paging.PagingData
 import androidx.paging.PagingSource
 import androidx.paging.map
 import androidx.room.withTransaction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.withContext
 import me.rerere.ai.ui.UIMessage
+import me.rerere.rikkahub.data.datastore.ConversationSortOrder
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.fts.MessageFtsManager
 import me.rerere.rikkahub.data.db.fts.MessageSearchSort
@@ -78,26 +78,42 @@ class ConversationRepository(
         }
     }
 
-    fun getUnfiledConversationsOfAssistantPaging(assistantId: Uuid): Flow<PagingData<Conversation>> = Pager(
+    fun getUnfiledConversationsOfAssistantPaging(
+        assistantId: Uuid,
+        sortOrder: ConversationSortOrder = ConversationSortOrder.UPDATE_TIME,
+    ): Flow<PagingData<Conversation>> = Pager(
         config = PagingConfig(
             pageSize = PAGE_SIZE,
             initialLoadSize = INITIAL_LOAD_SIZE,
             enablePlaceholders = false
         ),
-        pagingSourceFactory = { conversationDAO.getUnfiledConversationsOfAssistantPaging(assistantId.toString()) }
+        pagingSourceFactory = {
+            conversationDAO.getUnfiledConversationsOfAssistantPaging(
+                assistantId = assistantId.toString(),
+                sortByCreateTime = sortOrder == ConversationSortOrder.CREATE_TIME,
+            )
+        }
     ).flow.map { pagingData ->
         pagingData.map { entity ->
             conversationSummaryToConversation(entity)
         }
     }
 
-    fun getConversationsOfFolderPaging(folderId: Uuid): Flow<PagingData<Conversation>> = Pager(
+    fun getConversationsOfFolderPaging(
+        folderId: Uuid,
+        sortOrder: ConversationSortOrder = ConversationSortOrder.UPDATE_TIME,
+    ): Flow<PagingData<Conversation>> = Pager(
         config = PagingConfig(
             pageSize = PAGE_SIZE,
             initialLoadSize = INITIAL_LOAD_SIZE,
             enablePlaceholders = false
         ),
-        pagingSourceFactory = { conversationDAO.getConversationsOfFolderPaging(folderId.toString()) }
+        pagingSourceFactory = {
+            conversationDAO.getConversationsOfFolderPaging(
+                folderId = folderId.toString(),
+                sortByCreateTime = sortOrder == ConversationSortOrder.CREATE_TIME,
+            )
+        }
     ).flow.map { pagingData ->
         pagingData.map { entity ->
             conversationSummaryToConversation(entity)
@@ -110,34 +126,6 @@ class ConversationRepository(
         limit: Int,
     ): ConversationPageResult {
         val pagingSource = conversationDAO.getConversationsOfAssistantPaging(assistantId.toString())
-        return loadConversationPage(pagingSource, offset, limit)
-    }
-
-    suspend fun getUnfiledConversationsOfAssistantPage(
-        assistantId: Uuid,
-        offset: Int,
-        limit: Int,
-    ): ConversationPageResult = loadConversationPage(
-        conversationDAO.getUnfiledConversationsOfAssistantPaging(assistantId.toString()),
-        offset,
-        limit,
-    )
-
-    suspend fun getConversationsOfFolderPage(
-        folderId: Uuid,
-        offset: Int,
-        limit: Int,
-    ): ConversationPageResult = loadConversationPage(
-        conversationDAO.getConversationsOfFolderPaging(folderId.toString()),
-        offset,
-        limit,
-    )
-
-    private suspend fun loadConversationPage(
-        pagingSource: PagingSource<Int, LightConversationEntity>,
-        offset: Int,
-        limit: Int,
-    ): ConversationPageResult {
         return try {
             when (
                 val result = pagingSource.load(
@@ -173,6 +161,56 @@ class ConversationRepository(
             assistantId = assistantId.toString(),
             searchText = titleKeyword
         )
+        return try {
+            when (
+                val result = pagingSource.load(
+                    PagingSource.LoadParams.Refresh(
+                        key = if (offset == 0) null else offset,
+                        loadSize = limit,
+                        placeholdersEnabled = false
+                    )
+                )
+            ) {
+                is PagingSource.LoadResult.Page -> ConversationPageResult(
+                    items = result.data.map { entity ->
+                        conversationSummaryToConversation(entity)
+                    },
+                    nextOffset = result.nextKey
+                )
+
+                is PagingSource.LoadResult.Error -> throw result.throwable
+                is PagingSource.LoadResult.Invalid -> ConversationPageResult(emptyList(), null)
+            }
+        } finally {
+            pagingSource.invalidate()
+        }
+    }
+
+    suspend fun getUnfiledConversationsOfAssistantPage(
+        assistantId: Uuid,
+        offset: Int,
+        limit: Int,
+    ): ConversationPageResult = loadConversationPage(
+        conversationDAO.getUnfiledConversationsOfAssistantPaging(assistantId.toString(), sortByCreateTime = false),
+        offset,
+        limit,
+    )
+
+    suspend fun getConversationsOfFolderPage(
+        folderId: Uuid,
+        offset: Int,
+        limit: Int,
+    ): ConversationPageResult = loadConversationPage(
+        conversationDAO.getConversationsOfFolderPaging(folderId.toString(), sortByCreateTime = false),
+        offset,
+        limit,
+    )
+
+    private suspend fun loadConversationPage(
+        pagingSource: PagingSource<Int, LightConversationEntity>,
+        offset: Int,
+        limit: Int,
+    ): ConversationPageResult {
         return try {
             when (
                 val result = pagingSource.load(
@@ -250,20 +288,26 @@ class ConversationRepository(
             }
         }
 
-    suspend fun getConversationById(uuid: Uuid): Conversation? = withContext(Dispatchers.IO) {
+    suspend fun getConversationById(uuid: Uuid): Conversation? {
         val entity = conversationDAO.getConversationById(uuid.toString())
-        if (entity != null) {
+        return if (entity != null) {
             val nodes = loadMessageNodes(entity.id)
             conversationEntityToConversation(entity, nodes)
         } else null
     }
 
-    suspend fun existsConversationById(uuid: Uuid): Boolean = withContext(Dispatchers.IO) {
-        conversationDAO.existsById(uuid.toString())
+    suspend fun existsConversationById(uuid: Uuid): Boolean {
+        return conversationDAO.existsById(uuid.toString())
     }
 
     suspend fun getMessageNodeCount(conversationId: Uuid): Int {
         return messageNodeDAO.countNodesOfConversation(conversationId.toString())
+    }
+
+    suspend fun deleteConversationOfAssistant(assistantId: Uuid) {
+        getConversationsOfAssistant(assistantId).first().forEach { conversation ->
+            deleteConversation(conversation)
+        }
     }
 
     suspend fun countConversations(): Int {
@@ -276,24 +320,24 @@ class ConversationRepository(
         }.toMap()
     }
 
-    suspend fun insertConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
-        val convEntity = conversationToConversationEntity(conversation)
-        val nodeEntities = buildMessageNodeEntities(conversation.id.toString(), conversation.messageNodes)
+    suspend fun insertConversation(conversation: Conversation) {
         database.withTransaction {
-            conversationDAO.insert(convEntity)
-            messageNodeDAO.insertAll(nodeEntities)
+            conversationDAO.insert(
+                conversationToConversationEntity(conversation)
+            )
+            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
         }
         messageFtsManager.indexConversation(conversation)
     }
 
-    suspend fun updateConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
-        val convEntity = conversationToConversationEntity(conversation)
-        val nodeEntities = buildMessageNodeEntities(conversation.id.toString(), conversation.messageNodes)
+    suspend fun updateConversation(conversation: Conversation) {
         database.withTransaction {
-            conversationDAO.update(convEntity)
+            conversationDAO.update(
+                conversationToConversationEntity(conversation)
+            )
             // 删除旧的节点，插入新的节点
             messageNodeDAO.deleteByConversation(conversation.id.toString())
-            messageNodeDAO.insertAll(nodeEntities)
+            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
         }
         messageFtsManager.indexConversation(conversation)
     }
@@ -319,7 +363,11 @@ class ConversationRepository(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
         assistantId: Uuid? = null,
-    ) = messageFtsManager.search(keyword, sort, assistantId?.toString())
+    ) = messageFtsManager.search(keyword, sort, assistantId?.let { listOf(it.toString()) })
+
+    /** 只在 [assistantIds] 这些助手的对话里搜索 */
+    suspend fun searchMessagesOfAssistants(keyword: String, assistantIds: Set<Uuid>) =
+        messageFtsManager.search(keyword, MessageSearchSort.RELEVANCE, assistantIds.map { it.toString() })
 
     suspend fun rebuildAllIndexes(onProgress: (current: Int, total: Int) -> Unit = { _, _ -> }) {
         messageFtsManager.deleteAll()
@@ -331,12 +379,6 @@ class ConversationRepository(
             val conversation = conversationEntityToConversation(entity, nodes)
             messageFtsManager.indexConversation(conversation)
             onProgress(index + 1, total)
-        }
-    }
-
-    suspend fun deleteConversationOfAssistant(assistantId: Uuid) {
-        getConversationsOfAssistant(assistantId).first().forEach { conversation ->
-            deleteConversation(conversation)
         }
     }
 
@@ -357,6 +399,7 @@ class ConversationRepository(
             workspaceCwd = conversation.workspaceCwd ?: "",
             folderId = conversation.folderId?.toString() ?: "",
             stParentConversationId = conversation.stParentConversationId?.toString() ?: "",
+            config = conversation.config?.let { JsonInstant.encodeToString(it) } ?: "",
         )
     }
 
@@ -379,6 +422,7 @@ class ConversationRepository(
             workspaceCwd = conversationEntity.workspaceCwd.ifEmpty { null },
             folderId = conversationEntity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
             stParentConversationId = conversationEntity.stParentConversationId.ifEmpty { null }?.let { Uuid.parse(it) },
+            config = conversationEntity.config.trim().takeIf { it.isNotEmpty() && it != "{}" }?.let { runCatching { JsonInstant.decodeFromString<me.rerere.rikkahub.data.model.ConversationConfig>(it) }.getOrNull() },
         )
     }
 
@@ -401,6 +445,35 @@ class ConversationRepository(
 
     suspend fun updateConversationAssistant(conversationId: Uuid, assistantId: Uuid) {
         conversationDAO.updateAssistantId(conversationId.toString(), assistantId.toString())
+    }
+
+    /**
+     * 只更新会话持有的配置（含注入绑定和工作目录），不重写消息节点。
+     */
+    suspend fun updateConversationConfig(conversation: Conversation) {
+        conversationDAO.updateConfig(
+            id = conversation.id.toString(),
+            config = conversation.config?.let { JsonInstant.encodeToString(it) } ?: "",
+            modeInjectionIds = JsonInstant.encodeToString(conversation.modeInjectionIds),
+            lorebookIds = JsonInstant.encodeToString(conversation.lorebookIds),
+            workspaceCwd = conversation.workspaceCwd ?: "",
+        )
+    }
+
+    suspend fun updateTitle(conversationId: Uuid, title: String) {
+        conversationDAO.updateTitle(conversationId.toString(), title)
+        messageFtsManager.updateTitle(conversationId.toString(), title)
+    }
+
+    suspend fun updateCustomSystemPrompt(conversationId: Uuid, customSystemPrompt: String?) {
+        conversationDAO.updateCustomSystemPrompt(conversationId.toString(), customSystemPrompt ?: "")
+    }
+
+    suspend fun updateChatSuggestions(conversationId: Uuid, chatSuggestions: List<String>) {
+        conversationDAO.updateChatSuggestions(
+            id = conversationId.toString(),
+            chatSuggestions = JsonInstant.encodeToString(chatSuggestions),
+        )
     }
 
     /**
@@ -443,6 +516,9 @@ class ConversationRepository(
                     e.printStackTrace()
                     offset += pageSize
                     continue
+                } catch (e: CancellationException) {
+                    // CancellationException 是 IllegalStateException 的子类，必须先重新抛出，否则取消后会在事务内无限循环
+                    throw e
                 } catch (e: IllegalStateException) {
                     e.printStackTrace()
                     offset += pageSize
@@ -467,8 +543,8 @@ class ConversationRepository(
         }
     }
 
-    private fun buildMessageNodeEntities(conversationId: String, nodes: List<MessageNode>): List<MessageNodeEntity> {
-        return nodes.mapIndexed { index, node ->
+    private suspend fun saveMessageNodes(conversationId: String, nodes: List<MessageNode>) {
+        val entities = nodes.mapIndexed { index, node ->
             MessageNodeEntity(
                 id = node.id.toString(),
                 conversationId = conversationId,
@@ -477,10 +553,7 @@ class ConversationRepository(
                 selectIndex = node.selectIndex
             )
         }
-    }
-
-    private suspend fun saveMessageNodes(conversationId: String, nodes: List<MessageNode>) {
-        messageNodeDAO.insertAll(buildMessageNodeEntities(conversationId, nodes))
+        messageNodeDAO.insertAll(entities)
     }
 }
 

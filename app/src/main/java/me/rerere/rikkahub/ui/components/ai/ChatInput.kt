@@ -577,17 +577,58 @@ fun ChatInput(
                             KeepScreenOn()
                         }
 
+                        var isStopping by remember(loading) { mutableStateOf(false) }
+                        LaunchedEffect(isStopping) {
+                            if (isStopping) {
+                                kotlinx.coroutines.delay(300L)
+                                isStopping = false
+                            }
+                        }
                         AnimatedVisibility(
                             visible = !asrState.isRecording,
                             enter = fadeIn() + scaleIn(),
                             exit = fadeOut() + scaleOut(),
                         ) {
-                            SendButton(
-                                loading = loading,
-                                empty = state.isEmpty(),
-                                onClick = { sendMessage() },
-                                onLongClick = { sendMessageWithoutAnswer() },
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                if (loading && !state.isEmpty()) {
+                                    SendButton(
+                                        loading = true,
+                                        empty = true,
+                                        isStopping = isStopping,
+                                        onClick = {
+                                            if (!isStopping) {
+                                                isStopping = true
+                                                onCancelClick()
+                                            }
+                                        },
+                                        onLongClick = {
+                                            if (!isStopping) {
+                                                isStopping = true
+                                                onCancelClick()
+                                            }
+                                        },
+                                    )
+                                }
+                                SendButton(
+                                    loading = loading,
+                                    empty = state.isEmpty(),
+                                    isStopping = isStopping,
+                                    onClick = {
+                                        if (loading && state.isEmpty()) {
+                                            if (!isStopping) {
+                                                isStopping = true
+                                                sendMessage()
+                                            }
+                                        } else {
+                                            sendMessage()
+                                        }
+                                    },
+                                    onLongClick = { sendMessageWithoutAnswer() },
+                                )
+                            }
                         }
                     }
                 }
@@ -609,6 +650,7 @@ private fun SendButton(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
+    isStopping: Boolean = false,
 ) {
     val showStop = loading && empty
     val containerColor = when {
@@ -628,7 +670,7 @@ private fun SendButton(
             .testTag("chat_send_button")
             .clip(CircleShape)
             .combinedClickable(
-                enabled = showStop || !empty,
+                enabled = (showStop && !isStopping) || !empty,
                 onClick = onClick,
                 onLongClick = onLongClick,
             )

@@ -5,7 +5,7 @@
  */
 
 import { MacroEngine } from './engine/MacroEngine.js';
-import { MacroRegistry, MacroCategory, MacroValueType } from './engine/MacroRegistry.js';
+import { MacroRegistry, MacroCategory, MacroValueType, initRegisterMacros as seedRegistryMacros } from './engine/MacroRegistry.js';
 import { MacroLexer } from './engine/MacroLexer.js';
 import { MacroParser } from './engine/MacroParser.js';
 import { MacroCstWalker } from './engine/MacroCstWalker.js';
@@ -30,6 +30,6 @@ export const macros = {
     list: MacroRegistry.getAllMacros.bind(MacroRegistry),
 };
 
-export function initRegisterMacros() {}
+export function initRegisterMacros() { seedRegistryMacros(); }
 
 export default macros;

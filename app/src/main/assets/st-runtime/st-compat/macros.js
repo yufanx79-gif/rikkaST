@@ -97,3 +97,19 @@ export function getLastMessageId() {
         return -1;
     }
 }
+
+export function initMacros() {}
+
+export function evaluateMacros(text, env = {}) {
+    const s = String(text ?? '');
+    try {
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.substituteParams === 'function') {
+            return String(window.RikkaBridge.substituteParams(s, JSON.stringify(env || {})) ?? s);
+        }
+        const c = st();
+        if (c && typeof c.substituteParams === 'function') {
+            return String(c.substituteParams(s) ?? s);
+        }
+    } catch (_e) { /* noop */ }
+    return s;
+}

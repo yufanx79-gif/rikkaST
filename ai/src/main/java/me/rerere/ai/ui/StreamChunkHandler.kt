@@ -64,16 +64,12 @@ class StreamChunkHandler(private val model: Model? = null) {
     /**
      * 将一个 [chunk] 合并进消息列表末尾的助手消息，并返回新的消息列表。
      *
-     * [v243 BUGFIX B1] [messages] 允许为空（空列表 = 无上下文生成，结果就是一条新助手消息）。
-     *
-     * 旧实现在这里 `require(messages.isNotEmpty())`。重新生成会话里第 0 条助手消息
-     * （也就是助手预设开场白）时，ChatService.regenerateAtMessage 传的 messageRange 是 `0..<0`，
-     * Kotlin 求值为空区间 IntRange(0, -1)，切片结果为空列表 —— 预设开场白必然在 index 0，
-     * 所以这是**必现**的：旧行为在这里抛 IllegalArgumentException，生成链中断，
-     * UI 已经把该楼层换成空的流式气泡，表现为「点重新生成：原内容闪一下，立刻变成空白小条」。
+     * @throws IllegalArgumentException 当 [messages] 为空时抛出
      */
     fun handle(messages: List<UIMessage>, chunk: StreamChunk): List<UIMessage> {
-        val targetMessages = if (messages.isEmpty() || messages.last().role != MessageRole.ASSISTANT) {
+        require(messages.isNotEmpty()) { "messages must not be empty" }
+
+        val targetMessages = if (messages.last().role != MessageRole.ASSISTANT) {
             messages + UIMessage(modelId = model?.id, role = MessageRole.ASSISTANT, parts = emptyList())
         } else {
             messages
@@ -85,9 +81,12 @@ class StreamChunkHandler(private val model: Model? = null) {
     private fun append(message: UIMessage, chunk: StreamChunk): UIMessage = with(message) {
         when (chunk) {
             is StreamChunk.TextStart -> {
-                if (chunk.id in textPartIndexes) this
-                else copy(parts = parts + UIMessagePart.Text("", chunk.metadata)).also {
-                    textPartIndexes[chunk.id] = parts.size
+                if (chunk.id in textPartIndexes) {
+                    this
+                } else {
+                    copy(parts = parts + UIMessagePart.Text("", chunk.metadata)).also {
+                        textPartIndexes[chunk.id] = parts.size
+                    }
                 }
             }
             is StreamChunk.TextDelta -> {
@@ -101,7 +100,8 @@ class StreamChunkHandler(private val model: Model? = null) {
                     copy(parts = parts.toMutableList().apply {
                         val text = get(index) as UIMessagePart.Text
                         set(
-                            index, text.copy(
+                            index,
+                            text.copy(
                                 text = text.text + chunk.text,
                                 metadata = chunk.metadata ?: text.metadata,
                             )
@@ -112,14 +112,17 @@ class StreamChunkHandler(private val model: Model? = null) {
 
             is StreamChunk.TextEnd -> this.also { textPartIndexes.remove(chunk.id) }
             is StreamChunk.ReasoningStart -> {
-                if (chunk.id in reasoningPartIndexes) this
-                else copy(parts = parts + UIMessagePart.Reasoning(
-                    reasoning = "",
-                    createdAt = Clock.System.now(),
-                    finishedAt = null,
-                    metadata = chunk.metadata,
-                    reasoningType = chunk.reasoningType,
-                )).also { reasoningPartIndexes[chunk.id] = parts.size }
+                if (chunk.id in reasoningPartIndexes) {
+                    this
+                } else {
+                    copy(parts = parts + UIMessagePart.Reasoning(
+                        reasoning = "",
+                        createdAt = Clock.System.now(),
+                        finishedAt = null,
+                        metadata = chunk.metadata,
+                        reasoningType = chunk.reasoningType,
+                    )).also { reasoningPartIndexes[chunk.id] = parts.size }
+                }
             }
 
             is StreamChunk.ReasoningDelta -> {
@@ -146,24 +149,30 @@ class StreamChunkHandler(private val model: Model? = null) {
 
             is StreamChunk.ReasoningEnd -> {
                 val index = reasoningPartIndexes.remove(chunk.id)
-                if (index == null || parts.getOrNull(index) !is UIMessagePart.Reasoning) this
-                else copy(parts = parts.toMutableList().apply {
-                    val reasoning = get(index) as UIMessagePart.Reasoning
-                    set(index, reasoning.copy(
-                        finishedAt = Clock.System.now(),
-                        metadata = chunk.metadata ?: reasoning.metadata,
-                    ))
-                })
+                if (index == null || parts.getOrNull(index) !is UIMessagePart.Reasoning) {
+                    this
+                } else {
+                    copy(parts = parts.toMutableList().apply {
+                        val reasoning = get(index) as UIMessagePart.Reasoning
+                        set(index, reasoning.copy(
+                            finishedAt = Clock.System.now(),
+                            metadata = chunk.metadata ?: reasoning.metadata,
+                        ))
+                    })
+                }
             }
 
             is StreamChunk.ToolCallStart -> {
-                if (parts.any { it is UIMessagePart.Tool && it.toolCallId == chunk.id }) this
-                else copy(parts = parts + UIMessagePart.Tool(
-                    toolCallId = chunk.id,
-                    toolName = chunk.toolName,
-                    input = "",
-                    metadata = chunk.metadata,
-                ))
+                if (parts.any { it is UIMessagePart.Tool && it.toolCallId == chunk.id }) {
+                    this
+                } else {
+                    copy(parts = parts + UIMessagePart.Tool(
+                        toolCallId = chunk.id,
+                        toolName = chunk.toolName,
+                        input = "",
+                        metadata = chunk.metadata,
+                    ))
+                }
             }
 
             is StreamChunk.ToolCallDelta -> copy(parts = parts.map { part ->
@@ -174,10 +183,19 @@ class StreamChunkHandler(private val model: Model? = null) {
                         input = part.input + chunk.inputDelta,
                         metadata = chunk.metadata ?: part.metadata,
                     )
-                } else part
+                } else {
+                    part
+                }
             })
 
             is StreamChunk.ToolCallEnd -> this
+            is StreamChunk.ToolCallOutput -> copy(parts = parts.map { part ->
+                if (part is UIMessagePart.Tool && part.toolCallId == chunk.id) {
+                    part.copy(output = listOf(UIMessagePart.Text(chunk.output)))
+                } else {
+                    part
+                }
+            })
             is StreamChunk.ServerToolStart -> {
                 val index = parts.indexOfFirst {
                     it is UIMessagePart.ServerTool && it.toolCallId == chunk.id
@@ -243,11 +261,14 @@ class StreamChunkHandler(private val model: Model? = null) {
                 }
             }
             is StreamChunk.ImageStart -> {
-                if (chunk.id in imagePartIndexes) this
-                else copy(parts = parts + UIMessagePart.Image(
-                    url = "data:${chunk.mimeType};base64,",
-                    metadata = chunk.metadata,
-                )).also { imagePartIndexes[chunk.id] = parts.size }
+                if (chunk.id in imagePartIndexes) {
+                    this
+                } else {
+                    copy(parts = parts + UIMessagePart.Image(
+                        url = "data:${chunk.mimeType};base64,",
+                        metadata = chunk.metadata,
+                    )).also { imagePartIndexes[chunk.id] = parts.size }
+                }
             }
 
             is StreamChunk.ImageDelta -> {
@@ -328,16 +349,7 @@ fun List<UIMessage>.handleTextGenerationResult(
     result: TextGenerationResult,
     model: Model? = null,
 ): List<UIMessage> {
-    // [v243 BUGFIX B1] 同 handle()：空列表是合法的「无上下文生成」，不应抛异常。
-    if (isEmpty()) {
-        return listOf(
-            result.message.copy(
-                modelId = model?.id,
-                usage = result.usage,
-                finishedAt = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()),
-            ).finishReasoning(),
-        )
-    }
+    require(isNotEmpty()) { "messages must not be empty" }
     val incoming = result.message.copy(
         modelId = model?.id,
         usage = result.usage,
@@ -437,7 +449,9 @@ private fun UIMessage.appendMessage(delta: UIMessage): UIMessage {
                                 status = deltaPart.status,
                                 metadata = mergeMetadata(part.metadata, deltaPart.metadata),
                             )
-                        } else part
+                        } else {
+                            part
+                        }
                     }
                 }
             }

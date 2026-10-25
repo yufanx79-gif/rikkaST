@@ -73,7 +73,7 @@ data class TavernBookEntry(
     val comment: String = "",
     val content: String = "",
     val constant: Boolean = false,
-    val selective: Boolean = false,
+    val selective: Boolean = true, // 对齐 ST 1.19 newWorldInfoEntryDefinition 默认 true
     val selectiveLogic: Int = 0,  // 官方 world_info_logic: 0=AND_ANY 1=NOT_ALL 2=NOT_ANY 3=AND_ALL
     val group: String = "",
     val position: Int = 1,        // 官方枚举: 0=before_char 1=after_char 2=ANTop 3=ANBottom 4=atDepth 5=EMTop 6=EMBottom 7=outlet
@@ -96,7 +96,7 @@ data class TavernBookEntry(
     // 官方 extensions.delay_until_recursion：true 或数字层级（1/2/3…）；0=关闭
     @Serializable(with = DelayUntilRecursionSerializer::class)
     val delayUntilRecursion: Int = 0,
-    val useProbability: Boolean = false, // 是否启用概率过滤（酒馆默认false）
+    val useProbability: Boolean = true, // 是否启用概率过滤（对齐 ST 1.19 newWorldInfoEntryDefinition 默认 true）
     val inclusionGroup: String = "", // 本地遗留字段（官方无此字段；官方分组用顶层 group 逗号分隔）
     val useGroupScoring: Boolean = false, // 酒馆 extensions.use_group_scoring
     val groupPriority: Boolean = false, // 本地遗留字段（官方无此字段；官方优先用 group_override）

@@ -53,6 +53,9 @@ interface MessageNodeDAO {
 
     @Query("SELECT COUNT(*) FROM message_node WHERE conversation_id = :conversationId")
     suspend fun countNodesOfConversation(conversationId: String): Int
+
+    @Query("SELECT COUNT(*) FROM message_node")
+    suspend fun countAll(): Int
 }
 
 data class MessageTokenStats(

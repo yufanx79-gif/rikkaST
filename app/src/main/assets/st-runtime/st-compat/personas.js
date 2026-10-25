@@ -39,3 +39,27 @@ export async function getUserPersona() {
     }
     return '';
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export async function askForPersonaSelection(..._args) { return null; }
+export async function autoSelectPersona(..._args) { return null; }
+export function buildPersonaAvatarList(..._args) { return null; }
+export async function convertCharacterToPersona(..._args) { return null; }
+export async function createPersona(..._args) { return null; }
+export function getConnectedPersonas(..._args) { return null; }
+export function getCurrentConnectionObj(..._args) { return null; }
+export function getOrCreatePersonaDescriptor(..._args) { return null; }
+export async function initPersona(..._args) { return null; }
+export async function initPersonas(..._args) { return null; }
+export function initUserAvatar(..._args) { return null; }
+export function isPersonaConnectionLocked(..._args) { return null; }
+export function isPersonaLocked(..._args) { return null; }
+export function isPersonaPanelOpen(..._args) { return null; }
+export const persona_description_positions = { IN_PROMPT: 0, AFTER_CHAR: 1, TOP_AN: 2, BOTTOM_AN: 3, AT_DEPTH: 4, NONE: 9 };
+export const personasFilter = {};
+export async function retriggerFirstMessageOnEmptyChat(..._args) { return null; }
+export function setPersonaDescription(..._args) { return null; }
+export async function setPersonaLockState(..._args) { return null; }
+export async function showCharConnections(..._args) { return null; }
+export async function togglePersonaLock(..._args) { return null; }
+export function updatePersonaConnectionsAvatarList(..._args) { return null; }

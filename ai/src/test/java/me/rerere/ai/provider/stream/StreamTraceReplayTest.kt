@@ -411,9 +411,6 @@ class StreamTraceReplayTest {
                         put("title", annotation.title)
                         put("url", annotation.url)
                     })
-
-                    // 其它应用层注解（CharacterCardData / ExampleMessage / Hidden 等）不属于提供商流数据
-                    else -> Unit
                 }
             }
         }

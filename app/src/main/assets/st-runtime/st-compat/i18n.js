@@ -38,3 +38,8 @@ export function t(...args) {
 }
 
 export const translate = t;
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export function addLocaleData(..._args) { return null; }
+export function applyLocale(..._args) { return null; }
+export async function initLocales(..._args) { return null; }

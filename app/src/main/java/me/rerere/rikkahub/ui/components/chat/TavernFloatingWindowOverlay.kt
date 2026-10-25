@@ -1,12 +1,15 @@
 package me.rerere.rikkahub.ui.components.chat
 
 import android.graphics.Color as AndroidColor
+import android.net.Uri
+import android.webkit.ValueCallback
 import android.widget.FrameLayout
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -18,12 +21,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -67,9 +70,10 @@ import kotlin.math.roundToInt
  * 2. **角色卡与多插件通用悬浮窗适配（由此及彼）**：
  *    同时支持切换至「📱 小手机 (ST-iPhonie)」、「📊 记忆表格 (st-memory-enhancement)」、
  *    「📦 小白X (LittleWhiteBox)」以及「🗺️ 角色卡悬浮窗」（自动捕获角色卡 `TH-script` 脚本挂载的手机、地图、背包、状态 HUD 等悬浮窗）。
- * 3. **零二次白屏**：
- *    弹窗直接挂载常驻主运行时 `TavernRuntimeManager.webView`，关闭弹窗时仅从容器摘除而不销毁 WebView，
- *    因此无论打开多少次均为 0ms 秒开、绝无二次进入白屏或 IndexedDB 锁冲突。
+ * 3. **完整支持二级界面、文件选择、JS 弹窗与「本聊天不再显示」**：
+ *    - 接线 `webViewFileChooserLauncher` 处理 `<input type="file">`（换头像、换壁纸、导入配置）；
+ *    - 接线 `webViewJsDialogFlow` 处理 `alert` / `confirm` / `prompt`；
+ *    - 支持「本聊天不再显示」与 JS 侧关闭回执，真正收起弹窗并记忆当前会话隐藏状态。
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -80,6 +84,89 @@ fun BoxScope.TavernFloatingWindowOverlay(
     val summary by TavernRuntimeManager.floatingWindowsFlow.collectAsState()
     val ttsState by TavernRuntimeManager.stIphonieTtsStateFlow.collectAsState()
     val requestedTarget by TavernRuntimeManager.requestedFloatingTargetFlow.collectAsState()
+    val isBootReady by TavernRuntimeManager.isBootReadyFlow.collectAsState()
+    val hiddenVersion by TavernRuntimeManager.floatingHiddenVersionFlow.collectAsState()
+    val jsDialogEvent by TavernRuntimeManager.webViewJsDialogFlow.collectAsState()
+    val activeConvId = TavernRuntimeManager.activeConversationId
+
+    // 接线 WebView <input type="file"> 文件选择器（供小手机与角色浮窗换头像、上传背景、导入配置）
+    var pendingFileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        val cb = pendingFileCallback
+        pendingFileCallback = null
+        if (cb != null) {
+            if (uri != null) {
+                cb.onReceiveValue(arrayOf(uri))
+            } else {
+                cb.onReceiveValue(null)
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        TavernRuntimeManager.webViewFileChooserLauncher = { mimeTypes, _, callback ->
+            pendingFileCallback?.onReceiveValue(null)
+            pendingFileCallback = callback
+            val filter = mimeTypes.filter { it.isNotBlank() }.toTypedArray().ifEmpty { arrayOf("*/*") }
+            runCatching {
+                filePickerLauncher.launch(filter)
+                true
+            }.getOrElse {
+                pendingFileCallback = null
+                false
+            }
+        }
+        onDispose {
+            pendingFileCallback?.onReceiveValue(null)
+            pendingFileCallback = null
+        }
+    }
+
+    // 渲染 WebView JS alert / confirm / prompt 弹窗
+    jsDialogEvent?.let { dialog ->
+        var promptText by remember(dialog) { mutableStateOf(dialog.defaultValue) }
+        AlertDialog(
+            onDismissRequest = { dialog.onCancel() },
+            title = {
+                Text(
+                    when (dialog.type) {
+                        "confirm" -> "确认操作"
+                        "prompt" -> "输入内容"
+                        else -> "提示"
+                    }
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (dialog.message.isNotBlank()) {
+                        Text(dialog.message)
+                    }
+                    if (dialog.type == "prompt") {
+                        OutlinedTextField(
+                            value = promptText,
+                            onValueChange = { promptText = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { dialog.onConfirm(promptText) }) {
+                    Text("确定")
+                }
+            },
+            dismissButton = if (dialog.type == "confirm" || dialog.type == "prompt") {
+                {
+                    TextButton(onClick = { dialog.onCancel() }) {
+                        Text("取消")
+                    }
+                }
+            } else null,
+        )
+    }
 
     var installedAliases by remember { mutableStateOf<Set<String>>(emptySet()) }
     LaunchedEffect(settings.tavernThirdPartyDisabled) {
@@ -94,17 +181,24 @@ fun BoxScope.TavernFloatingWindowOverlay(
     val hasIphonie = summary.hasIphonie || installedAliases.any { it.contains("st-iphonie") }
     val hasMemory = summary.hasMemory || installedAliases.any { it.contains("st-memory-enhancement") }
     val hasLittleWhiteBox = summary.hasLittleWhiteBox || installedAliases.any { it.contains("littlewhitebox") }
-    val hasCardFloating = summary.hasCardFloating
-    val showResidentDock = hasIphonie || hasMemory || hasLittleWhiteBox || hasCardFloating
+    val hasCardFloating = summary.hasCardFloating &&
+        !TavernRuntimeManager.isFloatingTargetHidden(activeConvId, "card_floating")
+    val showResidentDock = hasIphonie || hasMemory || hasLittleWhiteBox || summary.hasCardFloating
 
     if (!showResidentDock && requestedTarget == null) return
 
     var dragOffsetY by rememberSaveable { mutableFloatStateOf(0f) }
     var activeTarget by rememberSaveable { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(requestedTarget) {
+    LaunchedEffect(requestedTarget, hiddenVersion) {
         if (requestedTarget != null) {
-            activeTarget = requestedTarget
+            if (!TavernRuntimeManager.isFloatingTargetHidden(activeConvId, requestedTarget!!)) {
+                activeTarget = requestedTarget
+            } else {
+                activeTarget = null
+            }
+        } else {
+            activeTarget = null
         }
     }
 
@@ -128,9 +222,13 @@ fun BoxScope.TavernFloatingWindowOverlay(
         Row(
             modifier = Modifier
                 .clickable {
+                    // 用户主动点右侧胶囊时，若此前点过「本聊天不再显示」，允许恢复打开
+                    if (summary.hasCardFloating && !hasCardFloating && !hasIphonie) {
+                        TavernRuntimeManager.clearHiddenFloatingTargetsForCurrentChat()
+                    }
                     val defaultTarget = when {
                         hasIphonie -> "iphonie"
-                        hasCardFloating -> "card_floating"
+                        summary.hasCardFloating -> "card_floating"
                         hasMemory -> "memory_table"
                         hasLittleWhiteBox -> "littlewhitebox"
                         else -> "iphonie"
@@ -178,8 +276,13 @@ fun BoxScope.TavernFloatingWindowOverlay(
             hasIphonie = hasIphonie,
             hasMemory = hasMemory,
             hasLittleWhiteBox = hasLittleWhiteBox,
-            hasCardFloating = hasCardFloating,
+            hasCardFloating = summary.hasCardFloating,
             ttsPlaying = ttsState.playing,
+            isBootReady = isBootReady,
+            onHideForCurrentChat = { targetToHide ->
+                activeTarget = null
+                TavernRuntimeManager.hideFloatingTargetForCurrentChat(targetToHide)
+            },
             onDismiss = {
                 activeTarget = null
                 TavernRuntimeManager.dismissFloatingWindow()
@@ -197,10 +300,18 @@ fun TavernFloatingWindowModal(
     hasLittleWhiteBox: Boolean = true,
     hasCardFloating: Boolean = false,
     ttsPlaying: Boolean = false,
+    isBootReady: Boolean = true,
+    onHideForCurrentChat: ((String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     var selectedTarget by remember(initialTarget) { mutableStateOf(initialTarget) }
     val containerHolder = remember { arrayOfNulls<FrameLayout>(1) }
+
+    LaunchedEffect(selectedTarget, isBootReady) {
+        containerHolder[0]?.let { frame ->
+            TavernRuntimeManager.attachHostWebViewToContainer(frame, selectedTarget)
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -244,8 +355,10 @@ fun TavernFloatingWindowModal(
                             FilterChip(
                                 selected = selectedTarget == "iphonie",
                                 onClick = {
-                                    selectedTarget = "iphonie"
-                                    TavernRuntimeManager.switchFloatingWindowTarget("iphonie")
+                                    if (selectedTarget != "iphonie") {
+                                        selectedTarget = "iphonie"
+                                        TavernRuntimeManager.switchFloatingWindowTarget("iphonie")
+                                    }
                                 },
                                 label = { Text("📱 小手机", fontSize = 12.sp) },
                                 colors = FilterChipDefaults.filterChipColors(
@@ -259,8 +372,10 @@ fun TavernFloatingWindowModal(
                             FilterChip(
                                 selected = selectedTarget == "memory_table",
                                 onClick = {
-                                    selectedTarget = "memory_table"
-                                    TavernRuntimeManager.switchFloatingWindowTarget("memory_table")
+                                    if (selectedTarget != "memory_table") {
+                                        selectedTarget = "memory_table"
+                                        TavernRuntimeManager.switchFloatingWindowTarget("memory_table")
+                                    }
                                 },
                                 label = { Text("📊 记忆表格", fontSize = 12.sp) },
                                 colors = FilterChipDefaults.filterChipColors(
@@ -274,8 +389,10 @@ fun TavernFloatingWindowModal(
                             FilterChip(
                                 selected = selectedTarget == "littlewhitebox",
                                 onClick = {
-                                    selectedTarget = "littlewhitebox"
-                                    TavernRuntimeManager.switchFloatingWindowTarget("littlewhitebox")
+                                    if (selectedTarget != "littlewhitebox") {
+                                        selectedTarget = "littlewhitebox"
+                                        TavernRuntimeManager.switchFloatingWindowTarget("littlewhitebox")
+                                    }
                                 },
                                 label = { Text("📦 小白X", fontSize = 12.sp) },
                                 colors = FilterChipDefaults.filterChipColors(
@@ -288,8 +405,10 @@ fun TavernFloatingWindowModal(
                         FilterChip(
                             selected = selectedTarget == "card_floating",
                             onClick = {
-                                selectedTarget = "card_floating"
-                                TavernRuntimeManager.switchFloatingWindowTarget("card_floating")
+                                if (selectedTarget != "card_floating") {
+                                    selectedTarget = "card_floating"
+                                    TavernRuntimeManager.switchFloatingWindowTarget("card_floating")
+                                }
                             },
                             label = {
                                 Text(
@@ -312,6 +431,13 @@ fun TavernFloatingWindowModal(
                                 Text("⏹ 停音", color = Color(0xFFFF8A80), fontSize = 12.sp)
                             }
                         }
+                        if (onHideForCurrentChat != null) {
+                            TextButton(
+                                onClick = { onHideForCurrentChat(selectedTarget) },
+                            ) {
+                                Text("不再显示", color = Color(0xFF9EA4B8), fontSize = 12.sp)
+                            }
+                        }
                         Spacer(modifier = Modifier.width(2.dp))
                         TextButton(onClick = onDismiss) {
                             Text("✕ 收起", color = Color(0xFFE4E6EF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
@@ -320,6 +446,8 @@ fun TavernFloatingWindowModal(
                 }
 
                 // 挂载常驻主运行时 WebView（不重新加载页面、不断开 IndexedDB、不中断音频）
+                // 注意：不在 update 回调中无条件重调 attachHostWebViewToContainer，防止 Compose 重组（如 TTS 状态跳动）
+                // 反复执行 __rikkaOpenFloatingTarget 导致小手机二级菜单/弹窗（sheet/dialog）被重置关闭！
                 AndroidView(
                     modifier = Modifier
                         .weight(1f)
@@ -332,7 +460,7 @@ fun TavernFloatingWindowModal(
                         }
                     },
                     update = { container ->
-                        TavernRuntimeManager.attachHostWebViewToContainer(container, selectedTarget)
+                        containerHolder[0] = container
                     },
                     onRelease = { container ->
                         if (containerHolder[0] === container) containerHolder[0] = null

@@ -11,7 +11,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessageAnnotation
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.core.ReasoningLevel
-import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.datastore.MessageStyleOverride
 import me.rerere.rikkahub.utils.SimpleCache
 import java.util.concurrent.TimeUnit
@@ -33,6 +33,7 @@ data class Assistant(
     val streamOutput: Boolean = true,
     val enableMemory: Boolean = false,
     val useGlobalMemory: Boolean = false, // 使用全局共享记忆而非助手隔离记忆
+    val autoConsolidateMemory: Boolean = true, // 对话停下来后在后台自动整理记忆; 关闭后只能手动整理
     val enableRecentChatsReference: Boolean = false,
     val messageTemplate: String = "{{ message }}",
     val contextTemplate: String = DEFAULT_CONTEXT_TEMPLATE, // 上下文组装模板（ADF风格）
@@ -177,6 +178,14 @@ private fun compileRegexCached(pattern: String): Regex? {
     }.onFailure { it.printStackTrace() }
     regexCache.put(pattern, result)
     return result.getOrNull()
+}
+
+fun List<UIMessagePart>.replaceUserRegexes(assistant: Assistant): List<UIMessagePart> = map { part ->
+    if (part is UIMessagePart.Text) {
+        part.copy(text = part.text.replaceRegexes(assistant, AssistantAffectScope.USER, visual = false))
+    } else {
+        part
+    }
 }
 
 fun String.replaceRegexes(
@@ -494,7 +503,7 @@ sealed class PromptInjection {
         val matchWholeWords: Boolean = false,           // 整词匹配（酒馆 match_whole_words）
         val scanDepth: Int? = null,                     // 扫描最近N条消息；null = 用全局默认（官方 world_info_depth=2）
         val constantActive: Boolean = false,            // 常驻激活（无需匹配）
-        val selective: Boolean = false,                 // 是否启用二级关键词逻辑
+        val selective: Boolean = true,                  // 是否启用二级关键词逻辑（对齐 ST 1.19 默认 true）
         val selectiveLogic: SelectiveLogic = SelectiveLogic.AND_ANY, // 触发逻辑
         val group: String = "",                         // 分组标签（同组条目互斥时只激活一个）
         val groupWeight: Int = 100,                     // 同组权重（随机选择时使用）

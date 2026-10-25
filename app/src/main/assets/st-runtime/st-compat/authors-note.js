@@ -30,3 +30,7 @@ export function shouldWIAddPrompt() {
         return false;
     }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export function initAuthorsNote(..._args) { return null; }
+export function setFloatingPrompt(..._args) { return null; }

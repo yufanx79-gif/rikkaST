@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/SillyTavern/SillyTavern",
+  "version": "1.19.0",
+  "archive": "SillyTavern-1.19.0.zip",
+  "sha256": "19F34009D55D4E2DD394CE9D6DD6E5D1B0E5B9E5D57DF8B5AA325A44C18969BE",
+  "modules": [
+    "public/script.js",
+    "public/lib.js",
+    "public/scripts/macros.js",
+    "public/scripts/macros/**",
+    "public/scripts/world-info.js",
+    "public/scripts/variables.js",
+    "public/scripts/slash-commands.js",
+    "public/scripts/slash-commands/**",
+    "public/scripts/extensions.js",
+    "public/scripts/st-context.js",
+    "public/scripts/openai.js",
+    "public/scripts/extensions/regex/engine.js",
+    "public/scripts/message-formatter.js"
+  ]
+}

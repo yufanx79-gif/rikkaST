@@ -413,6 +413,7 @@ private fun AssistantPromptContent(
                         it.fastForEach { message ->
                             ChatMessage(
                                 node = message.toMessageNode(),
+                                assistant = assistant,
                                 onFork = {},
                                 onRegenerate = {},
                                 onEdit = {},

@@ -825,7 +825,24 @@ class NodeRuntimeManager(
 
     companion object {
         const val SHARED_WORKSPACE_ROOT = "shared_tavern_node"
+        const val ROOTFS_NODE_DIR = "/usr/local/node"
         const val DEFAULT_PORT = 18181
+        const val NODE_PATH_PREFIX = "/usr/local/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        /**
+         * Resolves the shared Node.js installation directory (`workspaces/shared_tavern_node/linux/usr/local/node`)
+         * when the target workspace `linuxDir` does not have its own local `/usr/local/node/bin/node`.
+         * Strictly resolves only from `shared_tavern_node` (never from arbitrary assistant workspaces), and
+         * only the binary `/usr/local/node` directory is returned (never `files` or `tmp`), preserving strict
+         * per-workspace `/workspace` and `/tmp` isolation.
+         */
+        fun resolveSharedNodeDir(linuxDir: File): File? {
+            val localNodeBin = File(linuxDir, "usr/local/node/bin/node")
+            if (localNodeBin.isFile) return null
+            val workspacesBase = linuxDir.parentFile?.parentFile ?: return null
+            val sharedNodeDir = File(workspacesBase, "$SHARED_WORKSPACE_ROOT/linux/usr/local/node")
+            return if (File(sharedNodeDir, "bin/node").isFile) sharedNodeDir else null
+        }
         const val DEFAULT_NODE_VERSION = "v20.18.1"
         private const val MAX_LOG_LINES = 300
         private const val MAX_CRASH_RESTARTS = 3
@@ -833,6 +850,8 @@ class NodeRuntimeManager(
         // Official Node.js v20.18.1 release SHA-256 checksums from https://nodejs.org/dist/v20.18.1/SHASUMS256.txt
         const val SHA256_LINUX_ARM64 = "44d1ffc5905c005ace4515ca6f8c090c4c7cfce3a9a67df0dba35c727590b8f6"
         const val SHA256_LINUX_X64 = "c6fa75c841cbffac851678a472f2a5bd612fff8308ef39236190e1f8dbb0e567"
+        const val NODE_ARM64_SHA256 = SHA256_LINUX_ARM64
+        const val NODE_X64_SHA256 = SHA256_LINUX_X64
 
         fun detectArch(): String {
             val arch = System.getProperty("os.arch").orEmpty().lowercase(Locale.ROOT)
@@ -890,6 +909,68 @@ class NodeRuntimeManager(
                 }
             }
             return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+
+        fun verifySha256(file: File, expectedSha256: String): Boolean {
+            if (!file.isFile || expectedSha256.isBlank()) return false
+            return computeSha256(file).equals(expectedSha256.trim(), ignoreCase = true)
+        }
+
+        private fun parseSemverTuple(ver: String): Triple<Int, Int, Int>? {
+            val clean = ver.trim().removePrefix("v").removePrefix("V").substringBefore('-').substringBefore('+')
+            val nums = clean.split('.').map { it.trim() }
+            if (nums.isEmpty()) return null
+            val major = nums.getOrNull(0)?.toIntOrNull() ?: return null
+            val minor = nums.getOrNull(1)?.toIntOrNull() ?: 0
+            val patch = nums.getOrNull(2)?.toIntOrNull() ?: 0
+            return Triple(major, minor, patch)
+        }
+
+        private fun compareSemver(a: Triple<Int, Int, Int>, b: Triple<Int, Int, Int>): Int {
+            if (a.first != b.first) return a.first.compareTo(b.first)
+            if (a.second != b.second) return a.second.compareTo(b.second)
+            return a.third.compareTo(b.third)
+        }
+
+        fun satisfiesNodeEngine(versionStr: String, rangeExpr: String): Boolean {
+            val v = parseSemverTuple(versionStr) ?: return false
+            val orBranches = rangeExpr.split("||").map { it.trim() }.filter { it.isNotEmpty() }
+            if (orBranches.isEmpty()) return true
+            return orBranches.any { branch ->
+                val tokens = branch.split(Regex("\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+                tokens.all { tok ->
+                    when {
+                        tok.startsWith(">=") -> {
+                            val target = parseSemverTuple(tok.removePrefix(">=")) ?: return@all false
+                            compareSemver(v, target) >= 0
+                        }
+                        tok.startsWith("<=") -> {
+                            val target = parseSemverTuple(tok.removePrefix("<=")) ?: return@all false
+                            compareSemver(v, target) <= 0
+                        }
+                        tok.startsWith(">") -> {
+                            val target = parseSemverTuple(tok.removePrefix(">")) ?: return@all false
+                            compareSemver(v, target) > 0
+                        }
+                        tok.startsWith("<") -> {
+                            val target = parseSemverTuple(tok.removePrefix("<")) ?: return@all false
+                            compareSemver(v, target) < 0
+                        }
+                        tok.startsWith("^") -> {
+                            val target = parseSemverTuple(tok.removePrefix("^")) ?: return@all false
+                            v.first == target.first && compareSemver(v, target) >= 0
+                        }
+                        tok.startsWith("~") -> {
+                            val target = parseSemverTuple(tok.removePrefix("~")) ?: return@all false
+                            v.first == target.first && v.second == target.second && compareSemver(v, target) >= 0
+                        }
+                        else -> {
+                            val target = parseSemverTuple(tok) ?: return@all false
+                            compareSemver(v, target) == 0
+                        }
+                    }
+                }
+            }
         }
 
         fun isNodeVersionSupported(versionStr: String): Boolean {

@@ -1,0 +1,14 @@
+{
+  "version": "1.19.0",
+  "requiredFieldCount": 42,
+  "defaults": {
+    "selective": true,
+    "useProbability": true,
+    "addMemo": false,
+    "position": 0,
+    "order": 100,
+    "depth": 4,
+    "groupWeight": 100,
+    "probability": 100
+  }
+}

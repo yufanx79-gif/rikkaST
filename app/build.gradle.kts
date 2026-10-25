@@ -1,24 +1,25 @@
-import com.android.build.api.dsl.Packaging
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+@file:Suppress("UnstableApiUsage")
+
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import java.io.FileInputStream
 import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
+    // rikkaST 不使用官方 Firebase 项目；不要把 google-services.json 提交仓库
+    // alias(libs.plugins.google.services)
+    // alias(libs.plugins.firebase.crashlytics)
     alias(libs.plugins.baselineprofile)
     id("com.chaquo.python")
 }
+
 // Python 引擎配置 — Chaquopy 新 DSL
 chaquopy {
     defaultConfig {
         version = "3.12"
-        // PC 构建用的 Python 解释器：优先 local.properties 的 chaquopy.python，其次环境变量 CHAQUOPY_PYTHON，
-        // 都没有则交给 Chaquopy 用 PATH 上的 python。
-        // （原先这里写死了本机绝对路径，已移除以避免泄露个人环境；本机可写入 local.properties：）
-        //   chaquopy.python=C:/Users/<you>/AppData/Roaming/uv/python/cpython-3.12.13-windows-x86_64-none/python.exe
         val localProperties = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) {
@@ -43,6 +44,7 @@ chaquopy {
         }
     }
 }
+
 android {
     namespace = "me.rerere.rikkahub"
     compileSdk {
@@ -50,12 +52,13 @@ android {
             minorApiLevel = 2
         }
     }
+
     defaultConfig {
         applicationId = "me.rerere.rikkahub.st"  // 独立包名：可与官方 RikkaHub 共存，互不覆盖（debug 变体自动加 .debug 后缀）
         minSdk = 26
         targetSdk = 37
-        versionCode = 238 // 2.5.6 base migration; must be > previous 237
-        versionName = "2.5.6"
+        versionCode = 242 // 10-22-final + backup-db v33 compatibility (> 241 fixed2)
+        versionName = "2.5.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -63,10 +66,9 @@ android {
             abiFilters += listOf("arm64-v8a")
         }
     }
+
     splits {
         abi {
-            // AppBundle tasks usually contain "bundle" in their name
-            //noinspection WrongGradleMethod
             val isBuildingBundle = gradle.startParameter.taskNames.any { it.lowercase().contains("bundle") }
             isEnable = !isBuildingBundle
             reset()
@@ -74,16 +76,20 @@ android {
             isUniversalApk = true
         }
     }
+
     signingConfigs {
         create("release") {
             val localProperties = Properties()
             val localPropertiesFile = rootProject.file("local.properties")
+
             if (localPropertiesFile.exists()) {
                 localProperties.load(FileInputStream(localPropertiesFile))
+
                 val storeFilePath = localProperties.getProperty("storeFile")
                 val storePasswordValue = localProperties.getProperty("storePassword")
                 val keyAliasValue = localProperties.getProperty("keyAlias")
                 val keyPasswordValue = localProperties.getProperty("keyPassword")
+
                 if (storeFilePath != null && storePasswordValue != null &&
                     keyAliasValue != null && keyPasswordValue != null
                 ) {
@@ -95,12 +101,16 @@ android {
             }
         }
     }
+
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("release")
-            optimization {
-                enable = true
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}\"")
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }
@@ -111,8 +121,8 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     buildFeatures {
         compose = true
@@ -127,21 +137,26 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            pickFirsts += "lib/*/libtermux.so"
+            // 两个依赖都提供 libc++_shared.so，拣选一份即可
+            pickFirsts += listOf("**/libc++_shared.so", "**/libtermux.so")
+        }
+        resources {
+            excludes += listOf(
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE.md",
+                "META-INF/NOTICE.md",
+                "META-INF/io.netty.versions.properties",
+                "mozilla/public-suffix-list.txt",
+            )
         }
     }
-    tasks.withType<KotlinCompile>().configureEach {
-        compilerOptions.optIn.add("androidx.compose.material3.ExperimentalMaterial3Api")
-        compilerOptions.optIn.add("androidx.compose.material3.ExperimentalMaterial3ExpressiveApi")
-        compilerOptions.optIn.add("androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi")
-        compilerOptions.optIn.add("androidx.compose.animation.ExperimentalAnimationApi")
-        compilerOptions.optIn.add("androidx.compose.animation.ExperimentalSharedTransitionApi")
-        compilerOptions.optIn.add("androidx.compose.foundation.ExperimentalFoundationApi")
-        compilerOptions.optIn.add("androidx.compose.foundation.layout.ExperimentalLayoutApi")
-        compilerOptions.optIn.add("kotlin.uuid.ExperimentalUuidApi")
-        compilerOptions.optIn.add("kotlin.time.ExperimentalTime")
-        compilerOptions.optIn.add("kotlinx.coroutines.ExperimentalCoroutinesApi")
-        compilerOptions.optIn.add("androidx.navigation3.runtime.ExperimentalNavigation3Api")
+}
+
+// baselineprofile 插件按 release 复制出 nonMinifiedRelease 时只关掉 isMinifyEnabled，关不掉 optimization
+androidComponents {
+    finalizeDsl { extension ->
+        extension.buildTypes.findByName("nonMinifiedRelease")?.optimization?.enable = false
     }
 }
 
@@ -151,21 +166,47 @@ composeCompiler {
     )
 }
 
-tasks.register("buildAll") {
+tasks.register("printVersionName") {
+    doLast {
+        println(android.defaultConfig.versionName)
+    }
+}
+
+tasks.register("buildRelease") {
     dependsOn("assembleRelease", "bundleRelease")
     description = "Build both APK and AAB"
 }
+
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
 
-kotlin {
+tasks.withType<KotlinCompile>().configureEach {
     compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.add("-Xannotation-default-target=param-property")
+        freeCompilerArgs.add("-opt-in=kotlin.uuid.ExperimentalUuidApi")
+        freeCompilerArgs.add("-opt-in=androidx.compose.material3.ExperimentalMaterial3Api")
+        freeCompilerArgs.add("-opt-in=androidx.compose.material3.ExperimentalMaterial3ExpressiveApi")
+        freeCompilerArgs.add("-opt-in=androidx.compose.foundation.ExperimentalFoundationApi")
+        freeCompilerArgs.add("-opt-in=androidx.compose.foundation.layout.ExperimentalLayoutApi")
+        freeCompilerArgs.add("-opt-in=kotlin.time.ExperimentalTime")
+        freeCompilerArgs.add("-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi")
+        freeCompilerArgs.add("-opt-in=androidx.navigation3.runtime.ExperimentalNavigation3Api")
+        freeCompilerArgs.add("-opt-in=androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi")
+        freeCompilerArgs.add("-opt-in=androidx.compose.animation.ExperimentalAnimationApi")
+        freeCompilerArgs.add("-opt-in=androidx.compose.animation.ExperimentalSharedTransitionApi")
+    }
+}
+
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("io.github.dokar3:quickjs-kt-android"))
+            .using(module("io.github.dokar3:quickjs-kt-jvm:${libs.versions.quickjs.get()}"))
     }
 }
 
 dependencies {
+    implementation(libs.quickjs)
     implementation(libs.wang.quickjs)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -173,6 +214,8 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.profileinstaller)
+    implementation(libs.termux.terminal.view)
+    implementation(libs.guava.listenablefuture)
 
     // Compose
     implementation(libs.androidx.activity.compose)
@@ -184,47 +227,53 @@ dependencies {
     implementation(libs.androidx.material3.adaptive)
     implementation(libs.androidx.material3.adaptive.layout)
     implementation(libs.androidx.material3.adaptive.navigation3)
+
     // Navigation 3
     implementation(libs.androidx.navigation3.runtime)
     implementation(libs.androidx.navigation3.ui)
     implementation(libs.androidx.lifecycle.viewmodel.navigation3)
 
-
     // DataStore
     implementation(libs.androidx.datastore.preferences)
+
     // Image metadata extractor
-    // https://github.com/drewnoakes/metadata-extractor
     implementation(libs.metadata.extractor)
 
-    // Haze (background blur and glass)
+    // floatingx
+    implementation(libs.floatingx)
+    implementation(libs.floatingx.app)
+    implementation(libs.floatingx.compose)
+
+    // haze
     implementation(libs.haze)
     implementation(libs.haze.blur)
     implementation(libs.haze.blur.material3)
     implementation(libs.haze.glass)
     implementation(libs.haze.glass.material3)
 
-    // koin
+    // Koin
     implementation(platform(libs.koin.bom))
     implementation(libs.koin.android)
     implementation(libs.koin.compose)
     implementation(libs.koin.androidx.workmanager)
     implementation(libs.diffutils)
-    implementation(libs.termux.terminal.view)
-    implementation(libs.guava.listenablefuture)
-    // jetbrains markdown parser
     implementation(libs.jetbrains.markdown)
+
     // okhttp
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
     implementation(libs.retrofit)
     implementation(libs.retrofit.serialization.json)
+
     // ktor client
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.okhttp)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.kotlinx.json)
+
     // ucrop
     implementation(libs.ucrop)
+
     // pebble (template engine)
     implementation(libs.pebble)
 
@@ -234,53 +283,74 @@ dependencies {
     implementation(libs.coil.okhttp)
     implementation(libs.coil.svg)
     implementation(libs.coil.cache.control)
+
     // serialization
     implementation(libs.kotlinx.serialization.json)
+
+    // jSoup
+    implementation(libs.jsoup)
 
     // YAML front matter
     implementation(libs.snakeyaml)
 
-    // zxing
+    // zxing & exifinterface
     implementation(libs.zxing.core)
-    // 相机扫码三方库已全部移除（Quickie / ML Kit barcode-scanning / CameraX）：
-    // ML Kit 的 MlKitInitProvider 会在应用启动时自动初始化，部分设备上初始化失败会崩溃；
-    // 相册导入二维码走 zxing（MultiFormatReader），无需这些库。
-    // exifinterface（读取图片方向信息；原为 camera-core 的传递依赖，现显式声明）
     implementation(libs.androidx.exifinterface)
+
+    // quickie (qrcode scanner)
+    implementation(libs.quickie.bundled)
+    implementation(libs.barcode.scanning)
+    implementation(libs.androidx.camera.core)
+
     // Room
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     implementation(libs.androidx.room.paging)
     baselineProfile(project(":app:baselineprofile"))
     ksp(libs.androidx.room.compiler)
+
     // Paging3
     implementation(libs.androidx.paging.runtime)
     implementation(libs.androidx.paging.compose)
+
+    // media3 (video playback)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+
     // Apache Commons Text
     implementation(libs.commons.text)
+
     // Toast (Sonner)
     implementation(libs.sonner)
-    // Reorderable (https://github.com/Calvin-LL/Reorderable/)
+
+    // Reorderable
     implementation(libs.reorderable)
-    // lucide icons
+
+    // icons
     implementation(libs.lucide.icons)
     implementation(libs.huge.icons)
+
     // image viewer
     implementation(libs.image.viewer)
+
     // JLatexMath
-    // https://github.com/rikkahub/jlatexmath-android
     implementation(libs.jlatexmath)
     implementation(libs.jlatexmath.font.greek)
     implementation(libs.jlatexmath.font.cyrillic)
+
     // mcp
     implementation(libs.modelcontextprotocol.kotlin.sdk)
+
     // jmDNS (mDNS/Bonjour for .local hostname)
     implementation(libs.jmdns)
+
     // SLF4J Android binding — routes Ktor/SLF4J logs to logcat
     implementation(libs.slf4j.api)
     implementation(libs.slf4j.android)
+
     // sqlite-android (requery SQLite for Android)
     implementation(libs.sqlite.android)
+
     // modules
     implementation(project(":ai"))
     implementation(project(":web"))
@@ -288,17 +358,19 @@ dependencies {
     implementation(project(":highlight"))
     implementation(project(":search"))
     implementation(project(":speech"))
+    implementation(project(":mediagen"))
     implementation(project(":videogen"))
     implementation(project(":common"))
     implementation(project(":material3"))
+    implementation(project(":ui"))
     implementation(project(":workspace"))
     implementation(project(":oauth"))
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
     implementation(kotlin("reflect"))
-    // Leak Canary
-    // debugImplementation(libs.leakcanary.android)
+
     // tests
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

@@ -27,13 +27,13 @@ import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Tools
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeBlock
 import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
-import me.rerere.rikkahub.ui.components.ui.FormItem
-import me.rerere.rikkahub.ui.theme.AppType
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.JsonInstantPretty
 import me.rerere.rikkahub.utils.jsonPrimitiveOrNull
+import me.rerere.ui.components.FormItem
 
 /**
  * 工具调用的渲染上下文, 预解析好工具入参与输出, 避免各渲染器重复解析
@@ -46,6 +46,8 @@ data class ToolUIContext(
     val content: JsonElement?,
     /** 该工具调用是否在生成中 */
     val loading: Boolean,
+    /** 发起该工具调用的助手, 拿不到时为 null */
+    val assistant: Assistant? = null,
 )
 
 /**
@@ -91,7 +93,6 @@ private object DefaultToolUIRenderer : ToolUIRenderer {
  */
 object ToolUIRegistry {
     private val renderers: Map<String, ToolUIRenderer> = listOf(
-        MemoryToolUI,
         SearchWebToolUI,
         ScrapeWebToolUI,
         GetTimeInfoToolUI,
@@ -108,7 +109,7 @@ object ToolUIRegistry {
         ReadFileToolUI,
         WriteFileToolUI,
         ShellToolUI,
-    ).associateBy { it.toolName }
+    ).plus(MemoryFileToolUI.all).associateBy { it.toolName }
 
     /** 查找工具对应的渲染器, 未注册时返回默认渲染器 */
     fun resolve(toolName: String): ToolUIRenderer = renderers[toolName] ?: DefaultToolUIRenderer
@@ -154,7 +155,7 @@ fun DefaultToolPreview(
             HighlightCodeBlock(
                 code = JsonInstantPretty.encodeToString(context.arguments),
                 language = "json",
-                style = TextStyle(fontSize = AppType.micro, lineHeight = AppType.microLineHeight)
+                style = TextStyle(fontSize = 10.sp, lineHeight = 12.sp)
             )
         }
         if (context.tool.output.isNotEmpty()) {
@@ -173,7 +174,7 @@ fun DefaultToolPreview(
                                     )
                                 }.getOrElse { part.text },
                                 language = "json",
-                                style = TextStyle(fontSize = AppType.micro, lineHeight = AppType.microLineHeight)
+                                style = TextStyle(fontSize = 10.sp, lineHeight = 12.sp)
                             )
 
                             is UIMessagePart.Image -> ZoomableAsyncImage(

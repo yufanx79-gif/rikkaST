@@ -1,52 +1,47 @@
 package me.rerere.rikkahub.di
 
 import android.content.Context
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.http.HttpHeaders
 import io.pebbletemplates.pebble.PebbleEngine
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.common.http.AcceptLanguageBuilder
+import me.rerere.mediagen.provider.MediaGenerationManager
+import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.data.ai.AIRequestInterceptor
-import me.rerere.rikkahub.data.ai.RequestLoggingInterceptor
-import me.rerere.rikkahub.data.ai.transformers.AssistantTemplateLoader
 import me.rerere.rikkahub.data.ai.GenerationLoop
+import me.rerere.rikkahub.data.ai.ConversationMetaGenerator
+import me.rerere.rikkahub.data.ai.MemoryConsolidationScheduler
+import me.rerere.rikkahub.data.ai.MemoryConsolidator
+import me.rerere.rikkahub.data.ai.RequestLoggingInterceptor
 import me.rerere.rikkahub.data.ai.TranslationHandler
-import me.rerere.rikkahub.data.ai.transformers.TemplateTransformer
-import me.rerere.rikkahub.data.api.RikkaHubAPI
-import me.rerere.rikkahub.data.api.SponsorAPI
-import me.rerere.rikkahub.data.datastore.SettingsStore
-import me.rerere.rikkahub.data.sync.BackupManager
-import me.rerere.rikkahub.data.db.AppDatabaseFactory
-import me.rerere.rikkahub.data.db.AppDatabase
-import me.rerere.rikkahub.data.db.fts.MessageFtsManager
-import me.rerere.rikkahub.data.db.fts.SimpleDictManager
-import me.rerere.rikkahub.data.db.migrations.Migration_6_7
-import me.rerere.rikkahub.data.db.migrations.Migration_11_12
-import me.rerere.rikkahub.data.db.migrations.Migration_13_14
-import me.rerere.rikkahub.data.db.migrations.Migration_14_15
-import me.rerere.rikkahub.data.db.migrations.Migration_15_16
-import me.rerere.rikkahub.data.db.migrations.Migration_20_21
-import me.rerere.rikkahub.data.db.migrations.Migration_21_22
-import me.rerere.rikkahub.data.db.migrations.Migration_22_23
-import me.rerere.rikkahub.data.db.migrations.Migration_23_24
-import me.rerere.rikkahub.data.db.migrations.Migration_24_25
-import me.rerere.rikkahub.data.db.migrations.Migration_25_26
-import me.rerere.rikkahub.data.db.migrations.Migration_26_27
-import me.rerere.rikkahub.data.db.migrations.Migration_27_28
-import me.rerere.rikkahub.data.db.migrations.Migration_28_29
+import me.rerere.rikkahub.data.ai.UsageRecorder
+import me.rerere.rikkahub.data.ai.account.ProviderAccountManager
 import me.rerere.rikkahub.data.ai.mcp.McpManager
-import me.rerere.rikkahub.data.network.SettingsProxySelector
-import me.rerere.rikkahub.data.network.SettingsProxyAuthenticator
-import me.rerere.rikkahub.data.network.SettingsSocks5Authenticator
-import me.rerere.rikkahub.data.sync.webdav.WebDavSync
-import me.rerere.search.SearchService
+import me.rerere.rikkahub.data.ai.transformers.AssistantTemplateLoader
+import me.rerere.rikkahub.data.ai.transformers.TemplateTransformer
+import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.AppDatabaseFactory
+import me.rerere.rikkahub.data.db.fts.MessageFtsManager
+import me.rerere.rikkahub.data.remote.RemoteFileStore
+import me.rerere.rikkahub.data.remote.RikkaHubAPI
+import me.rerere.rikkahub.data.remote.SettingsProxyAuthenticator
+import me.rerere.rikkahub.data.remote.SettingsProxySelector
+import me.rerere.rikkahub.data.remote.SettingsSocks5Authenticator
+import me.rerere.rikkahub.data.remote.SponsorAPI
+import me.rerere.rikkahub.data.st.import.StArchiveImporter
+import me.rerere.rikkahub.data.sync.BackupManager
 import me.rerere.rikkahub.data.sync.S3Sync
-import me.rerere.rikkahub.data.files.FileFolders
-import me.rerere.workspace.ProotShellRunner
-import me.rerere.workspace.WorkspaceBindMount
+import me.rerere.rikkahub.data.sync.webdav.WebDavSync
+import me.rerere.rikkahub.service.memoryDreamKeepAlive
+import me.rerere.search.SearchService
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
@@ -72,11 +67,17 @@ val dataSourceModule = module {
     }
 
     single {
-        PebbleEngine.Builder()
+        val engine = PebbleEngine.Builder()
             .loader(get<AssistantTemplateLoader>())
             .defaultLocale(Locale.getDefault())
             .autoEscaping(false)
             .build()
+        // 消息模板按助手 ID 缓存，内容取自设置，设置变了就让已编译的模板失效
+        val settingsStore = get<SettingsStore>()
+        get<AppScope>().launch {
+            settingsStore.settingsFlow.collect { engine.templateCache.invalidateAll() }
+        }
+        engine
     }
 
     single { TemplateTransformer(engine = get(), settingsStore = get()) }
@@ -87,6 +88,10 @@ val dataSourceModule = module {
 
     single {
         get<AppDatabase>().memoryDao()
+    }
+
+    single {
+        get<AppDatabase>().memoryConsolidationDao()
     }
 
     single {
@@ -114,55 +119,18 @@ val dataSourceModule = module {
     }
 
     single {
-        val ctx: android.content.Context = get()
-        me.rerere.workspace.WorkspaceManager(
-            baseDir = java.io.File(ctx.filesDir, "workspaces"),
-            shellRunner = ProotShellRunner(
-                nativeLibraryDir = java.io.File(ctx.applicationInfo.nativeLibraryDir),
-            ),
-            bindMounts = listOf(
-                WorkspaceBindMount(
-                    source = java.io.File(ctx.filesDir, FileFolders.SKILLS).apply { mkdirs() },
-                    target = "/skills",
-                ),
-                WorkspaceBindMount(
-                    source = java.io.File(ctx.filesDir, FileFolders.TOOL_OUTPUTS).apply { mkdirs() },
-                    target = "/tool_outputs",
-                ),
-                WorkspaceBindMount(
-                    source = java.io.File(ctx.filesDir, FileFolders.UPLOAD).apply { mkdirs() },
-                    target = "/upload",
-                ),
-            ),
-        )
+        get<AppDatabase>().mediaCreationDao()
     }
 
     single {
-        me.rerere.workspace.RootfsInstaller(
-            manager = get(),
-        )
+        get<AppDatabase>().translationHistoryDao()
     }
 
     single {
-        me.rerere.rikkahub.data.repository.WorkspaceRepository(
-            dao = get(),
-            manager = get(),
-            rootfsInstaller = get(),
-            settingsStore = get(),
-        )
+        get<AppDatabase>().usageRecordDao()
     }
 
-    single {
-        me.rerere.rikkahub.data.repository.FolderRepository(get(), get())
-    }
-    single {
-        get<AppDatabase>().knowledgeBaseDao()
-    }
-    single {
-        MessageFtsManager(get())
-    }
-
-    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get()) }
+    single { get<AppDatabase>().knowledgeBaseDao() }
 
     single {
         GenerationLoop(
@@ -175,7 +143,41 @@ val dataSourceModule = module {
     }
 
     single {
-        TranslationHandler(providerManager = get())
+        UsageRecorder(dao = get(), scope = get<AppScope>())
+    }
+
+    single {
+        MessageFtsManager(get())
+    }
+
+    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get()) }
+
+    single {
+        MemoryConsolidator(
+            providerManager = get(),
+            usageRecorder = get(),
+            memoryRepository = get(),
+            conversationRepo = get(),
+            consolidationDao = get(),
+            settingsStore = get(),
+        )
+    }
+
+    single {
+        MemoryConsolidationScheduler(
+            scope = get<AppScope>(),
+            worker = get<MemoryConsolidator>(),
+            keepAlive = memoryDreamKeepAlive(get<Context>()),
+            isAppVisible = { ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) },
+        )
+    }
+
+    single {
+        TranslationHandler(providerManager = get(), usageRecorder = get())
+    }
+
+    single {
+        ConversationMetaGenerator(context = get(), providerManager = get(), usageRecorder = get())
     }
 
     single<OkHttpClient> {
@@ -257,10 +259,26 @@ val dataSourceModule = module {
     }
 
     single {
-        ProviderManager(client = get(), context = get())
+        ProviderAccountManager(
+            settingsStore = get(),
+            appScope = get(),
+            client = get(),
+        )
+    }
+
+    single {
+        ProviderManager(client = get(), context = get(), accountCredentials = get<ProviderAccountManager>())
     }
 
     single { BackupManager(context = get(), database = get(), settingsStore = get(), json = get()) }
+
+    single {
+        StArchiveImporter(
+            context = get(),
+            settingsStore = get(),
+            filesManager = get(),
+        )
+    }
 
     single {
         WebDavSync(
@@ -291,6 +309,18 @@ val dataSourceModule = module {
             context = get(),
             httpClient = get()
         )
+    }
+
+    single {
+        RemoteFileStore(
+            settingsStore = get(),
+            httpClient = get(),
+            scope = get<AppScope>()
+        )
+    }
+
+    single {
+        MediaGenerationManager(client = get())
     }
 
     single<Retrofit> {

@@ -9,7 +9,40 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const WORK_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const importFile = (p) => import(pathToFileURL(p).href);
 const ASSETS_RUNTIME = path.join(WORK_ROOT, 'app/src/main/assets/st-runtime');
-const ALL_NEEDS_DIR = process.env.ALL_NEEDS_DIR || '/tmp/rikka_work/all_needs';
+const EXPLICIT_ALL_NEEDS_DIR = (process.env.ALL_NEEDS_DIR || '').trim();
+const DEFAULT_ALL_NEEDS_CANDIDATES = process.env.RIKKA_FORCE_NO_DEFAULT_FIXTURE === '1'
+    ? []
+    : [
+        path.join(WORK_ROOT, 'testdata/all-needs'),
+        '/tmp/c_4ce2e51aba38f935/extract_all_needs',
+        '/tmp/rikkast_work/extracted_all_needs',
+        '/tmp/rikka_work/all_needs',
+    ];
+const ALL_NEEDS_DIR = EXPLICIT_ALL_NEEDS_DIR || DEFAULT_ALL_NEEDS_CANDIDATES.find((d) => fs.existsSync(d)) || '';
+const BUNDLED_FIXTURE_PRESENT = fs.existsSync(path.join(WORK_ROOT, 'testdata/all-needs'));
+
+function resolveOrSkipOptionalPlugin(t, pluginSubdir) {
+    if (!ALL_NEEDS_DIR) {
+        t.skip(
+            `[SKIP] Optional external plugin fixture ${pluginSubdir} not present in source archive. ` +
+            `Condition: requires unpacked 5-plugin fixture bundle (all_needs). ` +
+            `Run command when fixture is provided: ALL_NEEDS_DIR=/path/to/all_needs node --test scripts/st119-migration-and-5plugins.test.mjs`
+        );
+        return null;
+    }
+    const dir = path.join(ALL_NEEDS_DIR, pluginSubdir);
+    if (!fs.existsSync(dir)) {
+        if (EXPLICIT_ALL_NEEDS_DIR || BUNDLED_FIXTURE_PRESENT) {
+            assert.fail(`Fixture directory ALL_NEEDS_DIR=${ALL_NEEDS_DIR} was provided, but expected plugin directory is missing: ${dir}`);
+        }
+        t.skip(
+            `[SKIP] Optional external plugin fixture ${pluginSubdir} not present in ${ALL_NEEDS_DIR}. ` +
+            `Run command when fixture is provided: ALL_NEEDS_DIR=/path/to/all_needs node --test scripts/st119-migration-and-5plugins.test.mjs`
+        );
+        return null;
+    }
+    return dir;
+}
 
 // Provide minimal browser globals for st-compat and real extension modules
 globalThis.window = globalThis;
@@ -333,11 +366,8 @@ test('Real Extension Integration (1/5): ST-Prompt-Template-1.16 manifest & real 
     assert.equal(rendered.trim(), 'Aqua greets Kazuma (HP=85)');
     assert.equal(vars.hp, 100);
 
-    const stPtDir = path.join(ALL_NEEDS_DIR, 'ST-Prompt-Template-1.16');
-    if (!fs.existsSync(stPtDir)) {
-        t.skip('Unpacked ST-Prompt-Template-1.16 not present in ALL_NEEDS_DIR');
-        return;
-    }
+    const stPtDir = resolveOrSkipOptionalPlugin(t, 'ST-Prompt-Template-1.16');
+    if (!stPtDir) return;
     const manifest = JSON.parse(fs.readFileSync(path.join(stPtDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.display_name, 'Prompt Template/提示词模板');
     assert.equal(manifest.version, '1.16.3.0');
@@ -350,11 +380,8 @@ test('Real Extension Integration (2/5): JS-Slash-Runner-main manifest, bundle in
     assert.equal(typeof utilShims.getTavernHelperVersion, 'function');
     assert.equal(typeof utilShims.getTavernVersion, 'function');
 
-    const jsrDir = path.join(ALL_NEEDS_DIR, 'JS-Slash-Runner-main');
-    if (!fs.existsSync(jsrDir)) {
-        t.skip('Unpacked JS-Slash-Runner-main not present in ALL_NEEDS_DIR');
-        return;
-    }
+    const jsrDir = resolveOrSkipOptionalPlugin(t, 'JS-Slash-Runner-main');
+    if (!jsrDir) return;
     const manifest = JSON.parse(fs.readFileSync(path.join(jsrDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.display_name, '酒馆助手');
     assert.equal(manifest.version, '4.11.3');
@@ -366,11 +393,8 @@ test('Real Extension Integration (2/5): JS-Slash-Runner-main manifest, bundle in
 });
 
 test('Real Extension Integration (3/5): st-memory-enhancement-2.2.0 real module execution (data/pluginSetting.js & utils/stringUtil.js)', async (t) => {
-    const memDir = path.join(ALL_NEEDS_DIR, 'st-memory-enhancement-2.2.0');
-    if (!fs.existsSync(memDir)) {
-        t.skip('Unpacked st-memory-enhancement-2.2.0 not present in ALL_NEEDS_DIR');
-        return;
-    }
+    const memDir = resolveOrSkipOptionalPlugin(t, 'st-memory-enhancement-2.2.0');
+    if (!memDir) return;
     const manifest = JSON.parse(fs.readFileSync(path.join(memDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.version, '2.2.0');
     assert.ok(fs.existsSync(path.join(memDir, manifest.js)));
@@ -390,11 +414,8 @@ test('Real Extension Integration (3/5): st-memory-enhancement-2.2.0 real module 
 });
 
 test('Real Extension Integration (4/5): LittleWhiteBox-3.1.7 real module execution (generate-interceptor.js & core/constants.js)', async (t) => {
-    const lwbDir = path.join(ALL_NEEDS_DIR, 'LittleWhiteBox-3.1.7');
-    if (!fs.existsSync(lwbDir)) {
-        t.skip('Unpacked LittleWhiteBox-3.1.7 not present in ALL_NEEDS_DIR');
-        return;
-    }
+    const lwbDir = resolveOrSkipOptionalPlugin(t, 'LittleWhiteBox-3.1.7');
+    if (!lwbDir) return;
     const manifest = JSON.parse(fs.readFileSync(path.join(lwbDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.display_name, 'LittleWhiteBox');
     assert.equal(manifest.version, '3.1.7');
@@ -430,11 +451,8 @@ test('Real Extension Integration (4/5): LittleWhiteBox-3.1.7 real module executi
 });
 
 test('Real Extension Integration (5/5): ST-iPhonie-main real module execution (core/outgoing.js & core/protocol.js)', async (t) => {
-    const iphonieDir = path.join(ALL_NEEDS_DIR, 'ST-iPhonie-main');
-    if (!fs.existsSync(iphonieDir)) {
-        t.skip('Unpacked ST-iPhonie-main not present in ALL_NEEDS_DIR');
-        return;
-    }
+    const iphonieDir = resolveOrSkipOptionalPlugin(t, 'ST-iPhonie-main');
+    if (!iphonieDir) return;
     const manifest = JSON.parse(fs.readFileSync(path.join(iphonieDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.display_name, 'ST-iPhonie');
     assert.equal(manifest.version, '0.8.15');

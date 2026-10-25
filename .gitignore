@@ -84,3 +84,6 @@ dist/
 
 # v241: unreferenced key container, excluded before first push
 app/app.key
+
+.worktrees/
+.superpowers/

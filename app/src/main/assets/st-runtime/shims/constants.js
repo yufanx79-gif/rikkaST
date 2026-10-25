@@ -107,3 +107,6 @@ export const iframe_events = {
     REASONING_TOKEN_RECEIVED_INCREMENTALLY: 'js_reasoning_token_received_incrementally',
     GENERATION_ENDED: 'js_generation_ended',
 };
+
+// Compatible export alias for callers/tests expecting EVENT_NAMES from constants.js
+export const EVENT_NAMES = tavern_events;

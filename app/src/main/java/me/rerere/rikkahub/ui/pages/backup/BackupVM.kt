@@ -51,6 +51,8 @@ class BackupVM(
         loadS3BackupFileItems()
     }
 
+    fun updateSettings(transform: (Settings) -> Settings) = updateSettings(transform(settings.value))
+
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
             settingsStore.update(settings)

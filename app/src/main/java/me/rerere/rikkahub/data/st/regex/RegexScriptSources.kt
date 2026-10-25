@@ -1,66 +1,114 @@
 package me.rerere.rikkahub.data.st.regex
 
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlin.uuid.Uuid
 import me.rerere.rikkahub.data.datastore.Settings
-import me.rerere.rikkahub.data.export.parseActiveStPresetConfig
+import me.rerere.rikkahub.data.export.ModeInjectionSerializer
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
-import kotlin.uuid.Uuid
 
 /**
- * 统一合并当前生效的正则脚本（自动提取激活预设中的 `SPreset.RegexBinding` 强制启用/禁用列表）。
+ * 合并当前会话生效的全部 ST 正则脚本（全局 → 已启用预设内嵌 → 角色卡内嵌）。
+ *
+ * 对齐 SillyTavern `getRegexScripts({ allowedOnly: true })` 的三源合并顺序：
+ * 1. `GLOBAL`：`Settings.regexScripts`
+ * 2. `PRESET`：当前助手/会话已启用预设组对应的 `Settings.tavernPresets[group].extensions.regex_scripts`
+ * 3. `SCOPED`：`Assistant.tavernData.embeddedRegexScripts`
+ *
+ * 去重规则：按 `sourceTag`（`global` / `preset:<group>` / `card`）隔离去重键，
+ * 避免不同来源的脚本因复用默认 id（如 `"1"` / `"default"`）或空 id 而互相覆盖，
+ * 同时消除同一来源内的重复条目。
  */
 fun mergeActiveRegexScripts(
     settings: Settings,
     assistant: Assistant?,
-    conversationModeInjectionIds: Set<Uuid> = emptySet(),
+    extraModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
 ): List<RegexScript> {
-    val activeGroups = enabledPresetGroups(assistant, settings, conversationModeInjectionIds)
-    val activePresetCfg = parseActiveStPresetConfig(settings.tavernPresets, activeGroups)
+    val activeGroups = enabledPresetGroups(assistant, settings, extraModeInjectionIds)
+    val presetScriptsByGroup = LinkedHashMap<String, List<RegexScript>>()
+    val presetRoot = runCatching {
+        Json.parseToJsonElement(settings.tavernPresets) as? JsonObject
+    }.getOrNull()
+    for (group in activeGroups) {
+        val rawPreset = when (val el = presetRoot?.get(group)) {
+            is JsonPrimitive -> el.contentOrNull
+            is JsonObject -> el.toString()
+            else -> null
+        }
+        val scripts = if (rawPreset.isNullOrBlank()) {
+            emptyList()
+        } else {
+            ModeInjectionSerializer.inspectPresetRegexScripts(rawPreset, group).second
+        }
+        if (scripts.isNotEmpty()) {
+            presetScriptsByGroup[group] = scripts
+        }
+    }
+    val flatPresetScripts = presetScriptsByGroup.values.flatten()
     return mergeRegexScripts(
         global = settings.regexScripts,
-        assistant = assistant,
-        enabledPresetGroups = activeGroups,
-        spresetEnabledIds = activePresetCfg.spresetEnabledRegexIds,
-        spresetDisabledIds = activePresetCfg.spresetDisabledRegexIds,
+        card = assistant?.tavernData?.embeddedRegexScripts,
+        preset = flatPresetScripts,
+        presetByGroup = presetScriptsByGroup,
     )
 }
 
 /**
- * 合并全局正则脚本与角色卡内嵌正则脚本。
+ * 合并全局 ST 正则脚本、预设内嵌正则脚本与当前角色卡内嵌正则脚本。
  *
- * 内嵌脚本仅在该角色对话中生效（对齐 ST 语义：角色卡正则随角色激活，
- * 在酒馆中导入角色卡后即自动识别并绑定）。
+ * 执行顺序对齐 SillyTavern `getRegexScripts()`：
+ * 全局脚本 (`settings.regexScripts`) → 预设脚本 (`preset`) → 角色卡脚本 (`tavernData.embeddedRegexScripts`)。
  */
 fun mergeRegexScripts(
     global: List<RegexScript>,
-    assistant: Assistant?,
-    enabledPresetGroups: Set<String>? = null,
-    spresetEnabledIds: Set<String> = emptySet(),
-    spresetDisabledIds: Set<String> = emptySet(),
+    card: List<RegexScript>?,
+    preset: List<RegexScript> = emptyList(),
+    presetByGroup: Map<String, List<RegexScript>> = emptyMap(),
 ): List<RegexScript> {
-    val pureGlobal = global.filter { it.sourcePresetGroup.isNullOrBlank() }
-    val presetScoped = global.filter {
-        val group = it.sourcePresetGroup
-        !group.isNullOrBlank() && (enabledPresetGroups == null || group in enabledPresetGroups)
-    }
-    val cardScoped = assistant?.tavernData?.embeddedRegexScripts ?: emptyList()
-    val combined = pureGlobal + presetScoped + cardScoped
-    val seenIds = mutableSetOf<String>()
-    val deduped = combined.filter { s ->
-        if (s.id.isBlank()) true else seenIds.add(s.id)
-    }
-    if (spresetEnabledIds.isEmpty() && spresetDisabledIds.isEmpty()) return deduped
-    return deduped.map { s ->
-        when {
-            s.id in spresetDisabledIds || s.scriptName in spresetDisabledIds -> s.copy(disabled = true)
-            s.id in spresetEnabledIds || s.scriptName in spresetEnabledIds -> s.copy(disabled = false)
-            else -> s
+    val cardList = card.orEmpty()
+    if (cardList.isEmpty() && preset.isEmpty() && presetByGroup.isEmpty()) return global
+    val seenKeys = HashSet<String>(global.size + preset.size + cardList.size)
+    return buildList(global.size + preset.size + cardList.size) {
+        for (script in global) {
+            if (seenKeys.add(dedupKey("global", script))) {
+                add(script)
+            }
         }
+        if (presetByGroup.isNotEmpty()) {
+            for ((group, scripts) in presetByGroup) {
+                val tag = "preset:$group"
+                for (script in scripts) {
+                    if (seenKeys.add(dedupKey(tag, script))) {
+                        add(script)
+                    }
+                }
+            }
+        } else {
+            for (script in preset) {
+                if (seenKeys.add(dedupKey("preset", script))) {
+                    add(script)
+                }
+            }
+        }
+        for (script in cardList) {
+            if (seenKeys.add(dedupKey("card", script))) {
+                add(script)
+            }
+        }
+    }
+}
+
+private fun dedupKey(sourceTag: String, script: RegexScript): String {
+    val normalizedId = script.id.trim()
+    return if (normalizedId.isNotEmpty()) {
+        "$sourceTag#id:$normalizedId#${script.findRegex.hashCode()}#${script.replaceString.hashCode()}"
+    } else {
+        "$sourceTag#sig:${script.scriptName}#${script.findRegex}#${script.replaceString}#${script.placement.joinToString(",")}"
     }
 }
 

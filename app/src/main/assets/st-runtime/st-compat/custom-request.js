@@ -55,3 +55,6 @@ export class ChatCompletionService {
         return { choices: [{ message: { role: 'assistant', content: '' } }] };
     }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export class TextCompletionService { constructor(...args) { this._args = args; } }

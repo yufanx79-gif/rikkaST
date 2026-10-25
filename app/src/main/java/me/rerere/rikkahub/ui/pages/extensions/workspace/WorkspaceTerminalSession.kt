@@ -16,8 +16,10 @@ import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import me.rerere.rikkahub.data.files.FileFolders
+import me.rerere.workspace.NodeRuntimeManager
 import me.rerere.workspace.RootfsPatchOptions
 import me.rerere.workspace.RootfsPatcher
+import me.rerere.workspace.WorkspaceManager
 import java.io.File
 
 internal fun createWorkspaceTerminalSession(
@@ -36,6 +38,7 @@ internal fun createWorkspaceTerminalSession(
     val nativeLibraryDir = File(appContext.applicationInfo.nativeLibraryDir)
     val proot = File(nativeLibraryDir, "libproot_exec.so")
     val loader = File(nativeLibraryDir, "libproot_loader.so")
+    val shell = WorkspaceManager.rootfsShell(linuxDir)
 
     val args = mutableListOf(
         "--root-id",
@@ -52,6 +55,10 @@ internal fun createWorkspaceTerminalSession(
         "-b",
         "${builtinSkillsDir.absolutePath}:$BUILTIN_SKILLS_DIR",
     )
+    NodeRuntimeManager.resolveSharedNodeDir(linuxDir)?.let { sharedNodeDir ->
+        args += "-b"
+        args += "${sharedNodeDir.absolutePath}:${NodeRuntimeManager.ROOTFS_NODE_DIR}"
+    }
     listOf("/dev", "/proc", "/sys").forEach { path ->
         if (File(path).exists()) {
             args += "-b"
@@ -62,13 +69,15 @@ internal fun createWorkspaceTerminalSession(
         "/usr/bin/env",
         "-i",
         "HOME=/root",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH=/usr/local/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "NPM_CONFIG_CACHE=/tmp/.npm-cache",
+        "NODE_COMPILE_CACHE=/tmp/.node-compile-cache",
         "TERM=xterm-256color",
         "LANG=C.UTF-8",
         "LC_ALL=C.UTF-8",
         "USER=root",
-        "SHELL=/bin/bash",
-        "/bin/bash",
+        "SHELL=$shell",
+        shell,
     )
 
     val env = mutableListOf(
@@ -108,7 +117,7 @@ internal fun prepareWorkspaceTerminalSession(context: Context, root: String) {
 
 internal fun workspaceRootfsReady(context: Context, root: String): Boolean {
     val linuxDir = File(File(File(context.applicationContext.filesDir, "workspaces"), root), "linux")
-    return linuxDir.isDirectory && File(linuxDir, "bin/sh").isFile
+    return WorkspaceManager.isUsableRootfs(linuxDir)
 }
 
 internal class WorkspaceTerminalSessionClient(

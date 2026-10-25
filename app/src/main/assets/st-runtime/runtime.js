@@ -374,6 +374,286 @@ const LOG_PREFIX = '[RikkaTavern]';
             });
         };
 
+        const pendingProxy = (window.__rikkaProxyHttpPending = window.__rikkaProxyHttpPending || {});
+        window.__rikkaProxyHttpCallback = function (reqId, respJson) {
+            const entry = pendingProxy[reqId];
+            if (!entry) return;
+            delete pendingProxy[reqId];
+            try {
+                const parsed = typeof respJson === 'string' ? JSON.parse(respJson) : respJson;
+                entry.resolve(parsed);
+            } catch (e) {
+                entry.reject(e);
+            }
+        };
+
+        /* __RIKKA_PROXY_SECURITY_START__ */
+        function isForbiddenIpv4Parts(parts) { return isBlockedIpv4Parts(parts); }
+        function isBlockedIpv4Parts(parts) {
+            if (!Array.isArray(parts) || parts.length !== 4) return true;
+            for (let i = 0; i < 4; i++) {
+                const n = parts[i];
+                if (!Number.isInteger(n) || n < 0 || n > 255) return true;
+            }
+            const [a, b, c] = parts;
+            if (a === 0) return true; // 0.0.0.0/8
+            if (a === 10) return true; // 10.0.0.0/8 RFC1918
+            if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+            if (a === 127) return true; // 127.0.0.0/8 loopback
+            if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & cloud metadata
+            if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+            if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24, 192.0.2.0/24
+            if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+            if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmark
+            if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+            if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
+            if (a >= 224) return true; // multicast / reserved / broadcast
+            return false;
+        }
+
+        function isBlockedProxyHost(rawHost) {
+            const host = String(rawHost || '').trim().toLowerCase().replace(/\.+$/, '');
+            if (!host) return { blocked: true, reason: 'Empty proxy target host' };
+            const unbracketed = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+            if (
+                unbracketed === 'localhost' ||
+                unbracketed.endsWith('.localhost') ||
+                unbracketed === 'local' ||
+                unbracketed.endsWith('.local') ||
+                unbracketed.endsWith('.internal') ||
+                unbracketed === 'metadata' ||
+                unbracketed === 'metadata.google.internal' ||
+                unbracketed === 'instance-data'
+            ) {
+                return { blocked: true, reason: 'Loopback, local, or metadata hostname is forbidden' };
+            }
+            // Reject integer, octal, hex, or shorthand IPv4 encodings (e.g., 2130706433, 0177.0.0.1, 0x7f.0.0.1, 127.1)
+            if (/^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*$/i.test(unbracketed)) {
+                const segs = unbracketed.split('.');
+                if (segs.length !== 4 || segs.some((s) => /^0\d+$/.test(s) || /^0x/i.test(s))) {
+                    return { blocked: true, reason: 'Non-standard IPv4 literal encoding is forbidden' };
+                }
+                const nums = segs.map((s) => Number(s));
+                if (isBlockedIpv4Parts(nums)) {
+                    return { blocked: true, reason: 'Private, loopback, or reserved IPv4 range is forbidden' };
+                }
+                return { blocked: false };
+            }
+            // IPv6 literal checks
+            if (unbracketed.includes(':')) {
+                const normV6 = unbracketed.split('%')[0].toLowerCase();
+                if (normV6 === '::' || normV6 === '::1' || /^(?:0+:){7}0*1$/.test(normV6) || /^(?:0+:){7}0+$/.test(normV6)) {
+                    return { blocked: true, reason: 'IPv6 loopback or unspecified address is forbidden' };
+                }
+                if (/^fe[89ab][0-9a-f]:/.test(normV6)) {
+                    return { blocked: true, reason: 'IPv6 link-local address (fe80::/10) is forbidden' };
+                }
+                if (/^f[cd][0-9a-f]{2}:/.test(normV6)) {
+                    return { blocked: true, reason: 'IPv6 unique-local address (fc00::/7) is forbidden' };
+                }
+                if (/^ff[0-9a-f]{2}:/.test(normV6)) {
+                    return { blocked: true, reason: 'IPv6 multicast address is forbidden' };
+                }
+                // Check IPv4-mapped or IPv4-compatible IPv6 (e.g. ::ffff:127.0.0.1 or ::ffff:7f00:1 or ::ffff:a00:1)
+                const v4DotMatch = normV6.match(/(\d+\.\d+\.\d+\.\d+)$/);
+                if (v4DotMatch) {
+                    const nums = v4DotMatch[1].split('.').map((s) => Number(s));
+                    if (isBlockedIpv4Parts(nums)) {
+                        return { blocked: true, reason: 'IPv4-mapped private or loopback IPv6 address is forbidden' };
+                    }
+                }
+                const v4HexMatch = normV6.match(/(?:::ffff:|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+                if (v4HexMatch) {
+                    const hi = parseInt(v4HexMatch[1], 16);
+                    const lo = parseInt(v4HexMatch[2], 16);
+                    const nums = [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+                    if (isBlockedIpv4Parts(nums)) {
+                        return { blocked: true, reason: 'Hex IPv4-mapped private or loopback IPv6 address is forbidden' };
+                    }
+                }
+            }
+            return { blocked: false };
+        }
+
+        function validateProxyTargetUrl(rawTargetUrl) {
+            const text = String(rawTargetUrl || '').trim();
+            if (!text) return { ok: false, reason: 'Empty proxy target URL' };
+            let parsed;
+            try {
+                parsed = new URL(text);
+            } catch (_e) {
+                return { ok: false, reason: 'Malformed proxy target URL: ' + text };
+            }
+            const proto = String(parsed.protocol || '').toLowerCase();
+            if (proto !== 'http:' && proto !== 'https:') {
+                return { ok: false, reason: 'Disallowed proxy URL protocol: ' + proto };
+            }
+            if (parsed.username || parsed.password) {
+                return { ok: false, reason: 'Embedded credentials in proxy URL are forbidden' };
+            }
+            const hostCheck = isBlockedProxyHost(parsed.hostname);
+            if (hostCheck.blocked) {
+                return { ok: false, reason: hostCheck.reason };
+            }
+            return { ok: true, status: 200, url: parsed.toString(), normalizedUrl: parsed.toString(), origin: parsed.origin };
+        }
+        /* __RIKKA_PROXY_SECURITY_END__ */
+        window.__rikkaValidateProxyTargetUrl = validateProxyTargetUrl;
+
+        const handleCorsProxyFetch = async (rawUrl, url, options, p) => {
+            let targetUrl = '';
+            try {
+                const idx = rawUrl.indexOf('/proxy/');
+                const after = idx >= 0 ? rawUrl.slice(idx + 7) : p.slice(7);
+                targetUrl = /^https?:%2F%2F/i.test(after) ? decodeURIComponent(after) : after;
+            } catch (_e) {
+                targetUrl = p.slice(7);
+            }
+            const targetCheck = validateProxyTargetUrl(targetUrl);
+            if (!targetCheck.ok) {
+                return jsonResponse({ error: { code: 'PROXY_TARGET_FORBIDDEN', message: targetCheck.reason } }, 403);
+            }
+            targetUrl = targetCheck.url;
+            if (!bridge || typeof bridge.proxyHttpRequestAsync !== 'function') {
+                return originalFetch ? originalFetch(targetUrl, options) : jsonResponse({ error: { message: 'CORS proxy bridge unavailable' } }, 502);
+            }
+            const method = String((options && options.method) || (url && url.method) || 'GET').toUpperCase();
+            const bodyStr = (method === 'GET' || method === 'HEAD') ? '' : await readBody(url, options);
+            let headersObj = {};
+            const rawHeaders = (options && options.headers) || (url && url.headers);
+            if (rawHeaders) {
+                if (typeof rawHeaders.forEach === 'function') {
+                    rawHeaders.forEach((v, k) => { headersObj[k] = v; });
+                } else if (typeof rawHeaders === 'object') {
+                    headersObj = Object.assign({}, rawHeaders);
+                }
+            }
+            const reqId = 'proxy-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
+            return await new Promise((resolve, reject) => {
+                if (options && options.signal && options.signal.aborted) {
+                    reject(new DOMException('Aborted', 'AbortError'));
+                    return;
+                }
+                pendingProxy[reqId] = {
+                    resolve: (resp) => {
+                        if (!resp || resp.aborted) {
+                            reject(new DOMException('Aborted', 'AbortError'));
+                            return;
+                        }
+                        if (resp.networkError) {
+                            reject(new TypeError(String(resp.error || 'Network request failed')));
+                            return;
+                        }
+                        const status = Number(resp.status) || 502;
+                        const respHeaders = Object.assign({}, resp.headers || {});
+                        if (typeof resp.bodyBase64 === 'string') {
+                            const bin = atob(resp.bodyBase64);
+                            const bytes = new Uint8Array(bin.length);
+                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                            resolve(new Response(bytes, { status, headers: respHeaders }));
+                        } else {
+                            const textBody = typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body || {});
+                            resolve(new Response(textBody, { status, headers: respHeaders }));
+                        }
+                    },
+                    reject,
+                };
+                if (options && options.signal) {
+                    options.signal.addEventListener('abort', () => {
+                        delete pendingProxy[reqId];
+                        try { callBridge('proxyHttpAbort', reqId); } catch (_e) { /* noop */ }
+                        reject(new DOMException('Aborted', 'AbortError'));
+                    }, { once: true });
+                }
+                try {
+                    callBridge('proxyHttpRequestAsync', reqId, method, targetUrl, JSON.stringify(headersObj), bodyStr);
+                } catch (e) {
+                    delete pendingProxy[reqId];
+                    reject(new TypeError(String(e && e.message || e)));
+                }
+            });
+        };
+
+        const pendingImgGen = (window.__rikkaImgGenPending = window.__rikkaImgGenPending || {});
+        window.__rikkaImgGenCallback = function (reqId, respJson) {
+            const entry = pendingImgGen[reqId];
+            if (!entry) return;
+            delete pendingImgGen[reqId];
+            try {
+                const parsed = typeof respJson === 'string' ? JSON.parse(respJson) : respJson;
+                entry.resolve(parsed);
+            } catch (e) {
+                entry.reject(e);
+            }
+        };
+
+        const handleNativeImageModels = async () => {
+            try {
+                const raw = callBridge('getImageGenerationStatusJson');
+                if (raw) {
+                    const info = JSON.parse(raw);
+                    const models = Array.isArray(info && info.models) ? info.models : [];
+                    return jsonResponse({
+                        object: 'list',
+                        data: models.map((id) => ({ id: String(id), object: 'model' })),
+                    }, 200);
+                }
+            } catch (_e) { /* noop */ }
+            return jsonResponse({ object: 'list', data: [{ id: 'gpt-image-1', object: 'model' }] }, 200);
+        };
+
+        const handleNativeImageGeneration = async (url, options) => {
+            if (!bridge || typeof bridge.generateImageFromJsAsync !== 'function') {
+                return jsonResponse({ error: { message: 'RikkaHub native image generation bridge is not wired' } }, 503);
+            }
+            const bodyStr = await readBody(url, options);
+            const reqId = 'imggen-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
+            return await new Promise((resolve, reject) => {
+                if (options && options.signal && options.signal.aborted) {
+                    reject(new DOMException('Aborted', 'AbortError'));
+                    return;
+                }
+                pendingImgGen[reqId] = {
+                    resolve: (resp) => {
+                        if (!resp || resp.aborted) {
+                            reject(new DOMException('Aborted', 'AbortError'));
+                            return;
+                        }
+                        const status = Number(resp.status) || (resp.ok ? 200 : 500);
+                        const body = resp.body || (resp.b64_json
+                            ? { data: [{ b64_json: resp.b64_json }], output_format: resp.format || 'png' }
+                            : { error: { message: String(resp.error || 'Image generation failed') } });
+                        resolve(jsonResponse(body, status));
+                    },
+                    reject,
+                };
+                if (options && options.signal) {
+                    options.signal.addEventListener('abort', () => {
+                        delete pendingImgGen[reqId];
+                        try { callBridge('cancelImageGenerationFromJs', reqId); } catch (_e) { /* noop */ }
+                        reject(new DOMException('Aborted', 'AbortError'));
+                    }, { once: true });
+                }
+                try {
+                    callBridge('generateImageFromJsAsync', reqId, bodyStr || '{}');
+                } catch (e) {
+                    delete pendingImgGen[reqId];
+                    resolve(jsonResponse({ error: { message: String(e && e.message || e) } }, 500));
+                }
+            });
+        };
+
+        const handleComfyProxyFetch = async (_rawUrl, _url, _options, p) => {
+            const subRoute = p.slice('/api/sd/comfy/'.length);
+            return jsonResponse({
+                error: {
+                    code: 'UNSUPPORTED_DESKTOP_COMFY_EXTENSION',
+                    subRoute,
+                    message: '桌面端 SillyTavern ComfyUI 服务端扩展接口 (/api/sd/comfy/*) 不在移动端 WebView 运行时内托管；请切换为 OpenAI 兼容生图 (/v1/images/generations)、NovelAI 或 RikkaHub 原生生图桥。',
+                },
+            }, 501);
+        };
+
         // [10-19-21] 补齐 jQuery UI easing 函数（st-memory-enhancement appHeaderTableBaseDrawer.js 强依赖 easeInOutCubic）
         try {
             const jq = window.jQuery || window.$;
@@ -449,6 +729,12 @@ const LOG_PREFIX = '[RikkaTavern]';
                 if (p === '/api/images/upload' && method === 'POST') return handleImagesUpload(url, options);
                 if (p === '/api/images/list') return handleImagesList(url, options);
                 if (p === '/api/images/delete' && method === 'POST') return handleImagesDelete(url, options);
+                if (p.indexOf('/proxy/') === 0) return handleCorsProxyFetch(rawUrl, url, options, p);
+                if ((p === '/api/rikkahub/v1/images/generations' || p === '/api/images/generations' || p === '/sdapi/v1/txt2img') && method === 'POST') {
+                    return handleNativeImageGeneration(url, options);
+                }
+                if (p === '/api/rikkahub/v1/models') return handleNativeImageModels();
+                if (p.indexOf('/api/sd/comfy/') === 0) return handleComfyProxyFetch(rawUrl, url, options, p);
                 if (p.indexOf('/api/plugins/') === 0 || p.indexOf('/api/host/') === 0 || p === '/health') return handleNodePluginRequest(url, options, p);
             } catch (e) {
                 callBridge('log', 'warn', '[a1] fetch patch error: ' + String(e && e.message || e));
@@ -779,6 +1065,11 @@ function refreshForPanelMode() {
     try { window.dispatchEvent(new Event('rikka-st-refresh')); } catch (_e) { /* noop */ }
 }
 
+function refreshSettings() {
+    try { pullSettings(); } catch (_e) { /* noop */ }
+    try { pullThirdPartySettings(true); } catch (_e) { /* noop */ }
+}
+
 function refreshAll() {
     invalidateChatCache();
     pullChat(true);
@@ -1063,9 +1354,21 @@ const stMacrosFacade = {
     getMacro: (name) => stMacroRegistry.get(String(name)) ?? null,
 };
 
-/** ST ctx.substituteParams：展开内置消息索引/角色宏与已注册宏，未命中保持原样。 */
-function substituteParamsWithMacros(text) {
+/** ST ctx.substituteParams：优先调用 RikkaBridge.substituteParams（完整 82+ Kotlin 宏引擎），再展开 JS 函数宏与消息索引宏。 */
+function substituteParamsWithMacros(text, name1, name2, original, group) {
     let out = String(text == null ? '' : text);
+    if (!out.includes('{{') && !/<(?:user|char|bot|group)>/i.test(out)) return out;
+    try {
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.substituteParams === 'function') {
+            const ctxPayload = JSON.stringify({
+                name1: name1 ?? state.name1 ?? '',
+                name2: name2 ?? state.name2 ?? '',
+                original: original ?? '',
+                group: group ?? '',
+            });
+            out = String(window.RikkaBridge.substituteParams(out, ctxPayload) ?? out);
+        }
+    } catch (_e) { /* noop */ }
     if (!out.includes('{{')) return out;
     try {
         out = out.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, name) => {
@@ -1285,6 +1588,15 @@ function stMessageFormatting(text, ch_name, isSystem, isUser, messageId, sanitiz
 const TAVERN_ST_COMPAT_VERSION = '1.19.0';
 
 const stCtx = {
+    getThumbnailUrl(type = 'avatar', file = '') {
+        const f = String(file || '').trim();
+        if (f.startsWith('http://') || f.startsWith('https://') || f.startsWith('data:') || f.startsWith('blob:')) {
+            return f;
+        }
+        const effectiveFile = f || (state.character && state.character.avatar) || '';
+        if (!effectiveFile) return 'img/ai4.png';
+        return `https://appassets.androidplatform.net/thumbnail?type=${encodeURIComponent(String(type || 'avatar'))}&file=${encodeURIComponent(effectiveFile)}`;
+    },
     get chat() {
         if (window.__RIKKA_PANEL_MODE__ && (!Array.isArray(state.chat) || state.chat.length === 0 || (state.chat[0] && state.chat[0].__lightweightPlaceholder))) {
             try { pullChat(false); } catch (_e) { /* noop */ }
@@ -1325,8 +1637,8 @@ const stCtx = {
             return {};
         }
     },
-    substituteParams: (text) => substituteParamsWithMacros(text),
-    substituteParamsExtended: (text) => substituteParamsWithMacros(text),
+    substituteParams: (text, name1, name2, original, group) => substituteParamsWithMacros(text, name1, name2, original, group),
+    substituteParamsExtended: (text, name1, name2, original, group) => substituteParamsWithMacros(text, name1, name2, original, group),
     getRequestHeaders: () => ({}),
     getCurrentChatId: () => state.chatId,
     getCurrentLocale: () => 'zh-cn',
@@ -1392,7 +1704,23 @@ const stCtx = {
     generateRawData: async () => ({}),
     sendStreamingRequest: async () => {},
     sendGenerationRequest: async () => {},
-    stopGeneration: () => {},
+    stopGeneration: () => {
+        try {
+            if (stCompatScript && stCompatScript.externalAbortController && typeof stCompatScript.externalAbortController.abort === 'function') {
+                stCompatScript.externalAbortController.abort();
+            }
+        } catch (_e) { /* noop */ }
+        try {
+            const streams = window.__rikkaApiStreams || {};
+            for (const reqId of Object.keys(streams)) {
+                try { callBridge('chatCompletionCancel', reqId); } catch (_e2) { /* noop */ }
+                try { window.__rikkaApiFinish(reqId, 'ABORTED'); } catch (_e3) { /* noop */ }
+            }
+        } catch (_e) { /* noop */ }
+        try { callBridge('stopGeneration'); } catch (_e) { /* noop */ }
+        try { eventSource.emit(event_types.GENERATION_STOPPED); } catch (_e) { /* noop */ }
+        return true;
+    },
     clearChat: () => {},
     printMessages: () => {},
     // ---- [v214] ST getContext() 成员面补齐（st-context.js:129-311；按真实消费方优先级）----
@@ -1476,7 +1804,6 @@ const stCtx = {
         try { return (Array.isArray(state.characters) && state.characters[Number(id)]) || null; } catch (_e) { return null; }
     },
     getCharacterSource: () => 'character',
-    getThumbnailUrl: () => '',
     selectCharacterById: async () => {},
     openCharacterChat: async () => {},
     openGroupChat: async () => {},
@@ -1519,8 +1846,59 @@ const stCtx = {
     callPopup: callGenericPopupStub,
     registerHelper: () => {},
     registerDebugFunction: () => {},
-    isToolCallingSupported: () => false,
-    canPerformToolCalls: () => false,
+    isToolCallingSupported: () => true,
+    canPerformToolCalls: () => true,
+    getWorldInfoPrompt: async (chat, maxContext, isDryRun, globalScanData) => {
+        try {
+            if (window.RikkaBridge && typeof window.RikkaBridge.getWorldInfoPrompt === 'function') {
+                const raw = window.RikkaBridge.getWorldInfoPrompt(
+                    JSON.stringify(chat || state.chat || []),
+                    Number(maxContext) || 32768,
+                    Boolean(isDryRun ?? true),
+                    JSON.stringify(globalScanData || {}),
+                );
+                if (raw) return JSON.parse(raw);
+            }
+        } catch (_e) { /* noop */ }
+        return { worldInfoString: '', worldInfoBefore: '', worldInfoAfter: '', worldInfoExamples: [], worldInfoDepth: [], anBefore: '', anAfter: '', outletEntries: [] };
+    },
+    reloadWorldInfoEditor: () => {},
+    Popup: class Popup {
+        constructor(content, type, inputValue, options) {
+            this.content = content;
+            this.type = type;
+            this.value = inputValue;
+            this.options = options || {};
+            this.result = 1;
+        }
+        async show() { return this.value !== undefined ? this.value : this.result; }
+    },
+    get AccountStorage() { return accountStorage; },
+    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', LIST: 'list', OBJECT: 'object', CLOSURE: 'closure', SUBCOMMAND: 'subcommand' },
+    ConnectionManagerRequestService: { handleDropdown: () => {}, sendRequest: async () => ({}) },
+    ModuleWorkerWrapper: class ModuleWorkerWrapper { constructor(fn) { this.fn = fn; } async update(...args) { return typeof this.fn === 'function' ? await this.fn(...args) : undefined; } },
+    SlashCommand: class SlashCommand { static fromProps(props = {}) { return Object.assign(new SlashCommand(), props); } },
+    SlashCommandArgument: class SlashCommandArgument { static fromProps(props = {}) { return Object.assign(new SlashCommandArgument(), props); } },
+    SlashCommandEnumValue: class SlashCommandEnumValue { constructor(value = '', description = '') { this.value = value; this.description = description; } },
+    SlashCommandNamedArgument: class SlashCommandNamedArgument { static fromProps(props = {}) { return Object.assign(new SlashCommandNamedArgument(), props); } },
+    SlashCommandParser: { commands: {}, addCommandObject: (cmd) => cmd, addCommand: () => {}, getHelpString: () => '' },
+    TextCompletionService: { create: () => ({}), sendRequest: async () => ({}) },
+    convertCharacterBook: (book) => (book && typeof book === 'object' ? book : { entries: {} }),
+    getPresetManager: () => ({ getPresetList: () => ({ presets: [], preset_names: {} }), getCompletionPresetByName: () => ({}), updateList: () => {} }),
+    getWorldInfoNames: () => (Array.isArray(state.worldNames) ? state.worldNames.slice() : []),
+    registerDataBankScraper: () => {},
+    registerSlashCommand: () => {},
+    saveWorldInfo: async (name, data) => {
+        try {
+            if (window.RikkaBridge && typeof window.RikkaBridge.createOrReplaceLorebook === 'function') {
+                const entriesObj = (data && data.entries && typeof data.entries === 'object') ? data.entries : {};
+                return Boolean(window.RikkaBridge.createOrReplaceLorebook(String(name || ''), JSON.stringify(Object.values(entriesObj))));
+            }
+        } catch (_e) { /* noop */ }
+        return false;
+    },
+    tokenizers: {},
+    updateWorldInfoList: async () => {},
     shouldSendOnEnter: () => false,
     isMobile: () => true,
     timestampToMoment: () => ({ format: () => '' }),
@@ -2219,7 +2597,61 @@ async function runGenerationInterceptors(chatMessages, contextSize, type) {
     return { aborted };
 }
 
+window.__rikkaGenerationAbortEpoch = 0;
+window.__rikkaAbortActiveGeneration = function __rikkaAbortActiveGeneration(reason) {
+    try {
+        window.__rikkaGenerationAbortEpoch = (window.__rikkaGenerationAbortEpoch || 0) + 1;
+        try {
+            if (window.SillyTavern && typeof window.SillyTavern.getContext === 'function') {
+                const ctx = window.SillyTavern.getContext();
+                if (ctx && ctx.externalAbortController && typeof ctx.externalAbortController.abort === 'function') {
+                    ctx.externalAbortController.abort(reason || 'generation_stopped');
+                }
+            }
+        } catch (_eAc) { /* noop */ }
+        if (window.__rikkaApiStreams) {
+            Object.keys(window.__rikkaApiStreams).forEach((reqId) => {
+                try {
+                    const st = window.__rikkaApiStreams[reqId];
+                    if (st) {
+                        st.finished = true;
+                        st.status = 'ABORTED';
+                        if (typeof st.wake === 'function') st.wake();
+                    }
+                } catch (_e) { /* noop */ }
+            });
+        }
+        if (window.__rikkaProxyPending) {
+            Object.keys(window.__rikkaProxyPending).forEach((reqId) => {
+                try {
+                    const entry = window.__rikkaProxyPending[reqId];
+                    delete window.__rikkaProxyPending[reqId];
+                    if (entry && typeof entry.resolve === 'function') {
+                        entry.resolve({ aborted: true });
+                    }
+                } catch (_eProxy) { /* noop */ }
+            });
+        }
+        if (window.__rikkaImgGenPending) {
+            Object.keys(window.__rikkaImgGenPending).forEach((reqId) => {
+                try {
+                    const entry = window.__rikkaImgGenPending[reqId];
+                    delete window.__rikkaImgGenPending[reqId];
+                    if (entry && typeof entry.resolve === 'function') {
+                        entry.resolve({ aborted: true });
+                    }
+                } catch (_eImg) { /* noop */ }
+            });
+        }
+        try { eventSource.emit('generation_stopped', { reason: String(reason || 'manual') }); } catch (_e) { /* noop */ }
+        return true;
+    } catch (_e) {
+        return false;
+    }
+};
+
 window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq, messagesJson) {
+    const startEpoch = window.__rikkaGenerationAbortEpoch || 0;
     try {
         const parsedInput = JSON.parse(messagesJson || '[]');
         const rawMessages = Array.isArray(parsedInput)
@@ -2243,10 +2675,13 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
             return out;
         });
 
-        let aborted = false;
-        const interceptRes = await runGenerationInterceptors(activeMessages, 32768, 'normal');
-        if (interceptRes && interceptRes.aborted) {
-            aborted = true;
+        const isEpochAborted = () => (window.__rikkaGenerationAbortEpoch || 0) !== startEpoch;
+        let aborted = isEpochAborted();
+        if (!aborted) {
+            const interceptRes = await runGenerationInterceptors(activeMessages, 32768, 'normal');
+            if ((interceptRes && interceptRes.aborted) || isEpochAborted()) {
+                aborted = true;
+            }
         }
 
         // Sync .mes <-> .content after generate_interceptor (e.g., ST-iPhonie stIphonieInterceptor mutates .mes)
@@ -2289,51 +2724,62 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
                 set(v) { if (Array.isArray(v)) activeMessages = v; },
             });
 
-            try {
-                try { callBridge("log", "info", "[event] GENERATION_AFTER_COMMANDS " + JSON.stringify({ args: ["normal", {}, false] })); } catch (_eLog) { /* noop */ }
-                await eventSource.emitAndWait(event_types.GENERATION_AFTER_COMMANDS, eventData);
-            } catch (eAfter) {
-                console.error('[RikkaTavern] GENERATION_AFTER_COMMANDS handler failed:', (eAfter && eAfter.stack) || eAfter);
+            if (!isEpochAborted()) {
+                try {
+                    try { callBridge("log", "info", "[event] GENERATION_AFTER_COMMANDS " + JSON.stringify({ args: ["normal", {}, false] })); } catch (_eLog) { /* noop */ }
+                    await eventSource.emitAndWait(event_types.GENERATION_AFTER_COMMANDS, eventData);
+                } catch (eAfter) {
+                    console.error('[RikkaTavern] GENERATION_AFTER_COMMANDS handler failed:', (eAfter && eAfter.stack) || eAfter);
+                }
             }
 
-            try {
-                try { callBridge("log", "info", "[event] GENERATE_BEFORE_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-                await eventSource.emitAndWait(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, eventData);
-            } catch (eBeforeCombine) {
-                console.error('[RikkaTavern] GENERATE_BEFORE_COMBINE_PROMPTS handler failed:', (eBeforeCombine && eBeforeCombine.stack) || eBeforeCombine);
+            if (!isEpochAborted()) {
+                try {
+                    try { callBridge("log", "info", "[event] GENERATE_BEFORE_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                    await eventSource.emitAndWait(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, eventData);
+                } catch (eBeforeCombine) {
+                    console.error('[RikkaTavern] GENERATE_BEFORE_COMBINE_PROMPTS handler failed:', (eBeforeCombine && eBeforeCombine.stack) || eBeforeCombine);
+                }
             }
 
-            try {
-                try { callBridge("log", "info", "[event] GENERATE_AFTER_DATA " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-                await eventSource.emitAndWait(event_types.GENERATE_AFTER_DATA, eventData, false);
-            } catch (eAfterData) {
-                console.error('[RikkaTavern] GENERATE_AFTER_DATA handler failed:', (eAfterData && eAfterData.stack) || eAfterData);
+            if (!isEpochAborted()) {
+                try {
+                    try { callBridge("log", "info", "[event] GENERATE_AFTER_DATA " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                    await eventSource.emitAndWait(event_types.GENERATE_AFTER_DATA, eventData, false);
+                } catch (eAfterData) {
+                    console.error('[RikkaTavern] GENERATE_AFTER_DATA handler failed:', (eAfterData && eAfterData.stack) || eAfterData);
+                }
             }
 
             // Official SillyTavern 1.19.0 order: CHAT_COMPLETION_PROMPT_READY (openai.js:1619) fires BEFORE CHAT_COMPLETION_SETTINGS_READY (openai.js:3146)
-            try {
-                await eventSource.emitAndWait(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
-            } catch (ePrompt) {
-                console.error("[RikkaTavern] prompt-ready hook handler failed:", (ePrompt && ePrompt.stack) || ePrompt);
+            if (!isEpochAborted()) {
+                try {
+                    await eventSource.emitAndWait(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
+                } catch (ePrompt) {
+                    console.error("[RikkaTavern] prompt-ready hook handler failed:", (ePrompt && ePrompt.stack) || ePrompt);
+                }
             }
 
-            try {
-                await eventSource.emitAndWait(event_types.CHAT_COMPLETION_SETTINGS_READY, eventData);
-            } catch (eSettings) {
-                console.error('[RikkaTavern] generation hook handler failed:', (eSettings && eSettings.stack) || eSettings);
+            if (!isEpochAborted()) {
+                try {
+                    await eventSource.emitAndWait(event_types.CHAT_COMPLETION_SETTINGS_READY, eventData);
+                } catch (eSettings) {
+                    console.error('[RikkaTavern] generation hook handler failed:', (eSettings && eSettings.stack) || eSettings);
+                }
             }
 
-            try {
-                const afterData = {
-                    prompt: JSON.stringify(activeMessages),
-                    messages: activeMessages,
-                    chat: activeMessages,
-                    type: eventData.type || '',
-                    chatId: eventData.chatId,
-                    dryRun: false,
-                };
-                try { callBridge("log", "info", "[event] GENERATE_AFTER_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
-                await eventSource.emitAndWait(event_types.GENERATE_AFTER_COMBINE_PROMPTS, afterData);
+            if (!isEpochAborted()) {
+                try {
+                    const afterData = {
+                        prompt: JSON.stringify(activeMessages),
+                        messages: activeMessages,
+                        chat: activeMessages,
+                        type: eventData.type || '',
+                        chatId: eventData.chatId,
+                        dryRun: false,
+                    };
+                    try { callBridge("log", "info", "[event] GENERATE_AFTER_COMBINE_PROMPTS " + JSON.stringify({ dryRun: false })); } catch (_eLog) { /* noop */ }
+                    await eventSource.emitAndWait(event_types.GENERATE_AFTER_COMBINE_PROMPTS, afterData);
                 if (typeof afterData.prompt === 'string' && Array.isArray(activeMessages) &&
                     afterData.prompt !== JSON.stringify(activeMessages)) {
                     try {
@@ -2343,8 +2789,12 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
                 } else if (Array.isArray(afterData.messages)) {
                     activeMessages = afterData.messages;
                 }
-            } catch (eAfterCombine) {
-                console.error('[RikkaTavern] GENERATE_AFTER_COMBINE_PROMPTS handler failed:', (eAfterCombine && eAfterCombine.stack) || eAfterCombine);
+                } catch (eAfterCombine) {
+                    console.error('[RikkaTavern] GENERATE_AFTER_COMBINE_PROMPTS handler failed:', (eAfterCombine && eAfterCombine.stack) || eAfterCombine);
+                }
+            }
+            if (isEpochAborted()) {
+                aborted = true;
             }
         }
 
@@ -2407,10 +2857,13 @@ window.__rikkaEmit = function __rikkaEmit(name, payload) {
                 refreshSettings();
                 pullThirdPartySettings(true);
                 const nextIphonieJson = JSON.stringify((state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null);
-                if (prevIphonieJson !== nextIphonieJson && window.__rikkaLoadedExtModules) {
-                    const ipMod = window.__rikkaLoadedExtModules.get('st-iphonie');
+                if (prevIphonieJson !== nextIphonieJson && loadedExtensionHooks) {
+                    const ipKey = Object.keys(loadedExtensionHooks).find((k) => k.toLowerCase().includes('iphonie'));
+                    const ipEntry = ipKey ? loadedExtensionHooks[ipKey] : null;
+                    const ipMod = ipEntry ? (ipEntry.mod || ipEntry) : null;
                     const panelEl = document.getElementById('sttts-panel');
-                    if (ipMod && typeof ipMod.disable === 'function' && typeof ipMod.enable === 'function' && !(panelEl && panelEl.open)) {
+                    const isPanelOpen = Boolean(panelEl && (panelEl.open || panelEl.hasAttribute('open') || panelEl.style.display === 'block')) || window.__rikkaCurrentFloatingTarget === 'iphonie';
+                    if (ipMod && typeof ipMod.disable === 'function' && typeof ipMod.enable === 'function' && !isPanelOpen && window.__rikkaCurrentFloatingTarget !== 'iphonie') {
                         Promise.resolve().then(async () => {
                             try {
                                 await ipMod.disable();
@@ -3053,7 +3506,10 @@ function injectThirdPartyModule(ext, js) {
     if (thirdPartyLoadedUrls.has(src)) return Promise.resolve();
     thirdPartyLoadedUrls.add(src);
     return Promise.resolve()
-        .then(() => import(src))
+        .then(() => Promise.race([
+            import(src),
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`extension import timeout after 5000ms: ${src}`)), 5000)),
+        ]))
         .then(async (mod) => {
             loadedExtensionHooks[ext.folder] = {
                 mod: mod || null,
@@ -4339,10 +4795,12 @@ function installPanelMode() {
         window.Mvu = {
             events: mvuEvents,
             getMvuData: (option) => TavernHelper.getVariables(option),
+            setMvuData: (data, option) => TavernHelper.replaceVariables(data, option),
             replaceMvuData: (data, option) => TavernHelper.replaceVariables(data, option),
             getCurrentMvuData: () => TavernHelper.getVariables({ type: 'message', message_id: TavernHelper.getCurrentMessageId() }),
             replaceCurrentMvuData: async (data) => TavernHelper.replaceVariables(data, { type: 'message', message_id: TavernHelper.getCurrentMessageId() }),
             parseMessage: async (_message, data) => data,
+            UpdateData: async (_message, data) => data,
             reloadInitVar: async () => {},
         };
         console.log(`${LOG_PREFIX} PANEL mode: Mvu stub installed (→ TavernHelper)`);
@@ -4408,12 +4866,97 @@ function installPanelMode() {
             try { RikkaPanel.log('debug', '[panel] var-API wrap failed: ' + e); } catch (_e) { /* noop */ }
         }
     })();
+    try {
+        if (window.RikkaPanel && typeof window.RikkaPanel.onPanelRuntimeReady === 'function') {
+            window.RikkaPanel.onPanelRuntimeReady();
+        }
+    } catch (_e) { /* noop */ }
     console.log(`${LOG_PREFIX} PANEL mode ready (mount API: __rikkaPanelMount)`);
 }
 
 // ---------------------------------------------------------------- [10-19-21] 通用悬浮窗舞台与双通道 TTS 隔离桥
-function openRealStIphoniePanel() {
+function ensureRikkaIphonieFullscreenStyle() {
     try {
+        if (document.getElementById('rikka-iphonie-fullscreen-override')) return;
+        const st = document.createElement('style');
+        st.id = 'rikka-iphonie-fullscreen-override';
+        st.textContent = `
+            #sttts-panel, #sttts-panel.floating {
+                position: fixed !important;
+                inset: 0 !important;
+                left: 0 !important;
+                top: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                max-width: 100vw !important;
+                max-height: 100vh !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border-radius: 0 !important;
+                transform: none !important;
+                z-index: 9999 !important;
+            }
+            #sttts-panel > iframe, #sttts-panel.floating > iframe {
+                width: 100% !important;
+                height: 100% !important;
+                max-width: 100% !important;
+                max-height: 100% !important;
+                border-radius: 0 !important;
+                transform: none !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(st);
+    } catch (_e) { /* noop */ }
+}
+
+function seedStIphonieRikkaHubImageBridgeIfNeeded() {
+    try {
+        const rawStatus = callBridge('getImageGenerationStatusJson');
+        if (!rawStatus) return;
+        const status = JSON.parse(rawStatus);
+        if (!status || !status.configured) return;
+        const rawKeys = window.localStorage ? window.localStorage.getItem('st-iphonie-keys') : null;
+        const keysObj = rawKeys ? JSON.parse(rawKeys) : {};
+        const stSettings = (state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null;
+        const hasNaiKey = Boolean(keysObj && keysObj.nai && String(keysObj.nai).trim());
+        const hasGptKey = Boolean(keysObj && keysObj.gpt && String(keysObj.gpt).trim());
+        if (!hasNaiKey && !hasGptKey && window.localStorage) {
+            const presetId = (stSettings && stSettings.draw && stSettings.draw.connections && stSettings.draw.connections.gpt && stSettings.draw.connections.gpt.active) || 'default';
+            keysObj.gpt = presetId + '\trikkahub-native-bridge';
+            window.localStorage.setItem('st-iphonie-keys', JSON.stringify(keysObj));
+            if (stSettings && stSettings.draw) {
+                const origin = (window.location && window.location.origin && window.location.origin !== 'null')
+                    ? window.location.origin
+                    : 'https://appassets.androidplatform.net';
+                const bridgeUrl = origin + '/api/rikkahub/v1';
+                const modelId = String(status.modelId || 'gpt-image-1');
+                stSettings.draw.engine = 'gpt';
+                stSettings.draw.gpt = Object.assign({}, stSettings.draw.gpt || {}, {
+                    url: bridgeUrl,
+                    model: modelId,
+                    ask: false,
+                });
+                if (stSettings.draw.connections && stSettings.draw.connections.gpt && Array.isArray(stSettings.draw.connections.gpt.presets)) {
+                    const p = stSettings.draw.connections.gpt.presets.find((x) => x && x.id === presetId) || stSettings.draw.connections.gpt.presets[0];
+                    if (p) {
+                        p.url = bridgeUrl;
+                        p.model = modelId;
+                        p.name = 'RikkaHub 生图桥';
+                    }
+                }
+            }
+        }
+    } catch (_e) { /* noop */ }
+}
+
+function openRealStIphoniePanel(forceReopen = false) {
+    try {
+        ensureRikkaIphonieFullscreenStyle();
+        seedStIphonieRikkaHubImageBridgeIfNeeded();
+        const existingDlg = document.getElementById('sttts-panel');
+        if (!forceReopen && existingDlg && (existingDlg.open || existingDlg.hasAttribute('open')) && existingDlg.querySelector('iframe')) {
+            return true;
+        }
         const wand = document.getElementById('sttts-wand-entry');
         const realOpenBtn = document.querySelector('#sttts-extension-entry #sttts-open');
         if (realOpenBtn && realOpenBtn.getAttribute('data-rikka-fallback') !== 'true') {
@@ -4423,23 +4966,9 @@ function openRealStIphoniePanel() {
         }
         const dlg = document.getElementById('sttts-panel');
         if (dlg) {
-            dlg.classList.remove('floating');
-            dlg.style.setProperty('position', 'fixed', 'important');
-            dlg.style.setProperty('inset', '0', 'important');
-            dlg.style.setProperty('left', '0', 'important');
-            dlg.style.setProperty('top', '0', 'important');
-            dlg.style.setProperty('width', '100vw', 'important');
-            dlg.style.setProperty('height', '100vh', 'important');
-            dlg.style.setProperty('max-width', '100vw', 'important');
-            dlg.style.setProperty('max-height', '100vh', 'important');
-            dlg.style.setProperty('transform', 'none', 'important');
-            dlg.style.setProperty('z-index', '9999', 'important');
-            const ifr = dlg.querySelector('iframe');
-            if (ifr) {
-                ifr.style.setProperty('width', '100%', 'important');
-                ifr.style.setProperty('height', '100%', 'important');
-                ifr.style.setProperty('transform', 'none', 'important');
-            }
+            // 绝不移除 .floating class：ST-iPhonie index.js 的 panelResized() 在 180ms/500ms 会检查
+            // `float !== panel.classList.contains('floating')`，一旦不一致就会执行 `panel.close(); openPanel(undefined, true)`，
+            // 触发 stTtsPanelVisibility(false) 从而强行关闭二级菜单/sheet！全屏铺满由 ensureRikkaIphonieFullscreenStyle() 的 CSS !important 负责。
             if (!dlg.open) {
                 try { dlg.showModal(); } catch (_e) { dlg.setAttribute('open', 'true'); dlg.style.display = 'block'; }
             }
@@ -4603,8 +5132,9 @@ function installUniversalFloatingAndTtsBridge() {
     setTimeout(reportFloatingWindows, 500);
 
     // 3) 切换主运行时 WebView 的可视悬浮窗舞台（当用户在聊天页点击右侧常驻悬浮球时直接挂载显示）
-    window.__rikkaOpenFloatingTarget = async function (target) {
+    window.__rikkaOpenFloatingTarget = async function (target, forceReopen = false) {
         try {
+            window.__rikkaCurrentFloatingTarget = target || null;
             refreshAll();
             const compatDom = document.getElementById('rikka-st-compat-dom');
             const dlg = document.getElementById('sttts-panel');
@@ -4618,7 +5148,7 @@ function installUniversalFloatingAndTtsBridge() {
 
             if (target === 'iphonie') {
                 if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
-                let opened = openRealStIphoniePanel();
+                let opened = openRealStIphoniePanel(forceReopen);
                 if (!opened) {
                     await new Promise((r) => setTimeout(r, 250));
                     opened = openRealStIphoniePanel();
@@ -4630,7 +5160,7 @@ function installUniversalFloatingAndTtsBridge() {
                 try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
             }
 
-            if (target === 'memory_table') {
+            if (target === 'memory_table' || target === 'memory') {
                 if (compatDom) {
                     compatDom.style.setProperty('display', 'block', 'important');
                     compatDom.removeAttribute('aria-hidden');
@@ -4654,7 +5184,7 @@ function installUniversalFloatingAndTtsBridge() {
                 return true;
             }
 
-            if (target === 'littlewhitebox') {
+            if (target === 'littlewhitebox' || target === 'lwb') {
                 if (compatDom) {
                     compatDom.style.setProperty('display', 'block', 'important');
                     compatDom.removeAttribute('aria-hidden');
@@ -4667,9 +5197,26 @@ function installUniversalFloatingAndTtsBridge() {
                 return true;
             }
 
-            if (target === 'card_floating') {
+            if (target === 'card_floating' || target === 'card') {
                 if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
                 const cardNodes = detectCardFloatingNodes();
+                const bindFloatingCloseDelegates = (rootDoc) => {
+                    if (!rootDoc || rootDoc.__rikkaCloseDelegateBound) return;
+                    rootDoc.__rikkaCloseDelegateBound = true;
+                    rootDoc.addEventListener('click', (ev) => {
+                        const btn = ev.target && ev.target.closest ? ev.target.closest('button, a, [role="button"], .close, .btn-close') : null;
+                        if (!btn) return;
+                        const label = String(btn.textContent || btn.getAttribute('title') || btn.getAttribute('aria-label') || '').trim();
+                        if (/不再显示|don't show again|do not show/i.test(label)) {
+                            try { callBridge('closeFloatingWindow', 'card_floating', true); } catch (_e) {}
+                            emitToHost('close_floating_window', { target: 'card_floating', hideForChat: true });
+                        } else if (/^(关闭|收起|退出浮窗|close|dismiss)$/i.test(label)) {
+                            try { callBridge('closeFloatingWindow', 'card_floating', false); } catch (_e) {}
+                            emitToHost('close_floating_window', { target: 'card_floating', hideForChat: false });
+                        }
+                    }, true);
+                };
+                bindFloatingCloseDelegates(document);
                 for (const item of cardNodes) {
                     if (item.kind === 'body_node' && item.el && item.el.style) {
                         item.el.style.setProperty('display', 'block', 'important');
@@ -4678,6 +5225,17 @@ function installUniversalFloatingAndTtsBridge() {
                     } else if (item.kind === 'script_iframe' && item.frame) {
                         item.frame.__rikkaExpandedForFloating = true;
                         item.frame.style.cssText = 'display:block !important;position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;border:none !important;z-index:9500 !important;pointer-events:auto !important;background:transparent !important;';
+                        try {
+                            if (item.frame.contentDocument) {
+                                bindFloatingCloseDelegates(item.frame.contentDocument);
+                            }
+                            if (item.frame.contentWindow) {
+                                item.frame.contentWindow.close = () => {
+                                    try { callBridge('closeFloatingWindow', 'card_floating', false); } catch (_e) {}
+                                    emitToHost('close_floating_window', { target: 'card_floating', hideForChat: false });
+                                };
+                            }
+                        } catch (_eFrame) {}
                     }
                 }
                 return true;
@@ -4690,6 +5248,7 @@ function installUniversalFloatingAndTtsBridge() {
 
     window.__rikkaCloseFloatingStage = function () {
         try {
+            window.__rikkaCurrentFloatingTarget = null;
             const dlg = document.getElementById('sttts-panel');
             if (dlg && dlg.open) {
                 try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
@@ -4710,6 +5269,7 @@ function installUniversalFloatingAndTtsBridge() {
 
 // ---------------------------------------------------------------- 启动
 (async function boot() {
+    try { emitToHost('runtime_imported', { mode: window.__RIKKA_PANEL_MODE__ ? 'panel' : (window.__RIKKA_EXT_SETTINGS_MODE__ ? 'ext-settings' : 'host') }); } catch (_e) { /* noop */ }
     // [10-19-21 深度适配] 扩展设置页模式：
     // 1. 杜绝二次进入白屏（退出时主动关闭全部 IndexedDB 连接并调用扩展 disable 钩子）；
     // 2. 杜绝预插重复 DOM 导致事件绑定失效；
@@ -5725,6 +6285,7 @@ function installUniversalFloatingAndTtsBridge() {
     if (!window.Mvu || !mvuReady) {
         setTimeout(() => { loadMvu(); }, 300);
     }
+    emitToHost('boot_complete', { extMs: Date.now() - extT0, mvuReady: !!window.Mvu });
 })();
 
 // 页面卸载前冲刷变量

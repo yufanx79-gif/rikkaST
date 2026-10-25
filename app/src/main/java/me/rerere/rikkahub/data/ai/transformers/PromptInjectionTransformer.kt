@@ -23,6 +23,7 @@ import me.rerere.rikkahub.data.st.tokenizer.countTokens
 import me.rerere.rikkahub.data.st.tokenizer.estimateTokensHeuristic
 import me.rerere.rikkahub.data.st.regex.RegexScript
 import me.rerere.rikkahub.data.st.regex.RegexScriptEngine
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.regex.mergeRegexScripts
 import me.rerere.rikkahub.data.model.isTriggered
 import me.rerere.rikkahub.data.model.matchedKeyScore
@@ -213,13 +214,7 @@ object PromptInjectionTransformer : InputMessageTransformer {
             // [第6轮 D1 方案 A] 两通道并集：预设仓（modeInjections）+ 提示词注入（promptInjections）。
             modeInjections = ctx.settings.modeInjections + ctx.settings.promptInjections,
             lorebooks = ctx.settings.lorebooks,
-            regexScripts = mergeRegexScripts(
-                ctx.settings.regexScripts,
-                runtimeAssistant,
-                activeGroups,
-                activePresetConfig.spresetEnabledRegexIds,
-                activePresetConfig.spresetDisabledRegexIds,
-            ),
+            regexScripts = mergeActiveRegexScripts(ctx.settings, runtimeAssistant, runtimeConvModeIds),
             wiFormat = activePresetConfig.wiFormat,
             forbidOverridesMain = activePresetConfig.forbidOverridesMain,
             forbidOverridesJailbreak = activePresetConfig.forbidOverridesJailbreak,

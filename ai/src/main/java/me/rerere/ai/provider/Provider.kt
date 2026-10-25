@@ -17,8 +17,11 @@ import kotlin.uuid.Uuid
 interface Provider<T : ProviderSetting> {
     suspend fun listModels(providerSetting: T): List<Model>
 
+    /** 查询额度，见 [ProviderQuota]。不支持或没有开启时返回 null */
+    suspend fun getQuota(providerSetting: T): ProviderQuota? = null
+
     suspend fun getBalance(providerSetting: T): String {
-        return "TODO"
+        return (getQuota(providerSetting) as? ProviderQuota.Balance)?.value ?: "TODO"
     }
 
     suspend fun generateText(

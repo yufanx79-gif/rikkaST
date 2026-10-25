@@ -34,13 +34,53 @@ class AssistantVM(
 
     fun addAssistant(assistant: Assistant) {
         viewModelScope.launch {
-            val settings = settings.value
-            settingsStore.update(
-                settings.copy(
-                    assistants = settings.assistants.plus(assistant)
+            settingsStore.update { current ->
+                current.copy(
+                    assistants = current.assistants.filterNot { it.id == assistant.id } + assistant
                 )
-            )
+            }
         }
+    }
+
+    fun addAssistantAndActivate(assistant: Assistant, newLorebooks: List<Lorebook> = emptyList()): Assistant {
+        val lorebookIds = newLorebooks.map { it.id }.toSet()
+        val boundAssistant = if (lorebookIds.isNotEmpty()) {
+            assistant.copy(lorebookIds = assistant.lorebookIds + lorebookIds)
+        } else {
+            assistant
+        }
+        viewModelScope.launch {
+            settingsStore.update { current ->
+                current.copy(
+                    lorebooks = if (newLorebooks.isNotEmpty()) current.lorebooks + newLorebooks else current.lorebooks,
+                    assistants = current.assistants.filterNot { it.id == boundAssistant.id } + boundAssistant,
+                    assistantId = boundAssistant.id,
+                )
+            }
+        }
+        return boundAssistant
+    }
+
+    fun importAndActivateAssistant(
+        result: me.rerere.rikkahub.ui.pages.assistant.detail.TavernImportResult,
+        activateAsCurrent: Boolean = true,
+    ): Assistant {
+        val lorebookIds = result.newLorebooks.map { it.id }.toSet()
+        val boundAssistant = if (lorebookIds.isNotEmpty()) {
+            result.assistant.copy(lorebookIds = result.assistant.lorebookIds + lorebookIds)
+        } else {
+            result.assistant
+        }
+        viewModelScope.launch {
+            settingsStore.update { current ->
+                current.copy(
+                    lorebooks = if (result.newLorebooks.isNotEmpty()) current.lorebooks + result.newLorebooks else current.lorebooks,
+                    assistants = current.assistants.filterNot { it.id == boundAssistant.id } + boundAssistant,
+                    assistantId = if (activateAsCurrent) boundAssistant.id else current.assistantId,
+                )
+            }
+        }
+        return boundAssistant
     }
 
     fun removeAssistant(assistant: Assistant) {

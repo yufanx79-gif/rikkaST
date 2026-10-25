@@ -195,6 +195,8 @@ class ChatVM(
     val mcpManager = chatService.mcpManager
 
     // 更新设置
+    fun updateSettings(transform: (Settings) -> Settings): Job = updateSettings(transform(settings.value))
+
     fun updateSettings(newSettings: Settings): Job {
         return viewModelScope.launch {
             val oldSettings = settingsStore.settingsFlow.value
@@ -257,7 +259,7 @@ class ChatVM(
         }
         .distinctUntilChanged()
         .flatMapLatest { enabled ->
-            if (enabled) updateChecker.updateState else flowOf(UiState.Loading)
+            if (enabled) updateChecker.checkUpdate() else flowOf(UiState.Loading)
         }
         .stateIn(
             viewModelScope,
@@ -351,6 +353,24 @@ class ChatVM(
     /**
      * 压缩上下文
      */
+    fun handleCompressContext(additionalPrompt: String, keepRecentMessages: Int): Job {
+        return handleCompressContext(
+            additionalPrompt = additionalPrompt,
+            targetTokens = settings.value.getCurrentChatModel()?.contextLength ?: 4096,
+            keepRecentMessages = keepRecentMessages,
+        )
+    }
+
+    fun updateAssistant(assistant: Assistant) {
+        val current = settings.value
+        updateSettings(
+            current.copy(
+                assistants = current.assistants.map { existing ->
+                    if (existing.id == assistant.id) assistant else existing
+                },
+            )
+        )
+    }
     fun handleCompressContext(additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int): Job {
         return viewModelScope.launch {
             chatService.compressConversation(
@@ -538,14 +558,19 @@ class ChatVM(
 
     /**
      * 酒馆运行时聊天记录回写（JSR `setChatMessages` / MVU `saveChat`）：
-     * 在视图模型作用域内应用楼层内容变更（swipes / swipe_id / mes / is_system / name）并持久化。
+     * 同步更新会话状态并异步落盘，保证预设按钮切换 swipe_id 后紧随其后的脚本读取或触发立刻生效。
      */
-    fun applyRuntimeChatUpdates(jsonText: String) {
+    fun applyRuntimeChatUpdates(jsonText: String): Boolean {
+        val current = conversation.value
+        val currentSettings = settingsStore.settingsFlow.value
+        val assistant = currentSettings.getAssistantById(current.assistantId) ?: currentSettings.getCurrentAssistant()
+        val altGreetings = assistant.tavernData?.alternateGreetings.orEmpty()
+        val updated = applyTavernChatUpdates(current, jsonText, altGreetings) ?: return false
+        updateConversation(updated)
         viewModelScope.launch {
-            val current = conversation.value
-            val updated = applyTavernChatUpdates(current, jsonText) ?: return@launch
-            updateConversation(updated)
+            runCatching { chatService.saveConversation(_conversationId, updated) }
         }
+        return true
     }
 
     /**
@@ -938,6 +963,23 @@ class ChatVM(
         saveConversationAsync()
     }
 
+    fun updateWorkspaceCwd(cwd: String?) {
+        viewModelScope.launch {
+            chatService.updateWorkspaceCwd(conversation.value.id, cwd)
+        }
+    }
+
+    fun updateConversationSystemPrompt(prompt: String?) {
+        viewModelScope.launch {
+            chatService.updateConversationSystemPrompt(conversation.value.id, prompt)
+        }
+    }
+
+    fun updateDraftFolder(folderId: Uuid?) {
+        viewModelScope.launch {
+            chatService.updateDraftConversationFolder(conversation.value.id, folderId)
+        }
+    }
 }
 
 

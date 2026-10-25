@@ -6,12 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * v183：C4 渲染判定放宽的回归测试。
- *
- * 真实样本来源：魔法少女卡内嵌正则替换串（staging/card_panels/）：
- * - r1「游玩指南」：``` 围栏 + 完整 HTML，无 <script>（v182 判定失败 → 显示为代码块）
- * - r0「角色创建表单」：```html 围栏 + <script> + <button>/<input>
- * - r10「快速选项模块」：```html 围栏 + <script>（按钮由 JS 动态生成）
+ * v183：C4 渲染判定放宽的回归测试 + P0 多段 `<style>`/容器分段回归测试。
  */
 class MessageHtmlDetectionTest {
 
@@ -66,17 +61,21 @@ class MessageHtmlDetectionTest {
     fun plainMarkdownIsNotInteractive() {
         val t = "这是一段普通的 Markdown 文本，提到了组件和 div 的概念，但没有任何 HTML 结构标签，也不会触发内嵌渲染。"
         assertFalse(looksLikeInteractiveHtml(t))
+        assertFalse(looksLikeHtmlFragment(t))
+        assertFalse(shouldRenderAsHtmlPanel(t))
     }
 
     @Test
     fun escapedScriptIsNotInteractive() {
         val t = "被转义的 &lt;script&gt;alert(1)&lt;/script&gt; 不应触发内嵌渲染，保持普通 Markdown 路径。"
         assertFalse(looksLikeInteractiveHtml(t))
+        assertFalse(looksLikeHtmlFragment(t))
     }
 
     @Test
     fun shortTextIsNotInteractive() {
         assertFalse(looksLikeInteractiveHtml("<div>x</div>"))
+        assertFalse(looksLikeHtmlFragment("<div>x</div>"))
     }
 
     @Test
@@ -95,6 +94,44 @@ class MessageHtmlDetectionTest {
             ```
         """.trimIndent()
         assertFalse(looksLikeInteractiveHtml(xmlCodeFence))
+        assertFalse(looksLikeHtmlFragment(xmlCodeFence))
+        assertFalse(shouldRenderAsHtmlPanel(xmlCodeFence))
+    }
+
+    @Test
+    fun staticPostCardFragmentIsRecognizedAsHtmlPanel() {
+        val postCard = """
+            <div class="post-card">
+                <div class="post-header"><span class="post-author">早川雫</span></div>
+                <div class="post-body">雨天便利店的偶遇</div>
+            </div>
+        """.trimIndent()
+        assertTrue(looksLikeHtmlFragment(postCard))
+        assertTrue(shouldRenderAsHtmlPanel(postCard))
+    }
+
+    @Test
+    fun groupTopLevelHtmlNodesDoesNotSwallowFollowingStyleIntoPrecedingPanel() {
+        val content = """
+            <style>.phone{color:#fff}</style>
+            <div class="phone">小手机状态栏内容</div>
+            <style>.post-card{background:#111;padding:12px}</style>
+            <div class="post-card"><div class="title">动态卡片</div></div>
+
+            这里是后续的小说正文段落。
+        """.trimIndent()
+
+        val pieces = splitMixedMessagePieces(content)
+        val htmlPanels = pieces.filterIsInstance<MixedContentPiece.HtmlPanel>()
+        val mdBodies = pieces.filterIsInstance<MixedContentPiece.MarkdownBody>()
+
+        assertEquals(2, htmlPanels.size)
+        assertTrue(htmlPanels[0].html.contains(".phone"))
+        assertFalse(htmlPanels[0].html.contains(".post-card"))
+        assertTrue(htmlPanels[1].html.contains(".post-card"))
+        assertTrue(htmlPanels[1].html.contains("class=\"post-card\""))
+        assertEquals(1, mdBodies.size)
+        assertFalse(mdBodies[0].text.contains("post-card"))
     }
 
     @Test
@@ -129,5 +166,33 @@ class MessageHtmlDetectionTest {
         assertEquals("font/woff2", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("fonts/custom.WOFF2?ver=2.0"))
         assertEquals("font/ttf", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("fonts/pixel.ttf"))
         assertEquals("audio/mpeg", me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.mimeOf("voice/line01.MP3"))
+    }
+
+    @Test
+    fun activePanelWebViewPoolAndSchedulerEnforceDefaultBoundsAndCleanCancel() {
+        ActivePanelWebViewPool.resetForTest()
+        TavernPanelLoadScheduler.resetForTest()
+
+        // Default safe cap (6) and mode-specific cap (3)
+        for (i in 1..7) {
+            ActivePanelWebViewPool.acquire("k$i", maxActive = ActivePanelWebViewPool.DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS)
+        }
+        assertEquals(6, ActivePanelWebViewPool.activeKeysFlow.value.size)
+        assertFalse("Oldest key k1 must be evicted when 7th is acquired under cap 6", "k1" in ActivePanelWebViewPool.activeKeysFlow.value)
+        assertTrue("Newest key k7 must be present", "k7" in ActivePanelWebViewPool.activeKeysFlow.value)
+
+        // Paired release and conversation switch clearAll
+        ActivePanelWebViewPool.release("k7")
+        assertFalse("k7" in ActivePanelWebViewPool.activeKeysFlow.value)
+        ActivePanelWebViewPool.clearAll()
+        assertTrue(ActivePanelWebViewPool.activeKeysFlow.value.isEmpty())
+
+        // Cancelled scheduler request cancels gate immediately
+        val req1 = TavernPanelLoadScheduler.enqueue("p1", "Panel 1")
+        val req2 = TavernPanelLoadScheduler.enqueue("p2", "Panel 2")
+        TavernPanelLoadScheduler.cancel("p2")
+        assertTrue("Cancelled queued request gate must be cancelled", req2.gate.isCancelled)
+        TavernPanelLoadScheduler.cancel("p1")
+        TavernPanelLoadScheduler.resetForTest()
     }
 }

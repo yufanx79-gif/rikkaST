@@ -5,6 +5,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 
 class WorkspaceManager(
     private val baseDir: File,
@@ -40,7 +41,9 @@ class WorkspaceManager(
 
     fun tempDir(root: String): File = File(workspaceDir(root), TEMP_DIR)
 
-    fun hasRootfs(root: String): Boolean = File(linuxDir(root), "bin/sh").isFile
+    fun hasRootfs(root: String): Boolean = isUsableRootfs(linuxDir(root))
+
+    fun rootfsShell(root: String): String = rootfsShell(linuxDir(root))
 
     fun deleteWorkspace(root: String): Boolean = workspaceDir(root).deleteRecursively()
 
@@ -154,7 +157,8 @@ class WorkspaceManager(
         outputStream.use { out -> file.inputStream().use { it.copyTo(out) } }
     }
 
-    private fun resolveRootfsFile(root: String, path: String): File {
+    /** Rootfs 内绝对路径对应的宿主机文件, 不检查是否存在 */
+    fun resolveRootfsFile(root: String, path: String): File {
         val location = resolveRootfsPath(root, path)
         return fileSystem.resolve(location.rootDir, location.relativePath)
     }
@@ -255,6 +259,21 @@ class WorkspaceManager(
         val KERNEL_FS_MOUNTS = listOf("/dev", "/proc", "/sys")
 
         private val ROOT_NAME_REGEX = Regex("[A-Za-z0-9._-]+")
+
+        /** Rootfs 是否可用, 以 /bin/sh 存在为准 */
+        fun isUsableRootfs(linuxDir: File): Boolean =
+            linuxDir.isDirectory && linuxDir.hasRootfsEntry("bin/sh")
+
+        /** Rootfs 内使用的 shell: 优先 bash, 没有时 (如 Alpine minirootfs) 回退到 /bin/sh */
+        fun rootfsShell(linuxDir: File): String =
+            if (linuxDir.hasRootfsEntry("bin/bash")) "/bin/bash" else "/bin/sh"
+
+        // Alpine 等发行版的 /bin/sh 是指向 /bin/busybox 的绝对路径软链, 在宿主机上解析不到目标,
+        // 只有 proot 内才能正确解析, 所以软链本身存在即视为存在
+        private fun File.hasRootfsEntry(path: String): Boolean {
+            val entry = File(this, path)
+            return entry.isFile || Files.isSymbolicLink(entry.toPath())
+        }
     }
 }
 

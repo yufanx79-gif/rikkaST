@@ -34,6 +34,7 @@ import me.rerere.ai.ui.StreamChunkHandler
 import me.rerere.ai.ui.handleTextGenerationResult
 import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
+import me.rerere.rikkahub.data.st.preset.SpresetCompat
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
@@ -290,17 +291,8 @@ class GenerationLoop(
             }
             addAll(
                 buildMemoryTools(
-                    json = json,
-                    onCreation = { content ->
-                        memoryRepo.addMemory(memoryAssistantId, content)
-                    },
-                    onUpdate = { id, content ->
-                        memoryRepo.updateContent(id, content)
-                    },
-                    onDelete = { id ->
-                        memoryRepo.deleteMemory(id)
-                    },
-                    stableDate = settings.deepseekCacheOptimization,
+                    repository = memoryRepo,
+                    assistantId = memoryAssistantId,
                 )
             )
         }
@@ -828,11 +820,34 @@ class GenerationLoop(
             internalMessages = internalMessages + UIMessage.assistant(combinedPrefill).copy(isSynthetic = true)
         }
         val squashSep = postPresetCfg.spresetChatSquashSeparator.ifEmpty { "\n\n" }
-        if (postPresetCfg.squashSystemMessages && internalMessages.size > 1) {
+        val spresetCfg = postPresetCfg.spresetConfig
+        if (spresetCfg.enabled) {
+            // MessageInjections 属于预设请求结构的一部分，必须先于 ChatSquash 折叠。
+            internalMessages = runCatching {
+                SpresetCompat.applyMessageInjections(internalMessages, spresetCfg)
+            }.getOrDefault(internalMessages)
+        }
+        val chatSquash = spresetCfg.chatSquash
+        if (spresetCfg.enabled && chatSquash?.enabled == true && internalMessages.size > 1) {
+            // SPreset ChatSquash 完整语义（conditional 块合并 / 旧版角色合并、
+            // prefix/suffix、<|sep|>、squashed_post_script）。失败时保留原消息。
+            internalMessages = runCatching {
+                SpresetCompat.applyChatSquash(
+                    messages = internalMessages,
+                    cfg = chatSquash,
+                    userName = settings.displaySetting.userNickname.ifBlank { "User" },
+                    charName = assistant.name,
+                )
+            }.getOrDefault(internalMessages)
+        } else if (postPresetCfg.squashSystemMessages && internalMessages.size > 1) {
             internalMessages = squashAdjacentSystemMessages(internalMessages, squashSep)
         }
-        if (postPresetCfg.promptPostProcessing.isNotBlank() && internalMessages.size > 1) {
-            internalMessages = applyPromptPostProcessing(internalMessages, postPresetCfg.promptPostProcessing, squashSep)
+        val forcedPostMode = spresetCfg.forcedPostProcessing
+            ?.takeIf { spresetCfg.enabled && it.enabled && it.mode.isNotBlank() }
+            ?.mode
+        val effectivePostProcessing = forcedPostMode ?: postPresetCfg.promptPostProcessing
+        if (effectivePostProcessing.isNotBlank() && internalMessages.size > 1) {
+            internalMessages = applyPromptPostProcessing(internalMessages, effectivePostProcessing, squashSep)
         }
         // [v211] ST 生成前钩子（CHAT_COMPLETION_SETTINGS_READY）：让扩展（ST-PT 的 EJS 模板 /
         //  MVU 的 <UpdateVariable> 剥离）就地改写最终 messages。ST 契约：openai.js:1616-1623
@@ -859,7 +874,10 @@ class GenerationLoop(
                 } else {
                     android.util.Log.i("RikkaTavern", "[gen-hooks] no rewrite (null/timeout/not-ready)")
                 }
-            }.onFailure { android.util.Log.w("RikkaTavern", "[gen-hooks] failed: ${it.message}") }
+            }.onFailure { e ->
+                if (e is CancellationException) throw e
+                android.util.Log.w("RikkaTavern", "[gen-hooks] failed: ${e.message}")
+            }
             if (abortedByInterceptor) {
                 TavernRuntimeManager.recordSendDiagnostic(
                     stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
@@ -870,7 +888,7 @@ class GenerationLoop(
             }
         }
         var messages: List<UIMessage> = messages
-        val params = TextGenerationParams(
+        var params = TextGenerationParams(
             model = model,
             temperature = assistant.temperature ?: postPresetCfg.temperature,
             topP = assistant.topP ?: postPresetCfg.topP,
@@ -888,6 +906,23 @@ class GenerationLoop(
             ),
             sessionId = (conversationId ?: Uuid.random()).toString(),
         )
+        // SPreset FinalRequestProcessing：在请求发出前执行预设私有 JS。
+        // 典型用途：把 system 中的 <run_tool_replacement> 标记与 assistant 长上下文
+        // 折叠成 { system, user } + 一个 context 工具描述；失败时原请求直通。
+        val finalRequestProcessor = spresetCfg.finalRequestProcessing
+        if (spresetCfg.enabled && finalRequestProcessor.enabled && finalRequestProcessor.script.isNotBlank()) {
+            val rewritten = runCatching {
+                SpresetCompat.applyFinalRequestProcessing(
+                    messages = internalMessages,
+                    tools = params.tools,
+                    p = finalRequestProcessor,
+                )
+            }.getOrNull()
+            if (rewritten != null && rewritten.first.isNotEmpty()) {
+                internalMessages = rewritten.first
+                params = params.copy(tools = rewritten.second)
+            }
+        }
         TavernRuntimeManager.recordSendDiagnostic(
             stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT,
             conversationId = conversationId?.toString().orEmpty(),
@@ -914,10 +949,13 @@ class GenerationLoop(
                     val streamChunkHandler = StreamChunkHandler(model)
                     var attemptMessages = responseBaseMessages
                     try {
-                        providerImpl.streamText(
-                            providerSetting = provider,
-                            messages = internalMessages,
-                            params = params
+                        SpresetCompat.processStream(
+                            providerImpl.streamText(
+                                providerSetting = provider,
+                                messages = internalMessages,
+                                params = params,
+                            ),
+                            spresetCfg,
                         ).collect { chunk ->
                             try {
                                 if (retryCount > 0) {
@@ -948,7 +986,14 @@ class GenerationLoop(
                                 throw StreamChunkHandlingException(error)
                             }
                         }
-                        messages = attemptMessages
+                        messages = runCatching {
+                            SpresetCompat.finalizeAssistantOutput(
+                                messages = attemptMessages,
+                                config = spresetCfg,
+                                toolCallsAlreadyFormatted = true,
+                            )
+                        }.getOrDefault(attemptMessages)
+                        onUpdateMessages(messages)
                         break
                     } catch (error: Throwable) {
                         if (error is StreamChunkHandlingException) {
@@ -974,6 +1019,13 @@ class GenerationLoop(
                     )
                 }
                 messages = messages.handleTextGenerationResult(result = result, model = model)
+                messages = runCatching {
+                    SpresetCompat.finalizeAssistantOutput(
+                        messages = messages,
+                        config = spresetCfg,
+                        toolCallsAlreadyFormatted = false,
+                    )
+                }.getOrDefault(messages)
                 onUpdateMessages(messages)
             }
         } finally {
@@ -1008,8 +1060,12 @@ class GenerationLoop(
         enabled: Boolean,
     ): Int {
         // 用户主动停止生成时，底层连接也可能以 IOException("canceled") 收尾；
-        // 先检查协程状态，确保取消不会被当作网络波动重新拉起。
+        // 先检查协程状态，且若异常本身即为 Canceled 也直接按取消抛出，确保取消绝不会被当作网络波动重新拉起。
         currentCoroutineContext().ensureActive()
+        if (error is CancellationException) throw error
+        if (error is IOException && error.message?.contains("cancel", ignoreCase = true) == true) {
+            throw CancellationException("Network call canceled", error)
+        }
         if (!enabled || error !is IOException || retryCount >= MAX_PROVIDER_NETWORK_RETRIES) {
             throw error
         }

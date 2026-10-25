@@ -28,13 +28,16 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
@@ -50,6 +53,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.res.stringResource
@@ -58,6 +62,8 @@ import androidx.core.graphics.ColorUtils
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dokar.sonner.ToastType
 import kotlinx.coroutines.launch
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.FileImport
@@ -66,29 +72,30 @@ import me.rerere.hugeicons.stroke.PlusSign
 import me.rerere.hugeicons.stroke.Share03
 import me.rerere.hugeicons.stroke.Tick01
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.ItemAction
 import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
-import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.pages.setting.components.PresetThemeButtonGroup
-import me.rerere.rikkahub.ui.theme.AppRadii
-import me.rerere.rikkahub.ui.theme.AppSpacing
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.ui.theme.CustomTheme
 import me.rerere.rikkahub.ui.theme.LocalDarkMode
-import me.rerere.rikkahub.ui.theme.decodeCustomTheme
-import me.rerere.rikkahub.ui.theme.encodeCustomTheme
 import me.rerere.rikkahub.utils.plus
+import me.rerere.ui.components.RikkaConfirmDialog
 import org.koin.androidx.compose.koinViewModel
 import kotlin.math.roundToInt
 import kotlin.uuid.Uuid
+
+private val themeJson = Json {
+    ignoreUnknownKeys = true
+    prettyPrint = true
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingThemePage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val clipboardManager = LocalClipboard.current
     val toaster = LocalToaster.current
     val scope = rememberCoroutineScope()
@@ -100,20 +107,29 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
     var showImportDialog by remember { mutableStateOf(false) }
     var deletingTheme by remember { mutableStateOf<CustomTheme?>(null) }
 
-    PageScaffold(
-        title = stringResource(R.string.setting_page_theme_setting),
+    Scaffold(
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = { Text(stringResource(R.string.setting_page_theme_setting)) },
+                navigationIcon = { BackButton() },
+                scrollBehavior = scrollBehavior,
+                colors = CustomColors.topBarColors
+            )
+        },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = CustomColors.topBarColors.containerColor
     ) { innerPadding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = innerPadding + PaddingValues(8.dp),
-            verticalArrangement = Arrangement.spacedBy(AppSpacing.lg),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             if (settings.dynamicColor) {
                 item("dynamicColorHint") {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(AppSpacing.xxxl),
+                            .padding(32.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -139,14 +155,14 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(AppRadii.xl))
+                                .clip(RoundedCornerShape(20.dp))
                                 .background(MaterialTheme.colorScheme.surfaceBright)
                         ) {
                             PresetThemeButtonGroup(
                                 themeId = settings.themeId,
                                 modifier = Modifier.fillMaxWidth(),
                                 onChangeTheme = {
-                                    vm.updateSettings(settings.copy(themeId = it))
+                                    vm.updateSettings { latest -> latest.copy(themeId = it) }
                                 }
                             )
                         }
@@ -166,7 +182,7 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(AppSpacing.sm)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilledTonalButton(
                                 onClick = { showImportDialog = true }
                             ) {
@@ -193,7 +209,7 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(AppSpacing.xxxl),
+                                .padding(32.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
@@ -210,10 +226,10 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
                         theme = theme,
                         isSelected = settings.themeId == theme.id,
                         onSelect = {
-                            vm.updateSettings(settings.copy(themeId = theme.id))
+                            vm.updateSettings { it.copy(themeId = theme.id) }
                         },
                         onExport = {
-                            val json = encodeCustomTheme(theme)
+                            val json = themeJson.encodeToString(theme)
                             scope.launch {
                                 clipboardManager.setClipEntry(
                                     ClipEntry(ClipData.newPlainText("theme", json))
@@ -244,12 +260,12 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
                 } else {
                     settings.customThemes + theme
                 }
-                vm.updateSettings(
-                    settings.copy(
+                vm.updateSettings {
+                    it.copy(
                         customThemes = newThemes,
                         themeId = theme.id
                     )
-                )
+                }
                 showEditSheet = false
             }
         )
@@ -260,12 +276,12 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
             onDismiss = { showImportDialog = false },
             onImport = { theme ->
                 val importedTheme = theme.copy(id = Uuid.random().toString())
-                vm.updateSettings(
-                    settings.copy(
-                        customThemes = settings.customThemes + importedTheme,
+                vm.updateSettings {
+                    it.copy(
+                        customThemes = it.customThemes + importedTheme,
                         themeId = importedTheme.id
                     )
-                )
+                }
                 showImportDialog = false
                 toaster.show(importSuccessMsg, type = ToastType.Success)
             }
@@ -281,7 +297,7 @@ fun SettingThemePage(vm: SettingVM = koinViewModel()) {
             deletingTheme?.let { theme ->
                 val newThemes = settings.customThemes.filter { it.id != theme.id }
                 val newThemeId = if (settings.themeId == theme.id) "sakura" else settings.themeId
-                vm.updateSettings(settings.copy(customThemes = newThemes, themeId = newThemeId))
+                vm.updateSettings { it.copy(customThemes = newThemes, themeId = newThemeId) }
             }
             deletingTheme = null
         },
@@ -307,7 +323,7 @@ private fun CustomThemeItem(
     ListItem(
         modifier = Modifier
             .padding(horizontal = 8.dp)
-            .clip(RoundedCornerShape(AppRadii.lg))
+            .clip(RoundedCornerShape(16.dp))
             .clickable { onSelect() },
         headlineContent = { Text(theme.name.ifEmpty { "Unnamed" }) },
         leadingContent = {
@@ -404,7 +420,7 @@ private fun CustomThemeEditSheet(
                 modifier = Modifier
                     .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(AppSpacing.lg),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 OutlinedTextField(
                     value = currentTheme.name,
@@ -492,7 +508,7 @@ private fun ImportThemeDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.setting_theme_page_import_theme)) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(AppSpacing.sm)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = jsonText,
                     onValueChange = {
@@ -512,7 +528,7 @@ private fun ImportThemeDialog(
             Button(
                 onClick = {
                     try {
-                        val theme = decodeCustomTheme(jsonText)
+                        val theme = themeJson.decodeFromString<CustomTheme>(jsonText)
                         onImport(theme)
                     } catch (e: Exception) {
                         errorMessage = e.message
@@ -555,11 +571,11 @@ private fun ColorPickerRow(
     }
 
     Column(
-        verticalArrangement = Arrangement.spacedBy(AppSpacing.xs)
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(AppSpacing.md),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Canvas(
                 modifier = Modifier
@@ -670,7 +686,7 @@ private fun ThemePreview(theme: CustomTheme) {
     val scheme = theme.generateColorScheme(darkMode)
 
     Column(
-        verticalArrangement = Arrangement.spacedBy(AppSpacing.sm)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             text = stringResource(R.string.setting_theme_page_preview),
@@ -679,9 +695,9 @@ private fun ThemePreview(theme: CustomTheme) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(AppRadii.lg))
+                .clip(RoundedCornerShape(16.dp))
                 .background(scheme.surface)
-                .padding(AppSpacing.lg),
+                .padding(16.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             ColorSwatch(scheme.primary, "P")
@@ -698,7 +714,7 @@ private fun ThemePreview(theme: CustomTheme) {
 private fun ColorSwatch(color: Color, label: String) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(AppSpacing.xs),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Canvas(
             modifier = Modifier

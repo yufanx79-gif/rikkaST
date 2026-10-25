@@ -19,14 +19,17 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ProvideTextStyle
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +38,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -44,9 +48,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import me.rerere.highlight.LocalCodeHighlighter
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeVisualTransformation
-import me.rerere.rikkahub.ui.components.ui.FormItem
-import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.ui.theme.JetbrainsMono
@@ -57,6 +60,7 @@ import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchResult
 import me.rerere.search.SearchService
 import me.rerere.search.SearchServiceOptions
+import me.rerere.ui.components.FormItem
 import org.koin.androidx.compose.koinViewModel
 import kotlin.uuid.Uuid
 
@@ -66,6 +70,7 @@ fun SettingSearchDetailPage(
     vm: SettingVM = koinViewModel()
 ) {
     val settings by vm.settings.collectAsStateWithLifecycle()
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val nav = LocalNavController.current
 
     val service = settings.searchServices.find { it.id == serviceId } ?: return
@@ -76,28 +81,41 @@ fun SettingSearchDetailPage(
         options = updated
         val newServices = settings.searchServices.toMutableList()
         newServices[serviceIndex] = updated
-        vm.updateSettings(settings.copy(searchServices = newServices))
+        vm.updateSettings { it.copy(searchServices = newServices) }
     }
 
-    PageScaffold(
-        title = options.displayName,
-        actions = {
-            if (settings.searchServices.size > 1) {
-                IconButton(
-                    onClick = {
-                        val newServices = settings.searchServices.toMutableList()
-                        newServices.removeAt(serviceIndex)
-                        vm.updateSettings(settings.copy(searchServices = newServices))
-                        nav.popBackStack()
+    Scaffold(
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = {
+                    Text(options.displayName)
+                },
+                navigationIcon = {
+                    BackButton()
+                },
+                actions = {
+                    if (settings.searchServices.size > 1) {
+                        IconButton(
+                            onClick = {
+                                val newServices = settings.searchServices.toMutableList()
+                                newServices.removeAt(serviceIndex)
+                                vm.updateSettings { it.copy(searchServices = newServices) }
+                                nav.popBackStack()
+                            }
+                        ) {
+                            Icon(
+                                imageVector = HugeIcons.Delete01,
+                                contentDescription = stringResource(R.string.delete)
+                            )
+                        }
                     }
-                ) {
-                    Icon(
-                        imageVector = HugeIcons.Delete01,
-                        contentDescription = stringResource(R.string.delete)
-                    )
-                }
-            }
+                },
+                scrollBehavior = scrollBehavior,
+                colors = CustomColors.topBarColors
+            )
         },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = CustomColors.topBarColors.containerColor
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -204,6 +222,9 @@ private fun SearchServiceOptionsEditor(
         }
         is SearchServiceOptions.SerperOptions -> {
             SerperOptions(options) { onUpdateOptions(it) }
+        }
+        is SearchServiceOptions.DeepSeekOptions -> {
+            DeepSeekOptions(options) { onUpdateOptions(it) }
         }
         is SearchServiceOptions.CustomJsOptions -> {
             CustomJsOptions(options) { onUpdateOptions(it) }
@@ -587,6 +608,26 @@ internal fun BraveOptions(
 internal fun SerperOptions(
     options: SearchServiceOptions.SerperOptions,
     onUpdateOptions: (SearchServiceOptions.SerperOptions) -> Unit
+) {
+    FormItem(
+        label = {
+            Text(stringResource(R.string.search_detail_api_key))
+        }
+    ) {
+        OutlinedTextField(
+            value = options.apiKey,
+            onValueChange = {
+                onUpdateOptions(options.copy(apiKey = it))
+            },
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+internal fun DeepSeekOptions(
+    options: SearchServiceOptions.DeepSeekOptions,
+    onUpdateOptions: (SearchServiceOptions.DeepSeekOptions) -> Unit
 ) {
     FormItem(
         label = {

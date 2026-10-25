@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.ui.components.frosted
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -131,6 +133,13 @@ fun MessageBubbleContainer(
             }
         }
 
-        BubbleContainerKind.BARE -> (bareContent ?: bubbleContent)()
+        BubbleContainerKind.BARE -> {
+            // BARE 仍处在 LazyColumn 的测量路径中。必须消费调用方的 modifier（
+            // 其中包含且仅包含一次 animateContentSize），并主动提供稳定的满宽约束；
+            // 否则裸内容列会按自身固有宽度参与尺寸动画，宽度/高度互相反馈导致持续闪烁。
+            Box(modifier = modifier.fillMaxWidth()) {
+                (bareContent ?: bubbleContent)()
+            }
+        }
     }
 }

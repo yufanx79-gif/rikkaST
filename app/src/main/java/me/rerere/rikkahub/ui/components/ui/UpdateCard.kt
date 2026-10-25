@@ -82,7 +82,9 @@ fun UpdateCard(vm: ChatVM) {
         var dismissed by remember { mutableStateOf(false) }
         val current = remember { Version(BuildConfig.VERSION_NAME) }
         val latest = remember(info) { Version(info.version) }
-        if (latest > current && !dismissed) {
+        val eligibleDownloads = remember(info) { info.eligibleDownloads.ifEmpty { info.availableDownloads() } }
+        val versionCodeNewer = info.versionCode <= 0 || info.versionCode > BuildConfig.VERSION_CODE.toInt()
+        if (latest > current && versionCodeNewer && eligibleDownloads.isNotEmpty() && !dismissed) {
             Card(
                 onClick = {
                     showDetail = true
@@ -121,9 +123,9 @@ fun UpdateCard(vm: ChatVM) {
                 }
             }
         }
-        if (showDetail) {
+        if (showDetail && eligibleDownloads.isNotEmpty()) {
             val downloadHandler = useThrottle<UpdateDownload>(500) { item ->
-                vm.updateChecker.downloadUpdate(context, item)
+                vm.updateChecker.downloadUpdate(context, item, info)
                 showDetail = false
                 toaster.show(context.getString(R.string.update_card_downloading), type = ToastType.Info)
             }
@@ -156,7 +158,7 @@ fun UpdateCard(vm: ChatVM) {
                             .verticalScroll(rememberScrollState()),
                         style = MaterialTheme.typography.bodyMedium
                     )
-                    info.downloads.fastForEach { downloadItem ->
+                    eligibleDownloads.fastForEach { downloadItem ->
                         OutlinedCard(
                             onClick = {
                                 downloadHandler(downloadItem)

@@ -1,12 +1,47 @@
 {
-  "version": "2.5.6",
-  "publishedAt": "2026-10-20T00:00:00Z",
-  "changelog": "rikkaST 2.5.6-public：新增聊天页常驻小手机/通用悬浮窗、双通道独立语音、三种性能降低方案、第三方扩展与快速回复导入导出、内置 Node 本地伴生服务；修复小手机二次白屏、设置页空白、离线加载慢、长图比例变形、发送卡顿与返回闪退等问题；全面升级 SillyTavern 1.19.0 兼容底座。",
+  "version": "2.5.10",
+  "versionCode": 242,
+  "packageName": "me.rerere.rikkahub.st",
+  "minAndroidSdk": 26,
+  "publishedAt": "2026-10-26T00:00:00Z",
+  "artifactStatus": "READY",
+  "targetArtifactName": "rikkaST-2.5.10-public-20261026.apk",
+  "changelog": "1. 数据库升级到 Room v33：修复旧版 v29/v30/v31/v32 数据升级时 MemoryEntity 多出索引导致 Room TableInfo 校验失败的问题；新增 v32→v33 修复迁移，安装新版不会丢失聊天记录、角色卡或设置。\n2. 修复从 -4/2.5.6 等 v29 备份导入时迁移失败的问题；旧 settings.json、聊天数据库、世界书与角色卡均可继续导入。\n3. 保留并整合 2.5.9 的完整能力：SPreset 预设全兼容、TavernHelper/酒馆助手脚本导入、备份恢复稳定性、消息气泡闪烁修复、ST 正则与运行时兼容增强。\n4. 升级提示：请直接覆盖安装，不要卸载或清除应用数据；首次启动会执行数据库迁移，可能稍慢。",
   "downloads": [
     {
+      "name": "rikkaST-2.5.10-public-20261026.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261026/rikkaST-2.5.10-public-20261026.apk",
+      "size": "66,884,430 bytes (约 66.9 MB)",
+      "abi": "arm64-v8a",
+      "sha256": "01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc",
+      "status": "ready",
+      "targetReleaseName": "v2.5.10-public-20261026",
+      "version": "2.5.10",
+      "versionCode": 242
+    }
+  ],
+  "historicalArtifacts": [
+    {
+      "name": "rikkaST-2.5.7-universal-release.apk",
+      "version": "2.5.7",
+      "versionCode": 239,
+      "status": "historical-reference",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.7/rikkaST-2.5.7-universal-release.apk",
+      "size": "58.7 MB",
+      "abi": "arm64-v8a",
+      "sha256": "8620c3e2bf744732ed7fcdd6f9b9de8175814242315fe70a73124972a9f3441e",
+      "certificateSha256": "b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748"
+    },
+    {
       "name": "rikkaST-2.5.6-public-20261020.apk",
+      "version": "2.5.6",
+      "versionCode": 238,
+      "status": "historical-reference",
       "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.6-public-20261020/rikkaST-2.5.6-public-20261020.apk",
-      "size": "60,529,475 bytes (约 60.5 MB)"
+      "size": "60,529,475 bytes (约 60.5 MB)",
+      "abi": "arm64-v8a",
+      "sha256": "",
+      "certificateSha256": "b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748"
     }
   ]
 }

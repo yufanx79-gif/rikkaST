@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.adaptive.ExperimentalMaterial3AdaptiveApi::class)
+
 package me.rerere.rikkahub.ui.pages.chat
 
 import android.net.Uri
@@ -101,6 +103,7 @@ import me.rerere.hugeicons.stroke.LeftToRightListBullet
 import me.rerere.hugeicons.stroke.Menu03
 import me.rerere.hugeicons.stroke.MessageAdd01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.ui.theme.AppRadii
@@ -189,7 +192,7 @@ fun ChatPage(
         TavernRuntimeManager.setActiveAssistantId(tavernLatestConversation.value.assistantId.toString())
         TavernRuntimeManager.chatJsonSupplier = {
             val conv = tavernLatestConversation.value
-            buildTavernChatJson(conv, TavernVariableStore.getMessageVars(conv.id.toString()))
+            buildTavernChatJson(conv, tavernLatestSettings.value)
         }
         TavernRuntimeManager.chatUpdater = { jsonText -> vm.applyRuntimeChatUpdates(jsonText) }
         TavernRuntimeManager.tavernScriptsSupplier = {
@@ -264,6 +267,10 @@ fun ChatPage(
         // [v243 BUGFIX A2] JSR createChatMessages / deleteChatMessages 落点（同步更新，不触发生成）
         TavernRuntimeManager.chatInserter = { jsonText -> vm.insertRuntimeChatMessages(jsonText) }
         TavernRuntimeManager.chatDeleter = { idsJson -> vm.deleteRuntimeChatMessages(idsJson) }
+        TavernRuntimeManager.generationStopper = {
+            vm.stopGeneration()
+            true
+        }
         // [v243 BUGFIX A3] JSR 世界书条目写入与整书 CRUD / 绑定落点
         TavernRuntimeManager.lorebookUpserter = { name, json -> vm.applyLorebookUpsert(name, json) }
         TavernRuntimeManager.lorebookCreator = { name, entriesJson, replace ->
@@ -867,6 +874,38 @@ private fun ChatPageContent(
             },
             bottomBar = {
                 Column {
+                    if (!setting.init && currentChatModel == null && setting.getCurrentChatModel() == null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.92f),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Text(
+                                    text = "尚未配置默认聊天模型，完成 2 步配置即可开聊",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    TextButton(onClick = { navController.navigate(Screen.ModelWizard) }) {
+                                        Text("极速配置", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                    TextButton(onClick = { navController.navigate(Screen.Onboarding) }) {
+                                        Text("新手向导", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
                     TavernScriptButtonsRow()
                     val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
                     val voiceState by vm.voiceSession.state.collectAsStateWithLifecycle()
@@ -1422,6 +1461,7 @@ private fun ChatFilesPickerSheet(
     onDismiss: () -> Unit,
 ) {
     val voiceState by vm.voiceSession.state.collectAsStateWithLifecycle()
+    val chatModel = setting.getCurrentChatModel()
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     var showInjectionSheet by remember { mutableStateOf(false) }
@@ -1445,30 +1485,14 @@ private fun ChatFilesPickerSheet(
             conversation = conversation,
             state = inputState,
             assistant = assistant,
+            chatModel = chatModel,
             mcpManager = vm.mcpManager,
-            onCompressContext = { additionalPrompt, targetTokens, keepRecentMessages ->
-                vm.handleCompressContext(additionalPrompt, targetTokens, keepRecentMessages)
+            onCompressContext = { additionalPrompt, keepRecentMessages ->
+                vm.handleCompressContext(additionalPrompt, keepRecentMessages)
             },
-            onUpdateAssistant = {
-                vm.updateSettings(
-                    setting.copy(
-                        assistants = setting.assistants.map { assistant ->
-                            if (assistant.id == it.id) {
-                                it
-                            } else {
-                                assistant
-                            }
-                        }
-                    )
-                )
-            },
-            onUpdateConversation = {
-                vm.updateConversation(it)
-                vm.saveConversationAsync()
-            },
+            onUpdateAssistant = vm::updateAssistant,
             onUpdateSettings = { vm.updateSettings(it) },
-            showInjectionSheet = showInjectionSheet,
-            onShowInjectionSheetChange = { showInjectionSheet = it },
+            onUpdateWorkspaceCwd = vm::updateWorkspaceCwd,
             showCompressDialog = showCompressDialog,
             onShowCompressDialogChange = { showCompressDialog = it },
             onDismiss = { dismissAll() },
@@ -1477,6 +1501,7 @@ private fun ChatFilesPickerSheet(
             onPickVideo = attachmentPickerActions.onPickVideo,
             onPickAudio = attachmentPickerActions.onPickAudio,
             onPickFile = attachmentPickerActions.onPickFile,
+            onSketch = attachmentPickerActions.onSketch,
             onStartVoiceMode = if (
                 setting.getSelectedASRProvider()?.supportsServerVadVoiceMode == true &&
                 voiceState.phase == VoicePhase.Off

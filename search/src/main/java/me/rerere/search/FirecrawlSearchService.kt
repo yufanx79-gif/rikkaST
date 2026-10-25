@@ -124,10 +124,10 @@ object FirecrawlSearchService : SearchService<SearchServiceOptions.FirecrawlOpti
 
             val response = httpClient.newCall(request).await()
             if (!response.isSuccessful) {
-                error("response failed #${'$'}{response.code}")
+                error("response failed #${response.code}")
             }
 
-            val bodyString = response.body!!.string()
+            val bodyString = response.body.string()
             val payload = json.parseToJsonElement(bodyString).jsonObject
             val data = payload["data"]?.jsonObject ?: error("empty response data")
             val resultData = json.decodeFromJsonElement<FirecrawlSearchResultData>(data)
@@ -190,7 +190,7 @@ object FirecrawlSearchService : SearchService<SearchServiceOptions.FirecrawlOpti
                 error("response failed #${response.code}")
             }
 
-            val bodyString = response.body!!.string()
+            val bodyString = response.body.string()
             val payload = json.parseToJsonElement(bodyString).jsonObject
 
             val success = payload["success"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false

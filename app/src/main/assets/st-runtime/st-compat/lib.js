@@ -2,7 +2,8 @@
  * rikkaST st-compat: lib.js
  * ============================================================
  * ST 1.19.0 根级 `lib.js` 导出面（第三方扩展经 `../../../../lib.js` 或 `/lib.js` import）。
- * 已提供：jQuery（$）、lodash（_）、yaml、DOMPurify、Bowser、slideToggle 以及 ST 1.19.0 其余库导出。
+ * 已提供：jQuery（$）、lodash（_）、yaml、DOMPurify、Bowser、hljs、marked、showdown、
+ * katex、renderMathInElement、Popper、select2、slideToggle 以及 ST 1.19.0 其余库导出。
  */
 
 import * as yamlModule from '/st-runtime/vendor/lib/yaml.esm.js';
@@ -34,6 +35,28 @@ export const showdown = g.showdown || {
     },
     extension: () => {},
 };
+
+export const marked = g.marked || {
+    parse: (text) => {
+        try {
+            if (showdown && typeof showdown.Converter === 'function') {
+                return new showdown.Converter().makeHtml(String(text ?? ''));
+            }
+        } catch (_e) { /* noop */ }
+        return String(text ?? '');
+    },
+    setOptions: () => {},
+    use: () => {},
+};
+
+export const katex = g.katex || {
+    render: (tex, el) => { if (el) el.textContent = String(tex ?? ''); },
+    renderToString: (tex) => String(tex ?? ''),
+};
+
+export const renderMathInElement = g.renderMathInElement || ((el) => el);
+
+export const select2 = g.select2 || (($ && $.fn && $.fn.select2) ? $.fn.select2 : (() => {}));
 
 export const moment = g.moment || function momentShim(input) {
     const d = input ? new Date(input) : new Date();
@@ -95,7 +118,7 @@ export const morphdom = g.morphdom || ((fromNode, toNode) => {
 });
 export const Fuse = g.Fuse || class Fuse {
     constructor(list = []) { this._list = Array.isArray(list) ? list : []; }
-    search(q) { return this._list.map((item, refIndex) => ({ item, refIndex })); }
+    search() { return this._list.map((item, refIndex) => ({ item, refIndex })); }
 };
 export const Popper = g.Popper || {
     createPopper: () => ({ update: () => {}, destroy: () => {}, forceUpdate: () => {} }),
@@ -105,6 +128,38 @@ export const droll = g.droll || {
     roll: () => ({ total: 1, rolls: [1] }),
     validate: () => true,
 };
+
+
+export const DiffMatchPatch = g.DiffMatchPatch || class DiffMatchPatch {
+    diff_main(a = '', b = '') { return a === b ? [[0, String(a)]] : [[-1, String(a)], [1, String(b)]]; }
+    diff_cleanupSemantic() {}
+    patch_make() { return []; }
+    patch_apply(patches, text = '') { return [String(text), []]; }
+};
+export const Readability = g.Readability || class Readability {
+    constructor(doc) { this._doc = doc; }
+    parse() { return { title: '', content: this._doc?.body?.innerHTML || '', textContent: this._doc?.body?.textContent || '' }; }
+};
+export const isProbablyReaderable = g.isProbablyReaderable || (() => true);
+export const SVGInject = g.SVGInject || (async (el) => el);
+export const chalk = g.chalk || new Proxy((s) => String(s ?? ''), {
+    get: (target, prop) => (prop in target ? target[prop] : ((s) => String(s ?? ''))),
+});
+export const chevrotain = g.chevrotain || {
+    createToken: (cfg = {}) => ({ name: cfg.name || 'Token', PATTERN: cfg.pattern }),
+    Lexer: class Lexer { tokenize() { return { tokens: [], groups: {}, errors: [] }; } },
+    CstParser: class CstParser { constructor() {} performSelfAnalysis() {} },
+};
+export const css = g.css || {
+    parse: () => ({ type: 'stylesheet', stylesheet: { rules: [] } }),
+    stringify: () => '',
+};
+export const gzip = g.gzip || ((data, cb) => {
+    const out = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data ?? ''));
+    if (typeof cb === 'function') cb(null, out);
+    return out;
+});
+export const gzipSync = g.gzipSync || ((data) => (data instanceof Uint8Array ? data : new TextEncoder().encode(String(data ?? ''))));
 
 export function initLibraryShims() {}
 
@@ -138,7 +193,11 @@ export default {
     DOMPurify,
     Bowser,
     hljs,
+    marked,
     showdown,
+    katex,
+    renderMathInElement,
+    select2,
     moment,
     Handlebars,
     localforage,
@@ -148,6 +207,15 @@ export default {
     Popper,
     seedrandom,
     droll,
+    DiffMatchPatch,
+    Readability,
+    isProbablyReaderable,
+    SVGInject,
+    chalk,
+    chevrotain,
+    css,
+    gzip,
+    gzipSync,
     initLibraryShims,
     slideToggle,
 };

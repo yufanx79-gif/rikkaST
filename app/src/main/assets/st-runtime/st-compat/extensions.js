@@ -7,7 +7,8 @@
 
 import { SimpleMutex } from './util/SimpleMutex.js';
 
-const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
+const rootWin = () => (typeof window !== 'undefined' ? window : globalThis);
+const st = () => { const w = rootWin(); return (w && w.SillyTavern && w.SillyTavern.getContext ? w.SillyTavern.getContext() : {}); };
 const host = () => (window.__rikkaSt || {});
 
 export const UNSET_VALUE = undefined;
@@ -20,7 +21,7 @@ export let extensionNames = [];
 export let modules = [];
 
 try {
-    window.addEventListener('rikka-st-refresh', () => {
+    if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('rikka-st-refresh', () => {
         try {
             const c = st();
             if (c.extensionSettings && typeof c.extensionSettings === 'object') {
@@ -216,3 +217,13 @@ export function getExtensionManifest(extensionName) {
         )) || null;
     } catch (_e) { return null; }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export async function deleteExtension(..._args) { return null; }
+export async function disableExtension(..._args) { return null; }
+export function doDailyExtensionUpdatesCheck(..._args) { return null; }
+export async function enableExtension(..._args) { return null; }
+export function findExtension(..._args) { return null; }
+export function getAuthorFromUrl(..._args) { return null; }
+export async function initExtensions(..._args) { return null; }
+export async function installExtension(..._args) { return null; }

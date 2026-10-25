@@ -92,6 +92,8 @@ import me.rerere.rikkahub.ui.pages.backup.BackupPage
 import me.rerere.rikkahub.ui.pages.chat.ChatPage
 import me.rerere.rikkahub.ui.pages.chat.GroupChatListPage
 import me.rerere.rikkahub.ui.pages.knowledge.KnowledgeBasePage
+import me.rerere.rikkahub.ui.pages.onboarding.ModelWizardPage
+import me.rerere.rikkahub.ui.pages.onboarding.OnboardingPage
 import me.rerere.rikkahub.ui.pages.chat.GroupChatPage
 import me.rerere.rikkahub.ui.pages.setting.PersonaPage
 import me.rerere.rikkahub.ui.pages.setting.AuthorsNotePage
@@ -106,8 +108,17 @@ import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceTerminalPage
 import me.rerere.rikkahub.ui.pages.extensions.RegexScriptsPage
 import me.rerere.rikkahub.ui.pages.extensions.TavernExtensionSettingsPage
 import me.rerere.rikkahub.ui.pages.extensions.TavernExtensionsPage
-import me.rerere.rikkahub.ui.pages.extensions.SkillDetailPage
-import me.rerere.rikkahub.ui.pages.extensions.SkillsPage
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import me.rerere.rikkahub.data.repository.MediaCreationRepository
+import me.rerere.rikkahub.service.MediaCreationForegroundService
+import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailPage
+import me.rerere.rikkahub.ui.pages.extensions.skills.SkillsPage
+import me.rerere.rikkahub.ui.pages.memory.MemoryFilePage
+import me.rerere.rikkahub.ui.pages.mediacreation.MediaCreationPage
+import me.rerere.rikkahub.ui.pages.mediacreation.MediaCreationSessionsPage
+import me.rerere.rikkahub.ui.pages.setting.SettingMcpDetailPage
+import me.rerere.rikkahub.ui.pages.setting.SettingMediaPage
 import me.rerere.workspace.WorkspaceStorageArea
 import me.rerere.rikkahub.ui.pages.favorite.FavoritePage
 import me.rerere.rikkahub.ui.pages.history.HistoryPage
@@ -151,10 +162,12 @@ import kotlin.uuid.Uuid
 private const val TAG = "RouteActivity"
 private const val ACTION_TRANSLATE = "me.rerere.rikkahub.action.TRANSLATE"
 private const val ACTION_IMAGE_GEN = "me.rerere.rikkahub.action.IMAGE_GEN"
+private const val ACTION_MEDIA_CREATION = "me.rerere.rikkahub.action.MEDIA_CREATION"
 
 class RouteActivity : ComponentActivity() {
     private val okHttpClient by inject<OkHttpClient>()
     private val settingsStore by inject<SettingsStore>()
+    private val mediaCreationRepository by inject<MediaCreationRepository>()
     private var navStack: MutableList<NavKey>? = null
     private val pendingIntents = ArrayDeque<Intent>()
 
@@ -239,6 +252,10 @@ class RouteActivity : ComponentActivity() {
         val destination = when (intent.action) {
             ACTION_TRANSLATE -> Screen.Translator
             ACTION_IMAGE_GEN -> Screen.ImageGen
+            ACTION_MEDIA_CREATION -> {
+                openNewMediaCreation(backStack)
+                null
+            }
             Intent.ACTION_SEND -> Screen.ShareHandler(
                 text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty(),
                 streamUri = intent.getStringExtra(Intent.EXTRA_STREAM),
@@ -246,13 +263,26 @@ class RouteActivity : ComponentActivity() {
             Intent.ACTION_PROCESS_TEXT -> Screen.ShareHandler(
                 text = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString().orEmpty(),
             )
-            else -> intent.getStringExtra("conversationId")?.let { Screen.Chat(it) }
+            else -> mediaCreationDestination(intent)
+                ?: intent.getStringExtra("conversationId")?.let { Screen.Chat(it) }
         }
         if (destination != null) {
             Navigator(backStack).navigate(destination) {
                 launchSingleTop = true
             }
         }
+    }
+
+    private fun openNewMediaCreation(backStack: MutableList<NavKey>) {
+        lifecycleScope.launch {
+            val destination = Screen.MediaCreation(mediaCreationRepository.newSession().id.toString())
+            if (backStack.lastOrNull() != destination) backStack.add(destination)
+        }
+    }
+
+    private fun mediaCreationDestination(intent: Intent): Screen? {
+        val sessionId = intent.getStringExtra(MediaCreationForegroundService.EXTRA_MEDIA_SESSION_ID) ?: return null
+        return runCatching { Uuid.parse(sessionId) }.getOrNull()?.let { Screen.MediaCreation(it.toString()) }
     }
 
     @OptIn(ExperimentalComposeUiApi::class)
@@ -430,6 +460,10 @@ class RouteActivity : ComponentActivity() {
                                 AssistantMemoryPage(key.id)
                             }
 
+                            entry<Screen.MemoryFile> { key ->
+                                MemoryFilePage(memoryId = key.memoryId, path = key.path)
+                            }
+
                             entry<Screen.AssistantRequest> { key ->
                                 AssistantRequestPage(key.id)
                             }
@@ -460,6 +494,14 @@ class RouteActivity : ComponentActivity() {
 
                             entry<Screen.ImageGen> {
                                 ImageGenPage()
+                            }
+
+                            entry<Screen.MediaCreationSessions> {
+                                MediaCreationSessionsPage()
+                            }
+
+                            entry<Screen.MediaCreation> { key ->
+                                MediaCreationPage(key.id)
                             }
 
                             entry<Screen.WebView> { key ->
@@ -532,8 +574,16 @@ class RouteActivity : ComponentActivity() {
                                 SettingSpeechPage()
                             }
 
+                            entry<Screen.SettingMedia> {
+                                SettingMediaPage()
+                            }
+
                             entry<Screen.SettingMcp> {
                                 SettingMcpPage()
+                            }
+
+                            entry<Screen.SettingMcpDetail> { key ->
+                                SettingMcpDetailPage(id = Uuid.parse(key.serverId))
                             }
 
                             entry<Screen.SettingDonate> {
@@ -632,6 +682,14 @@ class RouteActivity : ComponentActivity() {
                             entry<Screen.KnowledgeBase> {
                                 KnowledgeBasePage()
                             }
+
+                            entry<Screen.Onboarding> {
+                                OnboardingPage()
+                            }
+
+                            entry<Screen.ModelWizard> {
+                                ModelWizardPage()
+                            }
                         }
                     )
                     if (BuildConfig.DEBUG) {
@@ -718,6 +776,9 @@ sealed interface Screen : NavKey {
     data class AssistantMemory(val id: String) : Screen
 
     @Serializable
+    data class MemoryFile(val memoryId: String, val path: String? = null) : Screen
+
+    @Serializable
     data class AssistantRequest(val id: String) : Screen
 
     @Serializable
@@ -740,6 +801,12 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object ImageGen : Screen
+
+    @Serializable
+    data object MediaCreationSessions : Screen
+
+    @Serializable
+    data class MediaCreation(val id: String) : Screen
 
     @Serializable
     data class WebView(val url: String = "", val contentId: String = "") : Screen
@@ -793,7 +860,13 @@ sealed interface Screen : NavKey {
     data object SettingSpeech : Screen
 
     @Serializable
+    data object SettingMedia : Screen
+
+    @Serializable
     data object SettingMcp : Screen
+
+    @Serializable
+    data class SettingMcpDetail(val serverId: String) : Screen
 
     @Serializable
     data object SettingDonate : Screen
@@ -864,4 +937,10 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object KnowledgeBase : Screen
+
+    @Serializable
+    data object Onboarding : Screen
+
+    @Serializable
+    data object ModelWizard : Screen
 }

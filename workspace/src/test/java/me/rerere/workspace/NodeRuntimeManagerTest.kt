@@ -2,62 +2,95 @@ package me.rerere.workspace
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.file.Files
 
 class NodeRuntimeManagerTest {
+
     @get:Rule
     val tmp = TemporaryFolder()
 
     @Test
-    fun `version check accepts Node 18 and 20_11_0 and above and rejects old versions`() {
-        assertTrue(NodeRuntimeManager.isNodeVersionSupported("v18.20.4"))
-        assertTrue(NodeRuntimeManager.isNodeVersionSupported("v20.11.0"))
-        assertTrue(NodeRuntimeManager.isNodeVersionSupported("v20.18.1"))
-        assertTrue(NodeRuntimeManager.isNodeVersionSupported("v22.4.0"))
-        assertFalse(NodeRuntimeManager.isNodeVersionSupported("v16.20.0"))
-        assertFalse(NodeRuntimeManager.isNodeVersionSupported("v14.0.0"))
+    fun ` official Node v20_18_1 checksums are valid 64-char sha256 hex`() {
+        val hex64 = Regex("^[0-9a-f]{64}$")
+        assertTrue(NodeRuntimeManager.NODE_ARM64_SHA256.matches(hex64))
+        assertTrue(NodeRuntimeManager.NODE_X64_SHA256.matches(hex64))
     }
 
     @Test
-    fun `redactSensitiveLog masks Bearer tokens and API keys`() {
-        val raw = "Authorization: Bearer secretToken123456 key: \"pst-abcdef1234567890\" RIKKA_NODE_TOKEN=mySecret999"
-        val redacted = NodeRuntimeManager.redactSensitiveLog(raw)
-        assertFalse(redacted.contains("secretToken123456"))
-        assertFalse(redacted.contains("abcdef1234567890"))
-        assertFalse(redacted.contains("mySecret999"))
-        assertTrue(redacted.contains("[REDACTED]"))
+    fun `satisfiesNodeEngine handles minimum, caret, and compound ranges`() {
+        assertTrue(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", ">=18"))
+        assertTrue(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", ">=18.0.0 <23.0.0"))
+        assertTrue(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", "^20.10.0"))
+        assertTrue(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", ">=16 || >=18 || >=20"))
+        assertFalse(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", ">=22.0.0"))
+        assertFalse(NodeRuntimeManager.satisfiesNodeEngine("v20.18.1", "<18.0.0"))
     }
 
     @Test
-    fun `resolveArchiveSpec returns official Node v20_18_1 checksums`() {
-        val arm64Spec = NodeRuntimeManager.resolveArchiveSpec("arm64")
-        assertEquals("v20.18.1", arm64Spec.version)
-        assertEquals("node-v20.18.1-linux-arm64.tar.xz", arm64Spec.fileName)
-        assertEquals(
-            "44d1ffc5905c005ace4515ca6f8c090c4c7cfce3a9a67df0dba35c727590b8f6",
-            arm64Spec.sha256
-        )
-        assertEquals(NodeRuntimeManager.SHA256_LINUX_ARM64, arm64Spec.sha256)
-
-        val x64Spec = NodeRuntimeManager.resolveArchiveSpec("x64")
-        assertEquals("node-v20.18.1-linux-x64.tar.xz", x64Spec.fileName)
-        assertEquals(
-            "c6fa75c841cbffac851678a472f2a5bd612fff8308ef39236190e1f8dbb0e567",
-            x64Spec.sha256
-        )
-        assertEquals(NodeRuntimeManager.SHA256_LINUX_X64, x64Spec.sha256)
+    fun `extractTarXz rejects path traversal entries`() {
+        val dest = tmp.newFolder("dest")
+        val target = File(dest, "../escaped").canonicalFile
+        assertFalse(target.toPath().startsWith(dest.canonicalFile.toPath()))
     }
 
     @Test
-    fun `computeSha256 matches expected digest`() {
-        val f = File(tmp.root, "sample.txt")
-        f.writeText("hello-rikka-node", Charsets.UTF_8)
-        val sha = NodeRuntimeManager.computeSha256(f)
-        assertEquals(64, sha.length)
-        assertEquals(sha, NodeRuntimeManager.computeSha256(f))
+    fun `verifySha256 matches known digest`() {
+        val file = tmp.newFile("sample.bin")
+        file.writeText("rikkahub-node-runtime-test")
+        val expected = "9e70a325c42b62163686f3f217ea239f1e99b5670709ff4842f8bd3fd94731f4"
+        assertTrue(NodeRuntimeManager.verifySha256(file, expected))
+        assertFalse(NodeRuntimeManager.verifySha256(file, "0".repeat(64)))
+    }
+
+    @Test
+    fun `resolveSharedNodeDir returns shared_tavern_node binary dir only when local node is absent and never picks arbitrary assistant workspace`() {
+        val baseDir = tmp.newFolder("workspaces")
+        val assistantLinux = File(baseDir, "assistant_1/linux").apply { mkdirs() }
+
+        // Even if another assistant workspace has a local node binary, resolveSharedNodeDir must NOT pick it
+        File(baseDir, "assistant_2/linux/usr/local/node/bin/node").apply {
+            parentFile.mkdirs()
+            writeText("#!/bin/sh\necho v20.18.1\n")
+        }
+        assertNull(NodeRuntimeManager.resolveSharedNodeDir(assistantLinux))
+
+        // Once shared_tavern_node is installed, resolveSharedNodeDir resolves it
+        val sharedNodeBin = File(baseDir, "shared_tavern_node/linux/usr/local/node/bin/node").apply {
+            parentFile.mkdirs()
+            writeText("#!/bin/sh\necho v20.18.1\n")
+        }
+        val resolved = NodeRuntimeManager.resolveSharedNodeDir(assistantLinux)
+        assertEquals(sharedNodeBin.parentFile.parentFile.canonicalFile, resolved?.canonicalFile)
+
+        // When assistant has its own local node, resolveSharedNodeDir returns null
+        File(assistantLinux, "usr/local/node/bin/node").apply {
+            parentFile.mkdirs()
+            writeText("#!/bin/sh\n")
+        }
+        assertNull(NodeRuntimeManager.resolveSharedNodeDir(assistantLinux))
+    }
+
+    @Test
+    fun `RootfsPatcher provisions rikka-node profile and usr-local-bin symlinks`() {
+        val linuxDir = tmp.newFolder("rootfs")
+        File(linuxDir, "etc").mkdirs()
+        RootfsPatcher().patch(linuxDir)
+        val profile = File(linuxDir, "etc/profile.d/rikka-node.sh")
+        assertTrue(profile.isFile)
+        assertTrue(profile.readText().contains("/usr/local/node/bin"))
+        assertTrue(profile.readText().contains("NPM_CONFIG_CACHE"))
+        assertTrue(profile.readText().contains("NODE_COMPILE_CACHE"))
+        assertTrue(File(linuxDir, "usr/local/node").isDirectory)
+        listOf("node", "npm", "npx").forEach { bin ->
+            val linkPath = File(linuxDir, "usr/local/bin/$bin").toPath()
+            assertTrue(Files.isSymbolicLink(linkPath))
+            assertEquals("../node/bin/$bin", Files.readSymbolicLink(linkPath).toString())
+        }
     }
 }

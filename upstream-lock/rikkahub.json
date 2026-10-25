@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/rikkahub/rikkahub.git",
+  "baselineTag": "2.5.6",
+  "baselineCommit": "447bb7e89710d31f1204d7a2973baa19fdbd5b28",
+  "targetTag": "3.1.0",
+  "targetCommit": "eeef60b22ba24383daf51f3c6c2e5b75bbab6bba",
+  "policy": "only-stable-tags"
+}

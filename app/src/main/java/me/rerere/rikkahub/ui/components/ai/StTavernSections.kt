@@ -252,7 +252,9 @@ internal fun TavernScriptsSection(
         presetBuckets = presetBuckets,
         enabledGroups = enabledGroups,
         onToggleCard = { brief, checked ->
-            val newRaw = setCardScriptEnabled(scriptTavData?.extensionsRaw, brief.id, checked)
+            // 传完整 Assistant：旧持久化卡可能 extensionsRaw 为空、脚本只在 extensions Map 中；
+            // 只传 raw 会导致「列表可见但开关写回 null」。
+            val newRaw = setCardScriptEnabled(assistant, brief.id, checked)
             if (newRaw != null) {
                 onUpdateAssistant(assistant.copy(tavernData = scriptTavData?.copy(extensionsRaw = newRaw)))
             }
@@ -1397,3 +1399,5 @@ internal fun applyPresetBundleToSettings(
         assistants = nextAssistants,
     ) to addedRegex
 }
+
+

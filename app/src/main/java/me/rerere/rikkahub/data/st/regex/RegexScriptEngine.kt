@@ -10,7 +10,9 @@ package me.rerere.rikkahub.data.st.regex
  * - 防御性增强：
  *   1. 对非专门匹配 `<think>`/`<thinking>`/`<thought>` 的脚本，自动保护思维链块不被立绘/CG 等正文正则穿透误匹配；
  *   2. 当反引号 `` `...` `` 闭合边界因前文不匹配代码段导致跨行吞噬整段文本（如 `` ` 格式：... - `织乃_zcw_2` ``）时，
- *      若末尾最后一对反引号子串本身即完整匹配该正则，自动重锚定到末尾真实 token，保留前文不被吞噬。
+ *      若末尾最后一对反引号子串本身即完整匹配该正则，自动重锚定到末尾真实 token，保留前文不被吞噬；
+ *   3. 结构化病态回溯（ReDoS）检测（覆盖任意嵌套括号层级与重叠分支交替）+ `BoundedRegexCharSequence` 步数/时间预算熔断器，
+ *      彻底杜绝短文本（如 34 字符）或长文本病态回溯冻结主线程或测试进程。
  */
 object RegexScriptEngine {
 
@@ -38,15 +40,258 @@ object RegexScriptEngine {
     /** [v214] 不定长 lookbehind 降级成功诊断钩子（tavern-runtime.log 可见降级后 pattern）。 */
     @Volatile var onCompileDegraded: ((String) -> Unit)? = null
 
-    /** 编译正则（支持 `/pattern/flags` 内联形式，flags: g/i/m/s/u） */
-    fun compileRegex(pattern: String): Regex? {
+    internal const val MIN_CATASTROPHIC_INPUT_LENGTH = 16
+    internal const val MAX_CATASTROPHIC_INPUT_LENGTH = 4096
+    internal const val MAX_REGEX_CHAR_ACCESS_STEPS = 250_000
+    internal const val MAX_REGEX_EXECUTION_NANOS = 50_000_000L // 50ms per script invocation
+
+    internal class RegexExecutionBudgetExceededException(message: String) : RuntimeException(message)
+
+    /**
+     * 步数与耗时双有界 `CharSequence` 包装器：
+     * `java.util.regex.Matcher` 在每次回溯读取字符时都会调用 `charAt(index)`；
+     * 一旦累计访问步数超过 [maxSteps] 或耗时超过 [timeoutNanos]，立即抛出 [RegexExecutionBudgetExceededException] 中止回溯。
+     */
+    internal class BoundedRegexCharSequence(
+        private val delegate: CharSequence,
+        private val maxSteps: Int = MAX_REGEX_CHAR_ACCESS_STEPS,
+        private val timeoutNanos: Long = MAX_REGEX_EXECUTION_NANOS,
+    ) : CharSequence {
+        private var steps = 0
+        private val startNanos = System.nanoTime()
+
+        override val length: Int
+            get() = delegate.length
+
+        override fun get(index: Int): Char {
+            val s = ++steps
+            if (s > maxSteps) {
+                throw RegexExecutionBudgetExceededException("Regex step budget exceeded ($maxSteps steps)")
+            }
+            if ((s and 0x3FF) == 0 && (System.nanoTime() - startNanos) > timeoutNanos) {
+                throw RegexExecutionBudgetExceededException("Regex time budget exceeded (${timeoutNanos / 1_000_000}ms)")
+            }
+            return delegate[index]
+        }
+
+        override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
+            BoundedRegexCharSequence(delegate.subSequence(startIndex, endIndex), maxSteps - steps, timeoutNanos)
+
+        override fun toString(): String = delegate.toString()
+    }
+
+    private fun hasRepeatableQuantifierAt(str: String, idx: Int): Boolean {
+        if (idx >= str.length) return false
+        return when (str[idx]) {
+            '+', '*' -> true
+            '{' -> {
+                val close = str.indexOf('}', idx + 1)
+                if (close <= idx + 1) return false
+                val inner = str.substring(idx + 1, close)
+                val parts = inner.split(',')
+                when (parts.size) {
+                    1 -> (parts[0].toIntOrNull() ?: 0) >= 2
+                    2 -> parts[1].isEmpty() || (parts[1].toIntOrNull() ?: 0) >= 2
+                    else -> false
+                }
+            }
+            else -> false
+        }
+    }
+
+    private fun hasInnerRepeatingToken(groupBody: String): Boolean {
+        var i = 0
+        while (i < groupBody.length) {
+            when (groupBody[i]) {
+                '\\' -> i += 2
+                '+', '*' -> return true
+                '{' -> {
+                    val close = groupBody.indexOf('}', i + 1)
+                    if (close > i + 1) {
+                        val inner = groupBody.substring(i + 1, close)
+                        val parts = inner.split(',')
+                        if (parts.size == 2) {
+                            val minVal = parts[0].toIntOrNull() ?: 0
+                            if (parts[1].isEmpty()) return true
+                            val maxVal = parts[1].toIntOrNull() ?: 0
+                            if (maxVal >= 2 && (minVal != maxVal || maxVal >= 10)) return true
+                        }
+                        if (parts.size == 1 && (parts[0].toIntOrNull() ?: 0) >= 10) return true
+                    }
+                    i++
+                }
+                else -> i++
+            }
+        }
+        return false
+    }
+
+    private fun splitTopLevelAlternation(groupBody: String): List<String> {
+        val branches = mutableListOf<String>()
+        var depth = 0
+        var inCharClass = false
+        var start = 0
+        var i = 0
+        while (i < groupBody.length) {
+            val c = groupBody[i]
+            if (c == '\\') {
+                i += 2
+                continue
+            }
+            if (inCharClass) {
+                if (c == ']') inCharClass = false
+                i++
+                continue
+            }
+            when (c) {
+                '[' -> inCharClass = true
+                '(' -> depth++
+                ')' -> if (depth > 0) depth--
+                '|' -> if (depth == 0) {
+                    branches += groupBody.substring(start, i)
+                    start = i + 1
+                }
+            }
+            i++
+        }
+        branches += groupBody.substring(start)
+        return branches
+    }
+
+    private fun firstAtomSignature(branch: String): String {
+        val b = branch.replace(Regex("^\\(\\?:|^\\(\\?<[^>]+>|^\\(\\?[imsug]+:", RegexOption.IGNORE_CASE), "").trim()
+        if (b.isEmpty()) return "*"
+        if (b.startsWith(".") || b.startsWith("\\w") || b.startsWith("\\S") || b.startsWith("[\\s\\S]")) return "ANY_WORD"
+        if (b.startsWith("\\d")) return "DIGIT"
+        if (b.startsWith("[")) {
+            val close = b.indexOf(']')
+            if (close > 1) {
+                val cls = b.substring(1, close)
+                if (cls.contains("a-z") || cls.contains("A-Z") || cls.contains("\\w")) return "ALPHA_OR_WORD"
+                if (cls.contains("0-9") || cls.contains("\\d")) return "DIGIT"
+                return "CLASS:${cls[0]}"
+            }
+        }
+        return "LIT:${b[0]}"
+    }
+
+    private val ESCAPED_ATOM_RE = Regex("\\\\.")
+    private val CHAR_CLASS_ATOM_RE = Regex("\\[(?:\\\\.|[^\\]\\\\])*\\]")
+    private val BRANCH_INNER_QUANTIFIER_RE = Regex("[+*?]")
+
+    private fun hasOverlappingAlternation(groupBody: String): Boolean {
+        val branches = splitTopLevelAlternation(groupBody)
+        if (branches.size < 2) return false
+        for (rawBranch in branches) {
+            val strippedBranch = CHAR_CLASS_ATOM_RE.replace(ESCAPED_ATOM_RE.replace(rawBranch, "X"), "C")
+            if (BRANCH_INNER_QUANTIFIER_RE.containsMatchIn(strippedBranch)) return true
+        }
+        val sigs = branches.map(::firstAtomSignature)
+        for (i in sigs.indices) {
+            for (j in i + 1 until sigs.size) {
+                val a = sigs[i]
+                val b = sigs[j]
+                if (a == b || a == "*" || b == "*") return true
+                if ((a == "ANY_WORD" || a == "ALPHA_OR_WORD") && (b == "ANY_WORD" || b == "ALPHA_OR_WORD" || b == "DIGIT")) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    internal fun isCatastrophicRegexPattern(pattern: String): Boolean = isPotentiallyCatastrophicRegex(pattern)
+
+    internal fun isPotentiallyCatastrophicRegex(pattern: String): Boolean {
+        if (pattern.length < 4) return false
+        val body = SLASH_FORM.matchEntire(pattern)?.groupValues?.getOrNull(1) ?: pattern
+        val stack = ArrayDeque<Int>()
+        var inCharClass = false
+        var i = 0
+        while (i < body.length) {
+            val c = body[i]
+            if (c == '\\') {
+                i += 2
+                continue
+            }
+            if (inCharClass) {
+                if (c == ']') inCharClass = false
+                i++
+                continue
+            }
+            when (c) {
+                '[' -> inCharClass = true
+                '(' -> stack.addLast(i)
+                ')' -> if (stack.isNotEmpty()) {
+                    val openIdx = stack.removeLast()
+                    var afterClose = i + 1
+                    while (afterClose < body.length && body[afterClose] == ' ') afterClose++
+                    if (hasRepeatableQuantifierAt(body, afterClose)) {
+                        var inner = body.substring(openIdx + 1, i)
+                        if (inner.startsWith("?:")) inner = inner.substring(2)
+                        else if (inner.startsWith("?<") && inner.indexOf('>') > 0) inner = inner.substring(inner.indexOf('>') + 1)
+                        if (hasInnerRepeatingToken(inner) || hasOverlappingAlternation(inner)) {
+                            return true
+                        }
+                    }
+                }
+            }
+            i++
+        }
+        return false
+    }
+
+    private val LEADING_INLINE_FLAGS_RE = Regex("^\\(\\?([imsug]+)\\)", RegexOption.IGNORE_CASE)
+
+    /**
+     * 提取模式头部的一个或多个 PCRE 内联标志组（如 `(?i)`, `(?is)`, `(?ims)`），返回 `(strippedBody, extractedFlags)`。
+     */
+    internal fun extractInlineRegexFlags(rawBody: String): Pair<String, String> {
+        var body = rawBody
+        val flags = StringBuilder()
+        while (true) {
+            val m = LEADING_INLINE_FLAGS_RE.find(body) ?: break
+            body = body.substring(m.value.length)
+            flags.append(m.groupValues[1].lowercase())
+        }
+        return body to flags.toString()
+    }
+
+    /**
+     * 剥离消息首尾未配对的 `〔`/`〕`、`〖`/`〗` 模板包装符，保留句内成对使用的括号（如“她翻开〔世界史〕笔记本”）。
+     */
+    fun stripUnmatchedBoundaryWrappers(input: String): String {
+        var out = input
+        for ((openCh, closeCh) in listOf('〔' to '〕', '〖' to '〗')) {
+            val openCount = out.count { it == openCh }
+            val closeCount = out.count { it == closeCh }
+            if (openCount == closeCount) continue
+            val trimmed = out.trim()
+            if (openCount == 1 && closeCount == 0 && trimmed.startsWith(openCh)) {
+                val idx = out.indexOf(openCh)
+                if (idx >= 0) out = out.removeRange(idx, idx + 1).trimStart('\r', '\n')
+            } else if (closeCount == 1 && openCount == 0 && trimmed.endsWith(closeCh)) {
+                val idx = out.lastIndexOf(closeCh)
+                if (idx >= 0) out = out.removeRange(idx, idx + 1).trimEnd('\r', '\n')
+            }
+        }
+        return out
+    }
+
+    /** 编译正则（支持 `/pattern/flags` 内联形式与前导 `(?ims)` 标志，缓存键包含 pattern + flags + scriptOptions） */
+    fun compileRegex(pattern: String, flags: String = "", scriptOptions: String = ""): Regex? {
+        val cacheKey = if (flags.isEmpty() && scriptOptions.isEmpty()) {
+            pattern
+        } else {
+            "$pattern\u0000$flags\u0000$scriptOptions"
+        }
         synchronized(cacheLock) {
-            if (cache.containsKey(pattern)) return cache[pattern]
+            if (cache.containsKey(cacheKey)) return cache[cacheKey]
         }
         var compiled: Regex? = null
         var failure: Exception? = null
         try {
-            compiled = compileRegexUncached(pattern)
+            compiled = compileRegexUncached(pattern, flags)
         } catch (e: Exception) {
             failure = e
             val degraded = try {
@@ -56,7 +301,7 @@ object RegexScriptEngine {
             }
             if (degraded != null && degraded != pattern) {
                 try {
-                    compiled = compileRegexUncached(degraded)
+                    compiled = compileRegexUncached(degraded, flags)
                     val msg = "[regex] degraded unbounded lookbehind: pattern=$pattern -> $degraded"
                     warn(msg)
                     onCompileDegraded?.invoke(msg)
@@ -72,7 +317,7 @@ object RegexScriptEngine {
             warn(msg)
             onCompileError?.invoke(msg)
         }
-        synchronized(cacheLock) { cache[pattern] = compiled }
+        synchronized(cacheLock) { cache[cacheKey] = compiled }
         return compiled
     }
 
@@ -90,11 +335,9 @@ object RegexScriptEngine {
         RegexOption.IGNORE_CASE,
     )
 
-    private fun compileRegexUncached(pattern: String): Regex {
-        val slashForm = SLASH_FORM.matchEntire(pattern)
-            ?: return Regex(pattern, JS_REGEX_OPTIONS)
+    private fun parseRegexOptions(flagChars: String): Set<RegexOption> {
         var options = JS_REGEX_OPTIONS
-        for (c in slashForm.groupValues[2].lowercase()) {
+        for (c in flagChars.lowercase()) {
             options = when (c) {
                 'i' -> options + RegexOption.IGNORE_CASE
                 'm' -> options + RegexOption.MULTILINE
@@ -102,7 +345,18 @@ object RegexScriptEngine {
                 else -> options
             }
         }
-        return Regex(slashForm.groupValues[1], options)
+        return options
+    }
+
+    private fun compileRegexUncached(pattern: String, flags: String = ""): Regex {
+        val slashForm = SLASH_FORM.matchEntire(pattern)
+        if (slashForm == null) {
+            val (cleanBody, inlineFlags) = extractInlineRegexFlags(pattern)
+            return Regex(cleanBody, parseRegexOptions(flags + inlineFlags))
+        }
+        val (cleanBody, inlineFlags) = extractInlineRegexFlags(slashForm.groupValues[1])
+        val mergedFlags = slashForm.groupValues[2] + flags + inlineFlags
+        return Regex(cleanBody, parseRegexOptions(mergedFlags))
     }
 
     internal fun degradeUnboundedLookbehind(pattern: String): String? {
@@ -278,6 +532,11 @@ object RegexScriptEngine {
         if (script.disabled) return rawString
         if (script.findRegex.isEmpty()) return rawString
         if (rawString.isEmpty()) return rawString
+        val normalizedRaw = if (rawString.indexOf('\r') >= 0) {
+            rawString.replace("\r\n", "\n").replace('\r', '\n')
+        } else {
+            rawString
+        }
 
         val pattern = when (script.substituteRegex) {
             SubstituteRegex.RAW -> substitute(script.findRegex)
@@ -286,7 +545,14 @@ object RegexScriptEngine {
             }
             else -> script.findRegex
         }
-        val regex = compileRegex(pattern) ?: return rawString
+        if (isPotentiallyCatastrophicRegex(pattern) && normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH) {
+            val msg = "[regex] skipped potentially catastrophic regex on input (${normalizedRaw.length} chars): pattern=$pattern"
+            warn(msg)
+            onCompileDegraded?.invoke(msg)
+            return normalizedRaw
+        }
+        val scriptOptionsKey = "${script.substituteRegex}:${script.markdownOnly}:${script.promptOnly}"
+        val regex = compileRegex(pattern, flags = "", scriptOptions = scriptOptionsKey) ?: return rawString
         val global = isGlobalPattern(pattern)
 
         // 若该脚本并非专门处理 <think>/<thinking>/<thought> 标签，但输入文本中含有未剥离的思维链块，
@@ -296,75 +562,78 @@ object RegexScriptEngine {
             (RegexPlacement.REASONING in script.placement && script.placement.size == 1)
         val shieldedBlocks = mutableListOf<String>()
         val workingInput = if (!scriptTargetsThinking &&
-            (rawString.contains("<think", ignoreCase = true) || rawString.contains("<thought", ignoreCase = true))
+            (normalizedRaw.contains("<think", ignoreCase = true) || normalizedRaw.contains("<thought", ignoreCase = true))
         ) {
-            THINK_BLOCK_SHIELD_REGEX.replace(rawString) { m ->
+            THINK_BLOCK_SHIELD_REGEX.replace(normalizedRaw) { m ->
                 val idx = shieldedBlocks.size
                 shieldedBlocks.add(m.value)
                 "\u0000__RIKKA_THINK_SHIELD_${idx}__\u0000"
             }
         } else {
-            rawString
+            normalizedRaw
         }
 
         val sb = StringBuilder()
         var cursor = 0
         var matched = false
-        for (match in regex.findAll(workingInput)) {
-            sb.append(workingInput, cursor, match.range.first)
-            val mVal = match.value
-            // 防御反引号跨行误吞噬：例如前文有 `无关代码` 闭合反引号，后文有 `织乃_zcw_2`，
-            // 当正则写为 /`(.+?_zcw_\d+)`/gs 时，match.value 会从前一个闭合反引号一直跨行吞到 `织乃_zcw_2`。
-            // 若 match.value 首尾均为反引号且内部还包含反引号，检查从最后一个内部反引号开始的子串是否独立完整匹配该正则；
-            // 若匹配，则保留被误吞的前缀文本，仅对末尾真实反引号 token 执行替换。
-            // 防御 1：若 match 跨过了思维链保护占位符（ __RIKKA_THINK_SHIELD_N__ ），重锚定到最后一个占位符之后
-            if (mVal.contains("\u0000__RIKKA_THINK_SHIELD_")) {
-                val lastShieldEnd = mVal.lastIndexOf("__\u0000")
-                if (lastShieldEnd >= 0) {
-                    val afterShieldIdx = lastShieldEnd + 3
-                    val tailAfterShield = mVal.substring(afterShieldIdx)
-                    val subMatch = regex.find(tailAfterShield)
-                    if (subMatch != null) {
-                        sb.append(mVal, 0, afterShieldIdx + subMatch.range.first)
-                        sb.append(buildReplacement(script, subMatch, substitute))
-                        sb.append(tailAfterShield, subMatch.range.last + 1, tailAfterShield.length)
+        try {
+            val boundedInput = BoundedRegexCharSequence(workingInput)
+            for (match in regex.findAll(boundedInput)) {
+                sb.append(workingInput, cursor, match.range.first)
+                val mVal = match.value
+                // 防御 1：若 match 跨过了思维链保护占位符（\u0000__RIKKA_THINK_SHIELD_N__\u0000），重锚定到最后一个占位符之后
+                if (mVal.contains("\u0000__RIKKA_THINK_SHIELD_")) {
+                    val lastShieldEnd = mVal.lastIndexOf("__\u0000")
+                    if (lastShieldEnd >= 0) {
+                        val afterShieldIdx = lastShieldEnd + 3
+                        val tailAfterShield = mVal.substring(afterShieldIdx)
+                        val subMatch = regex.find(BoundedRegexCharSequence(tailAfterShield))
+                        if (subMatch != null) {
+                            sb.append(mVal, 0, afterShieldIdx + subMatch.range.first)
+                            sb.append(buildReplacement(script, subMatch, substitute))
+                            sb.append(tailAfterShield, subMatch.range.last + 1, tailAfterShield.length)
+                            cursor = match.range.last + 1
+                            matched = true
+                            if (!global) break
+                            continue
+                        }
+                    }
+                }
+                // 防御 2：当贪婪正则把同一消息内的多对反引号吞入同一个 match 时，逐个扫描内部独立的反引号对
+                if (mVal.length > 3 && mVal.first() == '`' && mVal.last() == '`' && mVal.indexOf('`', 1) < mVal.lastIndex) {
+                    val pairRegex = Regex("`[^`\\r\\n]+`")
+                    val pairMatches = pairRegex.findAll(mVal).toList()
+                    if (pairMatches.any { pm -> regex.matchEntire(BoundedRegexCharSequence(pm.value)) != null }) {
+                        var localCur = 0
+                        for (pm in pairMatches) {
+                            sb.append(mVal, localCur, pm.range.first)
+                            val exactPairMatch = regex.matchEntire(BoundedRegexCharSequence(pm.value))
+                            if (exactPairMatch != null) {
+                                sb.append(buildReplacement(script, exactPairMatch, substitute))
+                            } else {
+                                sb.append(pm.value)
+                            }
+                            localCur = pm.range.last + 1
+                        }
+                        sb.append(mVal, localCur, mVal.length)
                         cursor = match.range.last + 1
                         matched = true
                         if (!global) break
                         continue
                     }
                 }
+                sb.append(buildReplacement(script, match, substitute))
+                cursor = match.range.last + 1
+                matched = true
+                if (!global) break
             }
-            // 防御 2：当贪婪正则把同一消息内的多对反引号（如 `无关代码` ... `织乃_zcw_2`，或两张独立 CG `织乃_zcw_1` ... `织乃_zcw_2`）
-            // 吞入同一个 match 时，逐个扫描内部独立的 `[^`]+` 反引号对：凡独立匹配该正则的反引号对均各自执行替换，其余原样保留！
-            if (mVal.length > 3 && mVal.first() == '`' && mVal.last() == '`' && mVal.indexOf('`', 1) < mVal.lastIndex) {
-                val pairRegex = Regex("`[^`\\r\\n]+`")
-                val pairMatches = pairRegex.findAll(mVal).toList()
-                if (pairMatches.any { pm -> regex.matchEntire(pm.value) != null }) {
-                    var localCur = 0
-                    for (pm in pairMatches) {
-                        sb.append(mVal, localCur, pm.range.first)
-                        val exactPairMatch = regex.matchEntire(pm.value)
-                        if (exactPairMatch != null) {
-                            sb.append(buildReplacement(script, exactPairMatch, substitute))
-                        } else {
-                            sb.append(pm.value)
-                        }
-                        localCur = pm.range.last + 1
-                    }
-                    sb.append(mVal, localCur, mVal.length)
-                    cursor = match.range.last + 1
-                    matched = true
-                    if (!global) break
-                    continue
-                }
-            }
-            sb.append(buildReplacement(script, match, substitute))
-            cursor = match.range.last + 1
-            matched = true
-            if (!global) break
+        } catch (budgetErr: RegexExecutionBudgetExceededException) {
+            val msg = "[regex] aborted excessive backtracking (${budgetErr.message}): pattern=$pattern"
+            warn(msg)
+            onCompileDegraded?.invoke(msg)
+            return normalizedRaw
         }
-        if (!matched) return rawString
+        if (!matched) return normalizedRaw
         sb.append(workingInput, cursor, workingInput.length)
         var out = sb.toString()
         if (shieldedBlocks.isNotEmpty()) {

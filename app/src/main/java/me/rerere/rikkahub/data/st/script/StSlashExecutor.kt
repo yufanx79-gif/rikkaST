@@ -222,6 +222,16 @@ interface StSlashHost {
 object StSlashExecutor {
     private const val UNKNOWN_CMD = "未知命令：/%s"
     private const val UNAVAILABLE_CMD = "命令不可用：/%s"
+    internal val UNSUPPORTED_MEDIA_COMMANDS = setOf(
+        "speak",
+        "narrate",
+        "tts",
+        "imagine",
+        "imagine-comfy-workflow",
+        "imagine-source",
+        "imagine-style",
+        "sd",
+    )
 
     /** [W4] 闭包递归深度上限（防无限递归栈溢出；官方无显式上限，靠 abortController 停止） */
     internal const val MAX_CLOSURE_DEPTH = 32
@@ -933,8 +943,13 @@ object StSlashExecutor {
         "is-mobile" -> "true"
         "?", "help" -> {
             val (txt, named) = resolveText(rawArgs, host, pipe, isFirst, seg.noPipeInject)
-            host?.executeExtendedCommand("?", named, txt, pipe)
-                ?: "STscript Ready (288 commands supported). Query: ${txt.ifBlank { "all" }}"
+            val q = txt.trim().removePrefix("/").lowercase()
+            if (q in UNSUPPORTED_MEDIA_COMMANDS) {
+                "/$q: 不支持（当前客户端暂未接入酒馆原生 TTS/SD 生图扩展命令）"
+            } else {
+                host?.executeExtendedCommand("?", named, txt, pipe)
+                    ?: "STscript Ready (288 commands supported, excluding unsupported TTS/SD commands: ${UNSUPPORTED_MEDIA_COMMANDS.joinToString(", ") { "/$it" }}). Query: ${txt.ifBlank { "all" }}"
+            }
         }
         "random" -> {
             val (txt, _) = resolveText(rawArgs, host, pipe, isFirst, seg.noPipeInject)
@@ -1005,6 +1020,12 @@ object StSlashExecutor {
             val (txt, named) = resolveText(rawArgs, host, pipe, isFirst, seg.noPipeInject)
             host?.executeExtendedCommand(seg.command, named, txt, pipe)
                 ?: runFallbackExtendedCommand(seg.command, named, txt, pipe, host, scope)
+        }
+
+        // 11) 已知暂不支持的酒馆原生 TTS / SD 生图命令（显式返回命令不可用，禁止伪装成功或报未知命令）
+        "speak", "narrate", "tts",
+        "imagine", "imagine-comfy-workflow", "imagine-source", "imagine-style", "sd" -> {
+            "命令不可用：/${seg.command}（当前客户端暂不支持酒馆原生 TTS/SD 生图扩展命令）"
         }
 
         else -> {

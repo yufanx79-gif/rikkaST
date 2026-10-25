@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.ui.pages.log
 
 import android.content.ClipData
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.ClipEntry
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Copy01
@@ -20,9 +22,12 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Switch
 import androidx.compose.material3.rememberBottomSheetState
@@ -33,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -41,8 +47,8 @@ import kotlinx.coroutines.launch
 import me.rerere.common.android.LogEntry
 import me.rerere.common.android.Logging
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.JsonTree
-import me.rerere.rikkahub.ui.components.ui.PageScaffold
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.ui.theme.JetbrainsMono
 import me.rerere.rikkahub.utils.JsonInstantPretty
@@ -54,19 +60,29 @@ import java.util.Locale
 fun LogPage() {
     var logs by remember { mutableStateOf(Logging.getRecentLogs()) }
     var requestLoggingEnabled by remember { mutableStateOf(Logging.isRequestLoggingEnabled()) }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
-    PageScaffold(
-        title = "Logs",
-        actions = {
-            IconButton(
-                onClick = {
-                    Logging.clear()
-                    logs = Logging.getRecentLogs()
-                }
-            ) {
-                Icon(HugeIcons.Delete01, null)
-            }
+    Scaffold(
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = { Text("Logs") },
+                navigationIcon = { BackButton() },
+                actions = {
+                    IconButton(
+                        onClick = {
+                            Logging.clear()
+                            logs = Logging.getRecentLogs()
+                        }
+                    ) {
+                        Icon(HugeIcons.Delete01, null)
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+                colors = CustomColors.topBarColors,
+            )
         },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = CustomColors.topBarColors.containerColor,
     ) { contentPadding ->
         UnifiedLogList(
             logs = logs,
@@ -242,6 +258,7 @@ private fun RequestLogCard(log: LogEntry.RequestLog, onClick: () -> Unit) {
 private fun RequestLogDetail(log: LogEntry.RequestLog) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()) }
     val clipboard = LocalClipboard.current
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     SelectionContainer {
@@ -321,9 +338,18 @@ private fun RequestLogDetail(log: LogEntry.RequestLog) {
                         IconButton(
                             onClick = {
                                 scope.launch {
-                                    clipboard.setClipEntry(
-                                        ClipEntry(ClipData.newPlainText("Request Body", body))
-                                    )
+                                    try {
+                                        clipboard.setClipEntry(
+                                            ClipEntry(ClipData.newPlainText("Request Body", body))
+                                        )
+                                    } catch (e: RuntimeException) {
+                                        // 内容过大时 Binder 会抛出 TransactionTooLargeException (被包装为 RuntimeException)
+                                        Toast.makeText(
+                                            context,
+                                            "Copy failed: content too large for clipboard",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
                                 }
                             }
                         ) {

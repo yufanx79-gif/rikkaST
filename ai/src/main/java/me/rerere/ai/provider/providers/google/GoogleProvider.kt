@@ -36,6 +36,8 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.Provider
+import me.rerere.ai.provider.ProviderQuota
+import me.rerere.ai.provider.runQuotaQuery
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
@@ -75,7 +77,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
+import me.rerere.common.http.sse.newEventSource
 import org.apache.commons.text.StringEscapeUtils
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
@@ -88,6 +90,11 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         ServiceAccountTokenProvider(client)
     }
     private val interactionsAPI = InteractionsAPI(client = client, keyRoulette = keyRoulette)
+
+    override suspend fun getQuota(providerSetting: ProviderSetting.Google): ProviderQuota? =
+        client.runQuotaQuery(providerSetting) {
+            keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+        }
 
     // Interactions API 目前只有 Gemini Developer API 提供，Vertex AI 仍走 generateContent
     private fun ProviderSetting.Google.usesInteractionsApi() = useInteractionsApi && !vertexAI
@@ -332,8 +339,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             }
         }
 
-        val eventSource = EventSources.createFactory(client)
-                .newEventSource(request, listener)
+        val eventSource = client.newEventSource(request, listener)
 
         awaitClose {
             println("[awaitClose] 关闭eventSource")

@@ -2,7 +2,7 @@
 
 > 本文回答一个问题：**这个项目到底实现了什么？酒馆生态里，除了「酒馆助手」和「提示词模板」，其他插件适配到什么程度？**
 >
-> 全部结论来自 `D:\rikkaST` 工作树的源码逐文件核对（不依赖 README 自述、不依赖构建结果）。每条结论附 `路径:行号`。
+> 全部结论来自 `[本机绝对路径已脱敏]` 工作树的源码逐文件核对（不依赖 README 自述、不依赖构建结果）。每条结论附 `路径:行号`。
 
 **证据强度标注**（下文每条都会带）：
 
@@ -207,7 +207,7 @@ slash-commands/SlashCommandCommonEnumsProvider.js
 | **st-memory-enhancement（记忆增强）** | 被当作「源码型扩展」的兼容基准：`lib.js` 的 `Bowser` 导出、`power-user.js`、`getSlideToggleOptions`、select2 依赖 | `st-compat/lib.js:18-21`；`st-compat/power-user.js:66-68`；`st-compat/script.js:185`；`index.html:44-46` | **B** |
 | **ST-Prompt-Template / 记忆增强 的设置页渲染** | `renderExtensionTemplateAsync` 返回空串导致设置页黑屏 → 已修 | `st-compat/extensions.js:74`；`runtime.js:1220` | **B** |
 
-> **另外**：`D:\rikkaST-refs\` 是一个**调研语料库**（19 个分类目录、数百个克隆仓库：`C-st-ext`、`E-worldinfo-memory`、`F-cards-render`、`H-ext-popular`、`K-st-official2`、`L-st-ext2`、`R-interaction-prompt` 等）。
+> **另外**：`[本机绝对路径已脱敏]` 是一个**调研语料库**（19 个分类目录、数百个克隆仓库：`C-st-ext`、`E-worldinfo-memory`、`F-cards-render`、`H-ext-popular`、`K-st-official2`、`L-st-ext2`、`R-interaction-prompt` 等）。
 > **语料库里存在的仓库 ≠ 已适配的插件。** 只有上面表格里那些在**代码注释/测试里被点名引用**的，才算真正做过兼容工作。
 
 ---

@@ -334,3 +334,74 @@ export default {
     tokenize,
     primeTokenizers,
 };
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export const BYTES_PER_TOKEN = 3.35;
+export const CHARACTERS_PER_TOKEN_RATIO = 3.35;
+export const TOKENIZER_SUPPORTED_KEY = 'tokenizationSupported';
+export const TOKENIZER_WARNING_KEY = 'tokenizationWarningShown';
+export const tokenizers = {
+    NONE: 0,
+    GPT2: 1,
+    OPENAI: 2,
+    LLAMA: 3,
+    NERD: 4,
+    NERD2: 5,
+    API_CURRENT: 6,
+    MISTRAL: 7,
+    YI: 8,
+    API_TEXTGENERATIONWEBUI: 9,
+    API_KOBOLD: 10,
+    CLAUDE: 11,
+    LLAMA3: 12,
+    GEMMA: 13,
+    JAMBA: 14,
+    QWEN2: 15,
+    COMMAND_R: 16,
+    NEMO: 17,
+    DEEPSEEK: 18,
+    COMMAND_A: 19,
+    BEST_MATCH: 99,
+};
+export const ENCODE_TOKENIZERS = [
+    tokenizers.LLAMA,
+    tokenizers.MISTRAL,
+    tokenizers.YI,
+    tokenizers.LLAMA3,
+    tokenizers.GEMMA,
+    tokenizers.JAMBA,
+    tokenizers.QWEN2,
+    tokenizers.COMMAND_R,
+    tokenizers.COMMAND_A,
+    tokenizers.NEMO,
+    tokenizers.DEEPSEEK,
+];
+export const TEXTGEN_TOKENIZERS = [];
+export function guesstimate(text) { return Math.ceil(String(text ?? '').length / BYTES_PER_TOKEN); }
+export function countTokensOpenAI(messages, full = false) {
+    void full;
+    if (typeof messages === 'string') return getTokenCount(messages);
+    if (Array.isArray(messages)) return messages.reduce((acc, m) => acc + getTokenCount(m?.content || ''), 0);
+    if (messages && typeof messages === 'object') return getTokenCount(messages.content || JSON.stringify(messages));
+    return 0;
+}
+export async function countTokensOpenAIAsync(messages, full = false) {
+    void full;
+    if (typeof messages === 'string') return await getTokenCountAsync(messages);
+    if (Array.isArray(messages)) {
+        let total = 0;
+        for (const m of messages) total += await getTokenCountAsync(m?.content || '');
+        return total;
+    }
+    if (messages && typeof messages === 'object') return await getTokenCountAsync(messages.content || JSON.stringify(messages));
+    return 0;
+}
+export function getTextTokens(tokenizerType, text) { void tokenizerType; return tokenize(text); }
+export function decodeTextTokens(tokenizerType, tokens) { void tokenizerType; return { text: Array.isArray(tokens) ? tokens.join('') : '' }; }
+export function getAvailableTokenizers() { return Object.entries(tokenizers).map(([k, v]) => ({ key: k, value: v })); }
+export function getFriendlyTokenizerName(tokenizerType) { return Object.keys(tokenizers).find(k => tokenizers[k] === tokenizerType) || 'OPENAI'; }
+export function getTokenizerBestMatch() { return tokenizers.OPENAI; }
+export function getTokenizerModel() { return 'cl100k_base'; }
+export async function initTokenizers() {}
+export async function saveTokenCache() {}
+export function selectTokenizer() {}

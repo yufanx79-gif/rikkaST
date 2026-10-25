@@ -161,3 +161,6 @@ export function getPresetManager(apiId) {
 }
 
 export default getPresetManager;
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export async function initPresetManager(..._args) { return null; }

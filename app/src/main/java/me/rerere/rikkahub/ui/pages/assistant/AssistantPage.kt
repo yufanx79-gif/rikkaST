@@ -370,21 +370,18 @@ private fun AssistantCreationSheet(
                         )
                     }
 
+                    val navController = LocalNavController.current
                     AssistantImporter(
                         onImport = { result ->
-                            update(result.assistant)
-                            // 保存内嵌世界书到 settings
-                            if (result.newLorebooks.isNotEmpty()) {
-                                val lorebookIds = vm.addLorebooks(result.newLorebooks)
-                                update(result.assistant.copy(
-                                    lorebookIds = result.assistant.lorebookIds + lorebookIds
-                                ))
-                            }
-                            state.confirm()
+                            val bound = vm.importAndActivateAssistant(result, activateAsCurrent = true)
+                            update(bound)
+                            state.dismiss()
+                            navController.navigate(Screen.Chat(id = Uuid.random().toString()))
                         },
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+                val navController = LocalNavController.current
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
@@ -400,6 +397,14 @@ private fun AssistantCreationSheet(
                             state.confirm()
                         }) {
                         Text(stringResource(R.string.assistant_page_save))
+                    }
+                    TextButton(
+                        onClick = {
+                            vm.addAssistantAndActivate(assistant)
+                            state.dismiss()
+                            navController.navigate(Screen.Chat(id = Uuid.random().toString()))
+                        }) {
+                        Text("保存并开聊")
                     }
                 }
             }

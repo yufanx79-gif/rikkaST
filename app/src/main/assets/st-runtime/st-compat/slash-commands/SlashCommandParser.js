@@ -1,16 +1,27 @@
 /**
  * rikkaST st-compat: slash-commands/SlashCommandParser.js
  * ============================================================
- * 模拟 ST1.18 `SlashCommandParser`：addCommandObject 收集命令至共享注册表，
- * 并暴露 `window.__rikkaExecuteJsSlashCommand` 供宿主 StSlashExecutor 回退调用。
+ * 对齐 SillyTavern 1.19.0 `SlashCommandParser`：
+ * addCommandObject / addCommand 收集命令至共享注册表，同步通知宿主 `js_slash_commands_updated`，
+ * 并提供 parse / parseCommand / parseNamedArgument / parseClosure / parseBreak 及 `__rikkaExecuteJsSlashCommand`。
  */
 
 import { __getRegistry } from './SlashCommand.js';
+import { SlashCommandClosure } from './SlashCommandClosure.js';
 
 export const PARSER_FLAG = {
     STRICT_ESCAPING: 1,
     REPLACE_GETVAR: 2,
 };
+
+function notifyHostCommandsChanged() {
+    try {
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.emitEvent === 'function') {
+            const names = Array.from(__getRegistry().keys());
+            window.RikkaBridge.emitEvent('js_slash_commands_updated', JSON.stringify(names));
+        }
+    } catch (_e) { /* noop */ }
+}
 
 export const SlashCommandParser = {
     commands: {},
@@ -30,13 +41,14 @@ export const SlashCommandParser = {
                         }
                     }
                 }
+                notifyHostCommandsChanged();
             }
         } catch (_e) { /* noop */ }
         return cmd;
     },
 
-    addCommand(name, callback, aliases = []) {
-        const cmd = { name, callback: callback || (() => ''), aliases };
+    addCommand(name, callback, aliases = [], helpString = '') {
+        const cmd = { name, callback: callback || (() => ''), aliases, helpString };
         try {
             __getRegistry().set(String(name), cmd);
             __getRegistry().set(String(name).toLowerCase(), cmd);
@@ -49,6 +61,7 @@ export const SlashCommandParser = {
                     }
                 }
             }
+            notifyHostCommandsChanged();
         } catch (_e) { /* noop */ }
         return cmd;
     },
@@ -58,6 +71,7 @@ export const SlashCommandParser = {
             __getRegistry().delete(String(name));
             __getRegistry().delete(String(name).toLowerCase());
             delete this.commands[String(name)];
+            notifyHostCommandsChanged();
         } catch (_e) { /* noop */ }
     },
 
@@ -69,7 +83,38 @@ export const SlashCommandParser = {
         }
     },
 
-    async parse() { return ''; },
+    parseCommand(text = '') {
+        const trimmed = String(text ?? '').trim();
+        if (!trimmed.startsWith('/')) return null;
+        const body = trimmed.slice(1).trimStart();
+        const sp = body.search(/\s/);
+        const name = sp === -1 ? body : body.slice(0, sp);
+        const args = sp === -1 ? '' : body.slice(sp + 1);
+        return { name, args, raw: trimmed };
+    },
+
+    parseNamedArgument(token = '') {
+        const s = String(token ?? '');
+        const eq = s.indexOf('=');
+        if (eq <= 0) return null;
+        return { name: s.slice(0, eq).trim(), value: s.slice(eq + 1).trim() };
+    },
+
+    parseClosure(text = '', scope = null) {
+        const closure = new SlashCommandClosure(scope);
+        closure.rawText = String(text ?? '');
+        return closure;
+    },
+
+    parseBreak(text = '') {
+        return { type: 'break', raw: String(text ?? '') };
+    },
+
+    async parse(text = '') {
+        const closure = this.parseClosure(text);
+        return closure;
+    },
+
     async executeCommand(name, namedArgs = {}, unnamedArgs = '') {
         const cmd = this.getCommand(name);
         if (!cmd || typeof cmd.callback !== 'function') return null;
@@ -77,7 +122,11 @@ export const SlashCommandParser = {
         return r == null ? '' : String(r);
     },
     addHelpCommand() {},
+    getHelpString() { return Object.keys(this.commands || {}).join(', '); },
+    registerLanguage() {},
 };
+
+export const parser = SlashCommandParser;
 
 try {
     if (typeof window !== 'undefined') {

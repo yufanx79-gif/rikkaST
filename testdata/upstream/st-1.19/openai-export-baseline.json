@@ -1,0 +1,19 @@
+{
+  "version": "1.19.0",
+  "module": "public/scripts/openai.js",
+  "exportCount": 45,
+  "endpoints": {
+    "SILICONFLOW_ENDPOINT": {
+      "GLOBAL": "global",
+      "CN": "cn"
+    },
+    "MINIMAX_ENDPOINT": {
+      "GLOBAL": "global",
+      "CN": "cn"
+    },
+    "ZAI_ENDPOINT": {
+      "COMMON": "common",
+      "CODING": "coding"
+    }
+  }
+}

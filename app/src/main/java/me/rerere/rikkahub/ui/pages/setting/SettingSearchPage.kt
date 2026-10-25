@@ -22,21 +22,20 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -44,13 +43,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
+import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
-import me.rerere.rikkahub.ui.components.ui.FormItem
 import me.rerere.rikkahub.ui.components.ui.ItemAction
 import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
-import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
-import me.rerere.rikkahub.ui.components.ui.PageScaffold
-import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.components.ui.Tag
 import me.rerere.rikkahub.ui.components.ui.TagType
 import me.rerere.rikkahub.ui.components.ui.longPressReorder
@@ -60,6 +56,9 @@ import me.rerere.rikkahub.utils.plus
 import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchService
 import me.rerere.search.SearchServiceOptions
+import me.rerere.ui.components.FormItem
+import me.rerere.ui.components.OutlinedNumberInput
+import me.rerere.ui.components.RikkaConfirmDialog
 import org.koin.androidx.compose.koinViewModel
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
@@ -68,35 +67,50 @@ import kotlin.reflect.full.primaryConstructor
 @Composable
 fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val lazyListState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val nav = LocalNavController.current
     var showAddDialog by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<SearchServiceOptions?>(null) }
 
-    PageScaffold(
-        title = stringResource(R.string.setting_page_search_title),
-        actions = {
-            IconButton(
-                onClick = { showAddDialog = true }
-            ) {
-                Icon(
-                    imageVector = HugeIcons.Add01,
-                    contentDescription = stringResource(R.string.setting_page_search_add_provider)
-                )
-            }
+    Scaffold(
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = {
+                    Text(stringResource(R.string.setting_page_search_title))
+                },
+                navigationIcon = {
+                    BackButton()
+                },
+                actions = {
+                    IconButton(
+                        onClick = { showAddDialog = true }
+                    ) {
+                        Icon(
+                            imageVector = HugeIcons.Add01,
+                            contentDescription = stringResource(R.string.setting_page_search_add_provider)
+                        )
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+                colors = CustomColors.topBarColors
+            )
         },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = CustomColors.topBarColors.containerColor
     ) {
-        val currentServices by rememberUpdatedState(settings.searchServices)
         val reorderableState = rememberReorderableLazyListState(lazyListState) { from, to ->
-            val services = currentServices
-            if (from.index in services.indices && to.index in 0..services.size) {
-                val newServices = services.toMutableList().apply {
-                    add(to.index, removeAt(from.index))
+            val fromIndex = from.index
+            val toIndex = to.index
+
+            if (fromIndex >= 0 && toIndex >= 0 && fromIndex < settings.searchServices.size && toIndex < settings.searchServices.size) {
+                val newServices = settings.searchServices.toMutableList().apply {
+                    add(toIndex, removeAt(fromIndex))
                 }
-                vm.updateSettings(
-                    settings.copy(searchServices = newServices)
-                )
+                vm.updateSettings {
+                    it.copy(searchServices = newServices)
+                }
             }
         }
 
@@ -133,9 +147,9 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
                 CommonOptions(
                     settings = settings,
                     onUpdate = { options ->
-                        vm.updateSettings(
-                            settings.copy(searchCommonOptions = options)
-                        )
+                        vm.updateSettings {
+                            it.copy(searchCommonOptions = options)
+                        }
                     }
                 )
             }
@@ -147,11 +161,11 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
             onDismiss = { showAddDialog = false },
             onConfirm = { options ->
                 showAddDialog = false
-                vm.updateSettings(
-                    settings.copy(
-                        searchServices = listOf(options) + settings.searchServices
+                vm.updateSettings {
+                    it.copy(
+                        searchServices = listOf(options) + it.searchServices
                     )
-                )
+                }
                 scope.launch {
                     lazyListState.animateScrollToItem(0)
                 }
@@ -166,9 +180,9 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
         dismissText = stringResource(R.string.cancel),
         onConfirm = {
             deleteTarget?.let { target ->
-                vm.updateSettings(
-                    settings.copy(searchServices = settings.searchServices.filter { it.id != target.id })
-                )
+                vm.updateSettings { latest ->
+                    latest.copy(searchServices = latest.searchServices.filter { it.id != target.id })
+                }
             }
             deleteTarget = null
         },

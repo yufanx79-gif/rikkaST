@@ -73,3 +73,38 @@ export function getGroupNames() {
         return names;
     } catch (_e) { return []; }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export const DEFAULT_AUTO_MODE_DELAY = 5;
+export async function createNewGroupChat(..._args) { return null; }
+export async function deleteGroup(..._args) { return null; }
+export async function deleteGroupChat(..._args) { return null; }
+export async function deleteGroupChatByName(..._args) { return null; }
+export async function editGroup(..._args) { return null; }
+export function findGroupMemberId(..._args) { return null; }
+export function getGroupAvatar(..._args) { return null; }
+export function getGroupBlock(..._args) { return null; }
+export function getGroupCharacterCards(..._args) { return null; }
+export function getGroupCharacterCardsLazy(..._args) { return null; }
+export async function getGroupChat(..._args) { return null; }
+export function getGroupChatNames(..._args) { return null; }
+export function getGroupDepthPrompts(..._args) { return null; }
+export async function getGroupPastChats(..._args) { return null; }
+export const groupCandidatesFilter = {};
+export const groupMembersFilter = {};
+export const group_activation_strategy = { NATURAL: 0, LIST: 1, MANUAL: 2, POOLED: 3 };
+export let group_generation_id = null;
+export const group_generation_mode = { SWAP: 0, APPEND: 1, APPEND_DISABLED: 2 };
+export let hideMutedSprites = false;
+export async function importGroupChat(..._args) { return null; }
+export let is_group_automode_enabled = false;
+export async function openGroupById(..._args) { return null; }
+export async function openGroupChat(..._args) { return null; }
+export let openGroupId = null;
+export async function regenerateGroup(..._args) { return null; }
+export async function renameGroupChat(..._args) { return null; }
+export async function renameGroupMember(..._args) { return null; }
+export function resetSelectedGroup(..._args) { return null; }
+export async function saveGroupBookmarkChat(..._args) { return null; }
+export function select_group_chats(..._args) { return null; }
+export async function unshallowGroupMembers(..._args) { return null; }

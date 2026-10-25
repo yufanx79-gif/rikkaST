@@ -1,0 +1,11 @@
+# local.properties.example — 复制为 local.properties 后在本机填写
+# Android SDK 路径
+sdk.dir=/path/to/Android/Sdk
+# Chaquopy 使用的 Python 解释器；以本机环境为准
+chaquopy.python=/path/to/python
+
+# 以下仅供需要签署 release APK 的本机配置；不要填写后提交到公共仓库
+storeFile=/path/to/private/release-keystore.jks
+storePassword=CHANGE_ME_LOCALLY
+keyAlias=CHANGE_ME_LOCALLY
+keyPassword=CHANGE_ME_LOCALLY

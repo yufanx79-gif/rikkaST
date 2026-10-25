@@ -133,6 +133,7 @@ fun ChatMessage(
     loading: Boolean = false,
     model: Model? = null,
     assistant: Assistant? = null,
+    extraModeInjectionIds: Set<Uuid> = emptySet(),
     lastMessage: Boolean = false,
     messageDepth: Int? = null,
     messageIndex: Int = 0,
@@ -200,6 +201,7 @@ fun ChatMessage(
             MessagePartsBlock(
                 messageKey = node.id.toString(),
                 assistant = assistant,
+                extraModeInjectionIds = extraModeInjectionIds,
                 role = message.role,
                 parts = message.parts,
                 annotations = message.annotations,
@@ -322,6 +324,7 @@ fun ChatMessage(
 @Composable
 private fun MessagePartsBlock(
     assistant: Assistant?,
+    extraModeInjectionIds: Set<Uuid> = emptySet(),
     role: MessageRole,
     model: Model?,
     parts: List<UIMessagePart>,
@@ -340,7 +343,7 @@ private fun MessagePartsBlock(
     // 消息输出HapticFeedback
     val hapticFeedback = LocalHapticFeedback.current
     val settings = LocalSettings.current
-    val stRegexScripts = remember(settings.regexScripts, settings.modeInjections, settings.tavernPresets, assistant) { mergeActiveRegexScripts(settings, assistant) }
+    val stRegexScripts = remember(settings.regexScripts, settings.modeInjections, settings.tavernPresets, assistant, extraModeInjectionIds) { mergeActiveRegexScripts(settings, assistant, extraModeInjectionIds) }
     val partsState by rememberUpdatedState(parts)
 
     val handleClickCitation: (String) -> Unit = remember {
@@ -445,7 +448,7 @@ private fun MessagePartsBlock(
                         val segments = if (
                             role == MessageRole.ASSISTANT &&
                             msgStyle.splitSegmentsAsBubbles &&
-                            !looksLikeInteractiveHtml(part.text)
+                            !shouldRenderAsHtmlPanel(part.text)
                         ) {
                             splitAssistantSegments(part.text)
                         } else {
@@ -482,7 +485,7 @@ private fun MessagePartsBlock(
                                     )
                                     val segRendered = regexResult.text
                                     val segIsPanelHtml = remember(segRendered) {
-                                        looksLikeInteractiveHtml(segRendered)
+                                        shouldRenderAsHtmlPanel(segRendered)
                                     }
                                     // [v245 DIAG A0] 中间格式标签泄漏取证（用户反馈：「大小姐」卡
                                     // 「助手输出的消息有大量代码内容」）。
@@ -560,9 +563,10 @@ private fun MessagePartsBlock(
                                         },
                                         bubbleContent = segBubble,
                                         bareContent = {
-                                            Column(
-                                                modifier = if (segIsPanelHtml) Modifier else Modifier.animateContentSize()
-                                            ) {
+                                            // 尺寸动画统一由 MessageBubbleContainer 的 BARE 外层
+                                            // Box 应用；内容层不再重复挂 animateContentSize，
+                                            // 避免同一内容产生两个互相牵制的动画测量节点。
+                                            Column {
                                                 if (regexResult.isComputing) {
                                                     Row(
                                                         modifier = Modifier

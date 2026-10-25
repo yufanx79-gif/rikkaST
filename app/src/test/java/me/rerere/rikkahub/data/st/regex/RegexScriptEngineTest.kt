@@ -361,4 +361,66 @@ class RegexScriptEngineTest {
             RegexScriptEngine.onCompileError = prev
         }
     }
+
+    @Test
+    fun `composite cache key and catastrophicBacktrackingGuard preserve input on long non-matching strings`() {
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a+)+b/"))
+        assertFalse(RegexScriptEngine.isPotentiallyCatastrophicRegex("/^hello\\s+world$/i"))
+        val r1 = RegexScriptEngine.compileRegex("/hello/g", flags = "g", scriptOptions = "opt1")
+        val r2 = RegexScriptEngine.compileRegex("/hello/g", flags = "i", scriptOptions = "opt2")
+        assertNotNull(r1)
+        assertNotNull(r2)
+        val longInput = "a".repeat(5000) + "c"
+        val script = RegexScript(
+            id = "cat-1",
+            scriptName = "Catastrophic",
+            findRegex = "/(a+)+b/",
+            replaceString = "REPLACED",
+        )
+        val out = RegexScriptEngine.runRegexScript(script, longInput)
+        assertEquals(longInput, out)
+    }
+
+    @Test
+    fun `catastrophic guard and BoundedRegexCharSequence protect short and nested adversarial inputs`() {
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a+)+b/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a+){30}b/g"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a+){6}b/g"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a{2,8}){30}b/g"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(\\w+)+b/g"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/((a+))+b/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(?:a|(?:a+))+b/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a|aa)+b/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(x?a|a)+b/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/([a-z]+|[a-z0-9]+)+!/"))
+        assertTrue(RegexScriptEngine.isPotentiallyCatastrophicRegex("/(a+){1,50}b/"))
+        assertFalse(RegexScriptEngine.isPotentiallyCatastrophicRegex("/^(\\d{4}-){3}\\d{4}$/"))
+
+        val shortAdversarial = "a".repeat(38) + "c"
+        for (pat in listOf("/(a+)+b/g", "/(a+){30}b/g", "/(a+){6}b/g", "/(a{2,8}){30}b/g", "/(\\w+)+b/g", "/((a+))+b/g", "/(a|aa)+b/g", "/(x?a|a)+b/g", "/(a+){1,50}b/g")) {
+            val s = script(pat, "REPLACED")
+            assertEquals(shortAdversarial, RegexScriptEngine.runRegexScript(s, shortAdversarial))
+        }
+
+        // Verify BoundedRegexCharSequence enforces maxSteps budget deterministically
+        val bounded = RegexScriptEngine.BoundedRegexCharSequence("abcdefghij", maxSteps = 5, timeoutNanos = 50_000_000L)
+        var budgetExceeded = false
+        try {
+            for (i in 0 until 10) {
+                bounded[i % bounded.length]
+            }
+        } catch (_: RegexScriptEngine.RegexExecutionBudgetExceededException) {
+            budgetExceeded = true
+        }
+        assertTrue(budgetExceeded)
+    }
+
+    @Test
+    fun `extractInlineRegexFlags and stripUnmatchedBoundaryWrappers match JS engine`() {
+        assertEquals("Visible reply", run("(?is)<think>.*?</think>\\s*", "", "<THINK>\nchain\n</THINK>\nVisible reply"))
+        assertEquals("Visible reply", run("/(?is)<think>.*?</think>\\s*/g", "", "<THINK>\nchain\n</THINK>\nVisible reply"))
+        assertEquals("Hello world", RegexScriptEngine.stripUnmatchedBoundaryWrappers("〔\nHello world"))
+        assertEquals("Hello world", RegexScriptEngine.stripUnmatchedBoundaryWrappers("Hello world\n〕"))
+        assertEquals("她翻开〔世界史〕笔记本", RegexScriptEngine.stripUnmatchedBoundaryWrappers("她翻开〔世界史〕笔记本"))
+    }
 }

@@ -2,220 +2,390 @@ package me.rerere.rikkahub.data.st.runtime
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.getAssistantById
+import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.isHidden
+import me.rerere.rikkahub.data.model.toMessageNode
 import me.rerere.rikkahub.data.model.withHidden
 import me.rerere.rikkahub.data.model.withoutHidden
 
+private val tavernChatJson = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+}
+
 /**
- * 把当前会话转换为 JSR `getChatMessages` / ST `chat[]` 语义的完整消息数组 JSON。
+ * 将当前 [Conversation] 序列化为 SillyTavern `getContext().chat` 标准数组格式（`ChatMessage[]`）。
  *
- * 字段对齐 ST 原生聊天记录（供 runtime.js / 第三方扩展 / MVU 消费）：
- * - `name` / `is_user` / `is_system`(隐藏) / `mes`(当前 swipe 文本) / `extra`；
- * - `swipe_id`：当前选中的 swipe 序号（0-based，= MessageNode.selectIndex）；
- * - `swipes`：全部 swipe 变体文本（字符串数组，MVU 会对条目调用 matchAll，严禁对象占位）；
- * - `swipe_info`：与 swipes 等长的变体元数据（本实现为 `{}` 占位）；
- * - `variables`：消息级变量（数组套数组，按 swipe 索引对齐；缺省为等长 `{}`）。
- *
- * [messageVariables] 传入 `TavernVariableStore.getMessageVars(chatId)` 的原始 JSON。
+ * 每项结构（对齐 SillyTavern `script.js` 与 `JS-Slash-Runner` / `MC-记忆表格` 契约）：
+ * - `mes`: 当前选中 swipe 的纯文本
+ * - `name`: 发言者名称（用户昵称或助手名称）
+ * - `is_user`: 是否为用户消息
+ * - `is_system`: 是否为隐藏消息（对齐 ST `/hide` 的 `is_system` 字段）
+ * - `swipe_id`: 当前选中分支下标（`node.selectIndex`）
+ * - `swipes`: 全部分支文本列表（`node.messages.map { it.toText() }`）
+ * - `extra`: `{}`（供扩展挂载附加元数据）
  */
-fun buildTavernChatJson(
-    conversation: Conversation,
-    messageVariables: JsonElement? = null,
-): String {
-    val varsArray = messageVariables as? JsonArray
-    return buildJsonArray {
-        conversation.messageNodes.forEachIndexed { index, node ->
-            if (node.messages.isEmpty()) return@forEachIndexed
-            val sel = node.selectIndex.coerceIn(0, node.messages.lastIndex)
-            val current = node.messages[sel]
-            val texts = node.messages.map { it.toText() }
-            val perSwipe = varsArray?.getOrNull(index) as? JsonArray
-            add(
-                buildJsonObject {
-                    put("name", current.name ?: defaultNameForRole(current.role))
-                    put("id", node.id.toString()) // 批次十三：面板靠它定位「本条消息」
-                    put("is_user", current.role == MessageRole.USER)
-                    put("is_system", current.isHidden)
-                    put("mes", texts[sel])
-                    put("swipe_id", sel)
-                    put("swipes", buildJsonArray { texts.forEach { add(it) } })
-                    put("swipe_info", buildJsonArray { repeat(texts.size) { add(buildJsonObject { }) } })
-                    put(
-                        "variables",
-                        buildJsonArray {
-                            repeat(texts.size) { i ->
-                                add(perSwipe?.getOrNull(i) ?: buildJsonObject { })
-                            }
-                        },
-                    )
-                    put("extra", buildJsonObject { })
+/**
+ * 楼层 JSON 节点级 LRU 缓存（Task F & F-04 修复）：
+ * - 在 200~500 楼长对话中，每次发送消息、`fireEvent` 或流式输出 token 时，`RikkaBridge.getChatJson()`
+ *   都会被调用；但绝大部分历史楼层的 `MessageNode` 引用与内容完全未变。
+ * - `NodeCacheKey` 完整覆盖被序列化进单楼层 JSON 的全部字段：
+ *   `(nodeId, index, selectIndex, messagesSize, currentMsgId, currentText, swipes, sendDate, isUser, isHidden, speakerName, altGreetingCount)`。
+ * - 这样无论是修改未选中的后台分支（non-selected swipe）、修改角色卡 `alternateGreetings` 文本、修改发送时间或发言者角色，
+ *   还是遇到相同 32-bit `hashCode()` 的不同字符串（如 `"Aa"` 与 `"BB"`），缓存键均能通过精确相等性比较立即识别并重建，绝不返回陈旧 JSON！
+ */
+internal object TavernChatJsonCache {
+    private const val MAX_NODE_ENTRIES = 1024
+
+    data class NodeCacheKey(
+        val nodeId: String,
+        val index: Int,
+        val selectIndex: Int,
+        val messagesSize: Int,
+        val currentMsgId: String,
+        val currentText: String,
+        val swipes: List<String>,
+        val sendDate: String,
+        val isUser: Boolean,
+        val isHidden: Boolean,
+        val speakerName: String,
+        val altGreetingCount: Int,
+    )
+
+    private val lock = Any()
+    private val nodeMap = object : java.util.LinkedHashMap<NodeCacheKey, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<NodeCacheKey, String>?): Boolean =
+            size > MAX_NODE_ENTRIES
+    }
+
+    @Volatile
+    var lastCacheHits: Int = 0
+        internal set
+
+    fun getOrBuildNodeJson(
+        index: Int,
+        node: MessageNode,
+        current: UIMessage,
+        speakerName: String,
+        alternateGreetings: List<String>,
+    ): Pair<String, Boolean> {
+        val currentText = current.toText()
+        val isUser = current.role == MessageRole.USER
+        val effectiveAltCount = if (index == 0 && !isUser && node.messages.size == 1) alternateGreetings.size else 0
+        val swipesList = if (effectiveAltCount > 0) {
+            listOf(currentText) + alternateGreetings
+        } else if (node.messages.size == 1) {
+            listOf(currentText)
+        } else {
+            node.messages.map { it.toText() }
+        }
+        val sendDate = current.createdAt.toString()
+        val key = NodeCacheKey(
+            nodeId = node.id.toString(),
+            index = index,
+            selectIndex = node.selectIndex,
+            messagesSize = node.messages.size,
+            currentMsgId = current.id.toString(),
+            currentText = currentText,
+            swipes = swipesList,
+            sendDate = sendDate,
+            isUser = isUser,
+            isHidden = current.isHidden,
+            speakerName = speakerName,
+            altGreetingCount = effectiveAltCount,
+        )
+        synchronized(lock) {
+            nodeMap[key]?.let { return it to true }
+        }
+        val built = buildJsonObject {
+            put("message_id", index)
+            put("name", speakerName)
+            put("is_user", isUser)
+            put("is_system", current.isHidden)
+            put("send_date", sendDate)
+            put("mes", currentText)
+            put("swipe_id", node.selectIndex)
+            put(
+                "swipes",
+                buildJsonArray {
+                    swipesList.forEach { s -> add(JsonPrimitive(s)) }
                 },
             )
+            put("extra", buildJsonObject {})
+        }.toString()
+        synchronized(lock) {
+            nodeMap[key] = built
         }
-    }.toString()
+        return built to false
+    }
+
+    fun clear() {
+        synchronized(lock) {
+            nodeMap.clear()
+            lastCacheHits = 0
+        }
+    }
 }
 
-private fun defaultNameForRole(role: MessageRole): String = when (role) {
-    MessageRole.USER -> "user"
-    MessageRole.ASSISTANT -> "assistant"
-    MessageRole.SYSTEM -> "system"
-    else -> role.name.lowercase()
+fun buildTavernChatJson(
+    conversation: Conversation?,
+    settings: Settings?,
+): String {
+    if (conversation == null || conversation.messageNodes.isEmpty()) return "[]"
+    val assistant = settings?.getAssistantById(conversation.assistantId)
+        ?: settings?.getCurrentAssistant()
+    val charName = assistant?.tavernData?.name?.ifBlank { assistant.name }
+        ?: assistant?.name?.ifBlank { "Assistant" }
+        ?: "Assistant"
+    val activePersona = settings?.personas?.firstOrNull { it.id == settings.activePersonaId }
+    val userName = activePersona?.name?.ifBlank { settings.displaySetting.userNickname }
+        ?: settings?.displaySetting?.userNickname?.ifBlank { "User" }
+        ?: "User"
+
+    val alternateGreetings = assistant?.tavernData?.alternateGreetings
+        ?.filter { it.isNotBlank() }
+        .orEmpty()
+
+    val sb = StringBuilder(conversation.messageNodes.size * 256)
+    sb.append('[')
+    var first = true
+    var hits = 0
+    conversation.messageNodes.forEachIndexed { index, node ->
+        val current = node.messages.getOrNull(node.selectIndex) ?: node.messages.firstOrNull()
+        if (current != null) {
+            val isUser = current.role == MessageRole.USER
+            val speakerName = current.name?.takeIf { it.isNotBlank() }
+                ?: if (isUser) userName else charName
+            val (nodeJson, hit) = TavernChatJsonCache.getOrBuildNodeJson(
+                index = index,
+                node = node,
+                current = current,
+                speakerName = speakerName,
+                alternateGreetings = alternateGreetings,
+            )
+            if (hit) hits++
+            if (!first) sb.append(',')
+            first = false
+            sb.append(nodeJson)
+        }
+    }
+    sb.append(']')
+    TavernChatJsonCache.lastCacheHits = hits
+    return sb.toString()
 }
 
 /**
- * 应用 JS 侧（JSR `setChatMessages` / MVU `saveChat`）对聊天记录的内容变更。
+ * 将 JS 侧 `setChatMessages` / `setChatMessage` / `saveChat` 回传的增量更新数组应用到 [Conversation]。
  *
- * 输入为楼层更新数组：`[{index, mes?, swipes?, swipe_id?, is_system?, name?}, ...]`，
- * 由 runtime.js 对工作副本与宿主快照做 diff 后仅推送变更楼层。
- * 返回更新后的会话；无任何变更时返回 null（调用方跳过持久化）。
- *
- * 语义对齐 ST：
- * - `swipes` 为变体全文数组（该楼层的变体列表以它为准重建，长度可增可减）；
- * - `mes` 写入当前选中变体（JS 侧 `swipes[swipe_id]` 同步由 shim 保证）；
- * - `is_system` 即"隐藏"（映射 UIMessageAnnotation.Hidden）；
- * - `name` 应用到该楼层全部变体。
+ * 支持：
+ * 1. 仅传 `swipe_id`（如角色卡开场白按钮点击切换内置预设开场白 `setChatMessages([{ message_id: 0, swipe_id: 2 }])`）：
+ *    若第 0 楼当前仅有 1 条消息但角色卡包含 `alternateGreetings`，自动将 `alternateGreetings` 展开为该楼层的 `messages` 分支并切换到目标 `swipe_id`；
+ * 2. 传 `swipes` 数组和/或 `mes`/`message` 文本：同步更新分支文本与选中下标；
+ * 3. 传 `is_system` / `name`：同步更新隐藏状态与发言者名称。
  */
-fun applyTavernChatUpdates(conversation: Conversation, jsonText: String): Conversation? {
-    val root = runCatching { Json.parseToJsonElement(jsonText) }.getOrNull() as? JsonArray ?: return null
-    if (root.isEmpty()) return null
+fun applyTavernChatUpdates(
+    conversation: Conversation,
+    updatesJson: String,
+    alternateGreetings: List<String> = emptyList(),
+): Conversation? {
+    if (updatesJson.isBlank()) return null
+    val arr = runCatching { tavernChatJson.parseToJsonElement(updatesJson) as? JsonArray }.getOrNull()
+        ?: return null
+    if (arr.isEmpty()) return null
 
     val nodes = conversation.messageNodes.toMutableList()
-    var changed = false
+    var mutated = false
 
-    for (el in root) {
+    for (el in arr) {
         val obj = el as? JsonObject ?: continue
-        val index = (obj["index"] as? JsonPrimitive)?.intOrNull ?: continue
-        if (index !in nodes.indices) continue
-        val node = nodes[index]
-        if (node.messages.isEmpty()) continue
+        val messageId = obj["message_id"]?.jsonPrimitiveOrNull?.intOrNull
+            ?: obj["id"]?.jsonPrimitiveOrNull?.intOrNull
+            ?: continue
+        if (messageId !in nodes.indices) continue
 
-        var sel = node.selectIndex.coerceIn(0, node.messages.lastIndex)
-        var msgs = node.messages
+        val node = nodes[messageId]
+        val currentMsg = node.messages.getOrNull(node.selectIndex) ?: node.messages.firstOrNull() ?: continue
 
-        // 1) swipe_id 先行（后续字段以它为基准）
-        (obj["swipe_id"] as? JsonPrimitive)?.intOrNull?.let { raw ->
-            if (raw >= 0) sel = raw.coerceAtMost(node.messages.lastIndex)
+        val swipesArr = obj["swipes"] as? JsonArray
+        val mesText = obj["mes"]?.jsonPrimitiveOrNull?.contentOrNull
+            ?: obj["message"]?.jsonPrimitiveOrNull?.contentOrNull
+        val swipeId = obj["swipe_id"]?.jsonPrimitiveOrNull?.intOrNull
+        val isSystem = obj["is_system"]?.jsonPrimitiveOrNull?.booleanOrNull
+        val newName = obj["name"]?.jsonPrimitiveOrNull?.contentOrNull
+
+        if (swipesArr == null && mesText == null && swipeId == null && isSystem == null && newName == null) {
+            continue
         }
 
-        // 2) swipes：变体全文重建（长度以输入为准）
-        val swipesEl = obj["swipes"] as? JsonArray
-        if (swipesEl != null) {
-            val texts = swipesEl.map { (it as? JsonPrimitive)?.contentOrNull.orEmpty() }
-            if (texts.isNotEmpty() && texts != msgs.map { it.toText() }) {
-                val existing = msgs
-                val proto = existing.getOrNull(sel) ?: existing.last()
-                msgs = List(texts.size) { i ->
-                    if (i < existing.size) existing[i].withMesText(texts[i])
-                    else proto.withMesText(texts[i])
+        val baseMessages: List<UIMessage> = if (
+            swipesArr == null &&
+            mesText == null &&
+            swipeId != null &&
+            swipeId >= node.messages.size &&
+            messageId == 0 &&
+            currentMsg.role == MessageRole.ASSISTANT &&
+            alternateGreetings.isNotEmpty()
+        ) {
+            val firstText = node.messages.firstOrNull()?.toText().orEmpty()
+            val allGreetingTexts = listOf(firstText) + alternateGreetings.filter { it.isNotBlank() }
+            allGreetingTexts.mapIndexed { idx, gText ->
+                val existing = node.messages.getOrNull(idx)
+                existing?.copy(parts = replaceTextParts(existing.parts, gText))
+                    ?: currentMsg.copy(
+                        id = kotlin.uuid.Uuid.random(),
+                        parts = listOf(UIMessagePart.Text(gText)),
+                    )
+            }
+        } else {
+            node.messages
+        }
+
+        val updatedMessages: List<UIMessage> = when {
+            swipesArr != null && swipesArr.isNotEmpty() -> {
+                val swipeTexts = swipesArr.map { it.jsonPrimitiveOrNull?.contentOrNull ?: "" }
+                val targetSwipeIdx = (swipeId ?: node.selectIndex).coerceIn(0, swipeTexts.lastIndex)
+                swipeTexts.mapIndexed { idx, sText ->
+                    val effectiveText = if (idx == targetSwipeIdx && mesText != null) mesText else sText
+                    val baseMsg = baseMessages.getOrNull(idx) ?: currentMsg.copy(id = kotlin.uuid.Uuid.random())
+                    baseMsg.withUpdatedFields(
+                        newText = effectiveText,
+                        isSystem = if (idx == targetSwipeIdx) isSystem else null,
+                        newName = if (idx == targetSwipeIdx) newName else null,
+                    )
+                }
+            }
+            mesText != null -> {
+                val targetIdx = (swipeId ?: node.selectIndex).coerceIn(0, (baseMessages.size - 1).coerceAtLeast(0))
+                if (baseMessages.isEmpty()) {
+                    listOf(
+                        currentMsg.withUpdatedFields(
+                            newText = mesText,
+                            isSystem = isSystem,
+                            newName = newName,
+                        )
+                    )
+                } else {
+                    baseMessages.mapIndexed { idx, msg ->
+                        if (idx == targetIdx) {
+                            msg.withUpdatedFields(
+                                newText = mesText,
+                                isSystem = isSystem,
+                                newName = newName,
+                            )
+                        } else {
+                            msg
+                        }
+                    }
+                }
+            }
+            else -> {
+                val targetIdx = (swipeId ?: node.selectIndex).coerceIn(0, (baseMessages.size - 1).coerceAtLeast(0))
+                baseMessages.mapIndexed { idx, msg ->
+                    if (idx == targetIdx && (isSystem != null || newName != null)) {
+                        msg.withUpdatedFields(
+                            newText = null,
+                            isSystem = isSystem,
+                            newName = newName,
+                        )
+                    } else {
+                        msg
+                    }
                 }
             }
         }
-        // 重建后修正选中索引（变体数可能变少）
-        sel = sel.coerceIn(0, msgs.lastIndex)
 
-        // 3) mes：写入当前选中变体
-        val mesEl = (obj["mes"] as? JsonPrimitive)?.contentOrNull
-        if (mesEl != null) {
-            val cur = msgs.getOrNull(sel)
-            if (cur != null && cur.toText() != mesEl) {
-                msgs = msgs.toMutableList().also { it[sel] = cur.withMesText(mesEl) }
-            }
-        }
-
-        // 4) is_system：隐藏标记（作用于当前选中变体）
-        val hiddenEl = (obj["is_system"] as? JsonPrimitive)?.booleanOrNull
-        if (hiddenEl != null) {
-            val cur = msgs.getOrNull(sel)
-            if (cur != null && cur.isHidden != hiddenEl) {
-                val updated = if (hiddenEl) cur.withHidden() else cur.withoutHidden()
-                msgs = msgs.toMutableList().also { it[sel] = updated }
-            }
-        }
-
-        // 5) name：应用到该楼层全部变体
-        val nameEl = (obj["name"] as? JsonPrimitive)?.contentOrNull
-        if (nameEl != null && msgs.any { it.name != nameEl }) {
-            msgs = msgs.map { it.copy(name = nameEl) }
-        }
-
-        if (msgs !== node.messages || sel != node.selectIndex) {
-            nodes[index] = node.copy(messages = msgs, selectIndex = sel)
-            changed = true
+        val newSelectIndex = (swipeId ?: node.selectIndex).coerceIn(0, (updatedMessages.size - 1).coerceAtLeast(0))
+        val newNode = node.copy(
+            messages = updatedMessages,
+            selectIndex = newSelectIndex,
+        )
+        if (newNode != node) {
+            nodes[messageId] = newNode
+            mutated = true
         }
     }
 
-    if (!changed) return null
-    return conversation.copy(messageNodes = nodes)
+    return if (mutated) conversation.copy(messageNodes = nodes) else null
 }
-
-/** 替换消息的文本内容（替换第一个 Text part；无 Text part 时前置插入；保留图片等其它 parts）。 */
-private fun UIMessage.withMesText(text: String): UIMessage {
-    val idx = parts.indexOfFirst { it is UIMessagePart.Text }
-    return if (idx >= 0) {
-        val np = parts.toMutableList()
-        np[idx] = UIMessagePart.Text(text)
-        copy(parts = np)
-    } else {
-        copy(parts = listOf(UIMessagePart.Text(text)) + parts)
-    }
-}
-
-// ============================================================
-// [v243 BUGFIX A2] JS `RikkaBridge.insertChatMessages` 载荷解析
-// ============================================================
-
-/** `createChatMessages` 的单条插入载荷。 */
-data class RuntimeChatInsert(
-    val role: MessageRole,
-    val name: String?,
-    val message: String,
-    val data: JsonObject?,
-)
 
 /**
- * 解析 JS 侧 `createChatMessages([...])` 归一化后的载荷：
- * `[{"role":"user"|"assistant"|"system","name":String?,"message":String,"data":Object?}]`。
- * 非法/空返回空列表（调用方据此返回 false，不静默吞掉）。
+ * 解析 JSR `createChatMessages` 传入的待插入楼层数组。
  */
-fun parseRuntimeChatInserts(jsonText: String): List<RuntimeChatInsert> {
+data class RuntimeChatInsertItem(
+    val role: MessageRole,
+    val message: String,
+    val name: String? = null,
+    val data: JsonObject? = null,
+)
+
+fun parseRuntimeChatInserts(jsonText: String): List<RuntimeChatInsertItem> {
     if (jsonText.isBlank()) return emptyList()
-    return try {
-        val arr = Json.parseToJsonElement(jsonText) as? JsonArray ?: return emptyList()
-        arr.mapNotNull { el ->
-            val obj = el as? JsonObject ?: return@mapNotNull null
-            val role = when ((obj["role"] as? JsonPrimitive)?.contentOrNull?.lowercase()) {
-                "assistant" -> MessageRole.ASSISTANT
-                "system" -> MessageRole.SYSTEM
-                else -> MessageRole.USER
-            }
-            val text = (obj["message"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-            if (text.isBlank()) return@mapNotNull null
-            RuntimeChatInsert(
-                role = role,
-                name = (obj["name"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
-                message = text,
-                data = obj["data"] as? JsonObject,
-            )
+    val arr = runCatching { tavernChatJson.parseToJsonElement(jsonText) as? JsonArray }.getOrNull()
+        ?: return emptyList()
+    return arr.mapNotNull { el ->
+        val obj = el as? JsonObject ?: return@mapNotNull null
+        val roleStr = obj["role"]?.jsonPrimitiveOrNull?.contentOrNull?.lowercase()?.trim() ?: "assistant"
+        val role = when (roleStr) {
+            "user", "human" -> MessageRole.USER
+            "system" -> MessageRole.SYSTEM
+            else -> MessageRole.ASSISTANT
         }
-    } catch (_: Exception) {
-        emptyList()
+        val msg = obj["message"]?.jsonPrimitiveOrNull?.contentOrNull
+            ?: obj["mes"]?.jsonPrimitiveOrNull?.contentOrNull
+            ?: ""
+        val name = obj["name"]?.jsonPrimitiveOrNull?.contentOrNull?.takeIf { it.isNotBlank() }
+        val dataObj = obj["data"] as? JsonObject
+        RuntimeChatInsertItem(
+            role = role,
+            message = msg,
+            name = name,
+            data = dataObj,
+        )
     }
 }
 
+private fun UIMessage.withUpdatedFields(
+    newText: String?,
+    isSystem: Boolean?,
+    newName: String?,
+): UIMessage {
+    var updated = if (newText != null) {
+        copy(parts = replaceTextParts(parts, newText))
+    } else {
+        this
+    }
+    if (isSystem != null) {
+        updated = if (isSystem) updated.withHidden() else updated.withoutHidden()
+    }
+    if (!newName.isNullOrBlank()) {
+        updated = updated.copy(name = newName)
+    }
+    return updated
+}
+
+private fun replaceTextParts(parts: List<UIMessagePart>, newText: String): List<UIMessagePart> {
+    val nonText = parts.filterNot { it is UIMessagePart.Text }
+    return listOf(UIMessagePart.Text(newText)) + nonText
+}
+
+private val kotlinx.serialization.json.JsonElement.jsonPrimitiveOrNull: JsonPrimitive?
+    get() = this as? JsonPrimitive
 
 /**
  * 将 Conversation 导出为官方 SillyTavern `.jsonl` 聊天记录格式（首行为对话元数据头，后续每行为一条消息 JSON）。
@@ -234,7 +404,7 @@ fun exportConversationToStJsonl(
         put("chat_metadata", chatMetadata)
     }
     lines += header.toString()
-    val chatArrayJson = buildTavernChatJson(conversation, TavernVariableStore.getMessageVars(conversation.id.toString()))
+    val chatArrayJson = buildTavernChatJson(conversation, null)
     val arr = runCatching { Json.parseToJsonElement(chatArrayJson) as? JsonArray }.getOrNull() ?: JsonArray(emptyList())
     for (el in arr) {
         val obj = el as? JsonObject ?: continue

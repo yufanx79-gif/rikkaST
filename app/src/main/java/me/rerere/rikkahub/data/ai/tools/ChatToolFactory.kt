@@ -14,6 +14,8 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.st.preset.SpresetCompat
+import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.workspace.WorkspaceShellStatus
 
 private const val TAG = "ChatToolFactory"
@@ -40,6 +42,7 @@ class ChatToolFactory(
         assistant: Assistant,
         model: Model,
         workspaceCwd: String? = null,
+        conversationModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
     ): List<Tool> = buildList {
         if (assistant.enableMemory) {
             val memoryAssistantId = if (assistant.useGlobalMemory) {
@@ -49,10 +52,8 @@ class ChatToolFactory(
             }
             addAll(
                 buildMemoryTools(
-                    json = json,
-                    onCreation = { content -> memoryRepository.addMemory(memoryAssistantId, content) },
-                    onUpdate = { id, content -> memoryRepository.updateContent(id, content) },
-                    onDelete = { id -> memoryRepository.deleteMemory(id) },
+                    repository = memoryRepository,
+                    assistantId = memoryAssistantId,
                 )
             )
         }
@@ -73,7 +74,7 @@ class ChatToolFactory(
             )
         }
 
-        val mcpTools = mcpManager.getAllAvailableTools()
+        val mcpTools = mcpManager.getAllAvailableTools(assistant)
         val invalidNames = mcpTools
             .map { it.second }
             .distinct()
@@ -129,6 +130,22 @@ class ChatToolFactory(
                     },
                 )
             )
+        }
+
+        // SPreset ToolBindings：预设内定义的动态工具（如“小猫之神”的 game_content）。
+        // 解析/QuickJS 执行失败时静默跳过，绝不阻断聊天。
+        runCatching {
+            val spresetConfig = SpresetCompat.parseActivePreset(
+                tavernPresetsJson = settings.tavernPresets,
+                enabledGroups = enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
+            )
+            val dynamicTools = SpresetCompat.createDynamicTools(
+                config = spresetConfig,
+                existingNames = mapTo(mutableSetOf()) { it.name },
+            )
+            dynamicTools.forEach { tool ->
+                if (none { it.name.equals(tool.name, ignoreCase = true) }) add(tool)
+            }
         }
     }
 

@@ -1,13 +1,16 @@
 package me.rerere.rikkahub.ui.components.ai
 
-import androidx.compose.foundation.LocalIndication
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.activity.compose.BackHandler
+import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -16,22 +19,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.wrapContentWidth
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.material3.Badge
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.ListItemShapes
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.ProvideTextStyle
-import androidx.compose.material3.SheetValue
-import androidx.compose.material3.Surface
+import androidx.compose.material3.SegmentedListItem
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -40,19 +39,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.util.fastForEach
+import kotlin.uuid.Uuid
 import kotlinx.coroutines.Job
+import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.hugeicons.HugeIcons
-import me.rerere.hugeicons.stroke.Voice
+import me.rerere.hugeicons.stroke.ArrowLeft01
+import me.rerere.hugeicons.stroke.ArrowRight01
 import me.rerere.hugeicons.stroke.Camera01
 import me.rerere.hugeicons.stroke.Codesandbox
 import me.rerere.hugeicons.stroke.ComputerTerminal01
@@ -62,41 +62,46 @@ import me.rerere.hugeicons.stroke.Image02
 import me.rerere.hugeicons.stroke.MusicNote03
 import me.rerere.hugeicons.stroke.Package
 import me.rerere.hugeicons.stroke.Package01
+import me.rerere.hugeicons.stroke.PaintBoard
 import me.rerere.hugeicons.stroke.Settings02
 import me.rerere.hugeicons.stroke.Video01
+import me.rerere.hugeicons.stroke.Voice
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.datastore.Settings
-import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.lastContextTokens
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.ui.components.ui.ExtensionSelector
-import me.rerere.rikkahub.ui.components.ui.permission.PermissionCamera
-import me.rerere.rikkahub.ui.components.ui.permission.PermissionManager
-import me.rerere.rikkahub.ui.components.ui.permission.rememberPermissionState
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.hooks.ChatInputState
+import me.rerere.rikkahub.utils.formatNumber
 import me.rerere.workspace.WorkspaceShellStatus
 import org.koin.compose.koinInject
-import kotlin.uuid.Uuid
+
+private enum class FilesPickerPage {
+    MAIN,
+    MCP,
+    EXTENSIONS,
+}
 
 @Composable
 internal fun FilesPicker(
     conversation: Conversation,
+    // 会话视角下的助手和模型：会话开始后以会话上固定的配置为准
     assistant: Assistant,
+    chatModel: Model?,
     state: ChatInputState,
     mcpManager: McpManager,
-    onCompressContext: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job,
+    onCompressContext: (additionalPrompt: String, keepRecentMessages: Int) -> Job,
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
     onUpdateSettings: (Settings) -> Unit,
-    showInjectionSheet: Boolean,
-    onShowInjectionSheetChange: (Boolean) -> Unit,
+    onUpdateWorkspaceCwd: (String?) -> Unit,
     showCompressDialog: Boolean,
     onShowCompressDialogChange: (Boolean) -> Unit,
     onDismiss: () -> Unit,
@@ -105,197 +110,227 @@ internal fun FilesPicker(
     onPickVideo: () -> Unit,
     onPickAudio: () -> Unit,
     onPickFile: () -> Unit,
+    onSketch: () -> Unit,
     onStartVoiceMode: (() -> Unit)? = null,
 ) {
     val settings = LocalSettings.current
-    val provider = settings.getCurrentChatModel()?.findProvider(providers = settings.providers)
+    val provider = chatModel?.findProvider(providers = settings.providers)
     val navController = LocalNavController.current
     val workspaceRepository: WorkspaceRepository = koinInject()
     val workspaces by workspaceRepository.listFlow().collectAsState(initial = emptyList())
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        FlowRow(
-            modifier = Modifier.fillMaxWidth().wrapContentWidth(Alignment.CenterHorizontally),
-            horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.Start),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            TakePicButton(onLaunchCamera = onTakePic)
+    val boundWorkspace = remember(workspaces, assistant.workspaceId) {
+        workspaces.find { it.id == assistant.workspaceId?.toString() }
+    }
+    val showCwd = boundWorkspace != null && boundWorkspace.shellStatus == WorkspaceShellStatus.READY.name
+    var showCwdSheet by remember { mutableStateOf(false) }
 
-            ImagePickButton(onClick = onPickImage)
-
-            if (provider != null && provider is ProviderSetting.Google) {
-                VideoPickButton(onClick = onPickVideo)
-
-                AudioPickButton(onClick = onPickAudio)
+    var page by remember { mutableStateOf(FilesPickerPage.MAIN) }
+    // 在子页面时，返回键回到主页面而不是关闭 sheet
+    BackHandler(enabled = page != FilesPickerPage.MAIN) {
+        page = FilesPickerPage.MAIN
+    }
+    AnimatedContent(
+        targetState = page,
+        transitionSpec = {
+            if (targetState != FilesPickerPage.MAIN) {
+                slideInHorizontally { it } + fadeIn() togetherWith
+                    slideOutHorizontally { -it } + fadeOut()
+            } else {
+                slideInHorizontally { -it } + fadeIn() togetherWith
+                    slideOutHorizontally { it } + fadeOut()
             }
-
-            FilePickButton(onClick = onPickFile)
-
-            onStartVoiceMode?.let { start ->
-                BigIconTextButton(
-                    icon = { Icon(HugeIcons.Voice, contentDescription = null) },
-                    text = { Text(stringResource(R.string.chat_page_voice_title)) },
-                    onClick = start,
-                )
-            }
-        }
-
-        HorizontalDivider(
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        if (workspaces.isNotEmpty()) {
-            WorkspacePickerListItem(
-                assistant = assistant,
-                conversation = conversation,
-                workspaces = workspaces,
-                onUpdateAssistant = onUpdateAssistant,
-                onUpdateConversation = onUpdateConversation,
-                onNavigateToDetail = { id ->
-                    onDismiss()
-                    navController.navigate(Screen.WorkspaceDetail(id))
-                },
-                onNavigateToTerminal = { id ->
-                    onDismiss()
-                    navController.navigate(Screen.WorkspaceTerminal(id))
-                },
-                onNavigateToManage = {
-                    onDismiss()
-                    navController.navigate(Screen.Workspaces)
-                },
-            )
-        }
-
-        if (settings.mcpServers.isNotEmpty()) {
-            McpPickerListItem(
+        },
+        label = "FilesPickerPage"
+    ) { currentPage ->
+        when (currentPage) {
+            FilesPickerPage.MCP -> McpPickerPage(
                 assistant = assistant,
                 servers = settings.mcpServers,
                 mcpManager = mcpManager,
                 onUpdateAssistant = onUpdateAssistant,
+                onBack = { page = FilesPickerPage.MAIN },
             )
-        }
 
-        // Extensions (Quick Messages + Prompt Injections + Skills)
-        val modeAndLorebookCount =
-            if (assistant.allowConversationPromptInjection) {
-                conversation.modeInjectionIds.size + conversation.lorebookIds.size
-            } else {
-                assistant.modeInjectionIds.size + assistant.lorebookIds.size
-            }
-        val activeCount =
-            assistant.quickMessageIds.size +
-                modeAndLorebookCount +
-                assistant.enabledSkills.size
-        ListItem(
-            leadingContent = {
-                Icon(
-                    imageVector = HugeIcons.Package,
-                    contentDescription = stringResource(R.string.assistant_page_tab_extensions),
-                )
-            },
-            headlineContent = {
-                Text(stringResource(R.string.assistant_page_tab_extensions))
-            },
-            trailingContent = {
-                if (activeCount > 0) {
-                    Text(
-                        text = activeCount.toString(),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            },
-            colors = ListItemDefaults.colors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainer
-            ),
-            modifier = Modifier
-                .clip(MaterialTheme.shapes.large)
-                .clickable {
-                    onShowInjectionSheetChange(true)
-                },
-        )
+            FilesPickerPage.EXTENSIONS -> ExtensionPickerPage(
+                assistant = assistant,
+                settings = settings,
+                onUpdateAssistant = onUpdateAssistant,
+                onUpdateSettings = onUpdateSettings,
+                onBack = { page = FilesPickerPage.MAIN },
+                onDismissAll = onDismiss,
+            )
 
-        // Compress History Button
-        ListItem(
-            leadingContent = {
-                Icon(
-                    imageVector = HugeIcons.Package01,
-                    contentDescription = stringResource(R.string.chat_page_compress_context),
-                )
-            },
-            headlineContent = {
-                Text(stringResource(R.string.chat_page_compress_context))
-            },
-            trailingContent = {
-                if (conversation.messageNodes.isNotEmpty()) {
-                    Text(
-                        text = stringResource(R.string.chat_page_message_count, conversation.messageNodes.size),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            },
-            colors = ListItemDefaults.colors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainer
-            ),
-            modifier = Modifier
-                .clip(MaterialTheme.shapes.large)
-                .clickable {
-                    onShowCompressDialogChange(true)
-                },
-        )
-
-        // Workspace CWD
-        val boundWorkspace = remember(workspaces, assistant.workspaceId) {
-            workspaces.find { it.id == assistant.workspaceId?.toString() }
-        }
-        if (boundWorkspace != null && boundWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
-            var showCwdSheet by remember { mutableStateOf(false) }
-            TextButton(
-                onClick = { showCwdSheet = true },
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            FilesPickerPage.MAIN -> Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                Icon(
-                    imageVector = HugeIcons.Folder01,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
+                AttachmentGrid(
+                    actions = buildList {
+                        add(AttachmentAction(HugeIcons.Camera01, R.string.take_picture, onTakePic))
+                        add(AttachmentAction(HugeIcons.Image02, R.string.photo, onPickImage))
+                        add(AttachmentAction(HugeIcons.PaintBoard, R.string.sketch, onSketch))
+                        if (provider != null && provider is ProviderSetting.Google) {
+                            add(AttachmentAction(HugeIcons.Video01, R.string.video, onPickVideo))
+                            add(AttachmentAction(HugeIcons.MusicNote03, R.string.audio, onPickAudio))
+                        }
+                        add(AttachmentAction(HugeIcons.Files02, R.string.upload_file, onPickFile))
+                        onStartVoiceMode?.let { start ->
+                            add(AttachmentAction(HugeIcons.Voice, R.string.chat_page_voice_title, start))
+                        }
+                    }
                 )
-                Spacer(Modifier.width(4.dp))
-                Text(
-                    text = conversation.workspaceCwd ?: "/workspace",
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (showCwdSheet) {
-                WorkspaceCwdPickerSheet(
-                    workspaceId = boundWorkspace.id,
-                    currentCwd = conversation.workspaceCwd,
-                    onSelectCwd = { newCwd ->
-                        onUpdateConversation(conversation.copy(workspaceCwd = newCwd))
-                    },
-                    onDismiss = { showCwdSheet = false },
-                )
+
+                // 分段列表：各项按显示条件依次占位，首尾项才有大圆角
+                val showWorkspace = workspaces.isNotEmpty()
+                val showMcp = settings.mcpServers.isNotEmpty()
+                // 限制了上下文消息数就是滚动上下文，旧消息会自动移出，不需要压缩
+                val showCompress = assistant.contextMessageLimit <= 0
+                val itemCount = 1 + listOf(showWorkspace, showWorkspace && showCwd, showMcp, showCompress).count { it }
+                var itemIndex = 0
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(ListItemDefaults.SegmentedGap),
+                ) {
+                    if (showWorkspace) {
+                        WorkspacePickerListItem(
+                            assistant = assistant,
+                            workspaces = workspaces,
+                            shapes = ListItemDefaults.segmentedShapes(index = itemIndex++, count = itemCount),
+                            onUpdateAssistant = onUpdateAssistant,
+                            onNavigateToDetail = { id ->
+                                onDismiss()
+                                navController.navigate(Screen.WorkspaceDetail(id))
+                            },
+                            onNavigateToTerminal = { id ->
+                                onDismiss()
+                                navController.navigate(Screen.WorkspaceTerminal(id))
+                            },
+                            onNavigateToManage = {
+                                onDismiss()
+                                navController.navigate(Screen.Workspaces)
+                            },
+                        )
+
+                        // Workspace CWD
+                        if (showCwd) {
+                            SegmentedListItem(
+                                onClick = { showCwdSheet = true },
+                                shapes = ListItemDefaults.segmentedShapes(index = itemIndex++, count = itemCount),
+                                leadingContent = {
+                                    Icon(
+                                        imageVector = HugeIcons.Folder01,
+                                        contentDescription = stringResource(R.string.workspace_cwd_select_directory),
+                                    )
+                                },
+                                trailingContent = {
+                                    Icon(HugeIcons.ArrowRight01, contentDescription = null)
+                                },
+                            ) {
+                                Text(
+                                    text = conversation.workspaceCwd ?: "/workspace",
+                                    // 路径的末尾更有辨识度，放不下时省略开头
+                                    maxLines = 1,
+                                    overflow = TextOverflow.StartEllipsis,
+                                )
+                            }
+                        }
+                    }
+
+                    if (showMcp) {
+                        McpPickerListItem(
+                            assistant = assistant,
+                            servers = settings.mcpServers,
+                            mcpManager = mcpManager,
+                            shapes = ListItemDefaults.segmentedShapes(index = itemIndex++, count = itemCount),
+                            onClick = { page = FilesPickerPage.MCP },
+                        )
+                    }
+
+                    // Extensions (Quick Messages + Prompt Injections + Skills)
+                    val activeCount =
+                        assistant.quickMessageIds.size +
+                            assistant.modeInjectionIds.size +
+                            assistant.lorebookIds.size +
+                            assistant.enabledSkills.size
+                    SegmentedListItem(
+                        onClick = { page = FilesPickerPage.EXTENSIONS },
+                        shapes = ListItemDefaults.segmentedShapes(index = itemIndex++, count = itemCount),
+                        leadingContent = {
+                            Icon(
+                                imageVector = HugeIcons.Package,
+                                contentDescription = null,
+                            )
+                        },
+                        trailingContent = {
+                            if (activeCount > 0) {
+                                CountBadge(count = activeCount)
+                            }
+                        },
+                    ) {
+                        Text(stringResource(R.string.assistant_page_tab_extensions))
+                    }
+
+                    // Compress History Button
+                    if (showCompress) {
+                        SegmentedListItem(
+                            onClick = { onShowCompressDialogChange(true) },
+                            shapes = ListItemDefaults.segmentedShapes(index = itemIndex++, count = itemCount),
+                            leadingContent = {
+                                Icon(
+                                    imageVector = HugeIcons.Package01,
+                                    contentDescription = null,
+                                )
+                            },
+                            trailingContent = {
+                                val contextTokens = remember(conversation.messageNodes) {
+                                    conversation.lastContextTokens()
+                                }
+                                val contextLength = chatModel?.contextLength?.takeIf { it > 0 }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Column(horizontalAlignment = Alignment.End) {
+                                        if (conversation.messageNodes.isNotEmpty()) {
+                                            Text(
+                                                text = stringResource(R.string.chat_page_message_count, conversation.messageNodes.size),
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        if (contextTokens != null && contextLength != null) {
+                                            Text(
+                                                text = "${contextTokens.formatNumber()} / ${contextLength.formatNumber()}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                    if (contextTokens != null && contextLength != null) {
+                                        ContextUsageRing(fraction = contextTokens.toFloat() / contextLength)
+                                    }
+                                }
+                            },
+                        ) {
+                            Text(stringResource(R.string.chat_page_compress_context))
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Injection Bottom Sheet
-    if (showInjectionSheet) {
-        InjectionQuickConfigSheet(
-            conversation = conversation,
-            assistant = assistant,
-            settings = settings,
-            onUpdateAssistant = onUpdateAssistant,
-            onUpdateConversation = onUpdateConversation,
-            onUpdateSettings = onUpdateSettings,
-            onDismiss = { onShowInjectionSheetChange(false) },
-            onDismissAll = onDismiss,
+    if (showCwdSheet && boundWorkspace != null) {
+        WorkspaceCwdPickerSheet(
+            workspaceId = boundWorkspace.id,
+            currentCwd = conversation.workspaceCwd,
+            onSelectCwd = { newCwd ->
+                onUpdateWorkspaceCwd(newCwd)
+            },
+            onDismiss = { showCwdSheet = false },
         )
     }
 
@@ -304,19 +339,16 @@ internal fun FilesPicker(
         CompressContextDialog(onDismiss = {
             onShowCompressDialogChange(false)
             onDismiss()
-        }, onConfirm = { additionalPrompt, targetTokens, keepRecentMessages ->
-            onCompressContext(additionalPrompt, targetTokens, keepRecentMessages)
-        })
+        }, onConfirm = onCompressContext)
     }
 }
 
 @Composable
 private fun WorkspacePickerListItem(
     assistant: Assistant,
-    conversation: Conversation,
     workspaces: List<WorkspaceEntity>,
+    shapes: ListItemShapes,
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
     onNavigateToDetail: (String) -> Unit,
     onNavigateToTerminal: (String) -> Unit,
     onNavigateToManage: () -> Unit,
@@ -326,15 +358,14 @@ private fun WorkspacePickerListItem(
         workspaces.find { it.id == assistant.workspaceId?.toString() }
     }
 
-    ListItem(
+    SegmentedListItem(
+        onClick = { showSheet = true },
+        shapes = shapes,
         leadingContent = {
             Icon(
                 imageVector = HugeIcons.Codesandbox,
-                contentDescription = stringResource(R.string.assistant_page_workspace),
+                contentDescription = null,
             )
-        },
-        headlineContent = {
-            Text(stringResource(R.string.assistant_page_workspace))
         },
         supportingContent = {
             Text(
@@ -365,13 +396,9 @@ private fun WorkspacePickerListItem(
                 }
             }
         },
-        colors = ListItemDefaults.colors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        ),
-        modifier = Modifier
-            .clip(MaterialTheme.shapes.large)
-            .clickable { showSheet = true },
-    )
+    ) {
+        Text(stringResource(R.string.assistant_page_workspace))
+    }
 
     if (showSheet) {
         WorkspaceSelectSheet(
@@ -380,10 +407,8 @@ private fun WorkspacePickerListItem(
             onSelect = { workspaceId ->
                 val newId = workspaceId?.let { Uuid.parse(it) }
                 if (newId != assistant.workspaceId) {
+                    // 会话的工作目录随工作区一并重置
                     onUpdateAssistant(assistant.copy(workspaceId = newId))
-                    if (conversation.workspaceCwd != null) {
-                        onUpdateConversation(conversation.copy(workspaceCwd = null))
-                    }
                 }
                 showSheet = false
             },
@@ -396,160 +421,163 @@ private fun WorkspacePickerListItem(
     }
 }
 
+// 扩展选择页，作为子页面嵌在加号 sheet 里
 @Composable
-private fun InjectionQuickConfigSheet(
-    conversation: Conversation,
+private fun ExtensionPickerPage(
     assistant: Assistant,
     settings: Settings,
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
     onUpdateSettings: (Settings) -> Unit,
-    onDismiss: () -> Unit,
+    onBack: () -> Unit,
     onDismissAll: () -> Unit,
 ) {
-    val sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))
     val navController = LocalNavController.current
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(0.75f)
+            .padding(horizontal = 16.dp),
+    ) {
+        SheetHeader(
+            title = stringResource(R.string.assistant_page_tab_extensions),
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(HugeIcons.ArrowLeft01, contentDescription = stringResource(R.string.back))
+                }
+            },
+        )
+        ExtensionSelector(
+            assistant = assistant,
+            settings = settings,
+            onUpdate = onUpdateAssistant,
+            onUpdateSettings = onUpdateSettings,
+            modifier = Modifier.weight(1f),
+            onNavigateToQuickMessages = {
+                onDismissAll()
+                navController.navigate(Screen.QuickMessages)
+            },
+            onNavigateToPrompts = {
+                onDismissAll()
+                navController.navigate(Screen.Prompts)
+            },
+            onNavigateToSkills = {
+                onDismissAll()
+                navController.navigate(Screen.Skills)
+            })
+
+        Spacer(modifier = Modifier.height(16.dp))
+    }
+}
+
+private class AttachmentAction(
+    val icon: ImageVector,
+    @param:StringRes val label: Int,
+    val onClick: () -> Unit,
+)
+
+// 附件入口：一行最多四个，再多就均分成两行
+@Composable
+private fun AttachmentGrid(
+    actions: List<AttachmentAction>,
+    modifier: Modifier = Modifier,
+) {
+    val perRow = if (actions.size <= 4) actions.size else (actions.size + 1) / 2
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        actions.chunked(perRow).fastForEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                row.fastForEach { action ->
+                    AttachmentTile(
+                        action = action,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttachmentTile(
+    action: AttachmentAction,
+    modifier: Modifier = Modifier,
+) {
+    FilledTonalButton(
+        onClick = action.onClick,
+        // 按下时圆角收紧
+        shapes = ButtonDefaults.shapes(
+            shape = MaterialTheme.shapes.extraLarge,
+            pressedShape = MaterialTheme.shapes.medium,
+        ),
+        modifier = modifier.heightIn(min = 88.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 16.dp),
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.75f)
-                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ExtensionSelector(
-                assistant = assistant,
-                settings = settings,
-                onUpdate = onUpdateAssistant,
-                conversation = conversation,
-                onUpdateConversation = onUpdateConversation,
-                onUpdateSettings = onUpdateSettings,
-                modifier = Modifier.weight(1f),
-                onNavigateToQuickMessages = {
-                    onDismissAll()
-                    navController.navigate(Screen.QuickMessages)
-                },
-                onNavigateToPrompts = {
-                    onDismissAll()
-                    navController.navigate(Screen.Prompts)
-                },
-                onNavigateToSkills = {
-                    onDismissAll()
-                    navController.navigate(Screen.Skills)
-                },
-                onNavigateToRegexScripts = {
-                    onDismissAll()
-                    navController.navigate(Screen.RegexScripts)
-                })
-
-            Spacer(modifier = Modifier.height(16.dp))
-        }
-    }
-}
-
-@Composable
-private fun ImagePickButton(onClick: () -> Unit = {}) {
-    BigIconTextButton(icon = {
-        Icon(HugeIcons.Image02, null)
-    }, text = {
-        Text(stringResource(R.string.photo))
-    }) {
-        onClick()
-    }
-}
-
-@Composable
-fun TakePicButton(onLaunchCamera: () -> Unit = {}) {
-    BigIconTextButton(icon = {
-        Icon(HugeIcons.Camera01, null)
-    }, text = {
-        Text(stringResource(R.string.take_picture))
-    }) {
-        onLaunchCamera()
-    }
-}
-
-@Composable
-fun VideoPickButton(onClick: () -> Unit = {}) {
-    BigIconTextButton(icon = {
-        Icon(HugeIcons.Video01, null)
-    }, text = {
-        Text(stringResource(R.string.video))
-    }) {
-        onClick()
-    }
-}
-
-@Composable
-fun AudioPickButton(onClick: () -> Unit = {}) {
-    BigIconTextButton(icon = {
-        Icon(HugeIcons.MusicNote03, null)
-    }, text = {
-        Text(stringResource(R.string.audio))
-    }) {
-        onClick()
-    }
-}
-
-@Composable
-fun FilePickButton(onClick: () -> Unit = {}) {
-    BigIconTextButton(icon = {
-        Icon(HugeIcons.Files02, null)
-    }, text = {
-        Text(stringResource(R.string.upload_file))
-    }) {
-        onClick()
-    }
-}
-
-@Composable
-private fun BigIconTextButton(
-    modifier: Modifier = Modifier,
-    icon: @Composable () -> Unit,
-    text: @Composable () -> Unit,
-    onClick: () -> Unit,
-) {
-    val interactionSource = remember { MutableInteractionSource() }
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(
-                interactionSource = interactionSource, indication = LocalIndication.current, onClick = onClick
+            Icon(
+                imageVector = action.icon,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
             )
-            .semantics {
-                role = Role.Button
-            }
-            .wrapContentWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(8.dp)
-        ) {
-            Box(
-                modifier = Modifier.padding(horizontal = 32.dp, vertical = 16.dp)
-            ) {
-                icon()
-            }
-        }
-        ProvideTextStyle(MaterialTheme.typography.bodySmall) {
-            text()
+            Text(
+                text = stringResource(action.label),
+                // 四个并排时较长的译文放不下，自动缩小字号
+                autoSize = TextAutoSize.StepBased(minFontSize = 11.sp, maxFontSize = 14.sp),
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
+}
+
+// 列表项尾部的已启用数量
+@Composable
+internal fun CountBadge(count: Int) {
+    Badge(
+        containerColor = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+    ) {
+        Text(count.toString())
+    }
+}
+
+// 上下文使用量进度环，接近上限时变色提醒压缩
+@Composable
+private fun ContextUsageRing(fraction: Float) {
+    val color = when {
+        fraction >= 0.9f -> MaterialTheme.colorScheme.error
+        fraction >= 0.7f -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    CircularProgressIndicator(
+        progress = { fraction.coerceIn(0f, 1f) },
+        modifier = Modifier.size(24.dp),
+        color = color,
+        strokeWidth = 3.dp,
+        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+    )
 }
 
 @Preview(showBackground = true)
 @Composable
-private fun BigIconTextButtonPreview() {
-    Row(
-        modifier = Modifier.padding(16.dp)
-    ) {
-        BigIconTextButton(icon = {
-            Icon(HugeIcons.Image02, null)
-        }, text = {
-            Text(stringResource(R.string.photo))
-        }) {}
-    }
+private fun AttachmentGridPreview() {
+    AttachmentGrid(
+        actions = listOf(
+            AttachmentAction(HugeIcons.Camera01, R.string.take_picture) {},
+            AttachmentAction(HugeIcons.Image02, R.string.photo) {},
+            AttachmentAction(HugeIcons.Video01, R.string.video) {},
+            AttachmentAction(HugeIcons.MusicNote03, R.string.audio) {},
+            AttachmentAction(HugeIcons.Files02, R.string.upload_file) {},
+        ),
+        modifier = Modifier.padding(16.dp),
+    )
 }

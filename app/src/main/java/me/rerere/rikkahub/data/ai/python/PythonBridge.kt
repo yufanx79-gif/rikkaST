@@ -4,7 +4,7 @@ import android.content.Context
 import androidx.annotation.Keep
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
-import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.knowledge.KnowledgeBaseService

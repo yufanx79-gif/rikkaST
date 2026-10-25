@@ -67,3 +67,8 @@ export class Popup {
         return this.result;
     }
 }
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export class PopupUtils { constructor(...args) { this._args = args; } }
+export function fixToastrForDialogs(..._args) { return null; }
+export function getTopmostModalLayer(..._args) { return null; }

@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 仓库 | `D:\rikkaST`（rikkaST 2.4.6，`versionCode = 237`） |
+| 仓库 | `[本机绝对路径已脱敏]`（rikkaST 2.4.6，`versionCode = 237`） |
 | 分支 / HEAD | `main` @ `439f030` |
 | 修复日期 | 2026-10-08 |
 | 触发条件 | 助手开启本地工具 **「JavaScript 引擎」** + provider 使用 **Gemini 协议**（Google / Vertex / 任何 Gemini 兼容中转，例如 Antigravity） |
@@ -157,9 +157,9 @@ parameters = { javascriptToolSchema() },
 ### 5.1 单元测试
 
 ```powershell
-cd D:\rikkaST
+cd [本机绝对路径已脱敏]
 .\gradlew.bat --offline :ai:testDebugUnitTest :app:testDebugUnitTest `
-  -Pchaquopy.python=C:/Users/<you>/AppData/Roaming/uv/python/cpython-3.12.13-windows-x86_64-none/python.exe
+  -Pchaquopy.python=[本机绝对路径已脱敏]<you>/AppData/Roaming/uv/python/cpython-3.12.13-windows-x86_64-none/python.exe
 ```
 
 ### 5.2 接口层验证（最贴近现场）
@@ -174,7 +174,7 @@ cd D:\rikkaST
 
 | 项 | 值 |
 | --- | --- |
-| 产物路径 | `D:\rikkaST\dist\rikkaST-2.4.6-jsitems-fix.apk` |
+| 产物路径 | `[本机绝对路径已脱敏]` |
 | 大小 | 58,616,037 B（约 55.9 MiB） |
 | SHA-256 | `B485988B189E0BAD68A6E0CDF3CC4CF98653A41CCD852981FE45D9DD25FAC940` |
 | MD5 | `A0DECE97B5D7C3D973871023E73807E6` |

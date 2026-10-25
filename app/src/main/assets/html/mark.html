@@ -6,8 +6,7 @@
     <title>Markdown Preview</title>
 
     <!-- KaTeX for LaTeX math rendering -->
-    <!-- [v235 R2] KaTeX 改为本地 vendored（离线）：assets/st-runtime/vendor/katex/ -->
-    <link rel="stylesheet" href="https://appassets.androidplatform.net/st-runtime/vendor/katex/katex.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
 
     <!-- Highlight.js for syntax highlighting -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
@@ -178,9 +177,9 @@
         import vscodemarkdownItKatex from 'https://esm.sh/@vscode/markdown-it-katex'
         import markdownItTaskLists from 'https://esm.sh/markdown-it-task-lists@2.1.1';
 
-        import katex from 'https://appassets.androidplatform.net/st-runtime/vendor/katex/katex.mjs';
+        import katex from 'https://esm.sh/katex@0.16.8';
         // mhchem 扩展: 支持 \ce{} 等化学公式语法
-        import 'https://appassets.androidplatform.net/st-runtime/vendor/katex/mhchem.mjs';
+        import 'https://esm.sh/katex@0.16.8/dist/contrib/mhchem.mjs';
         import hljs from 'https://esm.sh/highlight.js@11.9.0';
         import mermaid from 'https://esm.sh/mermaid@10.6.1';
         import { Base64 } from 'https://esm.sh/js-base64@3.7.5';

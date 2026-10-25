@@ -12,12 +12,16 @@ import androidx.compose.runtime.tooling.ComposeStackTraceMode
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import me.rerere.rikkahub.data.ai.MemoryConsolidationScheduler
 import me.rerere.rikkahub.data.files.FileFolders
-import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.skills.SkillManager
 import java.io.File
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -38,9 +42,12 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.sync.BackupManager
 import me.rerere.rikkahub.data.sync.RestoreFailedException
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.service.MediaCreationService
 import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
+import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.workspace.WorkspaceManager
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
 import org.koin.android.ext.koin.androidLogger
@@ -53,17 +60,12 @@ const val CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID = "chat_completed"
 const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update"
 const val CHAT_GENERATION_FOREGROUND_CHANNEL_ID = "chat_generation_foreground"
 const val WEB_SERVER_NOTIFICATION_CHANNEL_ID = "web_server"
+const val MEDIA_CREATION_NOTIFICATION_CHANNEL_ID = "media_creation"
+const val MEMORY_DREAM_NOTIFICATION_CHANNEL_ID = "memory_dream"
 
 class RikkaHubApp : Application() {
-    private fun trace(msg: String) {
-        try {
-            java.io.File("/sdcard/rikkahub_trace.txt").appendText("${System.currentTimeMillis()} $msg\n")
-        } catch (_: Exception) {}
-    }
-
     override fun onCreate() {
         super.onCreate()
-        trace("onCreate start")
         // Restore files and settings before eager Koin singletons or workers can access them.
         try {
             val restored = runBlocking(Dispatchers.IO) {
@@ -76,62 +78,102 @@ class RikkaHubApp : Application() {
             Log.e(TAG, "Backup restore rolled back", e)
             Toast.makeText(this, "备份恢复失败，已保留原数据。请重新导入备份。", Toast.LENGTH_LONG).show()
         }
-        try {
-            startKoin {
-                trace("koin config")
-                androidLogger()
-                androidContext(this@RikkaHubApp)
-                workManagerFactory()
-                modules(appModule, viewModelModule, dataSourceModule, repositoryModule)
-            }
-            trace("koin done")
-        } catch (e: Exception) {
-            trace("koin FAILED: ${e.message}")
-            throw e
+        startKoin {
+            androidLogger()
+            androidContext(this@RikkaHubApp)
+            workManagerFactory()
+            modules(appModule, viewModelModule, dataSourceModule, repositoryModule)
         }
         this.createNotificationChannel()
-        trace("notification done")
 
         // set cursor window size to 32MB
         DatabaseUtil.setCursorWindowSize(32 * 1024 * 1024)
-        trace("cursor done")
 
         // install crash handler
         CrashHandler.install(this)
-        trace("crashhandler done")
 
         // Init QuickJS native library
         QuickJSLoader.init()
-        trace("quickjs done")
 
-        // [v240 W5] 真 tokenizer 词表加载器（懒加载：首次用到才读 assets；失败自动回退启发式）
+        // Attach TikToken asset loader
         TikToken.attach { path ->
             runCatching { assets.open(path).buffered() }.getOrNull()
         }
-        trace("tokenizer assets done")
 
         // delete temp files
         deleteTempFiles()
-        trace("tempfiles done")
+
+        // cleanup stale tool output files
+        cleanupToolOutputs()
+
+        // cleanup workspace temp dirs (proot + rootfs /tmp)
+        cleanupWorkspaceTempDirs()
+
+        // check workspace integrity (mark workspaces with missing files as broken after backup restore)
+        checkWorkspaceIntegrity()
 
         // sync upload files to DB
         syncManagedFiles()
-        trace("sync done")
 
         // Extract builtin skills from assets after install/update
         extractBuiltinSkills()
 
         // Start WebServer if enabled in settings
         startWebServerIfEnabled()
-        trace("webserver done")
+
+        // Resume media generations interrupted by the last process death
+        resumeMediaCreations()
+        resumeMemoryConsolidation()
 
         // Increment launch count
         incrementLaunchCount()
         // Init tavern runtime variables (ST/JSR/MVU)
         initTavernRuntime()
-        trace("onCreate complete")
 
         // Composer.setDiagnosticStackTraceMode(ComposeStackTraceMode.Auto)
+    }
+
+    private fun resumeMediaCreations() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<MediaCreationService>().resumePending()
+            }.onFailure {
+                Log.e(TAG, "resumeMediaCreations failed", it)
+            }
+        }
+    }
+
+    private fun resumeMemoryConsolidation() {
+        // 应用被切走后进程随时可能被冻结，等不到空闲计时结束，这时直接开始整理
+        ProcessLifecycleOwner.get().lifecycle.addObserver(
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_STOP) get<MemoryConsolidationScheduler>().onAppHidden()
+            }
+        )
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<MemoryConsolidationScheduler>().resumePending()
+            }.onFailure {
+                Log.e(TAG, "resumeMemoryConsolidation failed", it)
+            }
+        }
+    }
+
+
+    private fun initTavernRuntime() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                TavernVariableStore.ensureInitialized(this@RikkaHubApp)
+                val store = get<SettingsStore>()
+                val settings = store.settingsFlowRaw.first()
+                TavernVariableStore.importLegacy(
+                    legacyGlobal = settings.macroGlobalVariables,
+                    legacyChats = settings.macroChatVariables,
+                )
+            }.onFailure {
+                Log.e(TAG, "initTavernRuntime failed", it)
+            }
+        }
     }
 
     private fun incrementLaunchCount() {
@@ -145,23 +187,22 @@ class RikkaHubApp : Application() {
         }
     }
 
-    /** 初始化酒馆运行时变量存储（ST/JSR/MVU 语义），并迁移旧宏变量（一次性，幂等）。 */
-    private fun initTavernRuntime() {
+    private fun cleanupWorkspaceTempDirs() {
         get<AppScope>().launch(Dispatchers.IO) {
             runCatching {
-                TavernVariableStore.ensureInitialized(this@RikkaHubApp)
-                val store = get<SettingsStore>()
-                val settings = store.settingsFlowRaw.first()
-                TavernVariableStore.importLegacy(
-                    legacyGlobal = settings.macroGlobalVariables,
-                    legacyChats = settings.macroChatVariables,
-                )
-                Log.i(
-                    TAG,
-                    "initTavernRuntime done: global=${settings.macroGlobalVariables.size}, chats=${settings.macroChatVariables.size}"
-                )
+                get<WorkspaceManager>().cleanupAllTempDirs()
             }.onFailure {
-                Log.e(TAG, "initTavernRuntime failed", it)
+                Log.e(TAG, "cleanupWorkspaceTempDirs failed", it)
+            }
+        }
+    }
+
+    private fun checkWorkspaceIntegrity() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<WorkspaceRepository>().checkIntegrity()
+            }.onFailure {
+                Log.e(TAG, "checkWorkspaceIntegrity failed", it)
             }
         }
     }
@@ -206,7 +247,7 @@ class RikkaHubApp : Application() {
         get<AppScope>().launch {
             runCatching {
                 delay(500)
-                val settings = get<SettingsStore>().settingsFlowRaw.first()
+                val settings = get<SettingsStore>().awaitLoaded()
                 if (settings.webServerEnabled) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                         ContextCompat.checkSelfPermission(
@@ -269,6 +310,20 @@ class RikkaHubApp : Application() {
             .setShowBadge(false)
             .build()
         notificationManager.createNotificationChannel(webServerChannel)
+
+        val mediaCreationChannel = NotificationChannelCompat
+            .Builder(MEDIA_CREATION_NOTIFICATION_CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_DEFAULT)
+            .setName(getString(R.string.media_creation_title))
+            .build()
+        notificationManager.createNotificationChannel(mediaCreationChannel)
+
+        val memoryDreamChannel = NotificationChannelCompat
+            .Builder(MEMORY_DREAM_NOTIFICATION_CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)
+            .setName(getString(R.string.memory_dream_title))
+            .setVibrationEnabled(false)
+            .setShowBadge(false)
+            .build()
+        notificationManager.createNotificationChannel(memoryDreamChannel)
 
         val generationForegroundChannel = NotificationChannelCompat
             .Builder(CHAT_GENERATION_FOREGROUND_CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)

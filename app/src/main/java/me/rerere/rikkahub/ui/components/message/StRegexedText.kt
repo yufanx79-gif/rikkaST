@@ -24,6 +24,7 @@ import me.rerere.rikkahub.data.st.regex.RegexScript
 import me.rerere.rikkahub.data.st.regex.RegexScriptEngine
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
+import java.util.Collections
 
 internal data class StRegexRenderResult(
     val text: String,
@@ -40,9 +41,133 @@ private val RESIDUAL_THINK_STRIP_RE = Regex(
     """<(think|thinking|thought)\b[^>]*>[\s\S]*?(?:</\1>|\z)""",
     RegexOption.IGNORE_CASE,
 )
+private val DRAW_TAG_BLOCK_RE = Regex(
+    """\[出图]\s*([\s\S]*?)\s*\[/出图]""",
+    RegexOption.IGNORE_CASE,
+)
+private val loggedWrapperDiagAssistants: MutableSet<String> =
+    Collections.synchronizedSet(HashSet<String>())
 
 /**
- * 快速检测文本是否可能命中 JS 侧 `MessageFormatter` 扩展钩子（如 ST-iPhonie 的 `<tts>`、`<pic>`、`<bgm>`、`<sfx>`、`<phone>` 或自定义测试钩子）。
+ * 检测角色卡描述/世界书模板是否包含未配对的 `〔` / `〕` 响应包装符（即模板要求包裹 `〔...〕`，但激活的正则脚本中无任何匹配 `〔` 或 `〕` 的清洗规则）。
+ */
+internal fun detectUnmatchedCardWrapperBrackets(
+    assistant: Assistant?,
+    activeScripts: List<RegexScript>,
+): Boolean {
+    val tav = assistant?.tavernData ?: return false
+    fun hasPair(s: String): Boolean =
+        (s.contains('〔') && s.contains('〕')) || (s.contains('〖') && s.contains('〗'))
+    val hasWrapperInCardPrompts = hasPair(tav.description) ||
+        hasPair(tav.systemPrompt) ||
+        hasPair(tav.postHistoryInstructions) ||
+        (tav.embeddedBook?.entries?.any { hasPair(it.content) } == true)
+    if (!hasWrapperInCardPrompts) return false
+    val anyRegexTouchesWrapper = activeScripts.any {
+        !it.disabled && (
+            it.findRegex.contains('〔') || it.findRegex.contains('〕') ||
+                it.findRegex.contains('〖') || it.findRegex.contains('〗')
+            )
+    }
+    return !anyRegexTouchesWrapper
+}
+
+private val STANDALONE_WRAPPER_LINE_RE = Regex("^\\s*[〔〕〖〗]\\s*$")
+private val HTML_BOUNDARY_LEADING_WRAPPER_RE = Regex("(?m)^(\\s*)[〔〖](\\s*<(?:style|div|section|article|main|script|!--|/base|/mes|/sh|/txt)\\b)", RegexOption.IGNORE_CASE)
+private val HTML_BOUNDARY_TRAILING_WRAPPER_RE = Regex("(?m)(</(?:div|style|script|section|article|main|base|mes|sh|txt)>|-->)(\\s*)[〕〗](\\s*)$", RegexOption.IGNORE_CASE)
+
+/**
+ * 视觉层可选清理：剥离消息首尾、HTML 模板块首尾或独立成行的 `〔`/`〕`、`〖`/`〗` 模板包装符，
+ * 严格保留句内正常使用的括号（如“她翻开〔世界史〕笔记本”）。
+ */
+private fun stripUnmatchedBoundaryWrappers(input: String): String {
+    var out = input
+    for ((openCh, closeCh) in listOf('〔' to '〕', '〖' to '〗')) {
+        val openCount = out.count { it == openCh }
+        val closeCount = out.count { it == closeCh }
+        if (openCount == closeCount) continue
+        val trimmed = out.trim()
+        if (openCount == 1 && closeCount == 0 && trimmed.startsWith(openCh)) {
+            val idx = out.indexOf(openCh)
+            if (idx >= 0) out = out.removeRange(idx, idx + 1).trimStart('\n', '\r')
+        } else if (closeCount == 1 && openCount == 0 && trimmed.endsWith(closeCh)) {
+            val idx = out.lastIndexOf(closeCh)
+            if (idx >= 0) out = out.removeRange(idx, idx + 1).trimEnd('\n', '\r')
+        }
+    }
+    return out
+}
+
+internal fun stripOuterTemplateWrapperBrackets(
+    text: String,
+    enabled: Boolean = true,
+): String {
+    if (!enabled || (!text.contains('〔') && !text.contains('〕') && !text.contains('〖') && !text.contains('〗'))) {
+        return text
+    }
+    var result = text
+    for ((openCh, closeCh) in listOf('〔' to '〕', '〖' to '〗')) {
+        val trimmedAll = result.trim()
+        if (trimmedAll.startsWith(openCh) && trimmedAll.endsWith(closeCh) && trimmedAll.length >= 2) {
+            val inner = trimmedAll.substring(1, trimmedAll.length - 1)
+            if (!inner.contains(openCh) || inner.count { it == openCh } == inner.count { it == closeCh }) {
+                result = inner.trim()
+            }
+        }
+    }
+    result = HTML_BOUNDARY_LEADING_WRAPPER_RE.replace(result, "$1$2")
+    result = HTML_BOUNDARY_TRAILING_WRAPPER_RE.replace(result, "$1$2$3")
+    result = stripUnmatchedBoundaryWrappers(result)
+    val lines = result.lines()
+    if (lines.any {
+            val t = it.trim()
+            t.startsWith('〔') || t.endsWith('〕') || t.startsWith('〖') || t.endsWith('〗')
+        }
+    ) {
+        val cleanedLines = mutableListOf<String>()
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (STANDALONE_WRAPPER_LINE_RE.matches(trimmed)) {
+                continue
+            }
+            var processedLine = line
+            for ((openCh, closeCh) in listOf('〔' to '〕', '〖' to '〗')) {
+                val t = processedLine.trim()
+                if (t.startsWith(openCh) && t.endsWith(closeCh) && t.length >= 2 &&
+                    t.substring(1, t.length - 1).indexOf(openCh) < 0 &&
+                    t.substring(1, t.length - 1).indexOf(closeCh) < 0
+                ) {
+                    val s = processedLine.replaceFirst(openCh.toString(), "")
+                    val lastIdx = s.lastIndexOf(closeCh)
+                    processedLine = if (lastIdx >= 0) s.removeRange(lastIdx, lastIdx + 1) else s
+                }
+            }
+            cleanedLines += processedLine
+        }
+        result = cleanedLines.joinToString("\n")
+    }
+    return result
+}
+
+/**
+ * 拦截正文内未被第三方扩展消费的 `[出图]...[/出图]` 提示词块：
+ * 将原本直接倾倒在正文里的长串生图 Tag 转换为折叠式小手机生图卡片，避免污染小说正文排版。
+ */
+internal fun convertUnhandledDrawTagsToHtml(text: String): String {
+    if (!text.contains("[出图]") || !text.contains("[/出图]")) return text
+    return DRAW_TAG_BLOCK_RE.replace(text) { match ->
+        val rawPrompt = match.groupValues[1].trim()
+        if (rawPrompt.isEmpty()) return@replace ""
+        val escapedPrompt = rawPrompt
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        """<div class="rikka-draw-card" style="margin:8px 0;padding:10px 12px;border-radius:10px;background:rgba(30,41,59,0.78);border:1px solid rgba(148,163,184,0.28);color:#e2e8f0;font-size:13px;"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><span style="font-weight:600;color:#93c5fd;">🎨 小手机生图指令已捕获</span><span style="font-size:11px;color:#94a3b8;">可在右侧小手机悬浮窗查看</span></div><details style="margin-top:6px;"><summary style="cursor:pointer;color:#94a3b8;font-size:12px;">展开生图参数</summary><pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 0 0;padding:8px;border-radius:6px;background:rgba(15,23,42,0.65);color:#cbd5e1;font-size:11px;">$escapedPrompt</pre></details></div>"""
+    }
+}
+
+/**
+ * 快速检测文本是否可能命中 JS 侧 `MessageFormatter` 扩展钩子（如 ST-iPhonie 的 `<tts>`、`<pic>`、`<bgm>`、`<sfx>`、`<phone>`、`[出图]` 或自定义测试钩子）。
  * 若当前文本不包含任何扩展多媒体/协议标签且未注入测试 evaluator，则无需跨线程等待 WebView IPC 往返，
  * 直接在 Kotlin 侧同步执行 `RegexScriptEngine`（耗时 < 2ms），彻底消除「正在应用显示正则与预设排版规则…」长等待！
  */
@@ -56,6 +181,8 @@ internal fun shouldInvokeWebViewMessageFormatter(rawText: String): Boolean {
         rawText.contains("<bgm", ignoreCase = true) ||
         rawText.contains("<sfx", ignoreCase = true) ||
         rawText.contains("<phone", ignoreCase = true) ||
+        rawText.contains("[出图]") ||
+        rawText.contains("[/出图]") ||
         rawText.contains("data-sttts", ignoreCase = true) ||
         rawText.contains("sttts-", ignoreCase = true)
     ) {
@@ -227,6 +354,7 @@ private fun buildMacroSubstitutor(
     charName: String,
     effectiveUser: String,
     conversationId: String?,
+    assistant: Assistant? = null,
 ): (String) -> String = { s ->
     if (!s.contains("{{") && !s.contains("<USER>", ignoreCase = true) && !s.contains("<BOT>", ignoreCase = true) && !s.contains("<CHAR>", ignoreCase = true)) {
         s
@@ -254,6 +382,7 @@ private fun buildMacroSubstitutor(
                         dyn[key] = DynamicMacro.Value(entry.second)
                     }
                 }
+                val tav = assistant?.tavernData
                 val env = MacroEnv(
                     names = MacroEnv.Names(
                         user = effectiveUser,
@@ -261,6 +390,19 @@ private fun buildMacroSubstitutor(
                         group = charName.ifEmpty { "Assistant" },
                         groupNotMuted = charName.ifEmpty { "Assistant" },
                         notChar = effectiveUser,
+                    ),
+                    character = MacroEnv.CharacterInfo(
+                        charPrompt = tav?.systemPrompt?.ifBlank { assistant?.systemPrompt.orEmpty() }.orEmpty(),
+                        charInstruction = tav?.postHistoryInstructions.orEmpty(),
+                        description = tav?.description.orEmpty(),
+                        personality = tav?.personality.orEmpty(),
+                        scenario = tav?.scenario.orEmpty(),
+                        mesExamplesRaw = tav?.mesExample.orEmpty(),
+                        version = tav?.characterVersion.orEmpty(),
+                        charDepthPrompt = tav?.depthPrompt.orEmpty(),
+                        creatorNotes = tav?.creatorNotes.orEmpty(),
+                        firstMessage = tav?.firstMessage.orEmpty(),
+                        alternateGreetings = tav?.alternateGreetings.orEmpty(),
                     ),
                     variables = VariableStores(
                         local = TavernVarMacroStoreAdapter(conversationId),
@@ -273,6 +415,34 @@ private fun buildMacroSubstitutor(
         }
         out
     }
+}
+
+private fun postProcessAssistantRenderedText(
+    regexed: String,
+    assistant: Assistant?,
+    scripts: List<RegexScript>,
+    scope: AssistantAffectScope,
+): String {
+    val trimmedRegexed = regexed.trim()
+    val shouldCleanWrapper = scope == AssistantAffectScope.ASSISTANT &&
+        (detectUnmatchedCardWrapperBrackets(assistant, scripts) ||
+            (trimmedRegexed.startsWith('〔') && trimmedRegexed.endsWith('〕')) ||
+            (trimmedRegexed.startsWith('〖') && trimmedRegexed.endsWith('〗')) ||
+            ((trimmedRegexed.startsWith('〔') || trimmedRegexed.startsWith('〖') ||
+                trimmedRegexed.endsWith('〕') || trimmedRegexed.endsWith('〗')) &&
+                (trimmedRegexed.contains("<style", ignoreCase = true) || trimmedRegexed.contains("<div", ignoreCase = true))))
+    if (shouldCleanWrapper && assistant != null && loggedWrapperDiagAssistants.add(assistant.id.toString())) {
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[render-diag] card='${assistant.name}' prompt contains unmatched 〔/〕 wrapper symbols; applied visual-only outer wrapper cleanup",
+        )
+    }
+    val wrapperCleaned = if (shouldCleanWrapper) {
+        stripOuterTemplateWrapperBrackets(regexed, enabled = true)
+    } else {
+        regexed
+    }
+    return convertUnhandledDrawTagsToHtml(wrapperCleaned)
 }
 
 /**
@@ -300,9 +470,9 @@ internal fun computePureKotlinRegexedText(
         ?: assistant?.name?.takeIf { it.isNotBlank() }
         ?: ""
     val effectiveUser = userName?.takeIf { it.isNotBlank() } ?: "User"
-    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId)
-    val afterAssistantRegex = text.replaceRegexes(assistant = assistant, scope = scope, visual = true)
-    return RegexScriptEngine.getRegexedString(
+    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId, assistant)
+    val afterAssistantRegex = sub(text.replaceRegexes(assistant = assistant, scope = scope, visual = true))
+    val regexed = RegexScriptEngine.getRegexedString(
         rawString = afterAssistantRegex,
         scripts = scripts,
         placement = placement,
@@ -311,6 +481,7 @@ internal fun computePureKotlinRegexedText(
         depth = depth,
         substitute = sub,
     )
+    return postProcessAssistantRenderedText(regexed, assistant, scripts, scope)
 }
 
 internal fun computeStRegexedText(
@@ -345,7 +516,7 @@ internal fun computeStRegexedText(
         ?: assistant?.name?.takeIf { it.isNotBlank() }
         ?: ""
     val effectiveUser = userName?.takeIf { it.isNotBlank() } ?: "User"
-    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId)
+    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId, assistant)
     val isUserMsg = (placement == 1)
     val invokeFormatter = shouldInvokeWebViewMessageFormatter(text)
     val beforeRegexText = if (invokeFormatter) {
@@ -353,7 +524,7 @@ internal fun computeStRegexedText(
     } else {
         text
     }
-    val afterAssistantRegex = beforeRegexText.replaceRegexes(assistant = assistant, scope = scope, visual = true)
+    val afterAssistantRegex = sub(beforeRegexText.replaceRegexes(assistant = assistant, scope = scope, visual = true))
     val regexed = RegexScriptEngine.getRegexedString(
         rawString = afterAssistantRegex,
         scripts = scripts,
@@ -363,21 +534,21 @@ internal fun computeStRegexedText(
         depth = depth,
         substitute = sub,
     )
-    val rendered = if (invokeFormatter || shouldInvokeWebViewMessageFormatter(regexed)) {
-        val afterRegex = TavernRuntimeManager.runMessageFormatterStageBlocking("afterRegex", regexed, charName, isUserMsg)
-        TavernRuntimeManager.runMessageFormatterStageBlocking("afterMarkdown", afterRegex, charName, isUserMsg)
+    val afterFormatter = if (invokeFormatter || shouldInvokeWebViewMessageFormatter(regexed)) {
+        TavernRuntimeManager.runMessageFormatterStageBlocking("afterRegex", regexed, charName, isUserMsg)
     } else {
         regexed
     }
+    val rendered = postProcessAssistantRenderedText(afterFormatter, assistant, scripts, scope)
     StRegexTextCache.put(cacheKey, text, rendered)
     return rendered
 }
 
 /**
- * 挂起式（非阻塞）消息正则与 ST 1.19.0 MessageFormatter 三阶段管线：
+ * 挂起式（非阻塞）消息正则与 ST 1.19.0 MessageFormatter 管线：
  * 供 Compose `produceState`（后台 `Dispatchers.Default`）或协程直接调用，
  * 通过 `runMessageFormatterStageAsync` 挂起等待 WebView JS 钩子完成，
- * 彻底消除主线程 `Looper.getMainLooper()` 提前返回导致 `MessageFormatter` 钩子被绕过的缺陷。
+ * `afterMarkdown` 阶段统一在 `MessageHtmlBlock.rememberAfterMarkdownHtml` 执行，避免重复执行两次。
  */
 internal suspend fun computeStRegexedTextAsync(
     text: String,
@@ -412,7 +583,7 @@ internal suspend fun computeStRegexedTextAsync(
         ?: assistant?.name?.takeIf { it.isNotBlank() }
         ?: ""
     val effectiveUser = userName?.takeIf { it.isNotBlank() } ?: "User"
-    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId)
+    val sub = buildMacroSubstitutor(charName, effectiveUser, conversationId, assistant)
     val isUserMsg = (placement == 1)
     val invokeFormatter = shouldInvokeWebViewMessageFormatter(cleanedText)
     val beforeRegexText = if (invokeFormatter) {
@@ -420,7 +591,7 @@ internal suspend fun computeStRegexedTextAsync(
     } else {
         cleanedText
     }
-    val afterAssistantRegex = beforeRegexText.replaceRegexes(assistant = assistant, scope = scope, visual = true)
+    val afterAssistantRegex = sub(beforeRegexText.replaceRegexes(assistant = assistant, scope = scope, visual = true))
     val regexed = RegexScriptEngine.getRegexedString(
         rawString = afterAssistantRegex,
         scripts = scripts,
@@ -430,12 +601,12 @@ internal suspend fun computeStRegexedTextAsync(
         depth = depth,
         substitute = sub,
     )
-    val rendered = if (invokeFormatter || shouldInvokeWebViewMessageFormatter(regexed)) {
-        val afterRegex = TavernRuntimeManager.runMessageFormatterStageAsync("afterRegex", regexed, charName, isUserMsg)
-        TavernRuntimeManager.runMessageFormatterStageAsync("afterMarkdown", afterRegex, charName, isUserMsg)
+    val afterFormatter = if (invokeFormatter || shouldInvokeWebViewMessageFormatter(regexed)) {
+        TavernRuntimeManager.runMessageFormatterStageAsync("afterRegex", regexed, charName, isUserMsg)
     } else {
         regexed
     }
+    val rendered = postProcessAssistantRenderedText(afterFormatter, assistant, scripts, scope)
     StRegexTextCache.put(cacheKey, cleanedText, rendered)
     return rendered
 }
@@ -462,7 +633,9 @@ internal fun rememberStRegexedTextWithStatus(
 ): StRegexRenderResult {
     val formatterVersion by TavernRuntimeManager.messageFormatterVersionFlow.collectAsState()
     val hasFormatterHooks = TavernRuntimeManager.hasMessageFormatterHooks
-    if (scripts.isEmpty() && assistant?.regexes.isNullOrEmpty() && !hasFormatterHooks) {
+    if (scripts.isEmpty() && assistant?.regexes.isNullOrEmpty() && !hasFormatterHooks &&
+        !text.contains("{{") && !text.contains("〔") && !text.contains("[出图]")
+    ) {
         return StRegexRenderResult(text = text, isComputing = false)
     }
     val lastRenderedHolder = remember(text) { mutableStateOf<String?>(null) }

@@ -73,6 +73,7 @@ export const world_info_match_whole_words = false;
 export const world_info_use_group_scoring = false;
 
 export function getWorldInfoSettings() {
+    try { __refreshWorldInfoData(); } catch (_e) { /* noop */ }
     // [v208] 对齐 ST getWorldInfoSettings（world-info.js:795-812，14 键）：
     //  ① 补 world_info（对象本体，含 globalSelect/charLore）与 world_info_budget_cap —— 缺它们
     //     JSR lorebook.ts:88 `(settings.world_info as {globalSelect}).globalSelect` 直接 TypeError（P0-2）；
@@ -215,7 +216,21 @@ export function convertCharacterBook(book) {
             base.automationId = String(entry.extensions?.automation_id ?? entry.automation_id ?? '');
             base.role = roleToStNumber(entry.extensions?.role ?? entry.role);
             base.outletName = String(entry.extensions?.outlet_name ?? entry.outlet_name ?? '');
-            base.triggers = Array.isArray(entry.triggers) ? entry.triggers.slice() : [];
+            base.triggers = Array.isArray(entry.triggers) ? entry.triggers.slice() : (Array.isArray(entry.extensions?.triggers) ? entry.extensions.triggers.slice() : []);
+            base.vectorized = entry.extensions?.vectorized === true || entry.vectorized === true;
+            base.sticky = entry.extensions?.sticky != null ? Number(entry.extensions.sticky) : (entry.sticky != null ? Number(entry.sticky) : null);
+            base.cooldown = entry.extensions?.cooldown != null ? Number(entry.extensions.cooldown) : (entry.cooldown != null ? Number(entry.cooldown) : null);
+            base.delay = entry.extensions?.delay != null ? Number(entry.extensions.delay) : (entry.delay != null ? Number(entry.delay) : null);
+            base.displayIndex = entry.extensions?.display_index != null ? Number(entry.extensions.display_index) : (entry.displayIndex != null ? Number(entry.displayIndex) : uid);
+            base.ignoreBudget = entry.extensions?.ignore_budget === true || entry.ignoreBudget === true;
+            base.matchPersonaDescription = entry.extensions?.match_persona_description === true || entry.matchPersonaDescription === true;
+            base.matchCharacterDescription = entry.extensions?.match_character_description === true || entry.matchCharacterDescription === true;
+            base.matchCharacterPersonality = entry.extensions?.match_character_personality === true || entry.matchCharacterPersonality === true;
+            base.matchCharacterDepthPrompt = entry.extensions?.match_character_depth_prompt === true || entry.matchCharacterDepthPrompt === true;
+            base.matchScenario = entry.extensions?.match_scenario === true || entry.matchScenario === true;
+            base.matchCreatorNotes = entry.extensions?.match_creator_notes === true || entry.matchCreatorNotes === true;
+            base.characterFilter = entry.extensions?.character_filter || entry.characterFilter || { isExclude: false, names: [], tags: [] };
+            base.extensions = (entry.extensions && typeof entry.extensions === 'object') ? Object.assign({}, entry.extensions) : {};
             base.world = String(book.name == null ? '' : book.name);
             entries[String(uid)] = base;
         });
@@ -247,19 +262,33 @@ export function parseRegexFromString(str) {
     }
 }
 
-// ---------------------------------------------------------------- 扫描 / 注入（P0 宿主不在 JS 侧处理）
-export async function getWorldInfoPrompt() {
-    // [v208] P2-4：对齐 ST getWorldInfoPrompt（world-info.js:892-914）的 8 键形态
-    // （JSR dataProcessor.ts:315-317 目前只解构 5 个，补 anBefore/anAfter/outletEntries 防将来解构炸）。
-    return {
+// ---------------------------------------------------------------- 扫描 / 注入（直连宿主只读扫描桥）
+export async function getWorldInfoPrompt(chat = [], maxContext = 0, isDryRun = true, globalScanData = {}) {
+    const fallback = {
         worldInfoString: '', worldInfoBefore: '', worldInfoAfter: '',
         worldInfoExamples: [], worldInfoDepth: [],
         anBefore: '', anAfter: '', outletEntries: [],
     };
+    try {
+        if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.getWorldInfoPrompt === 'function') {
+            const raw = window.RikkaBridge.getWorldInfoPrompt(
+                JSON.stringify(Array.isArray(chat) ? chat : []),
+                Number(maxContext) || 0,
+                Boolean(isDryRun),
+                JSON.stringify(globalScanData || {}),
+            );
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object') return Object.assign({}, fallback, parsed);
+            }
+        }
+    } catch (_e) { /* noop */ }
+    return fallback;
 }
 
-export async function checkWorldInfo() {
-    return { found: false, worldInfoString: '', worldInfoBefore: '', worldInfoAfter: '' };
+export async function checkWorldInfo(chat = [], maxContext = 0, isDryRun = true, globalScanData = {}) {
+    const res = await getWorldInfoPrompt(chat, maxContext, isDryRun, globalScanData);
+    return Object.assign({ found: Boolean(res.worldInfoString) }, res);
 }
 
 export async function charUpdatePrimaryWorld() {}
@@ -378,4 +407,95 @@ export async function onWorldInfoChange(eventOrOptions, worldName) {
         }
         await updateWorldInfoList();
     } catch (_e) { /* noop */ }
+}
+
+// ---- [ST 1.19.0 Full Export Parity] ----
+export const SORT_ORDER_KEY = 'world_info_sort_order';
+export const scan_state = {
+    NONE: 0,
+    INITIAL: 1,
+    RECURSION: 2,
+    MIN_ACTIVATIONS: 3,
+};
+export const newWorldInfoEntryDefinition = {
+    key: { default: [], type: 'array' },
+    keysecondary: { default: [], type: 'array' },
+    comment: { default: '', type: 'string' },
+    content: { default: '', type: 'string' },
+    constant: { default: false, type: 'boolean' },
+    vectorized: { default: false, type: 'boolean' },
+    selective: { default: true, type: 'boolean' },
+    selectiveLogic: { default: world_info_logic.AND_ANY, type: 'enum' },
+    addMemo: { default: false, type: 'boolean' },
+    order: { default: 100, type: 'number' },
+    position: { default: 0, type: 'number' },
+    disable: { default: false, type: 'boolean' },
+    ignoreBudget: { default: false, type: 'boolean' },
+    excludeRecursion: { default: false, type: 'boolean' },
+    preventRecursion: { default: false, type: 'boolean' },
+    matchPersonaDescription: { default: false, type: 'boolean' },
+    matchCharacterDescription: { default: false, type: 'boolean' },
+    matchCharacterPersonality: { default: false, type: 'boolean' },
+    matchCharacterDepthPrompt: { default: false, type: 'boolean' },
+    matchScenario: { default: false, type: 'boolean' },
+    matchCreatorNotes: { default: false, type: 'boolean' },
+    delayUntilRecursion: { default: 0, type: 'number' },
+    probability: { default: 100, type: 'number' },
+    useProbability: { default: true, type: 'boolean' },
+    depth: { default: DEFAULT_DEPTH, type: 'number' },
+    outletName: { default: '', type: 'string' },
+    group: { default: '', type: 'string' },
+    groupOverride: { default: false, type: 'boolean' },
+    groupWeight: { default: DEFAULT_WEIGHT, type: 'number' },
+    scanDepth: { default: null, type: 'number?' },
+    caseSensitive: { default: null, type: 'boolean?' },
+    matchWholeWords: { default: null, type: 'boolean?' },
+    useGroupScoring: { default: null, type: 'boolean?' },
+    automationId: { default: '', type: 'string' },
+    role: { default: 0, type: 'enum' },
+    sticky: { default: null, type: 'number?' },
+    cooldown: { default: null, type: 'number?' },
+    delay: { default: null, type: 'number?' },
+    characterFilterNames: { default: [], type: 'array', excludeFromTemplate: true },
+    characterFilterTags: { default: [], type: 'array', excludeFromTemplate: true },
+    characterFilterExclude: { default: false, type: 'boolean', excludeFromTemplate: true },
+    triggers: { default: [], type: 'array' },
+};
+export const worldInfoCache = new Map();
+export const worldInfoFilter = { filter: () => {} };
+export let world_info_budget = 25;
+export let world_info_budget_cap = 0;
+export let world_info_character_strategy = world_info_insertion_strategy.character_first;
+export let world_info_depth = 2;
+export let world_info_min_activations = 0;
+export let world_info_min_activations_depth_max = 0;
+export let world_info_overflow_alert = false;
+export let world_info_recursive = false;
+export async function assignLorebookToChat(..._args) { return null; }
+export function charSetAuxWorlds(..._args) { return null; }
+export async function charUpdateAddAuxWorld(..._args) { return null; }
+export function checkEmbeddedWorld(..._args) { return false; }
+export function deleteWIOriginalDataValue(data, uid, key) { if (data?.originalData?.entries?.[uid]) delete data.originalData.entries[uid][key]; }
+export function duplicateWorldInfoEntry(data, uid) { if (!data?.entries?.[uid]) return null; const copy = JSON.parse(JSON.stringify(data.entries[uid])); const nextUid = getFreeWorldEntryUid(data); copy.uid = nextUid; data.entries[nextUid] = copy; return copy; }
+export function getFreeWorldEntryUid(data) { if (!data?.entries) return 0; const uids = Object.keys(data.entries).map(Number).filter(Number.isFinite); return uids.length ? Math.max(...uids) + 1 : 0; }
+export function getFreeWorldName(baseName = 'New World') { return String(baseName || 'New World'); }
+export async function getSortedEntries(data) { if (!data?.entries) return []; return Object.values(data.entries).sort((a, b) => (b.order ?? 0) - (a.order ?? 0)); }
+export async function getWorldEntry(name, data, entry) { void name; void data; return entry || null; }
+export async function importEmbeddedWorldInfo(..._args) { return null; }
+export async function importWorldInfo(..._args) { return null; }
+export function initWorldInfo(..._args) { return null; }
+export async function moveWorldInfoEntry(..._args) { return null; }
+export function openWorldInfoEditor(..._args) { return null; }
+export function setWorldInfoSettings(settings = {}) { updateWorldInfoSettings(settings, settings?.world_info?.globalSelect); }
+export async function showWorldEditor(..._args) { return null; }
+export function sortWorldInfoEntries(entries = []) { return Array.isArray(entries) ? entries.slice().sort((a, b) => (b.order ?? 0) - (a.order ?? 0)) : []; }
+export function splitKeywordsAndRegexes(keys = []) {
+    const keywords = [];
+    const regexes = [];
+    for (const k of (Array.isArray(keys) ? keys : [])) {
+        const rx = parseRegexFromString(k);
+        if (rx) regexes.push({ regex: rx, raw: k });
+        else keywords.push(k);
+    }
+    return { keywords, regexes };
 }

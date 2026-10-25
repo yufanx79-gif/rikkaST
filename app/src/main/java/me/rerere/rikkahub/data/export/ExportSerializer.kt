@@ -24,6 +24,8 @@ import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.SelectiveLogic
 import me.rerere.rikkahub.data.st.regex.RegexScript
 import me.rerere.rikkahub.data.st.regex.parseCardRegexScripts
+import me.rerere.rikkahub.data.st.preset.SpresetCompat
+import me.rerere.rikkahub.data.st.preset.StSpresetConfig
 import me.rerere.rikkahub.ui.pages.assistant.detail.mapSelectiveLogic
 import me.rerere.rikkahub.ui.pages.assistant.detail.parseDelayUntilRecursionInt
 import me.rerere.rikkahub.ui.pages.assistant.detail.mapTavernRole
@@ -259,7 +261,7 @@ object ModeInjectionSerializer : ExportSerializer<PromptInjection.ModeInjection>
                 id = s.id.ifBlank { Uuid.random().toString() },
                 sourcePresetGroup = label,
             )
-        }
+        }.distinctBy { it.id }
         return PresetSubfieldState.PRESENT_VALID to tagged
     }
 
@@ -339,7 +341,7 @@ object ModeInjectionSerializer : ExportSerializer<PromptInjection.ModeInjection>
         val out = mutableListOf<String>()
         val spreset = ext["SPreset"] as? JsonObject
         if (spreset != null && spreset.isNotEmpty()) {
-            val supportedKeys = setOf("ChatSquash", "RegexBinding", "MacroNest", "version", "enabled")
+            val supportedKeys = SpresetCompat.supportedKeys()
             val unsupportedKeys = spreset.keys.filterNot { it in supportedKeys }
             if (unsupportedKeys.isNotEmpty()) {
                 out += "SPreset(${unsupportedKeys.take(6).joinToString(", ")})"
@@ -950,7 +952,7 @@ private data class SillyTavernEntry(
     val depth: Int = 4,
     val scanDepth: Int? = null,
     val caseSensitive: Boolean? = null,
-    val selective: Boolean = false,
+    val selective: Boolean = true,
     val selectiveLogic: Int = 0,
     val probability: Int? = 100,
     val useProbability: Boolean? = true,
@@ -1008,6 +1010,8 @@ data class StActivePresetConfig(
     val spresetDisabledRegexIds: Set<String> = emptySet(),
     /** extensions.SPreset.MacroNest 嵌套宏展开最大轮次 */
     val spresetMacroNestDepth: Int = 0,
+    /** extensions.SPreset 全量配置（ToolBindings / MessageInjections / OutputPreprocessing / ...） */
+    val spresetConfig: StSpresetConfig = StSpresetConfig(),
     /** 预设中的 logit_bias 映射（Token ID/文本 -> 偏置值 -100..100） */
     val logitBias: Map<String, Float> = emptyMap(),
     /** 预设中的 guidance_scale / cfg_scale（默认 1.0f） */
@@ -1104,6 +1108,7 @@ fun parseActiveStPresetConfig(
 
         // 解析 extensions.SPreset（ChatSquash / RegexBinding / MacroNest）
         val spreset = (root["extensions"] as? JsonObject)?.get("SPreset") as? JsonObject
+        val spresetConfig = SpresetCompat.parse(spreset)
         val chatSquashObj = spreset?.get("ChatSquash") as? JsonObject
         val spresetSquash = (chatSquashObj?.get("enabled") as? JsonPrimitive)?.booleanOrNull == true ||
             (spreset?.get("chat_squash") as? JsonPrimitive)?.booleanOrNull == true
@@ -1154,6 +1159,7 @@ fun parseActiveStPresetConfig(
             spresetEnabledRegexIds = spresetEnabledRx,
             spresetDisabledRegexIds = spresetDisabledRx,
             spresetMacroNestDepth = macroNestDepth,
+            spresetConfig = spresetConfig,
             logitBias = parsePresetLogitBias(root["logit_bias"]),
             cfgScale = (root["guidance_scale"] as? JsonPrimitive)?.contentOrNull?.toFloatOrNull()
                 ?: (root["cfg_scale"] as? JsonPrimitive)?.contentOrNull?.toFloatOrNull()

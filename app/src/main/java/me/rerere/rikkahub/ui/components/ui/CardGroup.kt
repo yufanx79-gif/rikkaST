@@ -1,67 +1,67 @@
 package me.rerere.rikkahub.ui.components.ui
 
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.LocalIndication
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemColors
-import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ProvideTextStyle
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastForEachIndexed
-import me.rerere.rikkahub.ui.theme.AppMotion
-import me.rerere.rikkahub.ui.theme.AppRadii
-import me.rerere.rikkahub.ui.theme.AppSpacing
-import me.rerere.rikkahub.ui.theme.AppStroke
-import me.rerere.rikkahub.ui.theme.AppType
 import me.rerere.rikkahub.ui.theme.CustomColors
-import me.rerere.rikkahub.ui.theme.appSurfaceColors
 
-// v217 A4：视觉对齐 Kelivo 的 iOS 分组卡（spec-kelivo-port-20261002 第 5.1 节）
-private val CardGroupCorner = AppRadii.md
-private val CardGroupDividerAlpha = 0.18f
+private val CardGroupCorner = 20.dp
+private val CardGroupItemSpacing = 2.dp
+private val CardGroupInnerCorner = 4.dp
 
 private data class CardGroupItem(
     val onClick: (() -> Unit)?,
     val modifier: Modifier,
     val overlineContent: (@Composable () -> Unit)?,
-    val headlineContent: @Composable () -> Unit,
+    val headlineContent: (@Composable () -> Unit)?,
     val supportingContent: (@Composable () -> Unit)?,
     val leadingContent: (@Composable () -> Unit)?,
     val trailingContent: (@Composable () -> Unit)?,
     val colors: ListItemColors?,
+    // 不为空时是表单项，标题行下方接这块内容
+    val formContent: (@Composable ColumnScope.() -> Unit)? = null,
 )
 
 @DslMarker
@@ -78,6 +78,16 @@ interface CardGroupScope {
         trailingContent: (@Composable () -> Unit)? = null,
         colors: ListItemColors? = null,
         headlineContent: @Composable () -> Unit,
+    )
+
+    // 表单项：标题行下方带一块自定义内容（输入框、滑块等），不传标题时整项都是自定义内容
+    fun formItem(
+        modifier: Modifier = Modifier,
+        headlineContent: (@Composable () -> Unit)? = null,
+        supportingContent: (@Composable () -> Unit)? = null,
+        leadingContent: (@Composable () -> Unit)? = null,
+        trailingContent: (@Composable () -> Unit)? = null,
+        content: @Composable ColumnScope.() -> Unit,
     )
 }
 
@@ -107,66 +117,209 @@ private class CardGroupScopeImpl : CardGroupScope {
             )
         )
     }
+
+    override fun formItem(
+        modifier: Modifier,
+        headlineContent: (@Composable () -> Unit)?,
+        supportingContent: (@Composable () -> Unit)?,
+        leadingContent: (@Composable () -> Unit)?,
+        trailingContent: (@Composable () -> Unit)?,
+        content: @Composable ColumnScope.() -> Unit,
+    ) {
+        items.add(
+            CardGroupItem(
+                onClick = null,
+                modifier = modifier,
+                overlineContent = null,
+                headlineContent = headlineContent,
+                supportingContent = supportingContent,
+                leadingContent = leadingContent,
+                trailingContent = trailingContent,
+                colors = null,
+                formContent = content,
+            )
+        )
+    }
 }
 
-/**
- * 一行设置项。
- *
- * v217 A4：整组共用一张卡片（见 [CardGroup]），所以这里不再自绘圆角，
- * 按压反馈也从「圆角弹开」换成「200ms 颜色补间 + 零涟漪」（Kelivo 的 iOS 触感语言，
- * 见 spec-kelivo-port-20261002 第 5.1 / 5.4 节）。
- */
+// 带开关的项，点整行也能切换
+fun CardGroupScope.switchItem(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    supportingContent: (@Composable () -> Unit)? = null,
+    leadingContent: (@Composable () -> Unit)? = null,
+    headlineContent: @Composable () -> Unit,
+) = item(
+    onClick = if (enabled) {
+        { onCheckedChange(!checked) }
+    } else null,
+    modifier = modifier,
+    supportingContent = supportingContent,
+    leadingContent = leadingContent,
+    trailingContent = {
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+    },
+    headlineContent = headlineContent,
+)
+
+// 分组里第 index 项的形状，给不方便走 CardGroup 的列表（比如可拖拽排序的）用
+fun cardGroupItemShape(index: Int, count: Int): Shape {
+    val top = if (index == 0) CardGroupCorner else CardGroupInnerCorner
+    val bottom = if (index == count - 1) CardGroupCorner else CardGroupInnerCorner
+    return RoundedCornerShape(topStart = top, topEnd = top, bottomStart = bottom, bottomEnd = bottom)
+}
+
+// 列表项开头带圆形底色的图标
+@Composable
+fun CardGroupIcon(
+    icon: ImageVector,
+    modifier: Modifier = Modifier,
+    containerColor: Color = MaterialTheme.colorScheme.secondaryContainer,
+    contentColor: Color = MaterialTheme.colorScheme.onSecondaryContainer,
+) {
+    val animatedContainerColor by animateColorAsState(
+        targetValue = containerColor,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+    )
+    val animatedContentColor by animateColorAsState(
+        targetValue = contentColor,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+    )
+    Box(
+        modifier = modifier
+            .size(40.dp)
+            .background(animatedContainerColor, CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            modifier = Modifier.size(20.dp),
+            tint = animatedContentColor,
+        )
+    }
+}
+
+// 标题行右侧显示当前取值的小标签，比如滑块的数值
+@Composable
+fun CardGroupValue(
+    text: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            // 等宽数字，拖动滑块时标签宽度不跳
+            style = MaterialTheme.typography.labelLarge.copy(fontFeatureSettings = "tnum"),
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun CardGroupFormItem(
+    item: CardGroupItem,
+    formContent: @Composable ColumnScope.() -> Unit,
+    count: Int,
+    index: Int,
+) {
+    Surface(
+        modifier = item.modifier.fillMaxWidth(),
+        shape = cardGroupItemShape(index, count),
+        color = CustomColors.listItemColors.containerColor,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (item.headlineContent != null || item.leadingContent != null || item.trailingContent != null) {
+                Row(
+                    // 和 ListItem 一致：带说明文字时，两侧内容靠上对齐
+                    verticalAlignment = if (item.supportingContent != null) Alignment.Top else Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    item.leadingContent?.invoke()
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        item.headlineContent?.let { headline ->
+                            ProvideTextStyle(MaterialTheme.typography.bodyLarge, headline)
+                        }
+                        item.supportingContent?.let { supporting ->
+                            CompositionLocalProvider(
+                                LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant
+                            ) {
+                                ProvideTextStyle(MaterialTheme.typography.bodyMedium, supporting)
+                            }
+                        }
+                    }
+                    item.trailingContent?.invoke()
+                }
+            }
+            formContent()
+        }
+    }
+}
+
 @Composable
 private fun CardGroupListItem(
     item: CardGroupItem,
+    count: Int,
+    index: Int,
 ) {
+    val isFirst = index == 0
+    val isLast = index == count - 1
+
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
-    val pressTint by animateColorAsState(
-        targetValue = if (isPressed) {
-            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
-        } else {
-            Color.Transparent
-        },
-        animationSpec = tween(durationMillis = AppMotion.press, easing = FastOutSlowInEasing),
-        label = "CardGroupPressTint",
+
+    val topCorner by animateDpAsState(
+        targetValue = if (isPressed || count == 1 || isFirst) CardGroupCorner else CardGroupInnerCorner,
+        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+    )
+    val bottomCorner by animateDpAsState(
+        targetValue = if (isPressed || count == 1 || isLast) CardGroupCorner else CardGroupInnerCorner,
+        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
     )
 
     ListItem(
-        headlineContent = item.headlineContent,
+        headlineContent = item.headlineContent ?: {},
         modifier = item.modifier
             .fillMaxWidth()
-            .background(pressTint)
+            .clip(
+                RoundedCornerShape(
+                    topStart = topCorner,
+                    topEnd = topCorner,
+                    bottomStart = bottomCorner,
+                    bottomEnd = bottomCorner,
+                )
+            )
             .then(
                 if (item.onClick != null) {
                     Modifier.clickable(
                         interactionSource = interactionSource,
-                        // 零涟漪：Kelivo 的 iOS 触感语言（上游 ios_tactile.dart:133-148）
-                        indication = null,
+                        indication = LocalIndication.current,
                         onClick = item.onClick,
                     )
-                } else {
-                    Modifier
-                }
+                } else Modifier
             ),
         overlineContent = item.overlineContent,
         supportingContent = item.supportingContent,
         leadingContent = item.leadingContent,
         trailingContent = item.trailingContent,
-        // 容器透明：底色由外层那张 surfaceCard 提供，行内只叠按压着色。
-        colors = item.colors ?: ListItemDefaults.colors(containerColor = Color.Transparent),
+        colors = item.colors ?: CustomColors.listItemColors,
     )
 }
 
-/**
- * iOS 风格分组设置卡。
- *
- * v217 A4：API 与 v216 完全一致（item DSL + title），只换视觉 ——
- * 由「每个 item 各自一张圆角 20 的 surfaceBright 卡、中间留 2dp 缝」
- * 改成「整组一张 surfaceCard 卡（圆角 12 + 0.6dp hairline 描边）+ 行间 0.6dp 分隔线」。
- * 填充与描边取 [MaterialTheme.appSurfaceColors]，因此会跟着 Surface Ladder（A2）走：
- * 自定义主题/动态色下自动协调，7 套预设回落 M3 容器档位。
- */
 @Composable
 fun CardGroup(
     modifier: Modifier = Modifier,
@@ -178,50 +331,24 @@ fun CardGroup(
 
     Column(modifier = modifier) {
         if (title != null) {
-            // 分组标题：13sp semibold、中性色、左边与卡片内容对齐（Kelivo settings_page 规格）。
-            ProvideTextStyle(
-                MaterialTheme.typography.labelLarge.copy(
-                    fontSize = AppType.label,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            ) {
-                CompositionLocalProvider(
-                    LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant
-                ) {
-                    Box(
-                        modifier = Modifier.padding(
-                            start = AppSpacing.lg,
-                            top = AppSpacing.sm,
-                            bottom = AppSpacing.sm,
-                        )
-                    ) {
+            CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.primary) {
+                ProvideTextStyle(MaterialTheme.typography.titleSmallEmphasized) {
+                    Box(modifier = Modifier.padding(start = 4.dp, top = 8.dp, bottom = 8.dp)) {
                         title()
                     }
                 }
             }
         }
-
         val count = scope.items.size
-        if (count > 0) {
-            val surfaceColors = MaterialTheme.appSurfaceColors
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(CardGroupCorner),
-                color = surfaceColors.surfaceCard,
-                border = BorderStroke(AppStroke.hairline, surfaceColors.hairline),
-            ) {
-                Column {
-                    scope.items.fastForEachIndexed { index, item ->
-                        CardGroupListItem(item = item)
-                        if (index != count - 1) {
-                            HorizontalDivider(
-                                thickness = AppStroke.hairline,
-                                color = MaterialTheme.colorScheme.outlineVariant
-                                    .copy(alpha = CardGroupDividerAlpha),
-                            )
-                        }
-                    }
-                }
+        scope.items.fastForEachIndexed { index, item ->
+            val formContent = item.formContent
+            if (formContent != null) {
+                CardGroupFormItem(item = item, formContent = formContent, count = count, index = index)
+            } else {
+                CardGroupListItem(item = item, count = count, index = index)
+            }
+            if (index != count - 1) {
+                Spacer(modifier = Modifier.height(CardGroupItemSpacing))
             }
         }
     }

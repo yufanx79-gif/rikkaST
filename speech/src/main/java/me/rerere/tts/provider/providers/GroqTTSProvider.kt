@@ -56,7 +56,7 @@ class GroqTTSProvider : TTSProvider<TTSProviderSetting.Groq> {
             )
         }
 
-        val audioData = response.body!!.bytes()
+        val audioData = response.body.bytes()
 
         emit(
             AudioChunk(

@@ -5,6 +5,7 @@ import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -13,6 +14,8 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import me.rerere.rikkahub.data.ai.MemoryConsolidationScheduler
+import me.rerere.rikkahub.data.ai.MemoryConsolidationStatus
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
@@ -23,20 +26,23 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.Lorebook
-import me.rerere.rikkahub.data.model.InjectionPosition
+import me.rerere.rikkahub.data.model.MemoryFile
 import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.SelectiveLogic
 import me.rerere.rikkahub.data.model.Tag
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.repository.memoryId
 import kotlin.uuid.Uuid
 
 private const val TAG = "AssistantDetailVM"
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class AssistantDetailVM(
     private val id: String,
     private val settingsStore: SettingsStore,
     private val memoryRepository: MemoryRepository,
+    private val memoryConsolidationScheduler: MemoryConsolidationScheduler? = null,
     private val filesManager: FilesManager,
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
@@ -78,16 +84,26 @@ class AssistantDetailVM(
             scope = viewModelScope, started = SharingStarted.Eagerly, initialValue = Assistant()
         )
 
-    val memories = assistant
+    val memoryId: String
+        get() = assistant.value.memoryId
+
+    val memories: StateFlow<List<MemoryFile>> = assistant
         .flatMapLatest { currentAssistant ->
-            if (currentAssistant.useGlobalMemory) {
-                memoryRepository.getGlobalMemoriesFlow()
-            } else {
-                memoryRepository.getMemoriesOfAssistantFlow(assistantId.toString())
-            }
+            memoryRepository.getFilesFlow(currentAssistant.memoryId)
         }
         .stateIn(
             scope = viewModelScope, started = SharingStarted.Eagerly, initialValue = emptyList()
+        )
+
+    val memoryConsolidation: StateFlow<MemoryConsolidationStatus> = assistant
+        .flatMapLatest { currentAssistant ->
+            memoryConsolidationScheduler?.statusOf(currentAssistant.memoryId)
+                ?: MutableStateFlow(MemoryConsolidationStatus())
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = MemoryConsolidationStatus(),
         )
 
     val providers = settingsStore
@@ -105,6 +121,16 @@ class AssistantDetailVM(
         }.stateIn(
             scope = viewModelScope, started = SharingStarted.Eagerly, initialValue = emptyList()
         )
+
+    fun organizeMemory() {
+        memoryConsolidationScheduler?.organize(memoryId)
+    }
+
+    fun deleteMemory(memory: MemoryFile) {
+        viewModelScope.launch {
+            memoryRepository.deleteFile(memoryId, memory.path)
+        }
+    }
 
     fun updateTags(tagIds: List<Uuid>, tags: List<Tag>) {
         viewModelScope.launch {
