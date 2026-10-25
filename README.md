@@ -1,12 +1,334 @@
-# rikkaST — Native Android SillyTavern 1.19 Compatible Client
+# rikkaST — 把酒馆装进手机
 
-[中文文档 (README_ZH_CN.md)](./README_ZH_CN.md) | [Compatibility Matrix](./COMPATIBILITY_MATRIX.md) | [Known Issues](./KNOWN_LIMITATIONS.md)
+["简体中文"](README.md) | ["English"](README_EN.md)
 
-**rikkaST** (`me.rerere.rikkahub.st`) is a native Android client built on top of **RikkaHub** (migrated to 3.1.0 core architecture) with full **SillyTavern 1.19.0** feature parity.
+> 最新版本：v2.5.6-public
 
-## Key Highlights
-- **1-Tap Character Card Import**: Supports V1 / V2 / CCv3 `.png`, `.json`, `.charx`, and `.byaf` archives with automatic lorebook binding, asset extraction, and `/thumbnail` + `/characters/<id>.png` avatar alias resolution.
-- **Accurate HTML Panel & Status Bar Rendering**: Multi-`<style>` container grouping (`findTopLevelHtmlNodes` + `groupTopLevelHtmlNodes`), static HTML card detection (`post-card`), visual-only unmatched `〔`/`〕` template wrapper cleanup, `[出图]...[/出图]` collapsible draw prompt cards, and a per-panel reload button below assistant bubbles.
-- **Universal Floating Window & ST-iPhonie Host**: Resident floating dock for `ST-iPhonie`, character card floating stages, `st-memory-enhancement`, and `LittleWhiteBox`, with file chooser (`<input type="file">`), JS dialog (`alert`/`confirm`/`prompt`), `window.open` sub-navigation, and per-chat "Don't show again" state.
-- **VPN-Independent Fast WebView Boot**: Local vendor caching with `Cache-Control` + `Content-Length`, explicit `boot_complete` readiness gating, and a 5-second per-extension dynamic import timeout.
-- **End-to-End Generation Cancellation**: OkHttp `Call.await()` cancellation propagation, JSR `chatCompletionCancel` job termination, bounded 2.5s `stopGeneration`, and a dedicated Stop button visible even when draft text or attachments are present.
+rikkaST 是一个基于 RikkaHub 定制的原生 Android 大模型聊天客户端，内建 SillyTavern（酒馆）兼容层，目标是让酒馆的角色卡、世界书、预设、提示词处理和第三方扩展生态更自然地运行在手机上。
+
+["下载最新 APK"](https://github.com/yufanx79-gif/rikkaST/releases/tag/v2.5.6-public) · ["查看全部 Releases"](https://github.com/yufanx79-gif/rikkaST/releases) · ["查看更新记录"](CHANGELOG_FOR_RELEASE.md)
+
+---
+
+## 写在前面
+
+这是一个在 AI 辅助下持续开发的个人开源项目。我还在学习，也在不断修复问题、补齐功能。项目能走到现在，离不开 RikkaHub、SillyTavern、Kelivo 等优秀开源项目提供的代码、文档与设计参考。
+
+我希望做的，不只是把一个聊天应用换个界面，而是尽可能把酒馆的使用体验带到 Android 上：能导入角色卡，能管理世界书和提示词，能运行脚本，也能逐步接入酒馆的第三方扩展。
+
+但 rikkaST 目前并不等于完整的 SillyTavern，也不保证所有酒馆插件都能运行。原生功能、兼容实现和仍然缺失的部分会尽量分开说明。
+
+如果你遇到了问题，欢迎提交 Issue 或提出建议。功能不完善的地方，我会继续迭代。
+
+## 目录
+
+- [项目简介](#项目简介)
+- [功能总览](#功能总览)
+- [酒馆兼容情况](#酒馆兼容情况)
+- [安装与更新](#安装与更新)
+- [构建项目](#构建项目)
+- [项目与上游的关系](#项目与上游的关系)
+- [隐私与网络](#隐私与网络)
+- [已知限制](#已知限制)
+- [致谢](#致谢)
+- [许可证](#许可证)
+
+---
+
+## 项目简介
+
+SillyTavern 的角色卡、世界书、预设、宏、正则和第三方扩展构成了一套相互关联的生态。但这套生态主要围绕网页环境构建，在手机上使用时，浏览器性能、界面交互和扩展兼容性都可能成为障碍。
+
+rikkaST 选择在 RikkaHub 的 Android 原生应用基础上，逐步实现酒馆的数据格式、提示词处理逻辑和扩展运行环境。
+
+项目采用两条路线：
+
+- 原生实现：角色卡、世界书、宏、预设管理、提示词注入、斜杠命令等适合原生实现的能力，直接接入 Android 应用。
+- WebView 兼容运行时：为部分酒馆 JavaScript 扩展提供其所需的前端 API、模块、DOM 容器和事件机制，尽量复用原有扩展，而不是逐个重写。
+
+项目目标是持续提高酒馆生态的兼容程度，同时保留 RikkaHub 原有的模型接入、聊天、工具和知识库等能力。
+
+相关技术文档：
+
+- [酒馆兼容性报告](docs/ST-COMPATIBILITY.md)
+- [酒馆功能对照表](docs/ST-FEATURE-MATRIX.md)
+- [与上游的代码差异](DIVERGENCE.md)
+- [构建说明](BUILDING.md)
+- [隐私与网络说明](docs/PRIVACY-NETWORK.md)
+
+## 功能总览
+
+### 1. 角色卡：导入、编辑与导出
+
+rikkaST 对 SillyTavern 角色卡进行了专门的兼容处理。
+
+- 支持酒馆角色卡的主要数据结构，包括 V2/V3 角色卡中的描述、性格、场景、开场白、示例对话、作者备注、备选开场白、深度提示等字段。
+- 尽量保留扩展字段及原始数据，减少导入再导出时的信息损失。
+- 支持角色卡内嵌世界书、正则和脚本等相关数据的处理。
+- 提供原生可视化编辑界面。
+- 支持 PNG / JSON 角色卡导出。
+- 支持 `.charx` 角色卡及内嵌资源处理，尽可能将 `embeded://`、`embedded://`、`ccdefault:` 等资源引用转换为应用可访问的本地资源地址。
+
+复杂角色卡仍可能存在个别字段或特殊资源的兼容问题，建议对重要角色卡保留原始文件。
+
+### 2. 世界书：关键词、递归扫描与注入
+
+世界书是酒馆角色设定与剧情记忆的重要组成部分。rikkaST 提供独立的世界书管理与提示词注入能力。
+
+- 支持主关键词、副关键词及多种组合逻辑。
+- 支持整词匹配、正则匹配和大小写敏感设置。
+- 支持常驻条目、触发概率、延迟激活、粘性、冷却和分组逻辑。
+- 支持递归扫描、扫描深度和 token 预算等设置。
+- 支持控制条目插入位置、排序和相关生成行为。
+- 支持外置与内嵌世界书的管理及同步。
+- 支持将世界书导出为 SillyTavern World Info JSON。
+
+世界书引擎以酒馆的相关语义为兼容目标，但不应将其视为对官方全部边缘行为的绝对复刻。
+
+### 3. 预设管理与提示词注入分离
+
+rikkaST 将预设管理和提示词注入作为独立入口，减少不同配置职责混在一起带来的维护负担。
+
+- 预设管理用于处理预设配置及相关导入内容。
+- 提示词注入用于管理与生成上下文相关的注入配置。
+- 支持导入酒馆预设文件及相关备份数据。
+- 对已接入的酒馆预设参数进行解析和应用。
+- 根据配置处理停止词、采样参数、强制回复前缀及部分消息后处理策略。
+
+具体参数是否生效，还取决于模型提供商、生成接口及对应参数的兼容情况。
+
+### 4. 宏与提示词模板
+
+rikkaST 内置宏处理逻辑，用于在发送消息前处理动态内容。
+
+- 支持对话变量的读取、写入和修改。
+- 支持条件判断、比较运算和嵌套条件。
+- 支持随机选择、骰子、时间及部分对话状态相关宏。
+- 支持对提示词、角色卡和世界书中的相关内容进行模板处理。
+- 支持 EJS 风格模板渲染，以兼容 ST-Prompt-Template 的部分使用方式。
+- 对无法识别的宏尽可能保留原文，避免破坏用户内容。
+
+### 5. 斜杠命令与 STscript
+
+rikkaST 提供原生斜杠命令入口，并实现了 SillyTavern STscript 的一部分语法与执行逻辑。
+
+包括：
+
+- 对话控制与消息操作。
+- 角色卡、人设和变量相关操作。
+- 消息分支、Swipe 及部分检查点操作。
+- 管道、参数传递及部分脚本控制命令。
+- `/popup`、`/input`、`/buttons` 等命令对应的原生弹窗交互。
+- Quick Reply 自动执行及扩展调用斜杠命令的相关路径。
+
+STscript 仍属于持续完善中的兼容实现，并非所有官方命令、参数和执行细节均已覆盖。
+
+### 6. Persona、导演备注与群聊
+
+- Persona（人设）：支持人设管理、角色绑定及多个注入位置。
+- Author's Note（导演备注）：支持注入间隔、深度、角色及开关等设置。
+- 群聊：支持多个角色参与对话，并提供角色选择策略、自动接话等功能。
+
+这些模块以酒馆的相关使用语义为参考，具体行为可能与官方版本存在差异。
+
+### 7. 正则、Quick Reply 与脚本管理
+
+- 正则脚本：支持多个作用域及不同处理位置，可用于输入、输出和相关提示词处理流程。
+- Quick Reply：支持快捷回复集合、命令执行及部分自动触发机制。
+- 脚本来源管理：支持角色卡脚本、全局脚本和预设脚本等来源的管理。
+- 自动触发：接入启动、切换会话、用户发送消息、AI 回复完成及相关联动场景中的部分生命周期。
+
+不同触发条件的实际效果取决于对应事件是否已经接入，以及脚本本身使用的 API。
+
+### 8. 第三方扩展运行时
+
+rikkaST 内置 WebView 运行时，尝试为酒馆第三方 JavaScript 扩展提供兼容环境。
+
+目前的工作包括：
+
+- 从 ZIP 或支持的 HTTP(S) 地址安装第三方扩展。
+- 加载扩展脚本、依赖及相关资源。
+- 提供部分酒馆核心模块的兼容实现。
+- 提供 `SillyTavern.getContext()`、`eventSource`、`TavernHelper` 等相关前端 API 的兼容入口。
+- 提供扩展设置界面所需的部分 DOM 容器。
+- 将部分酒馆事件接入原生生成、消息和世界书处理流程。
+- 为部分扩展提供聊天生成接口，使其能够调用应用的生成流程。
+- 尽可能本地化部分第三方 JavaScript 依赖，改善重复加载及网络受限环境下的体验。
+
+目前重点适配的扩展和能力：
+
+| 扩展或模块 | 当前工作重点 |
+| --- | --- |
+| 酒馆助手（JS-Slash-Runner） | 脚本、按钮、变量、世界书、斜杠命令及部分生成接口 |
+| ST-Prompt-Template | EJS 模板渲染、PromptManager 及相关变量语义 |
+| MVU（MagVarUpdate） | 变量更新解析、运行时及相关面板支持 |
+| 其他第三方扩展 | 按依赖的 API、事件和 DOM 能力逐步适配 |
+
+上述列表表示已有针对性适配工作，并不代表所有功能在所有扩展版本中都已通过完整实测。
+
+### 9. 原生工具、技能与知识库
+
+rikkaST 也保留并扩展了 RikkaHub 的原生能力。
+
+- 模型与聊天：多模型提供商、流式输出、对话分支、消息编辑及重新生成等。
+- 工具调用：包括文件操作、Shell、计算器、数据库查询、Python、网页抓取等部分工具。
+- 技能：支持技能加载、管理及相关安装流程。
+- 工作区：提供供 Agent 使用的工作目录和终端能力。
+- 知识库（RAG）：支持导入文档、文件夹、文本和聊天记录，并结合全文检索与向量检索提供上下文。
+- 原生多媒体：保留应用自身的图像生成、TTS 和 ASR 等相关能力，具体可用性取决于对应配置与服务。
+
+需要注意：应用原生的生图和语音能力，与酒馆官方的 Image Generation、TTS 扩展并不是同一套接口，因此不能据此推断酒馆的相关扩展也能运行。
+
+### 10. WebView 面板与稳定性优化
+
+针对酒馆角色卡中的 HTML 面板、状态栏和交互式内容，rikkaST 持续优化 WebView 资源加载和渲染流程。
+
+- 补充常见图片、字体、音视频等资源的 MIME 类型映射。
+- 改善部分外链图片的加载兼容性。
+- 优化部分 HTML/CSS 面板的识别和挂载逻辑。
+- 减少部分流式更新和变量刷新过程中的整页重载与闪烁。
+- 持久化运行时日志，便于定位扩展加载和执行问题。
+- 改善后台生成的保活与异常处理。
+
+不同面板的结构和依赖各不相同，复杂的第三方页面仍可能需要针对性适配。
+
+---
+
+## 酒馆兼容情况
+
+rikkaST 的目标是尽可能兼容 SillyTavern 的使用方式，但目前仍存在明确的技术边界。
+
+| 层级 | 当前状态 | 说明 |
+| --- | --- | --- |
+| 角色卡与基础数据 | 持续完善 | 支持主要字段及相关导入、编辑和导出流程 |
+| 世界书与提示词处理 | 持续完善 | 已实现较多核心逻辑，部分边缘语义仍需验证 |
+| 宏、正则与 STscript | 部分兼容 | 已实现多个常用能力，尚未覆盖全部官方行为 |
+| 第三方扩展运行时 | 部分兼容 | 具备运行环境和针对性适配，但扩展之间的依赖差异很大 |
+| 酒馆服务端 API | 覆盖有限 | 目前仅接入部分聊天生成相关端点 |
+| 酒馆官方内置扩展 | 不完整 | 部分扩展依赖的服务端接口及运行模块尚未实现 |
+
+### 目前已知的主要缺口
+
+- 酒馆服务端 API 尚未完整实现，部分扩展请求的 `/api/*` 路径会无法使用。
+- 官方事件虽然有一部分已经接入，但并非所有已定义事件都会在正确的时机发射。
+- 依赖未实现事件、服务端接口或官方内置扩展的第三方插件可能无法正常工作。
+- 部分扩展依赖复杂的 iframe、DOM 结构、网络代理或特定运行环境，仍需要单独适配。
+- 扩展安装成功并不等于扩展的所有功能都可用。
+
+如果你希望了解具体实现、已知缺口及对应代码证据，请查看：
+
+- [ST-COMPATIBILITY.md：兼容性报告](docs/ST-COMPATIBILITY.md)
+- [ST-FEATURE-MATRIX.md：功能对照表](docs/ST-FEATURE-MATRIX.md)
+
+我更希望把实际完成的部分和还没完成的部分说清楚，而不是用“完全兼容”这样的说法掩盖限制。
+
+---
+
+## 安装与更新
+
+### 下载
+
+前往 [GitHub Releases](https://github.com/yufanx79-gif/rikkaST/releases) 下载最新发布版本。
+
+当前发布版本：**v2.5.6-public**
+
+- 安装包：`rikkaST-2.5.6-public.apk`
+- 预编译架构：`arm64-v8a`
+- 安装包签名：本项目曾更换签名密钥，较早版本可能无法直接覆盖安装。
+
+### 更新注意事项
+
+如果安装时提示签名不一致，可能是因为旧版本与当前版本使用了不同的签名密钥。卸载旧版本后再安装可能解决该问题，但卸载会带来本地数据丢失风险。操作前请先确认聊天、配置和其他重要数据已经备份。
+
+新版本发布后，以 GitHub Releases 页面提供的版本和安装包为准。
+
+---
+
+## 构建项目
+
+详细构建流程、环境要求及配置说明请查看 [BUILDING.md](BUILDING.md)。
+
+基本构建命令：
+
+```bash
+# 构建 Release APK
+./gradlew :app:assembleRelease
+
+# 运行单元测试
+./gradlew :app:testDebugUnitTest
+```
+
+构建需要适配项目配置的 JDK、Android SDK 等环境；部分功能还涉及 NDK、Chaquopy 及本地配置。
+
+Release 签名及相关本地配置请参考构建文档。不要将密钥、令牌或个人配置文件提交到公开仓库。
+
+---
+
+## 项目与上游的关系
+
+rikkaST 是基于开源项目进行修改和扩展的衍生项目。
+
+- [RikkaHub](https://github.com/rikkahub/rikkahub)：提供原生 Android 聊天客户端的基础架构及相关功能。
+- [SillyTavern](https://github.com/SillyTavern/SillyTavern)：提供酒馆兼容目标、数据格式和扩展契约的参考。
+- [Kelivo](https://github.com/Chevey339/kelivo)：为部分 UI 与交互设计提供参考。
+
+本项目保留了大量上游功能，同时增加了酒馆兼容层和其他本地实现。具体哪些文件被修改、哪些文件为本地新增，以及上游版本迁移的相关记录，见 [DIVERGENCE.md](DIVERGENCE.md)。
+
+项目会继续维护与上游的差异，并根据实际需要评估后续更新。
+
+---
+
+## 隐私与网络
+
+项目的隐私与网络行为以代码和相关文档为准。
+
+- 项目声明不接入 Analytics / Crashlytics 类埋点或崩溃上报 SDK。
+- 模型请求会根据用户选择的提供商和配置发送到相应服务。
+- 第三方扩展、技能、网页抓取和用户主动调用的网络功能，可能访问外部服务。
+- 不同功能涉及的网络请求、权限及触发条件，请查看 [隐私与网络说明](docs/PRIVACY-NETWORK.md)。
+
+使用第三方模型服务或扩展时，请同时关注相应服务的隐私政策与数据处理方式。
+
+---
+
+## 已知限制
+
+- 酒馆兼容性仍在开发中。部分角色卡、宏、脚本和第三方扩展可能存在兼容问题。
+- 并非所有酒馆服务端 API 都已实现。依赖未接入接口的扩展可能无法正常工作。
+- 酒馆官方的生图与 TTS 扩展不保证可用。应用原生的图像生成、语音合成等功能属于另一套实现。
+- 预编译 APK 当前仅提供 `arm64-v8a` 架构。
+- 不同版本的签名可能不同。从旧版本升级前，请注意备份本地数据。
+- 项目仍在持续迭代。功能实现、兼容程度和已知问题会随着版本变化。
+
+如果发现问题，欢迎提供复现步骤、应用版本和相关日志。对于扩展兼容问题，如果能同时提供扩展名称与版本、相关设置及错误日志，将更有助于定位原因。
+
+---
+
+## 致谢
+
+感谢以下项目及其贡献者：
+
+- [RikkaHub](https://github.com/rikkahub/rikkahub)：原生 Android LLM 聊天客户端的上游项目。
+- [SillyTavern](https://github.com/SillyTavern/SillyTavern)：酒馆数据格式、功能语义与扩展生态的兼容参考。
+- [Kelivo](https://github.com/Chevey339/kelivo)：UI 与交互设计参考。
+- 所有被使用的第三方库、工具及其维护者。
+
+第三方组件及相关许可证信息请查看 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+---
+
+## 许可证
+
+本项目以 GNU Affero General Public License v3.0（AGPL-3.0）发布，详见 [LICENSE](LICENSE)。
+
+项目基于上游开源代码进行修改和扩展。分发二进制或修改版本时，请遵守适用许可证的要求，并一并提供必要的许可证及第三方声明文件。
+
+### 商标与项目关系
+
+“SillyTavern”及其他项目名称和商标归其各自所有者所有。rikkaST 是独立的兼容实现，不代表 SillyTavern、RikkaHub 或其他相关项目的官方产品，也不意味着获得这些项目的官方背书。
+
+---
+
+如果 rikkaST 对你有帮助，欢迎使用、反馈问题、提交建议，或者给仓库点一个 ⭐。
+
+项目还在继续完善。谢谢每一位愿意尝试它、指出问题并帮助它变得更好的人。
