@@ -2,11 +2,11 @@
 
 ["简体中文"](README.md) | ["English"](README_EN.md)
 
-> Latest version: v2.5.6-public
+> Latest version: v2.5.10-public-20261026
 
 rikkaST is a customized native Android LLM chat client based on RikkaHub, with a built-in SillyTavern compatibility layer. Its goal is to bring SillyTavern's character cards, World Info, presets, prompt processing, and third-party extension ecosystem to Android as naturally as possible.
 
-["Download Latest APK"](https://github.com/yufanx79-gif/rikkaST/releases/tag/v2.5.6-public) · ["All Releases"](https://github.com/yufanx79-gif/rikkaST/releases) · ["Changelog"](CHANGELOG_FOR_RELEASE.md)
+["Download Latest APK"](https://github.com/yufanx79-gif/rikkaST/releases/tag/v2.5.10-public-20261026) · ["All Releases"](https://github.com/yufanx79-gif/rikkaST/releases) · ["Changelog"](RELEASE_NOTES_2.5.10.md)
 
 ---
 
@@ -52,7 +52,7 @@ Related technical documentation:
 
 - [SillyTavern Compatibility Report](docs/ST-COMPATIBILITY.md)
 - [SillyTavern Feature Matrix](docs/ST-FEATURE-MATRIX.md)
-- [Code Differences from Upstream](DIVERGENCE.md)
+- [Code Differences from Upstream](UPSTREAM-COMPATIBILITY.md)
 - [Build Instructions](BUILDING.md)
 - [Privacy and Networking](docs/PRIVACY-NETWORK.md)
 
@@ -230,10 +230,13 @@ I would rather clearly distinguish what has been implemented from what remains i
 
 Visit [GitHub Releases](https://github.com/yufanx79-gif/rikkaST/releases) to download the latest published version.
 
-Current release: **v2.5.6-public**
+Current release: **v2.5.10-public-20261026**
 
-- Package: `rikkaST-2.5.6-public.apk`
+- Package: `rikkaST-2.5.10-public-20261026.apk`
+- SHA-256: `01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
 - Prebuilt architecture: `arm64-v8a`
+- Database: Room v33 (upgrades from v29 / v30 / v31 / v32)
+- Upgrade: install over the existing app; do not uninstall or clear app data.
 - APK signature: This project has changed signing keys in the past, so older versions may not support direct in-place upgrades.
 
 ### Update Notes
@@ -272,7 +275,7 @@ rikkaST is a derivative project that modifies and extends existing open-source p
 - [SillyTavern](https://github.com/SillyTavern/SillyTavern): Serves as a reference for SillyTavern compatibility targets, data formats, and extension contracts.
 - [Kelivo](https://github.com/Chevey339/kelivo): Provides references for selected UI and interaction designs.
 
-This project retains substantial upstream functionality while adding a SillyTavern compatibility layer and other native implementations. For details about modified files, newly added files, and upstream migration records, see [DIVERGENCE.md](DIVERGENCE.md).
+This project retains substantial upstream functionality while adding a SillyTavern compatibility layer and other native implementations. For details about modified files, newly added files, and upstream migration records, see [UPSTREAM-COMPATIBILITY.md](UPSTREAM-COMPATIBILITY.md).
 
 The project will continue maintaining its differences from upstream and evaluating future updates according to its needs.
 
