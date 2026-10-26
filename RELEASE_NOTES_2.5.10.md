@@ -1,59 +1,119 @@
-# rikkaST 2.5.10-public-20261026
+# rikkaST 2.5.10 Public Release
 
-- **版本**：2.5.10
-- **versionCode**：242
-- **包名**：`me.rerere.rikkahub.st`
-- **最低系统**：Android 8.0（API 26）
-- **架构**：arm64-v8a
-- **APK**：`rikkaST-2.5.10-public-20261026.apk`
-- **SHA-256**：`01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
+## ⚠️ 升级前必读：请务必备份数据
 
-## 本次重点
+本次版本涉及数据库兼容性调整及多项功能优化。为避免升级过程中出现闪退、启动失败或其他意外情况，**请务必在升级前完成一次完整的数据备份，并将备份文件保存到手机以外的安全位置。**
 
-### 1. 数据库兼容性修复（Room v33）
+- 请优先使用应用内的备份功能，确认备份文件已成功生成并可以找到。
+- 请勿在升级前卸载应用或清除应用数据。
+- 首次启动时可能需要迁移旧数据，请耐心等待。
+- 如果升级后出现闪退或无法启动，请先保留备份文件，不要反复卸载、清除数据或降级安装，以免增加数据恢复难度。
+- 新版本的数据库结构与旧版不同。**升级到 2.5.10 后，不要再覆盖安装旧版 2.5.6**，否则可能因为数据库降级导致启动失败。
 
-修复了旧版本升级时 `Migration_29_32` 给 `MemoryEntity` 创建多余索引的问题。该索引会导致 Room 在迁移后做 `TableInfo` 校验时失败，典型表现为：
+## 更新内容
 
-```text
-Migration didn't properly handle: MemoryEntity
-```
+### 1. 酒馆助手脚本显示优化
 
-本次新增 `Migration_32_33`，会清理已存在的错误索引：
+优化酒馆助手（TavernHelper）相关脚本的显示与使用体验，改善部分脚本内容的展示问题。
 
-- v29 / v30 / v31 → v32 → v33
-- v32 → v33
-- 全新安装直接创建 v33
+### 2. 闪退与稳定性优化
 
-**聊天记录、角色卡、世界书、记忆、设置等用户数据不会因为本修复被删除。**
+针对应用运行过程中出现的闪退及异常退出问题进行了优化，提升整体运行稳定性。
 
-### 2. 旧备份导入修复
+### 3. 上游 UI 与部分功能更新
 
-- 修复从 2.5.6 等旧版 v29 导出的数据库备份迁移失败问题。
-- 保留旧 `settings.json` 的兼容迁移。
-- 旧版本备份中的供应商、助手、预设、正则脚本等数据可继续导入。
+吸收上游 RikkaHub 的部分 UI 调整与功能更新，改善应用的整体使用体验。
 
-### 3. 保留 2.5.9 的完整能力
+今后，rikkaST 将不再刻意紧跟上游的每一次版本更新，而是优先考虑现有功能的稳定性、兼容性与实际使用体验。对于确实有价值的新功能，会在评估后择优跟进。
 
-- SPreset 预设全兼容。
-- TavernHelper / 酒馆助手脚本导入兼容。
-- 备份恢复稳定性修复。
-- 消息气泡闪烁修复。
-- ST 正则、World Info、运行时与流式生成相关兼容增强。
+### 4. 小手机（ST-iPhonie）出图问题优化
 
-## 升级方式
+针对小手机相关的出图流程问题进行了修复与优化，改善相关功能的使用体验。
 
-1. **请直接覆盖安装**，不要卸载，也不要在系统设置里清除应用数据。
-2. 由于数据库版本为 v33，首次启动会执行迁移，可能比平时稍慢。
-3. 迁移完成后，原有聊天记录和设置会保留。
-4. 如果用户已经卸载或清除过数据，只能通过之前导出的备份恢复；本版本已支持导入旧版 v29 备份。
+### 5. 大量聊天楼层时的性能与稳定性优化
 
-## 校验信息
+针对聊天记录楼层不断增加后，助手输出可能出现卡顿、应用异常退出等情况进行了优化，改善长对话场景下的使用体验。
 
-- 签名证书 SHA-256：`b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748`
-- 包名：`me.rerere.rikkahub.st`
-- 文件大小：66,884,430 bytes（约 66.9 MB）
-- SHA-256：`01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
+### 6. 小手机 WebView 二级页面交互优化
 
-## 说明
+优化小手机相关 WebView 二级页面的交互体验，改善页面操作及跳转过程中的使用问题。
 
-本版本基于 `10-22-final` 最新源码构建，版本号为 2.5.10 / 242。请不要使用旧版 2.5.6（versionCode 238 / Room v29）APK 覆盖本版本，否则会构成数据库降级并导致闪退。
+### 7. 扩展预设解析字段，兼容更多预设
+
+增加可解析的预设字段，扩展对不同预设配置的兼容能力，让更多预设有机会正常导入和使用。
+
+### 8. 数据库迁移与旧版备份兼容性修复
+
+修复旧版本升级过程中可能出现的数据迁移兼容问题，并改善旧版备份的导入与恢复能力。相关修复涵盖旧版设置、供应商、助手、预设及正则脚本等数据。
+
+### 9. 延续此前的兼容性改进
+
+保留此前版本在预设兼容、酒馆助手脚本导入、备份恢复、消息显示，以及 SillyTavern 正则、世界书和运行时兼容方面的改进。
+
+## 版本信息
+
+- 版本号：2.5.10
+- Version Code：242
+- 最低系统要求：Android 8.0（API 26）
+- 支持架构：arm64-v8a
+
+---
+
+# rikkaST 2.5.10 Public Release
+
+## ⚠️ Important: Back Up Your Data Before Updating
+
+This release includes database compatibility changes and several functional improvements. To reduce the risk of data loss or recovery difficulties caused by crashes, startup failures, or other unexpected issues, **please make a complete backup before updating and store a copy somewhere safe outside the app.**
+
+- Use the in-app backup feature and confirm that the backup file has been created successfully.
+- Do not uninstall the app or clear its data before updating.
+- The first launch may take longer than usual while existing data is migrated.
+- If the app crashes or fails to start after updating, keep your backup file safe. Avoid repeatedly uninstalling the app, clearing its data, or installing an older version.
+- Version 2.5.10 uses a newer database structure. **Do not install the older 2.5.6 APK over version 2.5.10**, as a database downgrade may prevent the app from starting.
+
+## What's New
+
+### 1. TavernHelper Script Display Improvements
+
+Improved the display and usability of TavernHelper-related scripts, addressing certain script presentation issues.
+
+### 2. Stability and Crash-Related Improvements
+
+Improved application stability and addressed issues related to crashes and unexpected exits.
+
+### 3. Selected Upstream UI and Feature Updates
+
+Adopted selected UI changes and functional updates from upstream RikkaHub to improve the overall user experience.
+
+Going forward, rikkaST will not aim to follow every upstream release immediately. Development will prioritize stability, compatibility, and practical usability. Valuable upstream features may be adopted selectively after evaluation.
+
+### 4. ST-iPhonie Image Generation Improvements
+
+Made fixes and improvements to image-generation workflows related to ST-iPhonie.
+
+### 5. Performance Improvements for Long Conversations
+
+Improved behavior in conversations with a large number of messages, targeting slow assistant responses, lag, and unexpected application exits.
+
+### 6. ST-iPhonie WebView Navigation and Interaction Improvements
+
+Improved interactions within secondary WebView pages related to ST-iPhonie, including page navigation and usability.
+
+### 7. Expanded Preset Parsing and Compatibility
+
+Added support for more preset fields to improve compatibility with a wider range of preset configurations and make more presets usable.
+
+### 8. Database Migration and Legacy Backup Compatibility
+
+Fixed database migration compatibility issues that could occur when upgrading from older versions and improved the import and recovery of legacy backups, including settings, providers, assistants, presets, and regex scripts.
+
+### 9. Previous Compatibility Improvements Retained
+
+Retains earlier improvements for preset compatibility, TavernHelper script imports, backup recovery, message rendering, and SillyTavern regex, World Info, and runtime compatibility.
+
+## Version Information
+
+- Version: 2.5.10
+- Version Code: 242
+- Minimum Android Version: Android 8.0 (API 26)
+- Supported ABI: arm64-v8a
