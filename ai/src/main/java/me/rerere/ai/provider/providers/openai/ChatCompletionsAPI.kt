@@ -37,6 +37,7 @@ import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.ToolChoice
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -434,6 +435,9 @@ class ChatCompletionsAPI(
                             })
                         })
                     }
+                }
+                if (params.toolChoice == ToolChoice.REQUIRED) {
+                    put("tool_choice", "required")
                 }
             }
         }.mergeCustomBody(params.customBody)

@@ -23,7 +23,11 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
@@ -32,8 +36,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.StateFlow
+import kotlin.coroutines.resume
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -312,6 +319,13 @@ object TavernRuntimeManager {
                     evaluator(stage, text, characterName, isUser)
                 } ?: text
             }.getOrDefault(text)
+        }
+        // WebView 可能比消息文本晚就绪：短暂等待而不是立刻把原文当成最终结果。
+        if (!pageReady) {
+            val deadline = System.currentTimeMillis() + timeoutMs.coerceAtMost(1_500L)
+            while (!pageReady && System.currentTimeMillis() < deadline) {
+                delay(80)
+            }
         }
         if (!pageReady) return text
         val wv = webView ?: return text
@@ -736,6 +750,15 @@ object TavernRuntimeManager {
     /** [v214] 由 UI 层注入：面板表单发送用户消息（text → 是否受理）。 */
     @Volatile var userMessageSender: ((String) -> Boolean)? = null
 
+    /** 带落库回执的面板发送：(text, answer, onPersisted) -> 是否受理。answer=false 表示只插入用户消息、不触发生成。 */
+    @Volatile var userMessageSenderWithReceipt: ((String, Boolean, (Boolean) -> Unit) -> Boolean)? = null
+
+    /** 面板以助手身份插入消息（sendMessageAsAssistant / 卡片剧情推进）。 */
+    @Volatile var assistantMessageInserter: ((String) -> Boolean)? = null
+
+    /** 面板 saveChat() 的宿主落点；未接线时视为成功（变量已由去抖持久化）。 */
+    @Volatile var chatSaver: (() -> Boolean)? = null
+
     /**
      * [v243 BUGFIX A2] 由 UI 层注入：JS `createChatMessages` 的宿主落点
      * （jsonText = [{role,name,message,data}] → 是否受理）。
@@ -795,6 +818,21 @@ object TavernRuntimeManager {
 
     private val _requestedFloatingTargetFlow = MutableStateFlow<String?>(null)
     val requestedFloatingTargetFlow: StateFlow<String?> get() = _requestedFloatingTargetFlow
+
+    /** 浮窗目标状态机：只有 JS 校验 DOM 并真正打开后才进入 Ready。 */
+    sealed interface FloatingTargetState {
+        data object Closed : FloatingTargetState
+        data class Opening(val target: String) : FloatingTargetState
+        data class Ready(val target: String) : FloatingTargetState
+        data class Failed(val target: String, val reason: String) : FloatingTargetState
+    }
+
+    private val _floatingTargetStateFlow = MutableStateFlow<FloatingTargetState>(FloatingTargetState.Closed)
+    val floatingTargetStateFlow: StateFlow<FloatingTargetState> get() = _floatingTargetStateFlow
+
+    @Volatile
+    var lastSuccessfulFloatingTarget: String? = null
+        private set
 
     private val _stIphonieTtsStateFlow = MutableStateFlow(StIphonieTtsState())
     val stIphonieTtsStateFlow: StateFlow<StIphonieTtsState> get() = _stIphonieTtsStateFlow
@@ -861,6 +899,52 @@ object TavernRuntimeManager {
         bootRecords.clear()
     }
 
+    fun auxWebViewCount(): Int = auxWebViews.size
+
+    fun bootTimeline(): List<WebViewBootRecord> = bootRecords.toList()
+
+    /** 开发者测试台用：对所有辅助 WebView（消息面板）执行同一段探针 JS。 */
+    suspend fun evaluateJsOnAuxProbes(script: String, timeoutMs: Long = 2_000L): List<String> {
+        val views = synchronized(auxWebViews) { auxWebViews.keys.toList() }
+        if (views.isEmpty()) return emptyList()
+        return coroutineScope {
+            views.map { wv ->
+                async(Dispatchers.Main.immediate) {
+                    withTimeoutOrNull(timeoutMs) {
+                        suspendCancellableCoroutine<String?> { continuation ->
+                            runCatching {
+                                wv.evaluateJavascript(script) { result ->
+                                    if (continuation.isActive) continuation.resume(result)
+                                }
+                            }.onFailure {
+                                if (continuation.isActive) continuation.resume(null)
+                            }
+                        }
+                    } ?: "null"
+                }
+            }.awaitAll()
+        }
+    }
+
+    /** 开发者测试台用：在主运行时执行一段返回 JSON/字符串的 JS，带超时且不抛异常。 */
+    suspend fun evaluateJsProbe(script: String, timeoutMs: Long = 3_000L): String? {
+        if (!pageReady || isInJavaBridgeCall()) return null
+        val wv = webView ?: return null
+        return withTimeoutOrNull(timeoutMs) {
+            withContext(Dispatchers.Main.immediate) {
+                suspendCancellableCoroutine<String?> { continuation ->
+                    runCatching {
+                        wv.evaluateJavascript(script) { result ->
+                            if (continuation.isActive) continuation.resume(result)
+                        }
+                    }.onFailure {
+                        if (continuation.isActive) continuation.resume(null)
+                    }
+                }
+            }
+        }
+    }
+
     /** 由 UI 层（ChatPage / ChatVM）注入：停止当前会话生成（响应 JS 侧 SillyTavern.getContext().stopGeneration）。 */
     @Volatile
     var generationStopper: (() -> Boolean)? = null
@@ -913,6 +997,19 @@ object TavernRuntimeManager {
         appendLog("info", "[cancel] dispatchStopGeneration from JS bridge: stopperWired=${stopper != null} ok=$ok")
         return ok
     }
+
+    /** 外链资源网络模式（设置页修改后由 ChatPage 同步到资源加载器）。 */
+    var resourceNetworkMode: me.rerere.rikkahub.data.datastore.ResourceFetchMode = me.rerere.rikkahub.data.datastore.ResourceFetchMode.AUTO
+        set(value) {
+            field = value
+            TavernResourceRoute.updateMode(
+                when (value) {
+                    me.rerere.rikkahub.data.datastore.ResourceFetchMode.AUTO -> ResourceNetworkMode.AUTO
+                    me.rerere.rikkahub.data.datastore.ResourceFetchMode.DIRECT -> ResourceNetworkMode.DIRECT
+                    me.rerere.rikkahub.data.datastore.ResourceFetchMode.VPN -> ResourceNetworkMode.VPN
+                }
+            )
+        }
 
     private val floatingHiddenTargetsByConv = ConcurrentHashMap<String, MutableSet<String>>()
     private val _floatingHiddenVersionFlow = MutableStateFlow(0L)
@@ -1055,17 +1152,105 @@ object TavernRuntimeManager {
             return
         }
         _requestedFloatingTargetFlow.value = target
+        _floatingTargetStateFlow.value = FloatingTargetState.Opening(target)
     }
 
     fun dismissFloatingWindow() {
         _requestedFloatingTargetFlow.value = null
+        _floatingTargetStateFlow.value = FloatingTargetState.Closed
         eval("window.__rikkaCloseFloatingStage && window.__rikkaCloseFloatingStage();")
     }
 
     fun switchFloatingWindowTarget(target: String) {
         _requestedFloatingTargetFlow.value = target
-        val escaped = JSONObject.quote(target)
-        eval("window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped);")
+        _floatingTargetStateFlow.value = FloatingTargetState.Opening(target)
+        // 真正的 WebView 挂载/切换由 TavernFloatingWindowModal 的 LaunchedEffect(selectedTarget)
+        // 调 attachHostWebViewToContainer 完成，避免同一次点击重复执行两次 open 把二级菜单重置。
+    }
+
+    fun retryFloatingWindowTarget(target: String) {
+        if (webView == null || !pageReady) {
+            _floatingTargetStateFlow.value = FloatingTargetState.Opening(target)
+            return
+        }
+        evalFloatingOpen(target, JSONObject.quote(target))
+    }
+
+    /** 开发者测试台清理：不把测试目标写进用户下次默认选择。 */
+    fun resetFloatingTargetSelection() {
+        lastSuccessfulFloatingTarget = null
+        lastAttachedFloatingTarget = null
+        _floatingTargetStateFlow.value = FloatingTargetState.Closed
+    }
+
+    fun reportFloatingTargetResult(target: String, ok: Boolean, reason: String = "") {
+        val requested = _requestedFloatingTargetFlow.value
+        if (!requested.isNullOrBlank() && requested != target) {
+            appendLog("debug", "[floating] ignore stale result target='$target' requested='$requested'")
+            return
+        }
+        mainHandler.post {
+            if (ok) {
+                lastSuccessfulFloatingTarget = target
+                lastAttachedFloatingTarget = target
+                _floatingTargetStateFlow.value = FloatingTargetState.Ready(target)
+                appendLog("info", "[floating] target ready='$target'")
+            } else {
+                if (lastAttachedFloatingTarget == target) lastAttachedFloatingTarget = null
+                _floatingTargetStateFlow.value = FloatingTargetState.Failed(
+                    target = target,
+                    reason = reason.ifBlank { "目标 DOM 未就绪" },
+                )
+                appendLog("warn", "[floating] target failed='$target' reason='$reason'")
+            }
+        }
+    }
+
+    private fun evalFloatingOpen(target: String, escapedTarget: String) {
+        val wv = webView
+        if (wv == null || !pageReady) {
+            _floatingTargetStateFlow.value = FloatingTargetState.Opening(target)
+            pendingFloatingAttachment?.let { pending ->
+                pendingFloatingAttachment = pending.first.get()?.let {
+                    java.lang.ref.WeakReference(it) to target
+                }
+            }
+            return
+        }
+        _floatingTargetStateFlow.value = FloatingTargetState.Opening(target)
+        mainHandler.postDelayed({
+            if (_floatingTargetStateFlow.value is FloatingTargetState.Opening &&
+                _requestedFloatingTargetFlow.value == target
+            ) {
+                if (lastAttachedFloatingTarget == target) lastAttachedFloatingTarget = null
+                _floatingTargetStateFlow.value = FloatingTargetState.Failed(
+                    target = target,
+                    reason = "运行时没有返回浮窗打开结果（超时）",
+                )
+                appendLog("warn", "[floating] open timeout target='$target'")
+            }
+        }, 1_800L)
+        runCatching {
+            wv.evaluateJavascript(
+                "window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escapedTarget, false);",
+            ) { raw ->
+                val obj = runCatching {
+                    if (raw.isNullOrBlank() || raw == "null") null else JSONObject(raw)
+                }.getOrNull()
+                // async function 返回 Promise，evaluateJavascript 回调通常拿到 {}；
+                // 真正的结果由 JS 内部 RikkaBridge.onFloatingTargetResult 回执，这里只在
+                // 回调明确带 ok 字段时处理，避免把 Promise 的 {} 误判成失败。
+                if (obj != null && obj.has("ok")) {
+                    reportFloatingTargetResult(
+                        target = target,
+                        ok = obj.optBoolean("ok", false),
+                        reason = obj.optString("reason", ""),
+                    )
+                }
+            }
+        }.onFailure {
+            reportFloatingTargetResult(target, ok = false, reason = it.message ?: "JS 调用失败")
+        }
     }
 
     /** 停止 ST-iPhonie 角色语音（当上游系统原生 TTS 启动或用户点击停止时调用）。 */
@@ -1111,12 +1296,12 @@ object TavernRuntimeManager {
                 )
             }
             if (pageReady && (parentChanged || lastAttachedFloatingTarget != target)) {
-                lastAttachedFloatingTarget = target
+                // 只有 JS 校验 DOM 并返回 ok 后才写入 lastAttachedFloatingTarget；
+                // 打开失败仍可对同一目标重试，不会把失败状态误记为已附加。
                 val escaped = JSONObject.quote(target)
-                wv.evaluateJavascript(
-                    "window.__rikkaOpenFloatingTarget && window.__rikkaOpenFloatingTarget($escaped, false);",
-                    null,
-                )
+                evalFloatingOpen(target, escaped)
+            } else if (pageReady && _floatingTargetStateFlow.value !is FloatingTargetState.Ready) {
+                evalFloatingOpen(target, JSONObject.quote(target))
             }
         }.onFailure { e ->
             appendLog("error", "[floating] attachHostWebViewToContainer failed: ${e.message}")
@@ -1314,7 +1499,7 @@ object TavernRuntimeManager {
                 view: WebView,
                 request: WebResourceRequest,
             ): WebResourceResponse? {
-                return interceptAsset(request.url)
+                return interceptAsset(request.url, request.requestHeaders)
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -1379,7 +1564,10 @@ object TavernRuntimeManager {
     }
 
     /** 资产拦截：/st-runtime/... → assets/st-runtime/...（含 ES module MIME）；角色立绘/CG资产多级回退；CDN 请求 → 本地 vendor。 */
-    internal fun interceptAsset(uri: Uri): WebResourceResponse? {
+    internal fun interceptAsset(
+        uri: Uri,
+        requestHeaders: Map<String, String>? = null,
+    ): WebResourceResponse? {
         val scheme = uri.scheme?.lowercase().orEmpty()
         if (scheme == "embeded" || scheme == "embedded" || scheme == "ccdefault") {
             val ctx = appContext ?: return notFound()
@@ -1390,7 +1578,10 @@ object TavernRuntimeManager {
             val resolved = resolveLocalCharacterAssetFile(ctx, rawTarget)
             return if (resolved != null) openFileResponse(resolved) ?: notFound() else notFound()
         }
-        if (uri.host != HOST && uri.host != "st.rikka.local") return interceptCdn(uri)
+        if (uri.host != HOST && uri.host != "st.rikka.local") {
+            return interceptCdn(uri)
+                ?: appContext?.let { TavernResourceRoute.intercept(it, uri, requestHeaders) }
+        }
         val path = uri.path ?: return notFound()
         // 0) 第三方扩展资源（真实文件端点）：
         if (path.startsWith("/scripts/extensions/third-party/")) return openThirdPartyAsset(path)
@@ -2216,6 +2407,154 @@ object TavernRuntimeManager {
         return true
     }
 
+    /**
+     * 面板命令总线（问题 2）：所有命令都带 requestId，宿主处理完广播 ack；
+     * JS 侧 4 秒超时并显示明确错误，绝不允许「只变颜色、没有动作」。
+     */
+    private fun dispatchPanelCommand(payloadJson: String): Boolean {
+        val obj = runCatching { JSONObject(payloadJson) }.getOrNull() ?: return false
+        val requestId = obj.optString("requestId", "").ifBlank { return false }
+        val kind = obj.optString("kind", "").trim()
+        val text = obj.optString("text", "")
+        val script = obj.optString("script", "")
+        val eventName = obj.optString("event", "")
+        val eventPayload = obj.optString("payload", "{}").ifBlank { "{}" }
+        appendLog("debug", "[panel-cmd] kind=$kind id=${requestId.take(24)} textLen=${text.length}")
+
+        fun ack(ok: Boolean, error: String = "", result: String = "") {
+            val ackJson = JSONObject().apply {
+                put("requestId", requestId)
+                put("ok", ok)
+                put("error", error)
+                if (result.isNotBlank()) put("result", result)
+            }.toString()
+            broadcast(
+                "window.__rikkaPanelCommandResult && window.__rikkaPanelCommandResult(" +
+                    JSONObject.quote(requestId) + "," + JSONObject.quote(ackJson) + ");"
+            )
+        }
+
+        when (kind) {
+            "send_message", "send_as_user" -> {
+                if (text.isBlank()) {
+                    ack(false, "消息内容为空")
+                    return true
+                }
+                // [P0 修复] JS 侧一直会传 answer（sendMessageAsUser 语义是「只插入、不生成」），
+                // 旧实现完全不解析它，导致 send_as_user 也会额外触发一次 AI 生成。
+                val wantsAnswer = when (kind) {
+                    "send_as_user" -> obj.optBoolean("answer", false)
+                    else -> obj.optBoolean("answer", true)
+                }
+                val asyncSender = userMessageSenderWithReceipt
+                if (asyncSender != null) {
+                    mainHandler.post {
+                        val accepted = runCatching {
+                            // [P0 修复] ack 语义 = 「宿主已受理」，不再等落库。
+                            // 生成中入队时落库会等上几十秒，旧实现必然 5 秒超时 -> 卡片误判失败 -> 可能重复发送。
+                            asyncSender(text, wantsAnswer) { persisted ->
+                                if (!persisted) {
+                                    appendLog(
+                                        "warn",
+                                        "[panel-cmd] accepted but not persisted yet kind=$kind len=${text.length}",
+                                    )
+                                }
+                            }
+                        }.getOrDefault(false)
+                        if (accepted) {
+                            ack(true, result = "accepted")
+                        } else {
+                            ack(false, "宿主未受理发送请求（当前会话未就绪）")
+                        }
+                    }
+                } else {
+                    val sender = userMessageSender
+                    if (sender == null) {
+                        ack(false, "发送桥未接线（当前不在聊天页）")
+                    } else {
+                        mainHandler.post {
+                            val accepted = runCatching { sender(text) }.getOrDefault(false)
+                            if (accepted) ack(true, result = "accepted") else ack(false, "宿主拒绝发送")
+                        }
+                    }
+                }
+            }
+
+            "send_as_assistant" -> {
+                if (text.isBlank()) {
+                    ack(false, "消息内容为空")
+                    return true
+                }
+                val inserter = assistantMessageInserter
+                if (inserter == null) {
+                    ack(false, "助手消息插入桥未接线")
+                } else {
+                    mainHandler.post {
+                        val ok = runCatching { inserter(text) }.getOrDefault(false)
+                        ack(ok, if (ok) "" else "插入助手消息失败")
+                    }
+                }
+            }
+
+            "trigger_slash" -> {
+                if (script.isBlank()) {
+                    ack(false, "slash 脚本为空")
+                    return true
+                }
+                runtimeScope.launch {
+                    val runner = slashRunner
+                    if (runner == null) {
+                        ack(false, "slash runner 未接线（当前不在聊天页）")
+                        return@launch
+                    }
+                    val result = runCatching { runner(script) }.getOrElse { e ->
+                        ack(false, "slash 执行失败: ${e.message}")
+                        return@launch
+                    }
+                    // [P0 修复] 与 JS 侧 toExecutionResult 的白名单对齐：斜杠失败一律带 (slash error: 前缀。
+                    val isError = result.startsWith("(slash error:") || result == "(slash runner not ready)" ||
+                        result.startsWith("未知命令") || result.startsWith("命令执行失败") || result.startsWith("命令不可用") ||
+                        result.startsWith("命令缺少")
+                    if (isError) ack(false, result) else ack(true, result = result)
+                }
+            }
+
+            "emit_event" -> {
+                if (eventName.isBlank()) {
+                    ack(false, "事件名为空")
+                } else if (webView == null || !pageReady) {
+                    // [P0 修复] 运行时未就绪时 fireEvent 会静默丢弃，不能假装成功。
+                    ack(false, "运行时未就绪，事件未派发")
+                } else {
+                    fireEvent(eventName, eventPayload)
+                    ack(true)
+                }
+            }
+
+            "save_chat" -> {
+                // [P0 修复] 未接线时必须失败，不能 `?: true` 假装保存成功。
+                val saver = chatSaver
+                if (saver == null) {
+                    ack(false, "保存桥未接线（当前不在聊天页）")
+                } else {
+                    val ok = runCatching { saver.invoke() }.getOrDefault(false)
+                    ack(ok, if (ok) "" else "保存会话失败")
+                }
+            }
+
+            "stop_generation" -> {
+                val ok = dispatchStopGeneration()
+                ack(ok, if (ok) "" else "没有正在生成的回复")
+            }
+
+            // 开发者测试台专用：只验证 requestId → host → ack 往返，不产生任何会话副作用。
+            "ping" -> ack(true, result = "pong")
+
+            else -> ack(false, "未知面板命令: $kind")
+        }
+        return true
+    }
+
     // ==================== 日志 ====================
 
     fun appendLog(level: String, message: String) {
@@ -2989,6 +3328,24 @@ object TavernRuntimeManager {
         @JavascriptInterface
         fun closeFloatingWindow(target: String, hideForChat: Boolean): Boolean {
             return closeFloatingWindowFromJs(target, hideForChat)
+        }
+
+        /** JS 浮窗校验结果回执：ok=false 时 UI 显示明确错误，不再把 compatDom 兜底当成目标。 */
+        @JavascriptInterface
+        fun onFloatingTargetResult(target: String, ok: Boolean, reason: String) {
+            reportFloatingTargetResult(target, ok, reason)
+        }
+
+        /** 面板 → 宿主命令的统一入口（发送 / slash / 事件 / 停止生成等），结果经广播回 panel。 */
+        @JavascriptInterface
+        fun panelCommand(payloadJson: String): Boolean {
+            return dispatchPanelCommand(payloadJson)
+        }
+
+        /** 面板事件转发到主运行时（避免 panel 独立 eventSource realm 丢失事件）。 */
+        @JavascriptInterface
+        fun emitHostEvent(name: String, payloadJson: String) {
+            fireEvent(name, payloadJson)
         }
 
         /** [v214] JSR/面板世界书写回：entriesJson = [{uid,disable},...] 整本书补丁。 */

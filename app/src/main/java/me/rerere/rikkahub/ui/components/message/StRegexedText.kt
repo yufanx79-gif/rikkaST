@@ -195,12 +195,36 @@ internal fun shouldInvokeWebViewMessageFormatter(rawText: String): Boolean {
  * 当 >50KB 超长开场白在后台计算正则期间（或开场白选择器预览时），快速提取可读纯文字正文，杜绝返回 "" 空串导致白条或裸露 CSS。
  */
 internal fun extractQuickPlainPreview(rawText: String): String {
-    return rawText
+    // 超长消息在后台正则/MessageFormatter 完成前，快速预览不能把图片一起剥掉；
+    // 保留 <img> 为 Markdown 图片，<pic> 明确显示“图片生成中”占位，异步结果回来后再替换。
+    val images = mutableListOf<String>()
+    var text = rawText
+    text = Regex("""<pic\b[^>]*>[\s\S]*?</pic>|<pic\b[^>]*/>""", RegexOption.IGNORE_CASE)
+        .replace(text) { match ->
+            val token = "\u0001PIC${images.size}\u0001"
+            images.add("*［图片生成中…］*")
+            "\n$token\n"
+        }
+    text = Regex("""<img\b[^>]*>""", RegexOption.IGNORE_CASE).replace(text) { match ->
+        val tag = match.value
+        val src = Regex("""\bsrc\s*=\s*(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
+            .find(tag)?.groupValues?.getOrNull(2).orEmpty()
+        val token = "\u0001IMG${images.size}\u0001"
+        images.add(
+            if (src.isNotBlank()) "![图片]($src)" else "*［图片加载中…］*"
+        )
+        "\n$token\n"
+    }
+    text = text
         .replace(QUICK_HTML_COMMENT_RE, "")
         .replace(QUICK_STRIP_BLOCKS_RE, "")
         .replace(QUICK_STRIP_TAGS_RE, "")
         .replace(Regex("\n{3,}"), "\n\n")
-        .trim()
+    images.forEachIndexed { index, replacement ->
+        text = text.replace("\u0001PIC$index\u0001", replacement)
+            .replace("\u0001IMG$index\u0001", replacement)
+    }
+    return text.trim()
 }
 
 /**
@@ -442,7 +466,37 @@ private fun postProcessAssistantRenderedText(
     } else {
         regexed
     }
-    return convertUnhandledDrawTagsToHtml(wrapperCleaned)
+    return convertUnhandledPicTagsToHtml(convertUnhandledDrawTagsToHtml(wrapperCleaned))
+}
+
+private val UNHANDLED_PIC_RE = Regex(
+    """<pic\b([^>]*)>([\s\S]*?)</pic>|<pic\b([^>]*)/>""",
+    RegexOption.IGNORE_CASE,
+)
+
+/**
+ * 扩展未加载或 MessageFormatter 超时时的兜底：<pic> 不能直接被 Markdown 当未知标签丢掉。
+ * 有 src 就渲染真实图片；没有 src 就显示“图片生成中/失败重试”的占位卡片。
+ */
+private fun convertUnhandledPicTagsToHtml(input: String): String {
+    if (!input.contains("<pic", ignoreCase = true)) return input
+    return UNHANDLED_PIC_RE.replace(input) { match ->
+        val attrs = match.groupValues[1].ifBlank { match.groupValues[3] }
+        val body = match.groupValues[2].trim()
+        val src = Regex("""\b(?:src|url|href)\s*=\s*(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
+            .find(attrs)?.groupValues?.getOrNull(2).orEmpty()
+        if (src.isNotBlank()) {
+            """<img src="${src.replace("\"", "&quot;")}" alt="pic" />"""
+        } else {
+            val prompt = body.ifBlank { "图片生成中…" }
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .replace("<", "＜")
+                .replace(">", "＞")
+                .take(160)
+            "\n\n🖼 图片生成/加载中… $prompt\n（长时间未显示请重发或点击消息重试）\n\n"
+        }
+    }
 }
 
 /**

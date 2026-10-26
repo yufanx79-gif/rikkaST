@@ -478,9 +478,18 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 }
             }
         }
-        if (useFunctionTools && useBuiltInTools) {
+        if ((useFunctionTools && useBuiltInTools) ||
+            (useFunctionTools && params.toolChoice == me.rerere.ai.provider.ToolChoice.REQUIRED)
+        ) {
             put("toolConfig", buildJsonObject {
-                put("includeServerSideToolInvocations", true)
+                if (useFunctionTools && useBuiltInTools) {
+                    put("includeServerSideToolInvocations", true)
+                }
+                if (useFunctionTools && params.toolChoice == me.rerere.ai.provider.ToolChoice.REQUIRED) {
+                    put("functionCallingConfig", buildJsonObject {
+                        put("mode", "ANY")
+                    })
+                }
             })
         }
 

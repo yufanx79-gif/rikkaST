@@ -273,12 +273,17 @@ class ChatVM(
      * @param content 消息内容
      * @param answer 是否触发消息生成，如果为false，则仅添加消息到消息列表中
      */
-    fun handleMessageSend(content: List<UIMessagePart>, answer: Boolean = true): Boolean {
+    fun handleMessageSend(
+        content: List<UIMessagePart>,
+        answer: Boolean = true,
+        onPersisted: ((Boolean) -> Unit)? = null,
+    ): Boolean {
         if (content.isEmptyInputMessage()) {
             TavernRuntimeManager.appendLog(
                 "warn",
                 "[send-diag] handleMessageSend rejected: empty input conv=$_conversationId",
             )
+            onPersisted?.invoke(false)
             return false
         }
         TavernRuntimeManager.recordSendDiagnostic(
@@ -286,7 +291,7 @@ class ChatVM(
             conversationId = _conversationId.toString(),
             detail = "parts=${content.size} answer=$answer",
         )
-        return chatService.sendMessage(_conversationId, content, answer)
+        return chatService.sendMessage(_conversationId, content, answer, onPersisted)
     }
 
     fun handleMessageEdit(parts: List<UIMessagePart>, messageId: Uuid) {
@@ -391,7 +396,30 @@ class ChatVM(
 
     fun deleteMessage(message: UIMessage) {
         viewModelScope.launch {
-            chatService.deleteMessage(_conversationId, message)
+            when (val result = chatService.deleteMessage(_conversationId, message)) {
+                me.rerere.rikkahub.service.DeleteMessageResult.Success -> Unit
+                me.rerere.rikkahub.service.DeleteMessageResult.NotFound -> {
+                    chatService.addError(
+                        error = IllegalStateException("消息不存在，可能已被其它操作删除"),
+                        conversationId = _conversationId,
+                        title = context.getString(R.string.error_title_operation),
+                    )
+                }
+                me.rerere.rikkahub.service.DeleteMessageResult.Generating -> {
+                    chatService.addError(
+                        error = IllegalStateException("生成中暂时无法删除这条消息，请稍后重试"),
+                        conversationId = _conversationId,
+                        title = context.getString(R.string.error_title_operation),
+                    )
+                }
+                is me.rerere.rikkahub.service.DeleteMessageResult.Failed -> {
+                    chatService.addError(
+                        error = result.error,
+                        conversationId = _conversationId,
+                        title = context.getString(R.string.error_title_operation),
+                    )
+                }
+            }
         }
     }
 

@@ -365,7 +365,7 @@ fun TavernExtensionSettingsPage(folder: String) {
                                 override fun shouldInterceptRequest(
                                     view: WebView,
                                     request: WebResourceRequest,
-                                ): WebResourceResponse? = TavernRuntimeManager.interceptAsset(request.url)
+                                ): WebResourceResponse? = TavernRuntimeManager.interceptAsset(request.url, request.requestHeaders)
 
                                 override fun onPageFinished(view: WebView, url: String) {
                                     TavernRuntimeManager.appendLog(

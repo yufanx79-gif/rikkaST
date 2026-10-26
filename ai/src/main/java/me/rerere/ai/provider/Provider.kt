@@ -68,12 +68,19 @@ data class TextGenerationResult(
 )
 
 @Serializable
+enum class ToolChoice {
+    AUTO,
+    REQUIRED,
+}
+
+@Serializable
 data class TextGenerationParams(
     val model: Model,
     val temperature: Float? = null,
     val topP: Float? = null,
     val maxTokens: Int? = null,
     val tools: List<Tool> = emptyList(),
+    val toolChoice: ToolChoice = ToolChoice.AUTO,
     val reasoningLevel: ReasoningLevel = ReasoningLevel.OFF,
     val customHeaders: List<CustomHeader> = emptyList(),
     val customBody: List<CustomBody> = emptyList(),

@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material3.MaterialTheme
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.BlurStrength
 import me.rerere.rikkahub.data.datastore.BlurStyle
 import me.rerere.rikkahub.data.datastore.BackgroundEffectType
@@ -38,6 +39,7 @@ import me.rerere.rikkahub.ui.components.ui.SegmentedTabs
 import me.rerere.rikkahub.ui.pages.setting.components.DeveloperModeSwitch
 import me.rerere.rikkahub.ui.pages.setting.components.WebViewPerfReductionCard
 import me.rerere.rikkahub.ui.components.ui.Select
+import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
@@ -45,6 +47,7 @@ import kotlin.math.roundToInt
 
 @Composable
 fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
+    val navController = LocalNavController.current
     val settings by vm.settings.collectAsStateWithLifecycle()
     var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
     val messageStyle = settings.messageStyle
@@ -108,6 +111,16 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                             )
                         },
                     )
+                    if (settings.developerMode) {
+                        item(
+                            onClick = { navController.navigate(Screen.SettingDeveloperLab) },
+                            headlineContent = { Text("开发者测试台") },
+                            supportingContent = { Text("按项目/分类一键测试按钮桥、浮窗、发送删除、工具、图片、WebView 与网络，并导出脱敏报告") },
+                            trailingContent = {
+                                Text("›", style = MaterialTheme.typography.titleLarge)
+                            },
+                        )
+                    }
                     item(
                         headlineContent = { Text(stringResource(R.string.setting_display_page_create_new_conversation_on_start_title)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_create_new_conversation_on_start_desc)) },

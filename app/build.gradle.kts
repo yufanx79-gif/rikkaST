@@ -57,7 +57,7 @@ android {
         applicationId = "me.rerere.rikkahub.st"  // 独立包名：可与官方 RikkaHub 共存，互不覆盖（debug 变体自动加 .debug 后缀）
         minSdk = 26
         targetSdk = 37
-        versionCode = 242 // 10-22-final + backup-db v33 compatibility (> 241 fixed2)
+        versionCode = 243 // 2.5.10-public-20261027：P0 生成静默失败修复（> 242）
         versionName = "2.5.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

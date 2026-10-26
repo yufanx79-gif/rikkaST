@@ -17,6 +17,19 @@ import me.rerere.rikkahub.utils.SimpleCache
 import java.util.concurrent.TimeUnit
 import kotlin.uuid.Uuid
 
+/** 助手级工具调用策略。null 表示自动：普通助手 auto，酒馆角色卡 none。 */
+@Serializable
+enum class ToolPolicy {
+    @SerialName("none")
+    NONE,
+
+    @SerialName("auto")
+    AUTO,
+
+    @SerialName("required")
+    REQUIRED,
+}
+
 @Serializable
 data class Assistant(
     val id: Uuid = Uuid.random(),
@@ -74,9 +87,11 @@ data class Assistant(
      * 当前覆盖分块相关字段：splitSegmentsAsBubbles（分段多气泡）/ assistantBubbleWrapContent（贴合内容）。
      */
     val messageStyleOverride: MessageStyleOverride? = null,
+    val enableTools: Boolean = true,                    // 助手级工具总开关
+    val toolPolicy: ToolPolicy? = null,                 // null=自动（酒馆卡默认关闭，普通助手 auto）
     val enableParallelToolExecution: Boolean = true,    // 并行执行多个工具调用
-    val toolRecurringLimit: Int = 8,                    // 单批同工具调用上限
-    val totalStepsLimit: Int = 256,                     // 总工具调用轮数上限
+    val toolRecurringLimit: Int = 2,                    // 单批同工具调用上限
+    val totalStepsLimit: Int = 16,                      // 总工具调用轮数上限
     val toolExecTimeout: Int = 120,                     // 单工具执行超时(秒)
     val jsTimeout: Int = 15,                            // JavaScript引擎超时(秒)
     val shellTimeout: Int = 60,                         // Shell命令超时(秒)
@@ -87,6 +102,26 @@ data class Assistant(
     val enableAutoMemoryExtract: Boolean = true,          // [新增] 自动从对话提取记忆（独立开关，不依赖 enableMemory）
     val autoMemoryExtractInterval: Int = 5,                // 每 N 轮对话提取一次记忆
 )
+
+/** 解析实际生效的工具策略：未显式设置时，酒馆角色卡默认关闭，普通助手保持 auto。 */
+fun Assistant.effectiveToolPolicy(): ToolPolicy {
+    if (!enableTools) return ToolPolicy.NONE
+    return toolPolicy ?: if (tavernData != null) ToolPolicy.NONE else ToolPolicy.AUTO
+}
+
+fun Assistant.effectiveToolsEnabled(): Boolean = effectiveToolPolicy() != ToolPolicy.NONE
+
+/** 酒馆角色扮演即使显式开启工具，也把单轮工具轮数限制在 1–2 次，避免模型把叙事变成工具调用。 */
+fun Assistant.effectiveMaxToolSteps(): Int {
+    val base = totalStepsLimit.coerceAtLeast(1)
+    // [P0 修复] 旧实现把酒馆卡硬压到 2 步。一次 step 等于一次完整模型请求，
+    // 压到 2 只够「1 轮工具 + 1 次收尾」，模型连续两轮要工具就直接没有正文。
+    // 上限保留但放宽到 8，与「防频繁调工具」的目标仍然一致（默认 ToolPolicy 仍是 NONE）。
+    return if (tavernData != null) base.coerceAtMost(TAVERN_MAX_TOOL_STEPS) else base
+}
+
+/** 酒馆卡单轮允许的模型往返次数上限（含工具轮）。 */
+const val TAVERN_MAX_TOOL_STEPS: Int = 8
 
 @Serializable
 data class QuickMessage(

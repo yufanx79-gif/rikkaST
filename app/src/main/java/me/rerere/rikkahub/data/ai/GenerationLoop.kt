@@ -53,6 +53,8 @@ import me.rerere.rikkahub.data.model.assembleContext
 import me.rerere.rikkahub.data.model.assembleCharacterCardMessages
 import me.rerere.rikkahub.data.model.assembleMainPrompt
 import me.rerere.rikkahub.data.model.buildExampleMessages
+import me.rerere.rikkahub.data.model.effectiveMaxToolSteps
+import me.rerere.rikkahub.data.model.effectiveToolPolicy
 import me.rerere.rikkahub.data.export.parseActiveStPresetConfig
 import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.data.model.isHidden
@@ -180,15 +182,19 @@ class GenerationLoop(
                         append(recent)
                     }
                 }
-                tools.forEach { tool ->
+                if (tools.isNotEmpty()) {
                     if (isNotEmpty()) appendLine()
-                    append(tool.systemPrompt(model, messages))
+                    appendLine("除非用户明确要求执行搜索、读取文件、运行命令等操作，否则不要调用工具；用叙事直接回应用户，不要用工具代替角色扮演。")
+                    tools.forEach { tool ->
+                        if (isNotEmpty()) appendLine()
+                        append(tool.systemPrompt(model, messages))
+                    }
                 }
             }
         } else {
             val assemblerContext = me.rerere.rikkahub.data.ai.prompts.PromptContext(
                 identitySection = mainIdentity,
-                leadInInstructions = buildString {
+                leadInInstructions = if (tools.isEmpty()) "" else buildString {
                     appendLine("<tool_selection>")
                     appendLine("Workspace files → workspace_read/write/edit (/workspace/...)")
                     appendLine("Workspace shell → workspace_shell (git, builds, Unix tools in sandbox)")
@@ -255,7 +261,7 @@ class GenerationLoop(
         assistant: Assistant,
         memories: List<AssistantMemory>? = null,
         tools: List<Tool> = emptyList(),
-        maxSteps: Int = 256,
+        maxSteps: Int = 16,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationId: Uuid? = null,
@@ -279,11 +285,16 @@ class GenerationLoop(
         val providerImpl = providerManager.getProviderByType(provider)
 
         var messages: List<UIMessage> = messages
+        val toolPolicy = assistant.effectiveToolPolicy()
+        val effectiveTools = if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.NONE) emptyList<Tool>() else tools
+        val effectiveMaxSteps = assistant.effectiveMaxToolSteps().let {
+            if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.NONE) 1 else it
+        }.coerceAtLeast(1)
 
     // ── 预构建：tools + systemPrompt（循环不变，移到外面）──
     val toolsInternal: List<Tool> = buildList {
-        Log.i(TAG, "generateInternal: build tools($assistant)")
-        if (assistant?.enableMemory == true) {
+        Log.i(TAG, "generateInternal: build tools($assistant) enabled=${toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE}")
+        if (assistant?.enableMemory == true && toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE) {
             val memoryAssistantId = if (assistant.useGlobalMemory) {
                 MemoryRepository.GLOBAL_MEMORY_ID
             } else {
@@ -296,7 +307,7 @@ class GenerationLoop(
                 )
             )
         }
-        addAll(tools)
+        addAll(effectiveTools)
     }
     val statusTrackedTools: List<Tool> = toolsInternal.map { tool ->
         if (tool.name == "ask_user") tool else tool.copy(
@@ -314,9 +325,9 @@ class GenerationLoop(
         )
     }
     // ── 预构建：system 消息列表（循环不变，移到外面）──
-    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, tools, model, context, conversationRepo, conversationModeInjectionIds)
+    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, effectiveTools, model, context, conversationRepo, conversationModeInjectionIds)
 
-        for (stepIndex in 0 until maxSteps) {
+        for (stepIndex in 0 until effectiveMaxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
             // Check if we have tool calls ready to continue after user interaction.
@@ -373,6 +384,7 @@ class GenerationLoop(
                     generationType = generationType,
                     maxTokensOverride = maxTokensOverride,
                     swipeMeta = swipeMeta,
+                    isFinalStep = stepIndex == effectiveMaxSteps - 1,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -457,14 +469,25 @@ class GenerationLoop(
                     emit(GenerationChunk.Messages(messages))
                 }
 
-                // 3. Guardrail: same tool called N+ times in one batch → break
-                if (!hasPendingApproval) {
-                    val toolNameCount = updatedTools.groupingBy { it.toolName }.eachCount()
-                    val looped = toolNameCount.entries.find { it.value >= assistant.toolRecurringLimit }
-                    if (looped != null) {
-                        Log.w(TAG, "Guardrail: ${looped.key} called ${looped.value} times in one batch, breaking")
-                        break
-                    }
+                // 3. Guardrail: 同批同名工具超限时「只丢弃超限那些」，不要整批 break。
+                //    [P0 修复] 旧实现 break 发生在执行之前：同批读两个文件（参数不同，去重救不了）
+                //    → 两个都不执行、循环结束、无正文且无提示。
+                val perToolLimit = assistant.toolRecurringLimit.coerceAtLeast(1)
+                val seenPerTool = HashMap<String, Int>()
+                val keptTools = ArrayList<UIMessagePart.Tool>(updatedTools.size)
+                val droppedTools = ArrayList<UIMessagePart.Tool>()
+                for (tool in updatedTools) {
+                    val n = (seenPerTool[tool.toolName] ?: 0) + 1
+                    seenPerTool[tool.toolName] = n
+                    if (n > perToolLimit) droppedTools += tool else keptTools += tool
+                }
+                val uniqueForExecution = keptTools
+                if (droppedTools.isNotEmpty()) {
+                    TavernRuntimeManager.appendLog(
+                        "warn",
+                        "[guardrail] dropped ${droppedTools.size} recurring tool call(s) over limit $perToolLimit: " +
+                            droppedTools.map { it.toolName }.distinct(),
+                    )
                 }
 
                 // If there are pending approvals, break and wait for user
@@ -473,11 +496,22 @@ class GenerationLoop(
                     break
                 }
 
-                toolsToProcess = updatedTools
+                toolsToProcess = uniqueForExecution
             } else {
                 // Resuming after user interaction - use the resumable tools directly.
                 Log.i(TAG, "generateText: resuming with ${pendingTools.size} resumable tools")
-                toolsToProcess = messages.last().getTools().filter { it.canResumeExecution }
+                // [P0 修复] 续跑的工具必须在 toolsInternal 里真的有实现。酒馆卡默认 ToolPolicy.NONE
+                // （toolsInternal 为空）+ effectiveMaxSteps 被压到 1 时，旧实现会「跳过请求 -> 执行一个
+                // 查不到的工具 -> 循环结束」，整轮一次 chat completion 都不发且没有任何提示。
+                val byName = toolsInternal.associateBy { it.name }
+                toolsToProcess = messages.last().getTools()
+                    .filter { it.canResumeExecution }
+                    .filter { byName.containsKey(it.toolName) }
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[resume] resumable=${pendingTools.size} executable=${toolsToProcess.size} " +
+                        "registered=${toolsInternal.map { it.name }}",
+                )
             }
 
             // Handle tools (execute approved tools, handle denied tools)
@@ -514,6 +548,13 @@ class GenerationLoop(
             }
 
             if (executedTools.isEmpty()) {
+                // [P0 修复] 不能静默 break：pendingTools 非空但我们一个都执行不了时，
+                // 说明工具实现缺失，必须给出可见错误，而不是「转圈 -> 什么都没有」。
+                if (pendingTools.isNotEmpty() && toolsToProcess.isEmpty()) {
+                    throw GenerationAbortedException(
+                        reason = "待续跑的工具没有可用实现（${pendingTools.map { it.toolName }.distinct().joinToString()}）",
+                    )
+                }
                 // No results to add (all tools were pending)
                 break
             }
@@ -555,6 +596,87 @@ class GenerationLoop(
             )
         }
 
+        // ── [P0 修复] 收尾请求 ────────────────────────────────────────────────
+        // 步数耗尽 / REQUIRED / guardrail 都可能让整轮结束时「只有工具卡、没有正文」。
+        // 这里补一次不带工具的请求，保证用户至少拿到一段叙事；仍无正文就明确报错，
+        // 而不是让用户看到「转圈结束、什么都没有」。
+        val lastAssistant = messages.lastOrNull()?.takeIf { it.role == MessageRole.ASSISTANT }
+        val hasNarration = lastAssistant?.parts?.any {
+            it is UIMessagePart.Text && it.text.isNotBlank()
+        } ?: false
+        if (!hasNarration && lastAssistant != null &&
+            lastAssistant.parts.any { it is UIMessagePart.Tool }
+        ) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[final-turn] no narration after ${effectiveMaxSteps} step(s), requesting a tool-free completion",
+            )
+            generateInternal(
+                assistant = assistant,
+                settings = settings,
+                messages = messages,
+                onUpdateMessages = {
+                    messages = it.transforms(
+                        transformers = outputTransformers,
+                        context = context,
+                        model = model,
+                        assistant = assistant,
+                        settings = settings,
+                        conversationId = conversationId,
+                        workspaceCwd = workspaceCwd,
+                    )
+                    emit(
+                        GenerationChunk.Messages(
+                            messages.visualTransforms(
+                                transformers = outputTransformers,
+                                context = context,
+                                model = model,
+                                assistant = assistant,
+                                settings = settings,
+                                conversationId = conversationId,
+                                workspaceCwd = workspaceCwd,
+                            )
+                        )
+                    )
+                },
+                transformers = inputTransformers,
+                model = model,
+                providerImpl = providerImpl,
+                provider = provider,
+                tools = emptyList(),
+                memories = memories ?: emptyList(),
+                stream = assistant.streamOutput,
+                processingStatus = processingStatus,
+                conversationSystemPrompt = conversationSystemPrompt,
+                conversationId = conversationId,
+                conversationModeInjectionIds = conversationModeInjectionIds,
+                conversationLorebookIds = conversationLorebookIds,
+                prebuiltSystemMessages = prebuiltSystemMessages,
+                workspaceCwd = workspaceCwd,
+                generationType = generationType,
+                maxTokensOverride = maxTokensOverride,
+                swipeMeta = swipeMeta,
+                isFinalStep = true,
+            )
+            messages = messages.visualTransforms(
+                transformers = outputTransformers,
+                context = context,
+                model = model,
+                assistant = assistant,
+                settings = settings,
+                conversationId = conversationId,
+                workspaceCwd = workspaceCwd,
+            )
+            val narrated = messages.lastOrNull()?.parts?.any {
+                it is UIMessagePart.Text && it.text.isNotBlank()
+            } ?: false
+            if (!narrated) {
+                throw GenerationAbortedException(
+                    reason = "工具调用轮数已用尽，模型仍未产出正文",
+                )
+            }
+        }
+
     }.flowOn(Dispatchers.IO)
 
     private suspend fun generateInternal(
@@ -579,7 +701,11 @@ class GenerationLoop(
         generationType: me.rerere.rikkahub.data.model.GenerationType = me.rerere.rikkahub.data.model.GenerationType.NORMAL,
         maxTokensOverride: Int? = null,
         swipeMeta: Map<Uuid, me.rerere.rikkahub.data.model.SwipeMeta> = emptyMap(),
+        /** 当前是否已是本次生成的最后一步：是则不允许再强制 REQUIRED，否则永远出不来正文。 */
+        isFinalStep: Boolean = false,
     ) {
+        // 工具策略在本函数内解析（generateText 的 toolPolicy 不在此作用域）
+        val toolPolicy = assistant.effectiveToolPolicy()
         // ST兼容（/hide）：隐藏消息不进入上下文与提示词（对齐 ST `coreChat = chat.filter(x => !x.is_system ...)`）
         // 例外：启用工具时保留含工具调用的隐藏消息，避免 tool_call/tool 链断裂（对齐 ST canUseTools 分支）
         val visibleMessages = messages.filter { msg ->
@@ -864,19 +990,19 @@ class GenerationLoop(
                     val hookOutcome = runCatching { me.rerere.rikkahub.data.st.runtime.parseStGenerationHookResult(rewritten) }.getOrNull()
                     if (hookOutcome != null && hookOutcome.aborted) {
                         abortedByInterceptor = true
-                        android.util.Log.i("RikkaTavern", "[gen-hooks] generation aborted by extension generate_interceptor")
+                        TavernRuntimeManager.appendLog("info", "[gen-hooks] generation aborted by extension generate_interceptor")
                     } else if (hookOutcome != null && hookOutcome.messages.isNotEmpty()) {
                         internalMessages = hookOutcome.messages
-                        android.util.Log.i("RikkaTavern", "[gen-hooks] messages rewritten by extensions (${hookOutcome.messages.size})")
+                        TavernRuntimeManager.appendLog("info", "[gen-hooks] messages rewritten by extensions (${hookOutcome.messages.size})")
                     } else {
-                        android.util.Log.w("RikkaTavern", "[gen-hooks] rewrite rejected (empty messages or parse failed)")
+                        TavernRuntimeManager.appendLog("warn", "[gen-hooks] rewrite rejected (empty messages or parse failed)")
                     }
                 } else {
-                    android.util.Log.i("RikkaTavern", "[gen-hooks] no rewrite (null/timeout/not-ready)")
+                    TavernRuntimeManager.appendLog("debug", "[gen-hooks] no rewrite (null/timeout/not-ready)")
                 }
             }.onFailure { e ->
                 if (e is CancellationException) throw e
-                android.util.Log.w("RikkaTavern", "[gen-hooks] failed: ${e.message}")
+                TavernRuntimeManager.appendLog("error", "[gen-hooks] failed: ${e.message}")
             }
             if (abortedByInterceptor) {
                 TavernRuntimeManager.recordSendDiagnostic(
@@ -884,7 +1010,9 @@ class GenerationLoop(
                     conversationId = conversationId?.toString().orEmpty(),
                     detail = "status=ABORTED_BY_INTERCEPTOR",
                 )
-                return
+                // [P0 修复] 旧实现直接 return：flow 正常完成 -> ChatService 记 SUCCESS ->
+                // 用户只看到转圈消失、没有请求、没有报错。改为抛出，由 onFailure 走 addError。
+                throw GenerationAbortedException("扩展中止了本次生成（generate_interceptor）")
             }
         }
         var messages: List<UIMessage> = messages
@@ -894,6 +1022,13 @@ class GenerationLoop(
             topP = assistant.topP ?: postPresetCfg.topP,
             maxTokens = maxTokensOverride ?: assistant.maxTokens ?: postPresetCfg.maxTokens,
             tools = tools,
+            // [P0 修复] REQUIRED 最后一步必须切回 AUTO：循环唯一的正常出口是「本轮没有 tool call」，
+            // 每步都强制工具就永远拿不到叙事正文。
+            toolChoice = if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.REQUIRED && !isFinalStep) {
+                me.rerere.ai.provider.ToolChoice.REQUIRED
+            } else {
+                me.rerere.ai.provider.ToolChoice.AUTO
+            },
             reasoningLevel = assistant.reasoningLevel,
             customHeaders = buildList {
                 addAll(assistant.customHeaders)
@@ -910,7 +1045,9 @@ class GenerationLoop(
         // 典型用途：把 system 中的 <run_tool_replacement> 标记与 assistant 长上下文
         // 折叠成 { system, user } + 一个 context 工具描述；失败时原请求直通。
         val finalRequestProcessor = spresetCfg.finalRequestProcessing
-        if (spresetCfg.enabled && finalRequestProcessor.enabled && finalRequestProcessor.script.isNotBlank()) {
+        if (spresetCfg.enabled && finalRequestProcessor.enabled && finalRequestProcessor.script.isNotBlank() &&
+            toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE
+        ) {
             val rewritten = runCatching {
                 SpresetCompat.applyFinalRequestProcessing(
                     messages = internalMessages,

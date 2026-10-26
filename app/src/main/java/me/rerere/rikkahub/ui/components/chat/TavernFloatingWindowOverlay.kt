@@ -53,11 +53,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import me.rerere.rikkahub.data.datastore.Settings
-import me.rerere.rikkahub.data.st.extensions.listExtensions
-import me.rerere.rikkahub.data.st.extensions.normalizeExtensionFolderAlias
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import kotlin.math.roundToInt
 
@@ -77,9 +72,7 @@ import kotlin.math.roundToInt
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun BoxScope.TavernFloatingWindowOverlay(
-    settings: Settings,
-) {
+fun BoxScope.TavernFloatingWindowOverlay() {
     val context = LocalContext.current
     val summary by TavernRuntimeManager.floatingWindowsFlow.collectAsState()
     val ttsState by TavernRuntimeManager.stIphonieTtsStateFlow.collectAsState()
@@ -168,19 +161,10 @@ fun BoxScope.TavernFloatingWindowOverlay(
         )
     }
 
-    var installedAliases by remember { mutableStateOf<Set<String>>(emptySet()) }
-    LaunchedEffect(settings.tavernThirdPartyDisabled) {
-        installedAliases = withContext(Dispatchers.IO) {
-            listExtensions(context)
-                .filter { it.folder !in settings.tavernThirdPartyDisabled }
-                .map { normalizeExtensionFolderAlias(it.folder) }
-                .toSet()
-        }
-    }
-
-    val hasIphonie = summary.hasIphonie || installedAliases.any { it.contains("st-iphonie") }
-    val hasMemory = summary.hasMemory || installedAliases.any { it.contains("st-memory-enhancement") }
-    val hasLittleWhiteBox = summary.hasLittleWhiteBox || installedAliases.any { it.contains("littlewhitebox") }
+    // [问题 3] 只显示 DOM 真正就绪的目标；扩展“已安装”不再冒充可打开。
+    val hasIphonie = summary.hasIphonie
+    val hasMemory = summary.hasMemory
+    val hasLittleWhiteBox = summary.hasLittleWhiteBox
     val hasCardFloating = summary.hasCardFloating &&
         !TavernRuntimeManager.isFloatingTargetHidden(activeConvId, "card_floating")
     val showResidentDock = hasIphonie || hasMemory || hasLittleWhiteBox || summary.hasCardFloating
@@ -226,13 +210,22 @@ fun BoxScope.TavernFloatingWindowOverlay(
                     if (summary.hasCardFloating && !hasCardFloating && !hasIphonie) {
                         TavernRuntimeManager.clearHiddenFloatingTargetsForCurrentChat()
                     }
-                    val defaultTarget = when {
-                        hasIphonie -> "iphonie"
-                        summary.hasCardFloating -> "card_floating"
-                        hasMemory -> "memory_table"
-                        hasLittleWhiteBox -> "littlewhitebox"
-                        else -> "iphonie"
-                    }
+                    val candidates = listOfNotNull(
+                        TavernRuntimeManager.lastSuccessfulFloatingTarget,
+                        "memory_table".takeIf { hasMemory },
+                        "card_floating".takeIf { summary.hasCardFloating },
+                        "iphonie".takeIf { hasIphonie },
+                        "littlewhitebox".takeIf { hasLittleWhiteBox },
+                    )
+                    val defaultTarget = candidates.firstOrNull { target ->
+                        when (target) {
+                            "iphonie" -> hasIphonie
+                            "memory_table", "memory" -> hasMemory
+                            "littlewhitebox", "lwb" -> hasLittleWhiteBox
+                            "card_floating", "card" -> summary.hasCardFloating
+                            else -> false
+                        }
+                    } ?: "iphonie"
                     activeTarget = defaultTarget
                     TavernRuntimeManager.requestOpenFloatingWindow(defaultTarget)
                 }
@@ -306,6 +299,7 @@ fun TavernFloatingWindowModal(
 ) {
     var selectedTarget by remember(initialTarget) { mutableStateOf(initialTarget) }
     val containerHolder = remember { arrayOfNulls<FrameLayout>(1) }
+    val targetState by TavernRuntimeManager.floatingTargetStateFlow.collectAsState()
 
     LaunchedEffect(selectedTarget, isBootReady) {
         containerHolder[0]?.let { frame ->
@@ -441,6 +435,32 @@ fun TavernFloatingWindowModal(
                         Spacer(modifier = Modifier.width(2.dp))
                         TextButton(onClick = onDismiss) {
                             Text("✕ 收起", color = Color(0xFFE4E6EF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                val failedState = targetState as? TavernRuntimeManager.FloatingTargetState.Failed
+                if (failedState != null && failedState.target == selectedTarget) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF3A1E22))
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "无法打开该悬浮窗：${failedState.reason}",
+                            color = Color(0xFFFFC2C7),
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            onClick = {
+                                TavernRuntimeManager.retryFloatingWindowTarget(selectedTarget)
+                            },
+                        ) {
+                            Text("重试", color = Color(0xFFEAF0FF), fontSize = 12.sp)
                         }
                     }
                 }

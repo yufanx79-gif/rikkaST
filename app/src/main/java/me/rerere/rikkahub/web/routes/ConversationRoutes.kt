@@ -331,9 +331,19 @@ fun Route.conversationRoutes(
             val messageId = call.parameters["messageId"].toUuid("message id")
 
             chatService.initializeConversation(uuid)
-            chatService.deleteMessage(uuid, messageId)
-
-            call.respond(HttpStatusCode.OK, mapOf("status" to "deleted"))
+            when (val result = chatService.deleteMessage(uuid, messageId)) {
+                me.rerere.rikkahub.service.DeleteMessageResult.Success ->
+                    call.respond(HttpStatusCode.OK, mapOf("status" to "deleted"))
+                me.rerere.rikkahub.service.DeleteMessageResult.NotFound ->
+                    call.respond(HttpStatusCode.NotFound, mapOf("error" to "message not found"))
+                me.rerere.rikkahub.service.DeleteMessageResult.Generating ->
+                    call.respond(HttpStatusCode.Conflict, mapOf("error" to "message is being generated"))
+                is me.rerere.rikkahub.service.DeleteMessageResult.Failed ->
+                    call.respond(
+                        HttpStatusCode.InternalServerError,
+                        mapOf("error" to (result.error.message ?: "delete failed")),
+                    )
+            }
         }
 
         // POST /api/conversations/{id}/nodes/{nodeId}/select - Switch branch selection for a message node

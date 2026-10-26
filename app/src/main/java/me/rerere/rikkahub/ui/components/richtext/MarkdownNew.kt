@@ -59,6 +59,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.TextUnitType
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.isSpecified
@@ -705,6 +706,19 @@ private fun HtmlProgress(element: Element) {
  */
 @Composable
 private fun HtmlInlineGroup(nodes: List<Node>, onClickCitation: (String) -> Unit) {
+    // 修复：<span><img></span> / <a><img></a> 这类嵌套 inline 图片此前会被 AnnotatedString 分支静默丢弃。
+    // 只要子树里存在 img，就改走 FlowRow 逐节点渲染，img 会被下面的 HtmlInlineAsComposable 接住。
+    if (nodes.any { it is Element && it.selectFirst("img") != null }) {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            itemVerticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            nodes.fastForEach { HtmlInlineAsComposable(it, onClickCitation) }
+        }
+        return
+    }
     val enableLatexRendering = LocalSettings.current.displaySetting.enableLatexRendering
     val colorScheme = MaterialTheme.colorScheme
     val textStyle = LocalTextStyle.current
@@ -758,6 +772,17 @@ private fun HtmlInlineAsComposable(node: Node, onClickCitation: (String) -> Unit
         is Element -> {
             val tag = node.tagName().lowercase()
             when {
+                tag != "img" && node.selectFirst("img") != null -> {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        itemVerticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        node.childNodes().fastForEach { HtmlInlineAsComposable(it, onClickCitation) }
+                    }
+                }
+
                 tag == "img" -> {
                     val src = node.attr("src")
                     val alt = node.attr("alt")
@@ -1027,6 +1052,34 @@ private fun AnnotatedString.Builder.appendHtmlInlineElement(
                 appendStyledChildren(inlineStyle)
             } else {
                 appendElementChildren()
+            }
+        }
+
+        "img" -> {
+            // 兜底：任何走到 AnnotatedString 的 <img> 也不能被静默丢弃。
+            val src = element.attr("src").trim()
+            if (src.isNotEmpty()) {
+                val id = "inline-img:${src.hashCode()}:${element.attr("alt").hashCode()}"
+                if (id !in inlineContents) {
+                    inlineContents[id] = InlineTextContent(
+                        placeholder = Placeholder(
+                            width = 200.sp,
+                            height = 140.sp,
+                            placeholderVerticalAlign = PlaceholderVerticalAlign.Center,
+                        ),
+                        children = {
+                            ZoomableAsyncImage(
+                                model = src,
+                                contentDescription = element.attr("alt").takeIf { it.isNotBlank() },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Fit,
+                            )
+                        },
+                    )
+                }
+                appendInlineContent(id, "[图片]")
             }
         }
 

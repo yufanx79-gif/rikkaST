@@ -144,7 +144,7 @@ import androidx.compose.foundation.layout.padding
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
-import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
 
 @Composable
@@ -243,33 +243,66 @@ fun ChatPage(
         TavernRuntimeManager.lorebookUpdater = { name, json ->
             vm.applyLorebookUpdate(name, json)
         }
-        // [v214 / Bug B 修复] 面板表单发送桥（JS RikkaBridge.sendUserMessage）：记录诊断并在发送成功后自动滚到底部
+        // 外链图片双通道：跟随设置实时切换 AUTO / 直连 / VPN。
+        TavernRuntimeManager.resourceNetworkMode = setting.displaySetting.resourceNetworkMode
+        // [v214 / Bug B 修复] 面板表单发送桥：带真实落库回执，只有用户消息写入成功才滚动。
         TavernRuntimeManager.userMessageSender = { text ->
+            vm.handleMessageSend(listOf(UIMessagePart.Text(text)))
+        }
+        TavernRuntimeManager.userMessageSenderWithReceipt = { text, answer, onPersisted ->
             TavernRuntimeManager.recordSendDiagnostic(
                 stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_1_SEND_CLICKED,
                 conversationId = tavernLatestConversation.value.id.toString(),
                 detail = "source=panel_sendUserMessage textLen=${text.length}",
             )
-            val sent = vm.handleMessageSend(listOf(UIMessagePart.Text(text)))
-            if (sent) {
-                scope.launch {
-                    val targetIdx = (tavernLatestConversation.value.messageNodes.size + 5).coerceAtLeast(0)
-                    TavernRuntimeManager.recordSendDiagnostic(
-                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
-                        conversationId = tavernLatestConversation.value.id.toString(),
-                        detail = "source=panel_sendUserMessage targetIdx=$targetIdx firstVisible=${chatListState.firstVisibleItemIndex}",
-                    )
-                    chatListState.requestScrollToItem(targetIdx)
-                }
-            }
+            val shouldScroll = !chatListState.canScrollForward
+            val sent = vm.handleMessageSend(
+                content = listOf(UIMessagePart.Text(text)),
+                answer = answer,
+                onPersisted = { persisted ->
+                    onPersisted(persisted)
+                    if (persisted && shouldScroll) {
+                        val targetIdx = vm.conversation.value.messageNodes.lastIndex.coerceAtLeast(0)
+                        TavernRuntimeManager.recordSendDiagnostic(
+                            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
+                            conversationId = tavernLatestConversation.value.id.toString(),
+                            detail = "source=panel_sendUserMessage targetIdx=$targetIdx firstVisible=${chatListState.firstVisibleItemIndex}",
+                        )
+                        scope.launch { chatListState.requestScrollToItem(targetIdx) }
+                    }
+                },
+            )
+            if (!sent) onPersisted(false)
             sent
+        }
+        TavernRuntimeManager.assistantMessageInserter = { text ->
+            // [P0 修复] 空文本 / 会话未就绪时不能假装成功。
+            if (text.isBlank()) {
+                false
+            } else {
+                vm.handleInsertMessage(MessageRole.ASSISTANT, text)
+                true
+            }
+        }
+        TavernRuntimeManager.chatSaver = {
+            // [P0 修复] 之前无条件返回 true。这里至少确认会话已加载且 id 一致，
+            // 否则「保存成功」是假的（卡脚本会据此认为写盘完成）。
+            val conv = vm.conversation.value
+            if (!vm.chatListInitialized) {
+                TavernRuntimeManager.appendLog("warn", "[panel-cmd] saveChat rejected: conversation not loaded yet")
+                false
+            } else {
+                vm.saveConversationAsync()
+                true
+            }
         }
         // [v243 BUGFIX A2] JSR createChatMessages / deleteChatMessages 落点（同步更新，不触发生成）
         TavernRuntimeManager.chatInserter = { jsonText -> vm.insertRuntimeChatMessages(jsonText) }
         TavernRuntimeManager.chatDeleter = { idsJson -> vm.deleteRuntimeChatMessages(idsJson) }
         TavernRuntimeManager.generationStopper = {
-            vm.stopGeneration()
-            true
+            val hadActive = vm.conversationJob.value != null
+            if (hadActive) vm.stopGeneration()
+            hadActive
         }
         // [v243 BUGFIX A3] JSR 世界书条目写入与整书 CRUD / 绑定落点
         TavernRuntimeManager.lorebookUpserter = { name, json -> vm.applyLorebookUpsert(name, json) }
@@ -316,6 +349,10 @@ fun ChatPage(
                 "[route] tavern bind: conv=${conversation.id} assistant=${conversation.assistantId}",
             )
         }
+    }
+
+    LaunchedEffect(setting.displaySetting.resourceNetworkMode) {
+        TavernRuntimeManager.resourceNetworkMode = setting.displaySetting.resourceNetworkMode
     }
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -420,7 +457,7 @@ fun ChatPage(
                     chatListState.scrollToItem(index)
                 }
             } else {
-                chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                chatListState.requestScrollToItem(conversation.messageNodes.lastIndex.coerceAtLeast(0))
             }
             vm.chatListInitialized = true
         }
@@ -566,6 +603,8 @@ private fun ChatPageContent(
     val scope = rememberCoroutineScope()
     val toaster = LocalToaster.current
     val context = LocalContext.current
+    // 发送防抖：一条消息从「点击发送」到「真正落库」之间锁住发送按钮
+    var sendPending by remember { mutableStateOf(false) }
     // 酒馆运行时：/js 执行结果 → Toast（M1 可见反馈）
     val tavernJsResult by TavernRuntimeManager.lastJsResult.collectAsStateWithLifecycle()
     val slashModalRequest by TavernRuntimeManager.pendingSlashModal.collectAsStateWithLifecycle()
@@ -983,9 +1022,55 @@ private fun ChatPageContent(
                                 // 若曾误触历史消息遗留了已失效的 editingMessage，自动清除并按正常新消息发送
                                 inputState.editingMessage = null
                             }
-                            val sent = vm.handleMessageSend(contents)
-                            if (sent) {
-                                inputState.clearInput()
+                            if (sendPending) {
+                                toaster.show("上一条消息正在发送，请稍候…")
+                                return@ChatInput
+                            }
+                            val draftSnapshot = contents
+                            val shouldAutoScroll = !chatListState.canScrollForward
+                            sendPending = true
+                            val sent = vm.handleMessageSend(contents, onPersisted = { persisted ->
+                                sendPending = false
+                                if (persisted) {
+                                    // 只有用户消息真正落库后才清空输入，避免发送失败时草稿消失。
+                                    // 同时比较完整草稿（含附件），避免误清空等待期间新加的附件。
+                                    if (!inputState.isEditing() && inputState.getContents() == draftSnapshot) {
+                                        inputState.clearInput()
+                                    }
+                                    if (shouldAutoScroll) {
+                                        val target = vm.conversation.value.messageNodes.lastIndex.coerceAtLeast(0)
+                                        TavernRuntimeManager.recordSendDiagnostic(
+                                            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
+                                            conversationId = conversation.id.toString(),
+                                            detail = "source=ChatPage_onSendClick targetIdx=$target firstVisible=${chatListState.firstVisibleItemIndex}",
+                                        )
+                                        scope.launch { chatListState.requestScrollToItem(target) }
+                                    }
+                                } else {
+                                    // 失败时恢复草稿（仅当用户没有继续输入新内容）。
+                                    if (inputState.getContents() == draftSnapshot || inputState.isEmpty()) {
+                                        inputState.setContents(draftSnapshot)
+                                    }
+                                    toaster.show("发送失败，草稿已保留，请重试", type = ToastType.Error)
+                                }
+                            })
+                            if (!sent) {
+                                sendPending = false
+                                toaster.show("发送失败，草稿已保留", type = ToastType.Error)
+                            } else {
+                                scope.launch {
+                                    delay(15.seconds)
+                                    if (sendPending) {
+                                        // 排队等待生成结束时不会立刻落库；给用户明确的“已排队”状态，
+                                        // 避免发送按钮永久卡在“正在发送”。若用户已继续输入，则只解除发送锁，
+                                        // 不清掉新草稿。
+                                        sendPending = false
+                                        if (inputState.getContents() == draftSnapshot) {
+                                            inputState.clearInput()
+                                        }
+                                        toaster.show("消息已加入发送队列，将在当前回复结束后发送")
+                                    }
+                                }
                                 val userQrs = selectAutoTriggeredQuickReplies(setting.quickMessages, "user")
                                 if (userQrs.isNotEmpty()) {
                                     scope.launch(kotlinx.coroutines.Dispatchers.Default) {
@@ -998,28 +1083,29 @@ private fun ChatPageContent(
                                         }
                                     }
                                 }
-                                scope.launch {
-                                    val immediateTarget = (vm.conversation.value.messageNodes.size + 5).coerceAtLeast(0)
-                                    TavernRuntimeManager.recordSendDiagnostic(
-                                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_4_SCROLL_TRIGGERED,
-                                        conversationId = conversation.id.toString(),
-                                        detail = "source=ChatPage_onSendClick targetIdx=$immediateTarget firstVisible=${chatListState.firstVisibleItemIndex}",
-                                    )
-                                    chatListState.requestScrollToItem(immediateTarget)
-                                    delay(120.milliseconds)
-                                    val settledTarget = (vm.conversation.value.messageNodes.size + 5).coerceAtLeast(0)
-                                    chatListState.requestScrollToItem(settledTarget)
-                                }
                             }
                         }
                     },
                     onLongSendClick = {
                         if (inputState.isEditing()) {
                             vm.handleMessageEdit(inputState.getContents(), inputState.editingMessage!!)
+                            inputState.clearInput()
                         } else {
-                            vm.handleMessageSend(content = inputState.getContents(), answer = false)
+                            val draft = inputState.getContents()
+                            val sent = vm.handleMessageSend(content = draft, answer = false, onPersisted = { persisted ->
+                                if (persisted) {
+                                    if (!inputState.isEditing() && inputState.getContents() == draft) inputState.clearInput()
+                                } else {
+                                    if (inputState.getContents() == draft || inputState.isEmpty()) {
+                                        inputState.setContents(draft)
+                                    }
+                                    toaster.show("发送失败，草稿已保留", type = ToastType.Error)
+                                }
+                            })
+                            if (!sent) {
+                                toaster.show("发送失败，草稿已保留", type = ToastType.Error)
+                            }
                         }
-                        inputState.clearInput()
                     },
                     onSlashDuplicate = {
                         val src = setting.getCurrentAssistant()
@@ -1209,10 +1295,21 @@ private fun ChatPageContent(
                             if (currentChatModel == null) {
                                 toaster.show(context.getString(R.string.slash_toast_no_model), type = ToastType.Error)
                             } else {
-                                vm.handleMessageSend(listOf(UIMessagePart.Text(content)))
-                                scope.launch {
-                                    chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
-                                }
+                                val shouldScroll = !chatListState.canScrollForward
+                                vm.handleMessageSend(
+                                    listOf(UIMessagePart.Text(content)),
+                                    onPersisted = { persisted ->
+                                        if (persisted && shouldScroll) {
+                                            scope.launch {
+                                                chatListState.requestScrollToItem(
+                                                    vm.conversation.value.messageNodes.lastIndex.coerceAtLeast(0)
+                                                )
+                                            }
+                                        } else if (!persisted) {
+                                            toaster.show("发送失败，请重试", type = ToastType.Error)
+                                        }
+                                    },
+                                )
                             }
                         }
                     },
@@ -1339,16 +1436,11 @@ private fun ChatPageContent(
                     }
                 },
                 onDelete = {
-                    if (loadingJob != null) {
-                        vm.showDeleteBlockedWhileGeneratingError()
-                    } else {
-                        vm.deleteMessage(it)
-                    }
+                    // 删除整楼是会话原子操作；不再被 UI 的 loadingJob 状态拦截（生成中也允许删历史楼）。
+                    vm.deleteMessage(it)
                 },
                 onDeleteSwipe = { node ->
-                    if (loadingJob != null) {
-                        vm.showDeleteBlockedWhileGeneratingError()
-                    } else if (node.messages.size > 1) {
+                    if (node.messages.size > 1) {
                         vm.deleteSwipeVariant(node)
                     }
                 },
@@ -1412,9 +1504,7 @@ private fun ChatPageContent(
                 )
 
                 // [ST 1.19.0 体验升级] 常驻右侧悬浮球与全能悬浮窗容器（ST-iPhonie 小手机 / 记忆表格 / 小白X / 角色卡悬浮窗）
-                TavernFloatingWindowOverlay(
-                    settings = setting,
-                )
+                TavernFloatingWindowOverlay()
 
                 // [v233 主人拍板] 顶栏遮罩**总开关**（默认关：「顶栏模糊直接给我删掉吧，太难看」）。
                 // 开 = 按「消息样式 → 顶栏」里选的样式渲染；关 = 完全不渲染。

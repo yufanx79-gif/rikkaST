@@ -1141,6 +1141,18 @@ enum class WebViewPerfMode {
 }
 
 @Serializable
+enum class ResourceFetchMode {
+    @SerialName("auto")
+    AUTO,
+
+    @SerialName("direct")
+    DIRECT,
+
+    @SerialName("vpn")
+    VPN,
+}
+
+@Serializable
 data class DisplaySetting(
     val userAvatar: Avatar = Avatar.Dummy,
     val userNickname: String = "",
@@ -1189,6 +1201,7 @@ data class DisplaySetting(
     val voiceModeListenWhileReplying: Boolean = false,
     val enableWebViewPerfReduction: Boolean = false,
     val webViewPerfMode: WebViewPerfMode = WebViewPerfMode.HIBERNATE_POOL,
+    val resourceNetworkMode: ResourceFetchMode = ResourceFetchMode.AUTO,
 )
 
 @Serializable

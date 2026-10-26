@@ -2499,4 +2499,7 @@
     <string name="setting_provider_page_grok_disclaimer">Uses your SuperGrok subscription by signing in like the Grok CLI. Experimental: xAI may change or restrict this at any time.</string>
     <string name="setting_provider_page_device_code_hint">Confirm this code in the browser</string>
     <string name="setting_provider_page_device_code_reopen">Tap to open the page again</string>
+  <string name="error_regenerate_target_missing">The message being regenerated no longer exists; chat history was left unchanged.</string>
+  <string name="error_generation_aborted">Generation stopped before any request was sent: %1$s</string>
+  <string name="error_tool_approval_stale">This tool approval is no longer valid (the tool already finished or the request was replaced).</string>
 </resources>

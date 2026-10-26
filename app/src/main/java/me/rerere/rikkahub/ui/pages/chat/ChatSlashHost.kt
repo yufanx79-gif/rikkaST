@@ -109,6 +109,16 @@ internal fun buildChatSlashHost(
         vm.saveConversationAsync()
     }
 
+    /**
+     * [P0 修复] 斜杠命令的失败必须带 `(slash error: ...)` 前缀。
+     *
+     * JS 侧的错误判定是白名单（st-compat/slash-commands.js toExecutionResult）：只认
+     * `(slash error:` / `(slash runner not ready)` / `未知命令：` / `命令不可用：` / `命令缺少`。
+     * 旧实现直接返回中文自然语言（"没有可触发的消息" 等），会被判成 isError=false →
+     * 卡片 `await triggerSlash('/trigger')` 以为成功 → 既不生成也不报错 → 用户只看到转圈。
+     */
+    fun slashError(reason: String): String = "(slash error: $reason)"
+
     return object : StSlashHost {
         override val chatKey: String?
             get() = conversationKey()
@@ -166,11 +176,11 @@ internal fun buildChatSlashHost(
             // 用户只看到「AI 不自动回复」。这里把每条分支都写进 tavern-runtime.log。
             if (!hasModel()) {
                 TavernRuntimeManager.appendLog("warn", "[slash] /trigger 中止：未选择模型（currentChatModel=null）")
-                return "未选择模型，无法生成"
+                return slashError("未选择模型，无法生成")
             }
             if (vm.conversation.value.currentMessages.isEmpty()) {
                 TavernRuntimeManager.appendLog("warn", "[slash] /trigger 中止：没有可触发的消息（currentMessages 为空）")
-                return "没有可触发的消息"
+                return slashError("没有可触发的消息")
             }
             TavernRuntimeManager.appendLog(
                 "info",
@@ -181,13 +191,13 @@ internal fun buildChatSlashHost(
         }
 
         override fun continueGen(prompt: String): String? {
-            if (!hasModel()) return "未选择模型，无法生成"
+            if (!hasModel()) return slashError("未选择模型，无法生成")
             vm.continueGeneration(prompt)
             return ""
         }
 
         override fun impersonate(prompt: String): String? {
-            if (!hasModel()) return "未选择模型，无法生成"
+            if (!hasModel()) return slashError("未选择模型，无法生成")
             val state = inputState ?: return null
             var announced = false
             vm.impersonateDraft(prompt) { draft ->
@@ -204,7 +214,7 @@ internal fun buildChatSlashHost(
         }
 
         override fun sysgen(prompt: String, name: String?, at: Int?, trim: Boolean): String? {
-            if (!hasModel()) return "未选择模型，无法生成"
+            if (!hasModel()) return slashError("未选择模型，无法生成")
             vm.handleGenerateSystemNarration(prompt, name, at, trim)
             return ""
         }
@@ -217,7 +227,7 @@ internal fun buildChatSlashHost(
             name: String?,
             trim: Boolean,
         ): String? {
-            if (!hasModel()) return "未选择模型，无法生成"
+            if (!hasModel()) return slashError("未选择模型，无法生成")
             val asEnum = when (asRole.lowercase()) {
                 "char" -> ChatService.QuietPromptAs.CHAR
                 else -> ChatService.QuietPromptAs.SYSTEM
@@ -243,7 +253,7 @@ internal fun buildChatSlashHost(
             length: Int,
             trim: Boolean,
         ): String? {
-            if (!hasModel()) return "未选择模型，无法生成"
+            if (!hasModel()) return slashError("未选择模型，无法生成")
             return kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
                 kotlinx.coroutines.withTimeoutOrNull(60_000L) {
                     vm.quietGenerateSync(

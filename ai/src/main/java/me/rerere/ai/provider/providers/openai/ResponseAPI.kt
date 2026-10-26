@@ -331,6 +331,9 @@ class ResponseAPI(
                         }
                     }
                 }
+                if (useFunctionTools && params.toolChoice == me.rerere.ai.provider.ToolChoice.REQUIRED) {
+                    put("tool_choice", "required")
+                }
             }
         }.mergeCustomBody(params.customBody)
     }

@@ -16,6 +16,8 @@ data class QueuedMessage(
     val isEditing: Boolean = false,
     // Optional in-memory observer; null result means the queued message was withdrawn.
     val reply: CompletableDeferred<String?>? = null,
+    // true 只在用户消息真正写入内存会话并完成落库后完成；失败/取消/撤回为 false。
+    val persisted: CompletableDeferred<Boolean>? = null,
 )
 
 data class MessageQueueState(
@@ -42,18 +44,25 @@ class MessageQueue {
     val state = mutableState.asStateFlow()
 
     @Synchronized
-    fun enqueue(parts: List<UIMessagePart>, answer: Boolean = true, reply: CompletableDeferred<String?>? = null) {
+    fun enqueue(
+        parts: List<UIMessagePart>,
+        answer: Boolean = true,
+        reply: CompletableDeferred<String?>? = null,
+        persisted: CompletableDeferred<Boolean>? = null,
+    ): QueuedMessage? {
         if (parts.isEmptyInputMessage()) {
             reply?.complete(null)
-            return
+            persisted?.complete(false)
+            return null
         }
-        mutableState.value = state.value.copy(
-            messages = state.value.messages + QueuedMessage(
-                parts = parts.toList(),
-                answer = answer,
-                reply = reply,
-            ),
+        val queued = QueuedMessage(
+            parts = parts.toList(),
+            answer = answer,
+            reply = reply,
+            persisted = persisted,
         )
+        mutableState.value = state.value.copy(messages = state.value.messages + queued)
+        return queued
     }
 
     @Synchronized
@@ -71,6 +80,7 @@ class MessageQueue {
         mutableState.value =
             state.value.copy(messages = state.value.messages.filterNot { it.id == id })
         removed.reply?.complete(null)
+        removed.persisted?.complete(false)
         return removed
     }
 

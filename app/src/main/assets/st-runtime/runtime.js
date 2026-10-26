@@ -785,6 +785,79 @@ function safeWarn(...args) {
     try { console.warn(LOG_PREFIX, ...args); } catch (_e) { /* noop */ }
 }
 
+// ---------------------------------------------------------------- 面板命令总线（问题 2）
+// 所有 panel → host 的动作都带 requestId，Kotlin 处理完广播 __rikkaPanelCommandResult。
+// 超时/失败必须 reject 到调用方，禁止“按钮只变色、没有动作”。
+const panelPendingCommands = new Map();
+let panelCommandSeq = 0;
+
+function panelCommand(kind, fields, timeoutMs) {
+    const timeout = Math.max(1000, Number(timeoutMs) || 5000);
+    return new Promise((resolve) => {
+        const requestId = 'panel-' + Date.now().toString(36) + '-' + (++panelCommandSeq);
+        let settled = false;
+        const finish = (ok, result, error) => {
+            if (settled) return;
+            settled = true;
+            try { clearTimeout(timer); } catch (_e) { /* noop */ }
+            panelPendingCommands.delete(requestId);
+            const payload = { ok: !!ok, result: result == null ? '' : String(result), error: error || '' };
+            try { if (window.RikkaPanel && RikkaPanel.log) RikkaPanel.log('debug', '[panel-cmd] ' + kind + ' ok=' + payload.ok + (payload.error ? ' err=' + payload.error : '')); } catch (_e) { /* noop */ }
+            resolve(payload);
+        };
+        const timer = setTimeout(() => finish(false, '', '宿主未响应（超时 ' + timeout + 'ms）'), timeout);
+        panelPendingCommands.set(requestId, finish);
+        let accepted = false;
+        try {
+            const payload = Object.assign({ requestId: requestId, kind: kind }, fields || {});
+            accepted = callBridge('panelCommand', JSON.stringify(payload));
+        } catch (e) {
+            finish(false, '', '桥接调用失败: ' + String((e && e.message) || e));
+            return;
+        }
+        if (accepted !== true) {
+            finish(false, '', '宿主未接线（不在聊天页或桥不可用）');
+        }
+    });
+}
+
+window.__rikkaPanelCommandResult = function (requestId, json) {
+    try {
+        const finish = panelPendingCommands.get(String(requestId || ''));
+        if (!finish) return;
+        const obj = typeof json === 'string' ? JSON.parse(json) : (json || {});
+        finish(obj.ok === true, obj.result || '', obj.error || '');
+    } catch (e) {
+        safeWarn('panel command ack parse failed', e);
+    }
+};
+
+window.__rikkaPanelPing = function () {
+    return panelCommand('ping', {}, 3000);
+};
+
+window.__rikkaPanelBridgeSelfTest = function () {
+    try {
+        const th = window.TavernHelper || {};
+        const form = document.getElementById('send_form');
+        const button = document.getElementById('send_but');
+        return JSON.stringify({
+            sendMessage: typeof th.sendMessage === 'function',
+            sendMessageAsUser: typeof th.sendMessageAsUser === 'function',
+            sendMessageAsAssistant: typeof th.sendMessageAsAssistant === 'function',
+            triggerSlashAsync: typeof th.triggerSlashAsync === 'function',
+            emitHostEvent: typeof th.emitHostEvent === 'function',
+            saveChat: typeof th.saveChat === 'function',
+            stopGeneration: typeof th.stopGeneration === 'function',
+            formSubmit: window.__RIKKA_PANEL_MODE__ ? !!(form && (form.tagName === 'FORM' || typeof form.submit === 'function')) : true,
+            sendButton: window.__RIKKA_PANEL_MODE__ ? !!button : true,
+            bridgePanelCommand: !!(window.RikkaBridge && typeof window.RikkaBridge.panelCommand === 'function'),
+        });
+    } catch (e) {
+        return JSON.stringify({ error: String((e && e.message) || e) });
+    }
+};
+
 // ---------------------------------------------------------------- 控制台转发（供调试面板/日志）
 (function patchConsole() {
     const MAX = 600;
@@ -1672,8 +1745,15 @@ const stCtx = {
         const r = await stCtx.executeSlashCommandsWithOptions(text);
         return r && typeof r === 'object' ? r.pipe : r;
     },
+    // [P0 修复] 不要再把失败吞成空字符串：宿主拒绝（未选模型 / 无消息 / slashRunner 未接线）
+    // 一律以 `(slash error: ...)` 返回，这里必须抛出去，让卡片的 `await generate()` 真的进 catch。
     generate: async () => {
-        try { return String(callBridge('triggerSlash', '/trigger') || ''); } catch (_e) { return ''; }
+        const raw = callBridge('triggerSlash', '/trigger');
+        const text = raw == null ? '' : String(raw);
+        if (text.startsWith('(slash error:') || text === '(slash runner not ready)') {
+            throw new Error(text);
+        }
+        return text;
     },
     generateRaw: async (opts) => {
         try {
@@ -1721,6 +1801,26 @@ const stCtx = {
         try { eventSource.emit(event_types.GENERATION_STOPPED); } catch (_e) { /* noop */ }
         return true;
     },
+    // ---- 面板/卡脚本统一命令面：全部返回 { ok, result, error }，不再是“发后即忘” ----
+    sendMessage: (text, options) => panelCommand('send_message', {
+        text: String(text == null ? '' : text),
+        answer: !(options && options.answer === false),
+    }, options && options.timeout),
+    sendMessageAsUser: (text, options) => panelCommand('send_as_user', {
+        text: String(text == null ? '' : text),
+    }, options && options.timeout),
+    sendMessageAsAssistant: (text, options) => panelCommand('send_as_assistant', {
+        text: String(text == null ? '' : text),
+    }, options && options.timeout),
+    triggerSlashAsync: (script, options) => panelCommand('trigger_slash', {
+        script: String(script == null ? '' : script),
+    }, options && options.timeout),
+    emitHostEvent: (name, payload, options) => panelCommand('emit_event', {
+        event: String(name == null ? '' : name),
+        payload: typeof payload === 'string' ? payload : JSON.stringify(payload == null ? {} : payload),
+    }, options && options.timeout),
+    saveChatAsync: () => panelCommand('save_chat', {}),
+    stopGenerationAsync: () => panelCommand('stop_generation', {}),
     clearChat: () => {},
     printMessages: () => {},
     // ---- [v214] ST getContext() 成员面补齐（st-context.js:129-311；按真实消费方优先级）----
@@ -2085,6 +2185,15 @@ try {
 
 // ---------------------------------------------------------------- TavernHelper 全局（JSR API 兼容层）
 const TavernHelper = {
+    // 宿主命令面（问题 2）：panel → host 统一 ack/toast，返回 Promise<{ok,error,result}>
+    sendMessage: (...args) => stCtx.sendMessage(...args),
+    sendMessageAsUser: (...args) => stCtx.sendMessageAsUser(...args),
+    sendMessageAsAssistant: (...args) => stCtx.sendMessageAsAssistant(...args),
+    triggerSlashAsync: (...args) => stCtx.triggerSlashAsync(...args),
+    emitHostEvent: (...args) => stCtx.emitHostEvent(...args),
+    saveChat: (...args) => stCtx.saveChatAsync(...args),
+    stopGeneration: () => stCtx.stopGenerationAsync(),
+    stopGenerationAsync: () => stCtx.stopGenerationAsync(),
     // 常量
     tavern_events: shimConstants.tavern_events,
     iframe_events: shimConstants.iframe_events,
@@ -2828,6 +2937,8 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
 };
 
 window.__rikkaEmit = function __rikkaEmit(name, payload) {
+    window.__rikkaIncomingHostEvent = true;
+    setTimeout(() => { window.__rikkaIncomingHostEvent = false; }, 0);
     try {
         if (['message_received', 'message_sent', 'message_updated', 'user_message_rendered',
              'character_message_rendered', 'message_swiped', 'active_conversation_changed'].includes(name)) {
@@ -4154,26 +4265,71 @@ function ensurePanelChatDomStubs() {
             host.appendChild(ta);
         }
         if (!document.getElementById('send_form')) {
-            const form = document.createElement('div');
+            // 必须是真正的 <form>：卡的提交按钮经常调用 form.submit()/requestSubmit()，
+            // 旧实现用 <div> 根本没有 submit 方法，点击只会变颜色。
+            const form = document.createElement('form');
             form.id = 'send_form';
             form.style.cssText = 'display:none;';
             host.appendChild(form);
+        }
+        const panelToast = (message) => {
+            try {
+                let el = document.getElementById('rikka-panel-toast');
+                if (!el) {
+                    el = document.createElement('div');
+                    el.id = 'rikka-panel-toast';
+                    el.style.cssText = 'position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483647;padding:8px 12px;border-radius:8px;background:#5c1f24;color:#ffe4e6;font:12px/1.5 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.35);';
+                    (document.body || document.documentElement).appendChild(el);
+                }
+                el.textContent = String(message || '操作失败');
+                el.style.display = 'block';
+                clearTimeout(el.__rikkaHideTimer);
+                el.__rikkaHideTimer = setTimeout(() => { el.style.display = 'none'; }, 4200);
+            } catch (_e) { /* noop */ }
+        };
+        const submitPanelSend = async (source) => {
+            const ta = document.getElementById('send_textarea');
+            const btn = document.getElementById('send_but');
+            const text = ta && typeof ta.value === 'string' ? ta.value : '';
+            if (!text.trim()) return false;
+            if (btn && btn.dataset.rikkaBusy === '1') return false;
+            if (btn) btn.dataset.rikkaBusy = '1';
+            try {
+                const result = await stCtx.sendMessage(text);
+                if (result && result.ok) {
+                    if (ta) ta.value = '';
+                    try { if (window.RikkaPanel && RikkaPanel.log) RikkaPanel.log('debug', '[panel] ' + source + ' → host ok len=' + text.length); } catch (_e) { /* noop */ }
+                    return true;
+                }
+                panelToast('发送失败：' + ((result && result.error) || '宿主未响应'));
+                return false;
+            } catch (e) {
+                panelToast('发送失败：' + String((e && e.message) || e));
+                return false;
+            } finally {
+                if (btn) btn.dataset.rikkaBusy = '0';
+            }
+        };
+        const form = document.getElementById('send_form');
+        if (form && !form.__rikkaSubmitBound) {
+            form.__rikkaSubmitBound = true;
+            form.addEventListener('submit', (ev) => {
+                try { ev.preventDefault(); } catch (_e) { /* noop */ }
+                submitPanelSend('form.submit-event');
+            });
+            // HTMLFormElement.submit() 原生实现不会触发 submit 事件：卡的按钮经常直接调它，
+            // 必须覆盖成我们的命令入口，否则仍然“只变颜色没有动作”。
+            try {
+                form.submit = function () { submitPanelSend('form.submit()'); };
+                form.requestSubmit = function () { form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true })); };
+            } catch (_e) { /* noop */ }
         }
         if (!document.getElementById('send_but')) {
             const btn = document.createElement('button');
             btn.id = 'send_but';
             btn.type = 'button';
             btn.style.cssText = 'display:none;';
-            btn.addEventListener('click', () => {
-                try {
-                    const ta = document.getElementById('send_textarea');
-                    const text = ta && typeof ta.value === 'string' ? ta.value : '';
-                    if (!text.trim()) return;
-                    const ok = callBridge('sendUserMessage', text);
-                    if (ta) ta.value = '';
-                    try { if (window.RikkaPanel && RikkaPanel.log) RikkaPanel.log('debug', '[panel] send_but → host sendUserMessage ok=' + (ok === true) + ' len=' + text.length); } catch (_e) { /* noop */ }
-                } catch (e) { safeWarn('panel send_but failed', e); }
-            });
+            btn.addEventListener('click', () => { submitPanelSend('send_but'); });
             host.appendChild(btn);
         }
     } catch (_e) { /* noop */ }
@@ -4274,6 +4430,30 @@ function installPanelMode() {
     } catch (_e) { /* noop */ }
     // [v243 BUGFIX C1] 面板独立 realm：同步已安装扩展元数据（不重新执行插件模块）
     syncThirdPartyExtensionMetadata();
+    // [问题 2-D] panel 的 eventSource 是独立 realm：关键事件必须经宿主转到主运行时，
+    // 否则卡脚本 emit('message_sent') 后主运行时的扩展永远收不到。宿主回灌事件用 flag 防环。
+    try {
+        if (!eventSource.__rikkaPanelForwardPatched) {
+            eventSource.__rikkaPanelForwardPatched = true;
+            const origEmit = eventSource.emit.bind(eventSource);
+            const forwardedEvents = new Set([
+                'message_sent', 'message_received', 'message_updated', 'message_deleted',
+                'message_swiped', 'message_swipe_deleted', 'generation_started', 'generation_stopped',
+                'generation_ended',
+            ]);
+            eventSource.emit = function (eventName, ...args) {
+                try {
+                    if (!window.__rikkaIncomingHostEvent &&
+                        forwardedEvents.has(String(eventName)) &&
+                        window.RikkaBridge && typeof RikkaBridge.emitHostEvent === 'function') {
+                        const payload = args.length <= 1 ? (args[0] == null ? {} : args[0]) : { args: args };
+                        RikkaBridge.emitHostEvent(String(eventName), JSON.stringify(payload));
+                    }
+                } catch (_eFwd) { /* noop */ }
+                return origEmit(eventName, ...args);
+            };
+        }
+    } catch (_eFwdPatch) { /* noop */ }
     // ---------------------------------------------------------------- [v243 BUGFIX A4] 面板自识别
     /**
      * 面板是「某条消息」的渲染宿主：本条消息 id 由 Kotlin 侧注入
@@ -4384,6 +4564,82 @@ function installPanelMode() {
         } catch (_e) { /* noop */ }
     };
     window.__rikkaPanelReport = report;
+    // [问题 7/性能] KaTeX 按需加载：静态 HUD/表单面板不再为 270KB 数学库付出解析成本。
+    let panelKatexPromise = null;
+    const ensurePanelKatex = () => {
+        if (window.katex) return Promise.resolve();
+        if (panelKatexPromise) return panelKatexPromise;
+        panelKatexPromise = new Promise((resolve) => {
+            try {
+                if (!document.querySelector('link[data-rikka-katex]')) {
+                    const link = document.createElement('link');
+                    link.rel = 'stylesheet';
+                    link.href = './vendor/katex/katex.min.css';
+                    link.setAttribute('data-rikka-katex', '1');
+                    document.head.appendChild(link);
+                }
+                const script = document.createElement('script');
+                script.src = './vendor/katex/katex.min.js';
+                const done = () => {
+                    try { mathRender.setKatex(window.katex); } catch (_eKatex) { /* noop */ }
+                    resolve();
+                };
+                script.onload = done;
+                script.onerror = done;
+                setTimeout(done, 2500);
+                document.head.appendChild(script);
+            } catch (_e) { resolve(); }
+        });
+        return panelKatexPromise;
+    };
+    // [问题 7] 真实资源就绪：DOM readyState + fonts + 图片 complete + 高度连续两帧稳定。
+    // 最多等 2.5s；超时仍回报 timedOut=true，让占位文案说真话（“仍有资源在加载”）。
+    let panelSettleToken = 0;
+    const nextFrame = () => new Promise((r) => {
+        try { requestAnimationFrame(() => r()); } catch (_e) { setTimeout(r, 16); }
+    });
+    const waitPanelResourcesSettled = async () => {
+        const token = ++panelSettleToken;
+        const started = Date.now();
+        try {
+            await nextFrame();
+            await nextFrame();
+            try {
+                if (document.fonts && document.fonts.ready) {
+                    await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 800))]);
+                }
+            } catch (_eFonts) { /* noop */ }
+            let lastHeight = -1;
+            let stable = 0;
+            while (Date.now() - started < 2500) {
+                const imgs = Array.from(document.images || []).filter((img) => {
+                    try { return img && !img.complete && img.loading !== 'lazy'; } catch (_e) { return false; }
+                });
+                const h = measure();
+                if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+                if (imgs.length === 0 && document.readyState === 'complete' && stable >= 2) break;
+                await new Promise((r) => setTimeout(r, 80));
+            }
+            await nextFrame();
+            if (token !== panelSettleToken) return;
+            const pendingImages = Array.from(document.images || []).some((img) => {
+                try { return img && !img.complete && img.loading !== 'lazy'; } catch (_e) { return false; }
+            });
+            const timedOut = pendingImages || document.readyState !== 'complete' || Date.now() - started >= 2500;
+            try {
+                if (window.RikkaPanel && typeof RikkaPanel.onPanelResourcesSettled === 'function') {
+                    RikkaPanel.onPanelResourcesSettled(!!timedOut);
+                }
+            } catch (_e) { /* noop */ }
+        } catch (_e) {
+            try {
+                if (window.RikkaPanel && typeof RikkaPanel.onPanelResourcesSettled === 'function') {
+                    RikkaPanel.onPanelResourcesSettled(true);
+                }
+            } catch (_e2) { /* noop */ }
+        }
+    };
+    window.__rikkaPanelAwaitSettled = () => { waitPanelResourcesSettled(); };
     const runScripts = async (container) => {
         // 消息挂载时页面早已 loaded：r0 类「DOMContentLoaded 后初始化」的脚本原生监听
         // 不会再触发，导致表单点不动。这里做补偿式补丁：已加载状态下注册的
@@ -4644,6 +4900,7 @@ function installPanelMode() {
         const t = tag || 'mount';
         if (t === 'mount' && window.__rikkaPanelMountedHtml === html) {
             report();
+            waitPanelResourcesSettled();
             return;
         }
         window.__rikkaPanelMountedHtml = html;
@@ -4658,11 +4915,13 @@ function installPanelMode() {
         try {
             root.innerHTML = normalizeHtml(html);
             Promise.resolve()
+                .then(() => (/katex|\$\$|\\\(|\\\[/i.test(String(html || '')) ? ensurePanelKatex() : null))
                 .then(() => runScripts(root))
                 .then(() => {
                     report();
                     setTimeout(report, 120);
                     setTimeout(report, 600);
+                    setTimeout(() => { waitPanelResourcesSettled(); }, 120);
                     probe(t);
                     setTimeout(() => probe(t + '+1500'), 1500);
                     // [v218.1] recon-ext-compat §2.3：RENDERED 类事件由面板渲染完成后自发。
@@ -5109,10 +5368,12 @@ function installUniversalFloatingAndTtsBridge() {
     let lastFloatingSummaryJson = '';
     const reportFloatingWindows = () => {
         try {
-            const list = (window.__rikkaSt && Array.isArray(window.__rikkaSt.extensions)) ? window.__rikkaSt.extensions : [];
-            const hasIphonie = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('st-iphonie')) || !!document.getElementById('sttts-extension-entry');
-            const hasMemory = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('st-memory-enhancement')) || !!document.getElementById('table_database_settings_drawer');
-            const hasXbx = list.some((e) => e && normalizeExtFolderAliasJs(e.folder).includes('littlewhitebox')) || !!document.querySelector('.littlewhitebox');
+            // [问题 3] 只认“真实 DOM 已就绪”，不再用“扩展已安装”冒充可打开目标。
+            const hasIphonie = !!document.getElementById('sttts-extension-entry') || !!document.getElementById('sttts-panel');
+            const hasMemory = !!document.getElementById('table_database_settings_drawer') ||
+                !!document.getElementById('table_drawer_content') ||
+                !!document.getElementById('database-content');
+            const hasXbx = !!document.querySelector('.littlewhitebox');
             const cardNodes = detectCardFloatingNodes();
             const summary = {
                 hasIphonie,
@@ -5131,10 +5392,126 @@ function installUniversalFloatingAndTtsBridge() {
     setInterval(reportFloatingWindows, 1500);
     setTimeout(reportFloatingWindows, 500);
 
+    const floatingNodeVisible = (el) => {
+        if (!el) return false;
+        try {
+            const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0)) return false;
+            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            return !rect || rect.width > 0 || rect.height > 0;
+        } catch (_e) { return true; }
+    };
+
+    const setFloatingIsolationTarget = (target) => {
+        try {
+            if (target) {
+                document.body.dataset.rikkaFloatingTarget = String(target);
+            } else {
+                delete document.body.dataset.rikkaFloatingTarget;
+            }
+            let style = document.getElementById('rikka-floating-isolation-style');
+            if (!style) {
+                style = document.createElement('style');
+                style.id = 'rikka-floating-isolation-style';
+                (document.head || document.documentElement).appendChild(style);
+            }
+            style.textContent =
+                'body[data-rikka-floating-target]:not([data-rikka-floating-target="iphonie"]) #sttts-extension-entry,' +
+                'body[data-rikka-floating-target]:not([data-rikka-floating-target="iphonie"]) #sttts-panel {' +
+                'display:none !important;visibility:hidden !important;pointer-events:none !important;}';
+        } catch (_e) { /* noop */ }
+    };
+
+    const hideIphonieFloatingPanel = () => {
+        const dlg = document.getElementById('sttts-panel');
+        if (dlg) {
+            try { if (dlg.open) dlg.close(); } catch (_e) { dlg.removeAttribute('open'); }
+            dlg.style.setProperty('display', 'none', 'important');
+        }
+        const entry = document.getElementById('sttts-extension-entry');
+        if (entry) entry.style.setProperty('display', 'none', 'important');
+    };
+
+    // 共享 compatDom 隔离：只显示目标节点所在的祖先链，其余（尤其 iPhonie 快捷设置）显式隐藏。
+    const isolateCompatDom = (targetNodes) => {
+        const compatDom = document.getElementById('rikka-st-compat-dom');
+        if (!compatDom) return;
+        compatDom.style.setProperty('display', 'block', 'important');
+        compatDom.removeAttribute('aria-hidden');
+        const targets = new Set(targetNodes.filter(Boolean));
+        const keep = new Set();
+        targetNodes.filter(Boolean).forEach((node) => {
+            let cur = node;
+            while (cur && cur !== compatDom) {
+                keep.add(cur);
+                cur = cur.parentElement;
+            }
+        });
+        // 共享 compatDom 里可能同时挂着 iPhonie 快捷设置：只保留目标节点所在的祖先链，
+        // 对每个祖先的其他分支逐级 display:none（而不是只处理 compatDom 的直接子节点）。
+        const prune = (parent) => {
+            Array.from(parent.children || []).forEach((child) => {
+                if (targets.has(child)) {
+                    child.style.removeProperty('display');
+                    return; // 目标子树内部不动
+                }
+                if (keep.has(child)) {
+                    child.style.removeProperty('display');
+                    prune(child);
+                } else {
+                    child.style.setProperty('display', 'none', 'important');
+                }
+            });
+        };
+        prune(compatDom);
+    };
+
+    const floatingResult = (target, ok, reason) => {
+        const result = { ok: !!ok, target: target || '', reason: reason || '' };
+        try {
+            if (window.RikkaBridge && typeof RikkaBridge.onFloatingTargetResult === 'function') {
+                RikkaBridge.onFloatingTargetResult(result.target, result.ok, result.reason);
+            }
+        } catch (_e) { /* noop */ }
+        if (ok) {
+            window.__rikkaLastGoodFloatingTarget = target;
+        }
+        return result;
+    };
+
+    // 预检：不执行任何打开动作，供开发者测试台判断 DOM 是否真的就绪。
+    window.__rikkaFloatingTargetProbe = function (target) {
+        const t = String(target || '');
+        const memoryNodes = [
+            document.getElementById('table_database_settings_drawer'),
+            document.getElementById('table_drawer_content'),
+            document.getElementById('database-content'),
+        ].filter(Boolean);
+        const result = { target: t, available: false, nodeCount: 0, reason: '' };
+        if (t === 'iphonie') {
+            result.nodeCount = document.querySelectorAll('#sttts-extension-entry, #sttts-panel').length;
+            result.available = result.nodeCount > 0;
+        } else if (t === 'memory_table' || t === 'memory') {
+            result.nodeCount = memoryNodes.length;
+            result.available = memoryNodes.length > 0;
+        } else if (t === 'littlewhitebox' || t === 'lwb') {
+            result.nodeCount = document.querySelectorAll('.littlewhitebox').length;
+            result.available = result.nodeCount > 0;
+        } else if (t === 'card_floating' || t === 'card') {
+            result.nodeCount = detectCardFloatingNodes().length;
+            result.available = result.nodeCount > 0;
+        } else {
+            result.reason = 'unknown target';
+        }
+        if (!result.available && !result.reason) result.reason = '目标 DOM 未创建';
+        return JSON.stringify(result);
+    };
+
     // 3) 切换主运行时 WebView 的可视悬浮窗舞台（当用户在聊天页点击右侧常驻悬浮球时直接挂载显示）
     window.__rikkaOpenFloatingTarget = async function (target, forceReopen = false) {
         try {
             window.__rikkaCurrentFloatingTarget = target || null;
+            setFloatingIsolationTarget(target || null);
             refreshAll();
             const compatDom = document.getElementById('rikka-st-compat-dom');
             const dlg = document.getElementById('sttts-panel');
@@ -5148,58 +5525,79 @@ function installUniversalFloatingAndTtsBridge() {
 
             if (target === 'iphonie') {
                 if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                const iphEntry = document.getElementById('sttts-extension-entry');
+                if (iphEntry) iphEntry.style.removeProperty('display');
+                const iphPanel = document.getElementById('sttts-panel');
+                if (iphPanel) iphPanel.style.removeProperty('display');
                 let opened = openRealStIphoniePanel(forceReopen);
                 if (!opened) {
                     await new Promise((r) => setTimeout(r, 250));
                     opened = openRealStIphoniePanel();
                 }
-                return opened;
+                await new Promise((r) => setTimeout(r, 80));
+                const panel = document.getElementById('sttts-panel');
+                const entry = document.getElementById('sttts-extension-entry');
+                const ready = opened && (floatingNodeVisible(panel) || (panel && panel.open) || floatingNodeVisible(entry));
+                return floatingResult(target, ready, ready ? '' : '小手机入口存在但面板未显示');
             }
 
+            // 任何非 iPhonie 目标都先显式关闭小手机（display:block/浮层状态也要关）。
+            hideIphonieFloatingPanel();
             if (dlg && dlg.open) {
                 try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
             }
 
             if (target === 'memory_table' || target === 'memory') {
-                if (compatDom) {
-                    compatDom.style.setProperty('display', 'block', 'important');
-                    compatDom.removeAttribute('aria-hidden');
-                }
                 const drawer = document.getElementById('table_database_settings_drawer');
                 const content = document.getElementById('table_drawer_content');
+                const database = document.getElementById('database-content');
+                if (!drawer && !content && !database) {
+                    if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                    return floatingResult(target, false, '记忆表格 DOM 未就绪：扩展尚未初始化或当前卡未加载表格');
+                }
+                isolateCompatDom([drawer, content, database]);
                 if (drawer) drawer.style.setProperty('display', 'block', 'important');
                 if (content) {
                     content.classList.remove('closedDrawer');
                     content.removeAttribute('data-slide-toggle');
                     content.style.setProperty('display', 'block', 'important');
+                    content.style.setProperty('visibility', 'visible', 'important');
                 }
                 ['#database-content', '#editor-content', '#setting-content'].forEach((sel, idx) => {
                     const el = document.querySelector(sel);
                     if (el) {
-                        el.style.setProperty('display', idx === 0 ? 'block' : 'none');
+                        el.style.setProperty('display', idx === 0 ? 'block' : 'none', 'important');
                         el.style.setProperty('height', 'auto', 'important');
                         el.style.setProperty('overflow', 'visible', 'important');
                     }
                 });
-                return true;
+                const ready = !!drawer || !!content || !!database;
+                if (!ready) {
+                    if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                    return floatingResult(target, false, '记忆表格节点存在但不可见');
+                }
+                return floatingResult(target, true);
             }
 
             if (target === 'littlewhitebox' || target === 'lwb') {
-                if (compatDom) {
-                    compatDom.style.setProperty('display', 'block', 'important');
-                    compatDom.removeAttribute('aria-hidden');
-                }
                 const xbx = document.querySelector('.littlewhitebox');
-                if (xbx) {
-                    xbx.style.setProperty('display', 'block', 'important');
-                    xbx.scrollIntoView({ block: 'start' });
+                if (!xbx) {
+                    if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
+                    return floatingResult(target, false, '小白X DOM 未就绪');
                 }
-                return true;
+                isolateCompatDom([xbx]);
+                xbx.style.setProperty('display', 'block', 'important');
+                xbx.style.setProperty('visibility', 'visible', 'important');
+                xbx.scrollIntoView({ block: 'start' });
+                return floatingResult(target, true);
             }
 
             if (target === 'card_floating' || target === 'card') {
                 if (compatDom) compatDom.style.setProperty('display', 'none', 'important');
                 const cardNodes = detectCardFloatingNodes();
+                if (cardNodes.length === 0) {
+                    return floatingResult(target, false, '角色卡悬浮窗未检测到可显示节点');
+                }
                 const bindFloatingCloseDelegates = (rootDoc) => {
                     if (!rootDoc || rootDoc.__rikkaCloseDelegateBound) return;
                     rootDoc.__rikkaCloseDelegateBound = true;
@@ -5238,25 +5636,30 @@ function installUniversalFloatingAndTtsBridge() {
                         } catch (_eFrame) {}
                     }
                 }
-                return true;
+                return floatingResult(target, true);
             }
+            return floatingResult(target, false, '未知悬浮窗目标');
         } catch (e) {
             console.warn('[floating] __rikkaOpenFloatingTarget failed:', e);
+            return floatingResult(target, false, '打开异常: ' + String((e && e.message) || e));
         }
-        return false;
     };
 
     window.__rikkaCloseFloatingStage = function () {
         try {
             window.__rikkaCurrentFloatingTarget = null;
+            setFloatingIsolationTarget(null);
             const dlg = document.getElementById('sttts-panel');
-            if (dlg && dlg.open) {
-                try { dlg.close(); } catch (_e) { dlg.removeAttribute('open'); dlg.style.display = 'none'; }
+            if (dlg) {
+                try { if (dlg.open) dlg.close(); } catch (_e) { dlg.removeAttribute('open'); }
+                dlg.style.setProperty('display', 'none', 'important');
             }
             const compatDom = document.getElementById('rikka-st-compat-dom');
             if (compatDom && !window.__RIKKA_EXT_SETTINGS_MODE__) {
                 compatDom.style.setProperty('display', 'none', 'important');
             }
+            const iphEntry = document.getElementById('sttts-extension-entry');
+            if (iphEntry) iphEntry.style.removeProperty('display');
             for (const [, frame] of scriptIframes) {
                 if (frame && frame.__rikkaExpandedForFloating) {
                     frame.__rikkaExpandedForFloating = false;

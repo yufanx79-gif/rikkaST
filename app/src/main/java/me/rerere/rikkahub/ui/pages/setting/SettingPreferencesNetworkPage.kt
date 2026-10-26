@@ -31,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
@@ -50,9 +51,12 @@ import me.rerere.hugeicons.stroke.View
 import me.rerere.hugeicons.stroke.ViewOff
 import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.ResourceFetchMode
 import me.rerere.rikkahub.data.remote.toProxyOrNull
+import me.rerere.rikkahub.data.st.runtime.TavernResourceRoute
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
+import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.components.ui.switchItem
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.theme.CustomColors
@@ -92,6 +96,9 @@ fun SettingPreferencesNetworkPage(vm: SettingVM = koinViewModel()) {
     val resources = LocalResources.current
     val toaster = LocalToaster.current
     var proxyTesting by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var resourceProbeText by remember { mutableStateOf("") }
+    var resourceProbing by remember { mutableStateOf(false) }
 
     fun updateUserAgent(value: String) {
         userAgent = value
@@ -294,6 +301,78 @@ fun SettingPreferencesNetworkPage(vm: SettingVM = koinViewModel()) {
                         },
                         headlineContent = {
                             Text(stringResource(R.string.setting_page_preferences_network_auto_retry))
+                        },
+                    )
+                }
+            }
+            item {
+                CardGroup(
+                    title = { Text("外链图片通道") },
+                ) {
+                    item(
+                        headlineContent = { Text("网络通道") },
+                        supportingContent = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("面板/消息里的外链图片会先走本地缓存；未命中时按此设置选择 VPN 或直连。自动 = 双通道竞速，谁先成功用谁。")
+                                Select(
+                                    options = ResourceFetchMode.entries,
+                                    selectedOption = settings.displaySetting.resourceNetworkMode,
+                                    onOptionSelected = { mode ->
+                                        vm.patchDisplaySetting { it.copy(resourceNetworkMode = mode) }
+                                        TavernResourceRoute.updateMode(
+                                            when (mode) {
+                                                ResourceFetchMode.AUTO -> me.rerere.rikkahub.data.st.runtime.ResourceNetworkMode.AUTO
+                                                ResourceFetchMode.DIRECT -> me.rerere.rikkahub.data.st.runtime.ResourceNetworkMode.DIRECT
+                                                ResourceFetchMode.VPN -> me.rerere.rikkahub.data.st.runtime.ResourceNetworkMode.VPN
+                                            }
+                                        )
+                                    },
+                                    optionToString = {
+                                        when (it) {
+                                            ResourceFetchMode.AUTO -> "自动（VPN/直连竞速）"
+                                            ResourceFetchMode.DIRECT -> "优先直连"
+                                            ResourceFetchMode.VPN -> "系统默认 / VPN"
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                                if (resourceProbeText.isNotBlank()) {
+                                    Text(
+                                        text = resourceProbeText,
+                                        style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        },
+                        trailingContent = {
+                            FilledTonalButton(
+                                enabled = !resourceProbing,
+                                onClick = {
+                                    resourceProbing = true
+                                    scope.launch {
+                                        val stats = TavernResourceRoute.probeChannels(
+                                            context,
+                                            "https://www.baidu.com/favicon.ico",
+                                        )
+                                        resourceProbeText = stats.joinToString("\n") { stat ->
+                                            val state = when {
+                                                stat.cacheHit -> "缓存命中"
+                                                stat.ok -> "成功 ${stat.totalMs}ms (TTFB ${stat.ttfbMs}ms)"
+                                                else -> "失败：${stat.error}"
+                                            }
+                                            "${stat.channel}: $state"
+                                        }
+                                        resourceProbing = false
+                                    }
+                                },
+                            ) {
+                                if (resourceProbing) {
+                                    LoadingIndicator(modifier = Modifier.size(20.dp))
+                                } else {
+                                    Text("探测")
+                                }
+                            }
                         },
                     )
                 }

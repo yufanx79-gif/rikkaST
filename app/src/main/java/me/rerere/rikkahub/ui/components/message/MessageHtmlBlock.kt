@@ -85,6 +85,7 @@ import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Refresh03
 import me.rerere.rikkahub.data.datastore.WebViewPerfMode
 import me.rerere.rikkahub.data.st.runtime.RikkaWebChromeClient
+import me.rerere.rikkahub.data.st.runtime.TavernResourceRoute
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
@@ -412,6 +413,7 @@ sealed interface PanelLoadStage {
     data class LoadingWebView(val panelTitle: String) : PanelLoadStage
     data class MountingDom(val panelTitle: String) : PanelLoadStage
     data class WaitingVars(val panelTitle: String) : PanelLoadStage
+    data class ResourcesLoading(val panelTitle: String) : PanelLoadStage
     data object Ready : PanelLoadStage
 }
 
@@ -422,7 +424,7 @@ sealed interface PanelLoadStage {
  * - 单面板完成后留出 60ms 帧间冷却间隔，彻底避免多个 WebView 同帧哄抢 `CrRendererMain`。
  */
 internal object TavernPanelLoadScheduler {
-    const val HOST_READY_WAIT_MAX_MS = 1500L
+    const val HOST_READY_WAIT_MAX_MS = 800L
     const val SINGLE_PANEL_TIMEOUT_MS = 2500L
     const val INTER_PANEL_COOLDOWN_MS = 60L
 
@@ -592,9 +594,14 @@ internal object TavernPanelLoadScheduler {
  * - 当第 4 个新面板挂载时，自动淘汰最早挂载的历史面板 WebView。
  */
 internal object ActivePanelWebViewPool {
+    // 保留原有公开预算常量（既有回归测试依赖它们）；实际运行使用下方更保守的 runtime 预算。
     const val MAX_ACTIVE_PANEL_WEBVIEWS = 3
     const val LIVE_QUIESCENT_MAX_ACTIVE_WEBVIEWS = 4
     const val DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS = 6
+
+    const val RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS = 3
+    const val RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS = 2
+    const val RUNTIME_LIVE_MAX_ACTIVE_WEBVIEWS = 3
     private val lock = Any()
     private val lruKeys = java.util.LinkedHashSet<String>()
     private val _activeKeysFlow = MutableStateFlow<Set<String>>(emptySet())
@@ -640,6 +647,8 @@ internal object ActivePanelWebViewPool {
         }
     }
 
+    fun activeCount(): Int = synchronized(lock) { lruKeys.size }
+
     fun clearAll() {
         synchronized(lock) {
             lruKeys.clear()
@@ -661,7 +670,7 @@ internal object ActivePanelWebViewPool {
  *   0ms 原地恢复显示，彻底杜绝无谓的二次重渲染！
  */
 internal object DetachedPanelWebViewCache {
-    private const val MAX_DETACHED_WEBVIEWS = 4
+    private const val MAX_DETACHED_WEBVIEWS = 2
 
     internal class CachedPanelEntry(
         val key: String,
@@ -696,6 +705,13 @@ internal object DetachedPanelWebViewCache {
         runCatching {
             (entry.container.parent as? ViewGroup)?.removeView(entry.container)
         }
+        runCatching { entry.mountState.webView?.onResume() }
+        runCatching {
+            entry.mountState.webView?.evaluateJavascript(
+                "try{if(window.__rikkaPanelAwaitSettled)window.__rikkaPanelAwaitSettled();}catch(e){}",
+                null,
+            )
+        }
         entry
     }
 
@@ -707,6 +723,8 @@ internal object DetachedPanelWebViewCache {
                 (container.parent as? ViewGroup)?.removeView(container)
             }
             map[key] = CachedPanelEntry(key = key, container = container, mountState = mountState)
+            // 离屏立即暂停定时器/动画/媒体，减少多个 WebView 同时占用主线程。
+            runCatching { mountState.webView?.onPause() }
             while (map.size > MAX_DETACHED_WEBVIEWS) {
                 val it = map.entries.iterator()
                 if (!it.hasNext()) break
@@ -724,6 +742,8 @@ internal object DetachedPanelWebViewCache {
             }
         }
     }
+
+    fun size(): Int = synchronized(lock) { map.size }
 
     fun evictAndDestroy(key: String) {
         val removed = synchronized(lock) { map.remove(key) } ?: return
@@ -829,8 +849,10 @@ internal fun PanelLoadingPlaceholderCard(
             "正在渲染「${stage.panelTitle}」界面排版与脚本…"
         is PanelLoadStage.WaitingVars ->
             "正在同步「${stage.panelTitle}」状态变量数据…"
+        is PanelLoadStage.ResourcesLoading ->
+            "骨架已显示，正在加载「${stage.panelTitle}」的图片/字体/脚本…"
         PanelLoadStage.Ready ->
-            "「$panelTitle」加载完成"
+            "「$panelTitle」资源已就绪"
     }
 
     Card(
@@ -990,10 +1012,10 @@ fun MessageHtmlBlock(
     val useLiveQuiescent = !perfEnabled || perfMode == WebViewPerfMode.LIVE_QUIESCENT
     val useHistoricalSnapshot = perfEnabled && perfMode == WebViewPerfMode.HISTORICAL_SNAPSHOT_IMAGE
     val maxActivePoolSize = when {
-        !perfEnabled -> ActivePanelWebViewPool.DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS
-        useHibernatePool -> ActivePanelWebViewPool.MAX_ACTIVE_PANEL_WEBVIEWS
-        useLiveQuiescent -> ActivePanelWebViewPool.LIVE_QUIESCENT_MAX_ACTIVE_WEBVIEWS
-        else -> ActivePanelWebViewPool.MAX_ACTIVE_PANEL_WEBVIEWS
+        !perfEnabled -> ActivePanelWebViewPool.RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS
+        useHibernatePool -> ActivePanelWebViewPool.RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS
+        useLiveQuiescent -> ActivePanelWebViewPool.RUNTIME_LIVE_MAX_ACTIVE_WEBVIEWS
+        else -> ActivePanelWebViewPool.RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS
     }
     val screenHeightDp = configuration.screenHeightDp.coerceAtLeast(480)
     val minHeightDp = 48
@@ -1039,7 +1061,7 @@ fun MessageHtmlBlock(
     var stage by remember(effectiveQueueKey) {
         mutableStateOf<PanelLoadStage>(
             if (DetachedPanelWebViewCache.has(effectiveQueueKey)) {
-                PanelLoadStage.Ready
+                PanelLoadStage.ResourcesLoading(panelTitle)
             } else {
                 PanelLoadStage.Queued(panelTitle, 1, 1)
             }
@@ -1117,7 +1139,11 @@ fun MessageHtmlBlock(
         if (!mountState.mounted) {
             stage = PanelLoadStage.LoadingWebView(panelTitle)
         } else {
-            stage = PanelLoadStage.Ready
+            stage = if (mountState.resourcesSettled) {
+                PanelLoadStage.Ready
+            } else {
+                PanelLoadStage.ResourcesLoading(panelTitle)
+            }
         }
     }
 
@@ -1139,6 +1165,34 @@ fun MessageHtmlBlock(
     LaunchedEffect(isCappedScrollable, mountState.mounted) {
         if (mountState.mounted) {
             mountState.setInternalScrollEnabled(isCappedScrollable)
+        }
+    }
+
+    // 仅对真正拿到渲染槽位的面板预取外链图片，离屏/排队面板不抢网络。
+    LaunchedEffect(slotGranted, contentHash) {
+        if (slotGranted) {
+            TavernResourceRoute.prefetchImages(context, html)
+        }
+    }
+
+    LaunchedEffect(mountState.mounted, mountState.resourcesSettled, mountState.resourcesTimedOut, heightDp) {
+        if (mountState.mounted && heightDp > 0) {
+            stage = if (mountState.resourcesSettled) {
+                PanelLoadStage.Ready
+            } else {
+                PanelLoadStage.ResourcesLoading(panelTitle)
+            }
+        }
+    }
+
+    // JS 侧 settle 回调缺失（旧页面/脚本异常）时的宿主兜底：4 秒后明确标成“仍有资源在加载”，
+    // 不允许一个小转圈永久挂在面板底部。
+    LaunchedEffect(mountState.mounted, mountState.resourcesSettled, heightDp) {
+        if (mountState.mounted && heightDp > 0 && !mountState.resourcesSettled) {
+            delay(4_000)
+            if (!mountState.resourcesSettled) {
+                mountState.markResourcesSettled(timedOut = true)
+            }
         }
     }
 
@@ -1175,18 +1229,19 @@ fun MessageHtmlBlock(
         return
     }
 
-    val isHibernated = (useHibernatePool || (useBoundedWebViewPool && isHistoricalFloor)) && slotGranted && effectiveQueueKey !in activePoolKeys
+    // 活跃池之外的面板一律休眠（不仅历史楼层），确保“活跃 WebView 数量上限”是真实上限。
+    val isHibernated = useBoundedWebViewPool && slotGranted && effectiveQueueKey !in activePoolKeys
     val isPanelVisiblyReady = slotGranted && !isHibernated && mountState.mounted && heightDp > 0
 
     // 面板完成渲染后：
     // 1. 始终在后台预捕获一张等比例高清快照存入 PanelSnapshotStore（无论当前处于方案一、二还是三），
     //    这样用户在偏好设置里切换到方案三时直接秒切静态图，完全无需重新渲染 WebView！
     // 2. 若开启方案二（全视觉保活+静默降频），自动静默后台轮询定时器。
-    LaunchedEffect(isPanelVisiblyReady, heightDp, useLiveQuiescent, useHistoricalSnapshot, isHistoricalFloor) {
+    LaunchedEffect(isPanelVisiblyReady, heightDp, mountState.resourcesSettled, useLiveQuiescent, useHistoricalSnapshot, isHistoricalFloor) {
         if (!isPanelVisiblyReady || heightDp <= 0) return@LaunchedEffect
         delay(420L)
         if (!mountState.isDisposed && mountState.mounted) {
-            if (useHistoricalSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
+            if (useHistoricalSnapshot && mountState.resourcesSettled && snapshotEntry == null && snapshotCompositeKey != null) {
                 val captured = PanelSnapshotStore.captureFromWebView(
                     context = context,
                     compositeKey = snapshotCompositeKey,
@@ -1253,7 +1308,13 @@ fun MessageHtmlBlock(
                             val cachedHeight = PanelHeightCache.get(messageKey, contentHash)
                             if (cachedHeight > 0) {
                                 heightDp = cachedHeight
-                                stage = PanelLoadStage.Ready
+                                // 缓存高度只能用于占位，必须重新等本轮 resources_settled；
+                                // 否则缓存复挂载会瞬间显示“加载完成”，实际图片还没回来。
+                                stage = if (cachedEntry.mountState.resourcesSettled) {
+                                    PanelLoadStage.Ready
+                                } else {
+                                    PanelLoadStage.ResourcesLoading(panelTitle)
+                                }
                                 TavernPanelLoadScheduler.markDone(effectiveQueueKey)
                             }
                             return@AndroidView cachedEntry.container
@@ -1348,7 +1409,7 @@ fun MessageHtmlBlock(
                                     view: WebView,
                                     request: WebResourceRequest,
                                 ): WebResourceResponse? {
-                                    return TavernRuntimeManager.interceptAsset(request.url)
+                                    return TavernRuntimeManager.interceptAsset(request.url, request.requestHeaders)
                                 }
 
                                 override fun onPageFinished(view: WebView, url: String) {
@@ -1452,7 +1513,10 @@ fun MessageHtmlBlock(
                                         }
                                         heightDp = h
                                         if (h > 0) {
-                                            stage = PanelLoadStage.Ready
+                                            // 高度 > 0 只代表骨架已经排版，绝不再冒充“加载完成”。
+                                            if (!mountState.resourcesSettled) {
+                                                stage = PanelLoadStage.ResourcesLoading(panelTitle)
+                                            }
                                             TavernPanelLoadScheduler.markDone(effectiveQueueKey)
                                         }
                                     },
@@ -1513,15 +1577,32 @@ fun MessageHtmlBlock(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        if (!mountState.lastError.isNullOrBlank()) {
-                            Text(
-                                text = "面板资源或脚本异常，可点右侧重载",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
-                                modifier = Modifier.weight(1f).padding(end = 8.dp),
-                            )
-                        } else {
-                            Spacer(modifier = Modifier.weight(1f))
+                        when {
+                            !mountState.resourcesSettled -> {
+                                Text(
+                                    text = "正在加载图片/字体/脚本…",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                )
+                            }
+                            mountState.resourcesTimedOut -> {
+                                Text(
+                                    text = "部分图片仍在加载，可下拉稍候或点右侧重载",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                )
+                            }
+                            !mountState.lastError.isNullOrBlank() -> {
+                                Text(
+                                    text = "面板资源或脚本异常，可点右侧重载",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                )
+                            }
+                            else -> Spacer(modifier = Modifier.weight(1f))
                         }
                         Surface(
                             onClick = {
@@ -1647,8 +1728,19 @@ internal object PanelSnapshotStore {
         val aspectRatio: Float = (imageBitmap.width.toFloat() / imageBitmap.height.coerceAtLeast(1).toFloat()).coerceIn(0.05f, 20f),
     )
 
-    private const val MAX_MEMORY_ENTRIES = 36
+    private const val MAX_MEMORY_ENTRIES = 12
+    private const val MAX_MEMORY_BYTES = 24L * 1024L * 1024L
+    private const val MAX_SNAPSHOT_WIDTH = 1080
+    private const val MAX_SNAPSHOT_HEIGHT = 3072
     private val memoryMap = java.util.LinkedHashMap<String, SnapshotEntry>(16, 0.75f, true)
+
+    fun memoryCount(): Int = synchronized(memoryMap) { memoryMap.size }
+
+    fun memoryBytes(): Long = synchronized(memoryMap) {
+        memoryMap.values.sumOf { entry ->
+            entry.imageBitmap.width.toLong() * entry.imageBitmap.height.toLong() * 4L
+        }
+    }
 
     fun compositeKey(messageKey: String?, contentHash: Int): String? {
         if (messageKey.isNullOrEmpty()) return null
@@ -1669,10 +1761,14 @@ internal object PanelSnapshotStore {
     private fun putMemory(compositeKey: String, entry: SnapshotEntry) {
         synchronized(memoryMap) {
             memoryMap[compositeKey] = entry
-            while (memoryMap.size > MAX_MEMORY_ENTRIES) {
+            fun currentBytes(): Long = memoryMap.values.sumOf {
+                it.imageBitmap.width.toLong() * it.imageBitmap.height.toLong() * 4L
+            }
+            while (memoryMap.size > MAX_MEMORY_ENTRIES || currentBytes() > MAX_MEMORY_BYTES) {
                 val it = memoryMap.keys.iterator()
                 if (!it.hasNext()) break
-                it.next()
+                val oldest = it.next()
+                if (oldest == compositeKey && memoryMap.size == 1) break
                 it.remove()
             }
         }
@@ -1691,7 +1787,18 @@ internal object PanelSnapshotStore {
                 val dir = File(context.filesDir, "panel_snapshots")
                 val file = File(dir, safeFileName(compositeKey))
                 if (!file.isFile || file.length() <= 0L) return@withContext null
-                val bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return@withContext null
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                var sample = 1
+                while (bounds.outWidth / sample > MAX_SNAPSHOT_WIDTH ||
+                    bounds.outHeight / sample > MAX_SNAPSHOT_HEIGHT
+                ) {
+                    sample *= 2
+                }
+                val bmp = BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sample },
+                ) ?: return@withContext null
                 val resolvedHeightDp = if (fallbackHeightDp > 0) {
                     fallbackHeightDp
                 } else {
@@ -1720,8 +1827,8 @@ internal object PanelSnapshotStore {
         val h = webView.height
         if (w < 16 || h < 16) return null
         return runCatching {
-            val maxDimW = 1440f
-            val maxDimH = 4096f
+            val maxDimW = MAX_SNAPSHOT_WIDTH.toFloat()
+            val maxDimH = MAX_SNAPSHOT_HEIGHT.toFloat()
             // 强制使用单一等比例缩放因子 uniformScale，保证水平与垂直缩放率 100% 相同，绝不压扁长图！
             val uniformScale = minOf(1f, maxDimW / w.toFloat(), maxDimH / h.toFloat()).coerceAtLeast(0.1f)
             val targetW = (w * uniformScale).toInt().coerceAtLeast(16)
@@ -1883,6 +1990,21 @@ internal class PanelMountState {
     var mountedHtml by mutableStateOf<String?>(null)
         private set
     var lastError by mutableStateOf<String?>(null)
+    var resourcesSettled by mutableStateOf(false)
+        private set
+    var resourcesTimedOut by mutableStateOf(false)
+        private set
+
+    fun markResourcesSettled(timedOut: Boolean) {
+        if (isDisposed || !mounted) return
+        resourcesTimedOut = timedOut
+        resourcesSettled = true
+    }
+
+    private fun resetResourceSettleState() {
+        resourcesSettled = false
+        resourcesTimedOut = false
+    }
 
     fun reloadNow() {
         if (isDisposed) return
@@ -1893,6 +2015,7 @@ internal class PanelMountState {
         }
         val wv = webView ?: return
         lastError = null
+        resetResourceSettleState()
         pageLoadRetries = 0
         pageReady = false
         everMounted = false
@@ -1952,6 +2075,7 @@ internal class PanelMountState {
             pageReady = false
             everMounted = false
             mountedHtml = null
+            resetResourceSettleState()
             appliedForeground = null
             appliedKey = null
             appliedViewportPx = 0
@@ -2020,6 +2144,7 @@ internal class PanelMountState {
         pageReady = false
         everMounted = false
         mountedHtml = null
+        resetResourceSettleState()
         appliedForeground = null
         appliedKey = null
         appliedViewportPx = 0
@@ -2036,6 +2161,7 @@ internal class PanelMountState {
         val wv = webView ?: return false
         if (pageLoadRetries >= MAX_PAGE_LOAD_RETRIES) return false
         pageLoadRetries++
+        resetResourceSettleState()
         if (pageReady && pendingHtml != null) {
             everMounted = false
             mountedHtml = null
@@ -2065,6 +2191,7 @@ internal class PanelMountState {
         pendingKey = messageKey
         if (viewportPx > 0) pendingViewportPx = viewportPx
         if (isIdentical && mounted) return
+        resetResourceSettleState()
         if (everMounted && pageReady) {
             val now = clockMsProvider()
             val elapsed = now - lastRemountTimestampMs
@@ -2094,6 +2221,7 @@ internal class PanelMountState {
         pageReady = false
         everMounted = false
         mountedHtml = null
+        resetResourceSettleState()
         appliedForeground = null
         appliedKey = null
         appliedViewportPx = 0
@@ -2109,6 +2237,7 @@ internal class PanelMountState {
             pageReady = false
             everMounted = false
             mountedHtml = null
+            resetResourceSettleState()
             TavernRuntimeManager.unregisterAuxWebView(wv)
             try {
                 wv.stopLoading()
@@ -2180,6 +2309,7 @@ internal class PanelMountState {
             } else {
                 inPlaceRemountCount++
                 mountedHtml = html
+                resetResourceSettleState()
                 if (desiredInternalScroll) {
                     setInternalScrollEnabled(true)
                 }
@@ -2197,6 +2327,7 @@ internal class PanelMountState {
         }
         everMounted = true
         mountedHtml = html
+        resetResourceSettleState()
         if (desiredInternalScroll) {
             setInternalScrollEnabled(true)
         }
@@ -2237,6 +2368,21 @@ private class PanelBridge(
             )
             mountState.onPageReady()
             mountState.tryMountIfNeeded()
+        }
+    }
+
+    @JavascriptInterface
+    fun onPanelResourcesSettled(timedOut: Boolean) {
+        if (mountState.isDisposed) return
+        handler.post {
+            if (mountState.isDisposed) return@post
+            TavernRuntimeManager.recordWebViewBootStage(
+                hostType = "panel",
+                hostId = mountState.currentPendingKey().ifEmpty { "anon" },
+                stage = "resources_settled",
+                detail = if (timedOut) "timed_out=true (仍有图片/字体/脚本在加载)" else "complete",
+            )
+            mountState.markResourcesSettled(timedOut)
         }
     }
 

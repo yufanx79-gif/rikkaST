@@ -39,6 +39,7 @@ import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.ai.ui.UIMessage
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.ToolPolicy
 import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.InjectionPosition
@@ -339,6 +340,10 @@ internal fun parseV2Card(context: Context?, json: JsonObject, background: String
         presetMessages = presetMessages,
         background = background,
         tavernData = tavData,
+        enableTools = false,
+        toolPolicy = ToolPolicy.NONE,
+        localTools = emptyList(),
+        totalStepsLimit = 12,
     )
     ensureAssistantAvatarAlias(context, assistant.id, avatarUri)
 
@@ -494,6 +499,10 @@ internal fun parseV3Card(context: Context?, json: JsonObject, background: String
         presetMessages = presetMessages,
         background = background,
         tavernData = tavData,
+        enableTools = false,
+        toolPolicy = ToolPolicy.NONE,
+        localTools = emptyList(),
+        totalStepsLimit = 12,
     )
     ensureAssistantAvatarAlias(context, assistant.id, avatarUri)
 

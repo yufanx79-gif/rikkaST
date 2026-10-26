@@ -5,12 +5,16 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -36,6 +40,8 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.db.entity.KnowledgeSourceEntity
 import me.rerere.rikkahub.data.knowledge.KnowledgeBaseService
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.ToolPolicy
+import me.rerere.rikkahub.data.model.effectiveToolPolicy
 import me.rerere.rikkahub.ui.components.ai.ModelSelector
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
@@ -168,6 +174,42 @@ private fun AssistantLocalToolContent(
     ) {
         CardGroup {
             item(
+                headlineContent = { Text("工具调用策略") },
+                supportingContent = {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            when (assistant.effectiveToolPolicy()) {
+                                ToolPolicy.NONE -> "关闭：请求中不会出现 tools，模型不会调用任何工具。"
+                                ToolPolicy.AUTO -> "自动：仅当任务确实需要搜索、文件或命令时调用。"
+                                ToolPolicy.REQUIRED -> "必须：强制模型本轮至少调用一个工具。"
+                            }
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(
+                                ToolPolicy.NONE to "关闭",
+                                ToolPolicy.AUTO to "自动",
+                                ToolPolicy.REQUIRED to "必须",
+                            ).forEach { (policy, label) ->
+                                FilterChip(
+                                    selected = assistant.effectiveToolPolicy() == policy,
+                                    onClick = {
+                                        onUpdate(
+                                            assistant.copy(
+                                                enableTools = policy != ToolPolicy.NONE,
+                                                toolPolicy = policy,
+                                            )
+                                        )
+                                    },
+                                    label = { Text(label) },
+                                    colors = FilterChipDefaults.filterChipColors(),
+                                )
+                            }
+                        }
+                        Text("已配置 ${assistant.localTools.size} 个本地工具；当前策略为「${if (assistant.effectiveToolPolicy() == ToolPolicy.NONE) "关闭" else "启用"}」，酒馆角色卡默认关闭且单轮最多 2 次工具轮次。")
+                    }
+                },
+            )
+            item(
                 headlineContent = {
                     Text("并行执行工具")
                 },
@@ -183,7 +225,7 @@ private fun AssistantLocalToolContent(
             )
             item(
                 headlineContent = { Text("工具重复调用上限") },
-                supportingContent = { Text("同一批内相同工具调用超过此数打断，默认8") },
+                supportingContent = { Text("同一批内相同工具调用超过此数打断，默认2") },
                 trailingContent = {
                     OutlinedTextField(
                         value = assistant.toolRecurringLimit.toString(),
@@ -199,7 +241,7 @@ private fun AssistantLocalToolContent(
             )
             item(
                 headlineContent = { Text("总工具调用轮数上限") },
-                supportingContent = { Text("整个对话AI调工具的总次数上限，默认256") },
+                supportingContent = { Text("本轮生成最多工具轮数，默认16；酒馆角色卡最多2") },
                 trailingContent = {
                     OutlinedTextField(
                         value = assistant.totalStepsLimit.toString(),

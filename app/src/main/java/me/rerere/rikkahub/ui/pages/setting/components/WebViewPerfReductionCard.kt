@@ -90,7 +90,7 @@ fun WebViewPerfReductionCard(
         item(
             headlineContent = { Text("性能降低开关") },
             supportingContent = {
-                Text("开启后可选择历史楼层 WebView 降载方案，减少多楼层轮询带来的性能消耗与卡顿")
+                Text("基础安全预算（首屏懒加载、活跃 WebView 数量上限、离屏暂停、快照内存上限）始终生效；这里选择历史楼层的额外降载方案。")
             },
             trailingContent = {
                 Switch(
@@ -115,7 +115,7 @@ fun WebViewPerfReductionCard(
                     ) {
                         PerfModeOptionItem(
                             title = "方案一：后台面板休眠方案",
-                            description = "限制同时存活的 WebView 数量（最多保留 3 个活跃面板），更早的历史楼层自动休眠为轻量占位卡片，点击「唤醒面板」可随时恢复。",
+                            description = "限制同时存活的 WebView 数量（最多保留 2 个活跃面板），更早的历史楼层自动休眠为轻量占位卡片，点击「唤醒面板」可随时恢复。",
                             selected = displaySetting.webViewPerfMode == WebViewPerfMode.HIBERNATE_POOL,
                             onClick = {
                                 if (displaySetting.webViewPerfMode != WebViewPerfMode.HIBERNATE_POOL) {
@@ -128,7 +128,7 @@ fun WebViewPerfReductionCard(
 
                         PerfModeOptionItem(
                             title = "方案二：全视觉保活 + 静默降频方案",
-                            description = "保留所有楼层面板的完整界面显示（不折叠为休眠卡片），在楼层渲染完成后自动静默后台轮询定时器。",
+                            description = "当前可见面板保持完整显示，离屏面板自动暂停定时器/动画并按预算休眠；滚动回来可即时唤醒。",
                             selected = displaySetting.webViewPerfMode == WebViewPerfMode.LIVE_QUIESCENT,
                             onClick = {
                                 if (displaySetting.webViewPerfMode != WebViewPerfMode.LIVE_QUIESCENT) {

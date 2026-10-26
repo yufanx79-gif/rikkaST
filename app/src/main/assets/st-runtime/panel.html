@@ -16,9 +16,7 @@
     <!-- Vue 3 / Vue Router（面板 UI 常用） -->
     <script src="./vendor/lib/vue.runtime.global.prod.js"></script>
     <script src="./vendor/lib/vue-router.global.prod.js"></script>
-    <!-- [v235 R2] KaTeX 0.16.45（MIT，本地 vendored，离线）：消息/面板里的 $$..$$ 与 \(..\) 渲染 -->
-    <link rel="stylesheet" href="./vendor/katex/katex.min.css">
-    <script src="./vendor/katex/katex.min.js"></script>
+    <!-- KaTeX 改为按需加载：只有面板 HTML 真的包含数学公式时才拉取 270KB JS + CSS。 -->
     <style>
         html, body { margin: 0; padding: 0; background: transparent; }
         #rikka-panel-root { width: 100%; overflow-x: hidden; }

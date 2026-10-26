@@ -140,6 +140,8 @@ import me.rerere.rikkahub.data.model.getAssistantOf
 import me.rerere.rikkahub.data.model.getStoredAssistantOf
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantAffectScope
+import me.rerere.rikkahub.data.model.effectiveMaxToolSteps
+import me.rerere.rikkahub.data.model.effectiveToolsEnabled
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
@@ -230,6 +232,14 @@ data class ChatError(
 
 enum class ChatErrorSolution {
     CheckFastModelSettings,
+}
+
+/** 删除整楼的结果：UI 必须据此给出明确反馈，不能静默失败。 */
+sealed interface DeleteMessageResult {
+    data object Success : DeleteMessageResult
+    data object NotFound : DeleteMessageResult
+    data object Generating : DeleteMessageResult
+    data class Failed(val error: Throwable) : DeleteMessageResult
 }
 
 private val inputTransformers by lazy {
@@ -596,14 +606,29 @@ class ChatService(
         dispatchNextQueuedMessage(conversationId)
     }
 
-    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true): Boolean {
-        if (content.isEmptyInputMessage()) return false
+    fun sendMessage(
+        conversationId: Uuid,
+        content: List<UIMessagePart>,
+        answer: Boolean = true,
+        onPersisted: ((Boolean) -> Unit)? = null,
+    ): Boolean {
+        if (content.isEmptyInputMessage()) {
+            onPersisted?.invoke(false)
+            return false
+        }
         val session = sessionManager.getOrCreate(conversationId)
+        val persistence = if (onPersisted != null) CompletableDeferred<Boolean>() else null
+        if (onPersisted != null && persistence != null) {
+            appScope.launch {
+                val ok = persistence.await()
+                withContext(Dispatchers.Main.immediate) { onPersisted(ok) }
+            }
+        }
         synchronized(session) {
             // [Bug B 修复] 用户显式点击发送时总是恢复队列（resume），避免上一轮网络/工具异常触发 pause() 后
             // 队列非空导致 messages.isEmpty() 为 false、新消息被静默困在暂停队列中无法发出。
             session.messageQueue.resume()
-            session.messageQueue.enqueue(content, answer)
+            session.messageQueue.enqueue(content, answer, persisted = persistence)
             val activeJob = session.getJob()
             TavernRuntimeManager.appendLog(
                 "info",
@@ -662,6 +687,7 @@ class ChatService(
             keepAliveInBackground = answer,
         ) {
             session.isExecutingSendTurn = answer
+            var userMessagePersisted = false
             try {
                 if (!session.isInitialized) {
                     initializeConversation(conversationId)
@@ -687,6 +713,8 @@ class ChatService(
                 updateConversation(conversationId, newConversation, checkFiles = false)
                 session.submittingMessage = null
                 saveConversation(conversationId, newConversation, checkFiles = false)
+                userMessagePersisted = true
+                queued.persisted?.complete(true)
                 TavernRuntimeManager.recordSendDiagnostic(
                     stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED,
                     conversationId = conversationId.toString(),
@@ -722,6 +750,7 @@ class ChatService(
                 if (queued.reply == null) _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 session.isExecutingSendTurn = false
+                if (!userMessagePersisted) queued.persisted?.complete(false)
                 queued.reply?.completeExceptionally(e)
                 e.printStackTrace()
                 if (e is CancellationException) {
@@ -744,7 +773,10 @@ class ChatService(
             }
         }
         job.invokeOnCompletion { cause ->
-            if (cause != null) queued.reply?.completeExceptionally(cause)
+            if (cause != null) {
+                queued.reply?.completeExceptionally(cause)
+                queued.persisted?.complete(false)
+            }
             synchronized(session) {
                 if (session.submittingMessage?.id == queued.id) session.submittingMessage = null
             }
@@ -1064,27 +1096,64 @@ class ChatService(
         ) {
             try {
                 previousJob?.join()
+
+                suspend fun runRegenerate() {
                 val conversation = session.state.value
 
-                if (message.role == MessageRole.USER) {
-                    // 如果是用户消息，则截止到当前消息
-                    val node = conversation.getMessageNodeByMessage(message)
-                    val indexAt = conversation.messageNodes.indexOf(node)
-                    val newConversation = conversation.copy(
-                        messageNodes = conversation.messageNodes.subList(0, indexAt + 1)
+                // [P0 修复] 必须按 id 查找：UI 传来的 UIMessage 可能是旧快照（流式/翻译/swipe 之后），
+                // 用结构相等匹配会返回 null -> indexOf(null) == -1 -> subList(0, 0) 把整个会话清空并落库。
+                val targetId = message.id
+                val node = conversation.getMessageNodeByMessageId(targetId)
+                    ?: conversation.messageNodes.firstOrNull { n -> n.messages.any { it.id == targetId } }
+                if (node == null) {
+                    TavernRuntimeManager.appendLog(
+                        "warn",
+                        "[regenerate] target message not found, aborting without touching history messageId=$targetId",
                     )
-                    saveConversation(conversationId, newConversation)
+                    addError(
+                        IllegalStateException(context.getString(R.string.error_regenerate_target_missing)),
+                        conversationId,
+                        title = context.getString(R.string.error_title_regenerate_message),
+                    )
+                    return
+                }
+
+                if (node.role == MessageRole.USER) {
+                    // 截止到当前消息：在最新状态上原子截断，找不到索引就放弃（绝不写成空列表）
+                    val truncated = session.tryUpdate { current ->
+                        val index = current.messageNodes.indexOfFirst { it.id == node.id }
+                        if (index < 0) return@tryUpdate null
+                        current.copy(messageNodes = current.messageNodes.take(index + 1))
+                    }
+                    if (truncated == null) {
+                        TavernRuntimeManager.appendLog(
+                            "warn",
+                            "[regenerate] node disappeared before truncation nodeId=${node.id}",
+                        )
+                        return
+                    }
+                    session.flush()
                     handleMessageComplete(conversationId, generationType = GenerationType.REGENERATE)
                 } else {
                     if (regenerateAssistantMsg) {
-                        val node = conversation.getMessageNodeByMessage(message)
-                        val nodeIndex = conversation.messageNodes.indexOf(node)
-                        handleMessageComplete(conversationId, messageRange = 0..<nodeIndex, generationType = GenerationType.REGENERATE)
+                        val nodeIndex = conversation.messageNodes.indexOfFirst { it.id == node.id }
+                        if (nodeIndex <= 0) {
+                            // 第 0 楼没有可截断的上文，直接整轮重生成（等价于空 messageRange）
+                            handleMessageComplete(conversationId, generationType = GenerationType.REGENERATE)
+                        } else {
+                            handleMessageComplete(
+                                conversationId,
+                                messageRange = 0..<nodeIndex,
+                                generationType = GenerationType.REGENERATE,
+                            )
+                        }
                     } else {
                         saveConversation(conversationId, conversation)
                     }
                 }
+                }
 
+                runRegenerate()
                 _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -1121,10 +1190,22 @@ class ChatService(
             try {
                 afterPreviousGeneration(previousJob) {
                     val conversation = session.state.value
-                    // Ignore double taps and stale approvals for completed or inactive tools.
+                    // [P0 修复] 双击 / 过期审批：job 在外层已经 setJob 挂上（UI 会转圈），
+                    // 旧实现直接 return -> 零请求、零提示。必须给出可见错误。
                     if (conversation.currentMessages.none { message ->
                             message.getTools().any { it.toolCallId == toolCallId && it.isPending }
-                        }) return@afterPreviousGeneration
+                        }) {
+                        TavernRuntimeManager.appendLog(
+                            "warn",
+                            "[tool-approval] stale or duplicate approval ignored toolCallId=$toolCallId",
+                        )
+                        addError(
+                            IllegalStateException(context.getString(R.string.error_tool_approval_stale)),
+                            conversationId,
+                            title = context.getString(R.string.error_title_tool_approval),
+                        )
+                        return@afterPreviousGeneration
+                    }
                     val newApprovalState = when {
                         answer != null -> ToolApprovalState.Answered(answer)
                         approved -> ToolApprovalState.Approved
@@ -1616,7 +1697,13 @@ class ChatService(
             checkInvalidMessages(conversationId)
             val conversation = getConversationFlow(conversationId).value
 
-            val tools = try {
+            val tools = if (!assistant.effectiveToolsEnabled()) {
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[tools] disabled by policy for assistant=${assistant.id} tavern=${assistant.tavernData != null}",
+                )
+                emptyList<Tool>()
+            } else try {
                 val officialTools = chatToolFactory.createTools(
                     settings = settings,
                     assistant = assistant,
@@ -1706,7 +1793,7 @@ class ChatService(
                     }
                 },
                 assistant = assistant,
-                maxSteps = assistant.totalStepsLimit,
+                maxSteps = assistant.effectiveMaxToolSteps(),
                 conversationSystemPrompt = conversation.customSystemPrompt,
                 conversationModeInjectionIds = conversation.modeInjectionIds,
                 conversationLorebookIds = conversation.lorebookIds,
@@ -1816,7 +1903,19 @@ class ChatService(
             stopGenerationForeground()
 
             it.printStackTrace()
-            addError(it, conversationId, title = context.getString(R.string.error_title_generation))
+            // [P0 修复] 中止类错误单独给文案：让用户知道「请求根本没发出去」，而不是一个泛化的失败。
+            if (it is me.rerere.rikkahub.data.ai.GenerationAbortedException) {
+                addError(
+                    IllegalStateException(
+                        context.getString(R.string.error_generation_aborted, it.reason),
+                        it,
+                    ),
+                    conversationId,
+                    title = context.getString(R.string.error_title_generation),
+                )
+            } else {
+                addError(it, conversationId, title = context.getString(R.string.error_title_generation))
+            }
             Logging.log(TAG, "handleMessageComplete: $it")
             Logging.log(TAG, it.stackTraceToString())
         }.onSuccess {
@@ -2136,7 +2235,7 @@ class ChatService(
             } else {
                 memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
             },
-            tools = buildList {
+            tools = if (!assistant.effectiveToolsEnabled()) emptyList<Tool>() else buildList {
                 if (assistant.localTools.contains(LocalToolOption.FileTools)) {
                     addAll(createFileTools())
                 }
@@ -2788,37 +2887,75 @@ class ChatService(
         }
     }
 
+    /**
+     * 原子删除整楼（MessageNode 及其全部 swipe 变体）。
+     *
+     * 旧实现先读快照再 saveConversation，流式更新/标题生成会在这段窗口里覆盖删除；
+     * 现在删除变换在 ConversationSession.tryUpdate 的同一临界区内完成，落库走 session.flush()
+     * （写入内存此刻的最新状态），不会再被旧快照回滚。
+     */
     suspend fun deleteMessage(
         conversationId: Uuid,
         messageId: Uuid,
         failIfMissing: Boolean = true,
-    ) {
-        val currentConversation = getConversationFlow(conversationId).value
-        val updatedConversation = buildConversationAfterMessageDelete(currentConversation, messageId)
-
-        if (updatedConversation == null) {
-            if (failIfMissing) {
-                throw NotFoundException("Message not found")
+    ): DeleteMessageResult {
+        val session = sessionManager.getOrCreate(conversationId)
+        if (!session.isInitialized) {
+            runCatching {
+                session.initialize(
+                    load = {
+                        conversationRepo.getConversationById(conversationId)
+                            ?: throw NotFoundException("Conversation not found")
+                    },
+                )
+            }.onFailure {
+                return if (failIfMissing) DeleteMessageResult.Failed(it) else DeleteMessageResult.NotFound
             }
-            return
         }
-
-        saveConversation(conversationId, updatedConversation)
-
-        // [R4] ST MESSAGE_DELETED：ST 载荷为删除后的 chat.length
-        fireTavernEvent(
-            conversationId,
-            TavernRuntimeManager.EVENT_MESSAGE_DELETED,
-            "{\"args\":[${updatedConversation.currentMessages.size}]}",
-        )
+        val snapshot = session.state.value
+        val targetIndex = snapshot.messageNodes.indexOfFirst { node ->
+            node.messages.any { it.id == messageId }
+        }
+        if (targetIndex == -1) return DeleteMessageResult.NotFound
+        // 正在生成的最后一楼被流式写回时可能“删了又出现”；历史楼允许删除，
+        // 当前生成目标给出明确状态，由 UI 提示先停止生成。
+        if (targetIndex == snapshot.messageNodes.lastIndex && session.isGenerating) {
+            return DeleteMessageResult.Generating
+        }
+        val removed = session.tryUpdate { current ->
+            buildConversationAfterMessageDelete(current, messageId)
+        } ?: return DeleteMessageResult.NotFound
+        val deletedNodeCount = session.state.value.messageNodes.size
+        return try {
+            session.flush()
+            // 删除可能解除工具审批阻塞；沿用旧 saveConversation 的队列推进语义。
+            dispatchNextQueuedMessage(conversationId)
+            // [R4] ST MESSAGE_DELETED：ST 载荷为删除后的 chat.length
+            fireTavernEvent(
+                conversationId,
+                TavernRuntimeManager.EVENT_MESSAGE_DELETED,
+                "{\"args\":[${removed.currentMessages.size}]}",
+            )
+            TavernRuntimeManager.recordSendDiagnostic(
+                stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                conversationId = conversationId.toString(),
+                detail = "delete_node ok nodes=$deletedNodeCount messageId=$messageId",
+            )
+            DeleteMessageResult.Success
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // 落库失败且期间没有别的更新：回滚内存，避免 UI 显示已删除但数据库仍有。
+            if (session.state.value === removed) {
+                runCatching { session.updateConversation(snapshot) }
+            }
+            DeleteMessageResult.Failed(e)
+        }
     }
 
     suspend fun deleteMessage(
         conversationId: Uuid,
         message: UIMessage,
-    ) {
-        deleteMessage(conversationId, message.id, failIfMissing = false)
-    }
+    ): DeleteMessageResult = deleteMessage(conversationId, message.id)
 
     /**
      * [v234 I2] 删除节点的单个 swipe 变体（对齐 ST script.js deleteSwipe / MESSAGE_SWIPE_DELETED）：
@@ -2833,9 +2970,13 @@ class ChatService(
         nodeId: Uuid,
         swipeIndex: Int?,
     ) {
+        val session = sessionManager.getOrCreate(conversationId)
         val currentConversation = getConversationFlow(conversationId).value
         val nodeIndex = currentConversation.messageNodes.indexOfFirst { it.id == nodeId }
         if (nodeIndex == -1) throw NotFoundException("Message node not found")
+        if (nodeIndex == currentConversation.messageNodes.lastIndex && session.isGenerating) {
+            throw BadRequestException("Message is being generated")
+        }
         val node = currentConversation.messageNodes[nodeIndex]
         val total = node.messages.size
         if (total <= 1) throw BadRequestException("Can't delete the last swipe.")
@@ -2861,7 +3002,12 @@ class ChatService(
         )
     }
 
-    private fun buildConversationAfterMessageDelete(
+    /**
+     * 产品语义：「删除消息」= 删除整楼（MessageNode 的所有 swipe 变体）。
+     * 只删当前变体请走 [swipeDeleteNode]。旧实现只删当前 message，
+     * 多 swipe 节点删完会选中下一条，用户看起来像“没删掉”。
+     */
+    internal fun buildConversationAfterMessageDelete(
         conversation: Conversation,
         messageId: Uuid,
     ): Conversation? {
@@ -2872,21 +3018,8 @@ class ChatService(
             return null
         }
 
-        val updatedNodes = conversation.messageNodes.mapIndexedNotNull { index, node ->
-            if (index != targetNodeIndex) {
-                return@mapIndexedNotNull node
-            }
-
-            val nextMessages = node.messages.filterNot { it.id == messageId }
-            if (nextMessages.isEmpty()) {
-                return@mapIndexedNotNull null
-            }
-
-            val nextSelectIndex = node.selectIndex.coerceAtMost(nextMessages.lastIndex)
-            node.copy(
-                messages = nextMessages,
-                selectIndex = nextSelectIndex,
-            )
+        val updatedNodes = conversation.messageNodes.filterIndexed { index, _ ->
+            index != targetNodeIndex
         }
 
         // 同步清理群聊 speakerMap，避免残留已删除节点的发言人映射
