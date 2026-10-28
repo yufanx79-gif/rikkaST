@@ -3,24 +3,35 @@
   "versionCode": 243,
   "packageName": "me.rerere.rikkahub.st",
   "minAndroidSdk": 26,
-  "publishedAt": "2026-10-27T00:00:00Z",
+  "publishedAt": "2026-10-28T00:00:00Z",
   "artifactStatus": "READY",
-  "targetArtifactName": "rikkaST-2.5.10-public-20261027.apk",
-  "changelog": "1. 修复「点发送后一直转圈、却不生成任何内容，模型服务商也收不到请求」的问题：现在所有在发出请求之前就中断的情况（未选择模型、当前会话没有可生成的消息、扩展中止生成、重新生成的目标消息已不存在、工具审批已失效等）都会给出明确的中文错误提示，不再出现「转圈半天、什么都没有、也没有报错」。\n2. 重大数据安全修复：修复「重新生成某条消息时，如果该消息已被编辑或刷新，可能导致整个聊天记录被清空」的严重问题。现在找不到目标消息只会提示失败，绝不会改动历史记录。\n3. 修复酒馆预设/酒馆助手脚本的生成按钮无反应：脚本调用生成接口被宿主拒绝时，现在会把真实原因返回给脚本和用户，卡片可以正常提示而不是静默失败。\n4. 修复工具调用导致「有输出没正文」的问题：模型连续多轮调用工具时不再被过早中断，本轮结束时若只产生了工具卡片、没有正文，会自动补一次收尾请求，保证用户一定能看到回复内容。\n5. 修复同一次回复里并行调用两个同名工具（例如同时读取两个文件）时，两个工具都不执行、直接结束的问题；现在只跳过超量的调用，其余正常执行。\n6. 修复面板按钮「回执造假」：发送类按钮不再在排队阶段误报超时、导致卡片重复发送；「只插入用户消息」的接口不再额外触发一次 AI 生成；保存会话、插入消息、派发事件等接口失败时会如实返回失败。\n7. 新增开发者测试台（设置 → 通用设置 → 开发者测试台，需开启开发者模式）：提供 10 项自检，可单项或一键全部运行，显示状态与耗时，并支持复制/导出报告。\n8. 消息内图片渲染增强：支持嵌套在 span/a/div 里的图片，超长消息的快速预览保留图片，图片加载失败可点击重试，外链图片默认本地缓存。\n9. 外链图片网络优化：新增「自动 / 直连 / VPN」三种模式（设置 → 网络），自动模式会同时尝试两条通道并采用更快的那个。\n10. WebView 性能与加载状态优化：面板加载状态改为真实反馈（字体/图片/两帧稳定后才算就绪），不再以「高度大于 0」冒充加载完成；离屏面板暂停渲染并限制活跃数量，长对话更流畅。\n11. 修复内存表格误打开成「小手机」、以及部分界面残留空白面板的问题。\n12. 升级提示：请直接覆盖安装，不要卸载或清除应用数据。",
+  "targetArtifactName": "rikkaST-2.5.10-public-20261028.apk",
+  "changelog": "修复了发消息会被本地卡住的问题",
   "downloads": [
     {
-      "name": "rikkaST-2.5.10-public-20261027.apk",
-      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261027/rikkaST-2.5.10-public-20261027.apk",
-      "size": "66,940,774 bytes (约 66.9 MB)",
+      "name": "rikkaST-2.5.10-public-20261028.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261028/rikkaST-2.5.10-public-20261028.apk",
+      "size": "66,957,418 bytes (约 67.0 MB)",
       "abi": "arm64-v8a",
-      "sha256": "ad7830bad5abb0d817c1da752f191368d729d9b055ce195b83041e619013abd2",
+      "sha256": "15ea34ec705bbb5dd66d2715c20a764d88b9254acf4424cfb96932131400f56b",
       "status": "ready",
-      "targetReleaseName": "v2.5.10-public-20261027",
+      "targetReleaseName": "v2.5.10-public-20261028",
       "version": "2.5.10",
       "versionCode": 243
     }
   ],
   "historicalArtifacts": [
+    {
+      "name": "rikkaST-2.5.10-public-20261027.apk",
+      "version": "2.5.10",
+      "versionCode": 243,
+      "status": "historical-reference",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261027/rikkaST-2.5.10-public-20261027.apk",
+      "size": "66,940,774 bytes (约 66.9 MB)",
+      "abi": "arm64-v8a",
+      "sha256": "ad7830bad5abb0d817c1da752f191368d729d9b055ce195b83041e619013abd2",
+      "certificateSha256": "b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748"
+    },
     {
       "name": "rikkaST-2.5.10-public-20261026.apk",
       "version": "2.5.10",
