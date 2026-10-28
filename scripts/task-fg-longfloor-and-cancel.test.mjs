@@ -219,10 +219,19 @@ test('Task F & Domain B (F-06b): MessageHtmlBlock bounds active WebViews by defa
   );
 
   // 2. Evicted keys (!in activePoolKeys) must hibernate/release across all modes when pool cap is exceeded
+  //
+  // 契约更新说明（v2.5.10-public-20261027+）：
+  // 旧断言要求表达式里保留 `useHibernatePool || (useBoundedWebViewPool && isHistoricalFloor)`
+  // 的历史楼层限定。但在该版本中「活跃池之外一律休眠」是有意为之的改动
+  // （见 MessageHtmlBlock.kt 的注释：确保"活跃 WebView 数量上限"是真实上限，
+  //  不再只对历史楼层生效）。因此这里改为断言**语义**：
+  //   ① isHibernated 由「useBoundedWebViewPool && slotGranted && key !in activePoolKeys」决定；
+  //   ② onRelease 在被淘汰时走 evictAndDestroy + release（而不是 parkContainer 保活）。
   assert.ok(
-    messageHtmlKt.includes('val isHibernated = (useHibernatePool || (useBoundedWebViewPool && isHistoricalFloor)) && slotGranted && effectiveQueueKey !in activePoolKeys') &&
-      messageHtmlKt.includes('if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys)'),
-    'MessageHtmlBlock must hibernate evicted historical panels and release evicted WebViews in onRelease across all bounded pool modes'
+    /val isHibernated = useBoundedWebViewPool && slotGranted && effectiveQueueKey !in activePoolKeys/.test(messageHtmlKt) &&
+      messageHtmlKt.includes('if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys)') &&
+      messageHtmlKt.includes('DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)'),
+    'MessageHtmlBlock must hibernate every panel outside the bounded active pool and release evicted WebViews in onRelease'
   );
 
   // 3. Disk snapshot loading is gated on useHistoricalSnapshot, and snapshot capture releases historical pool slot

@@ -28,8 +28,26 @@ object RegexScriptEngine {
     /** 正则引擎诊断 logcat tag。 */
     private const val TAG = "RegexScriptEngine"
 
-    /** [v214] 不定长 lookbehind 降级时的量词上界（可调）。 */
-    internal const val BOUNDED_LOOKBEHIND_MAX = 4000
+    /**
+     * [v214] 不定长 lookbehind 降级时的量词上界（可调）。
+     *
+     * [P0 根治 2026-10-28] 从 **4000 下调到 256**。
+     *
+     * 真机取证（tavern-runtime.log 18:25 / 18:27，线程栈直指此处）：
+     *   用户脚本里有一条 `/(?<!<details>\s*)<summary>.../`，Java 不支持无界 lookbehind
+     *   → 编译失败 → 本函数把它降级成 `\s{0,4000}` → 能编译了，但**运行时爆炸**。
+     *
+     * 实测（ReDoSTest，JDK 21，同一条降级后的正则）：
+     *   输入 1000 字符 → 4010 ms
+     *   输入 2000 字符 → 31974 ms   （4 倍输入 → 8 倍耗时，O(N²)）
+     * 而真机消息长度约 20000 字符 → 单条正则需要**数百秒**，
+     * 表现为「点发送后转圈、上游零请求、transforms 永不返回」。
+     *
+     * 为什么 256 够用：lookbehind 的语义是「往前看有限个字符」，正常写法是 `\s*`（0~几十个空白）。
+     * 4000 这种量级在语义上没有意义，只会把「每个匹配位置」的成本放大 4000 倍。
+     * 降到 256 后，同一测试用例的复杂度下降约 15 倍，且对真实脚本语义无影响。
+     */
+    internal const val BOUNDED_LOOKBEHIND_MAX = 256
 
     /**
      * [v214] 编译失败诊断钩子。宿主接线（TavernRuntimeManager）后可在 tavern-runtime.log
@@ -56,9 +74,10 @@ object RegexScriptEngine {
         private val delegate: CharSequence,
         private val maxSteps: Int = MAX_REGEX_CHAR_ACCESS_STEPS,
         private val timeoutNanos: Long = MAX_REGEX_EXECUTION_NANOS,
+        /** 与父序列共享的计时起点：subSequence 不再重置超时。 */
+        private val startNanos: Long = System.nanoTime(),
     ) : CharSequence {
         private var steps = 0
-        private val startNanos = System.nanoTime()
 
         override val length: Int
             get() = delegate.length
@@ -75,7 +94,19 @@ object RegexScriptEngine {
         }
 
         override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
-            BoundedRegexCharSequence(delegate.subSequence(startIndex, endIndex), maxSteps - steps, timeoutNanos)
+            // [P0 修复 2026-10-28] 子序列必须**继承**父序列的预算，不能重置。
+            //
+            // 旧实现 new BoundedRegexCharSequence(..., maxSteps - steps, timeoutNanos)：
+            // 新实例的 steps 从 0 开始、startNanos 也是新的 → Matcher 每做一次 subSequence
+            // 就得到一份**全新预算**，总步数可以无限超出 maxSteps，熔断形同不存在。
+            // 真机线程栈（18:27:23.586）显示两个 worker 都卡在 MatcherNative.findImpl，
+            // 正是这条路径上预算被不断重置的结果。
+            BoundedRegexCharSequence(
+                delegate.subSequence(startIndex, endIndex),
+                (maxSteps - steps).coerceAtLeast(1),
+                timeoutNanos,
+                startNanos,
+            )
 
         override fun toString(): String = delegate.toString()
     }
@@ -201,6 +232,102 @@ object RegexScriptEngine {
     }
 
     internal fun isCatastrophicRegexPattern(pattern: String): Boolean = isPotentiallyCatastrophicRegex(pattern)
+
+    /**
+     * [P0 根治 2026-10-28] 检测「降级后的变长后顾」—— 这是真机上 60 秒卡死的直接元凶。
+     *
+     * 真机取证（tavern-runtime.log 18:25 / 18:27，两次都带完整线程栈）：
+     *   DefaultDispatcher-worker-12 RUNNABLE
+     *     MatcherNative.findImpl
+     *     <- Regex.find
+     *     <- RegexScriptEngine.runRegexScript
+     *     <- RegexScriptEngine.getRegexedString
+     *     <- PromptInjectionTransformerKt.collectInjections
+     *     <- PromptInjectionTransformer.transform
+     * 即：世界书注入收集阶段，某条脚本正则发生灾难性回溯，把 transforms 永久卡住，
+     * 于是 STAGE_6 永远到不了、上游零请求、UI 无限转圈。
+     *
+     * 实测（ReDoSTest / ReDoSFixed，同一条降级后的正则）：
+     *   输入 1000 字符 → 4010 ms
+     *   输入 2000 字符 → 31974 ms     （4 倍输入 → 8 倍耗时，O(N²)）
+     * 真机消息约 20000 字符 → 单条正则需数百秒。
+     *
+     * 为什么 [isPotentiallyCatastrophicRegex] 没拦住：
+     *   它只分析**捕获组**的嵌套量词与重叠交替，**完全不看 lookbehind**。
+     *   而 `(?<!<details>\s{0,N})` 的成本是「每个扫描位置 × N」，
+     *   外面再套一个 `[\s\S]*?` 就是 O(文本长度 × N) —— 典型的隐性 ReDoS。
+     *
+     * 判据（三条同时满足才拒绝，避免误杀正常后顾）：
+     *   1) 存在变长后顾 `(?<=` / `(?<!`；
+     *   2) 该后顾**内部**含量词（`*` `+` `{m,n}`），即它需要回溯试探；
+     *   3) 该后顾**外面**还有 `*` / `+` / `{m,}` 这类可跨全文的扫描量词。
+     * 只满足 1+2 而外面没有全文扫描的（例如 `(?<=\s+)foo`）成本有界，不拒绝。
+     */
+    internal fun isDangerousVariableLookbehind(pattern: String): Boolean {
+        val body = SLASH_FORM.matchEntire(pattern)?.groupValues?.getOrNull(1) ?: pattern
+        // 1) 找所有变长后顾，记录区间
+        val lookbehindRanges = mutableListOf<IntRange>()
+        var i = 0
+        while (i < body.length) {
+            val c = body[i]
+            if (c == '\\') { i += 2; continue }
+            if (c == '[') { i = skipCharClass(body, i); continue }
+            if (c == '(' && i + 3 < body.length && body[i + 1] == '?' && body[i + 2] == '<' &&
+                (body[i + 3] == '=' || body[i + 3] == '!')
+            ) {
+                val end = findMatchingParen(body, i)
+                if (end < 0) break
+                lookbehindRanges.add(i..end)
+                i = end + 1
+                continue
+            }
+            i++
+        }
+        if (lookbehindRanges.isEmpty()) return false
+
+        // 2) 后顾内部是否含量词
+        val hasQuantifierInside = lookbehindRanges.any { r ->
+            val inner = body.substring(r.first + 4, r.last)
+            var k = 0
+            var found = false
+            while (k < inner.length) {
+                val ch = inner[k]
+                if (ch == '\\') { k += 2; continue }
+                if (ch == '[') { k = skipCharClass(inner, k); continue }
+                if (ch == '*' || ch == '+' || (ch == '{' && inner.indexOf('}', k + 1) > k + 1)) { found = true; break }
+                k++
+            }
+            found
+        }
+        if (!hasQuantifierInside) return false
+
+        // 3) 后顾外面是否还有可跨全文的扫描量词
+        val outside = StringBuilder(body.length)
+        var cursor = 0
+        for (r in lookbehindRanges) {
+            if (r.first > cursor) outside.append(body, cursor, r.first)
+            cursor = r.last + 1
+        }
+        if (cursor < body.length) outside.append(body, cursor, body.length)
+        val outStr = outside.toString()
+        var j = 0
+        while (j < outStr.length) {
+            val ch = outStr[j]
+            if (ch == '\\') { j += 2; continue }
+            if (ch == '[') { j = skipCharClass(outStr, j); continue }
+            if (ch == '*' || ch == '+') return true
+            if (ch == '{') {
+                val close = outStr.indexOf('}', j + 1)
+                if (close > j + 1) {
+                    val inner = outStr.substring(j + 1, close)
+                    val parts = inner.split(',')
+                    if (parts.size == 2 && parts[1].isEmpty()) return true // {m,} 无上界
+                }
+            }
+            j++
+        }
+        return false
+    }
 
     internal fun isPotentiallyCatastrophicRegex(pattern: String): Boolean {
         if (pattern.length < 4) return false
@@ -547,6 +674,15 @@ object RegexScriptEngine {
         }
         if (isPotentiallyCatastrophicRegex(pattern) && normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH) {
             val msg = "[regex] skipped potentially catastrophic regex on input (${normalizedRaw.length} chars): pattern=$pattern"
+            warn(msg)
+            onCompileDegraded?.invoke(msg)
+            return normalizedRaw
+        }
+        // [P0 根治 2026-10-28] 变长后顾 + 全文扫描量词 = 隐性 ReDoS。
+        // 真机实测 2000 字符就要 32 秒（O(N²)），20000 字符必然数百秒 —— 直接跳过并留痕。
+        // 这条必须在真正执行正则**之前**判定：一旦进了 Matcher，主流程只能等它跑完。
+        if (normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH && isDangerousVariableLookbehind(pattern)) {
+            val msg = "[regex] skipped variable-lookbehind ReDoS risk (${normalizedRaw.length} chars): pattern=$pattern"
             warn(msg)
             onCompileDegraded?.invoke(msg)
             return normalizedRaw

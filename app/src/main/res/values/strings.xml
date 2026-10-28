@@ -2502,4 +2502,9 @@
   <string name="error_regenerate_target_missing">The message being regenerated no longer exists; chat history was left unchanged.</string>
   <string name="error_generation_aborted">Generation stopped before any request was sent: %1$s</string>
   <string name="error_tool_approval_stale">This tool approval is no longer valid (the tool already finished or the request was replaced).</string>
+  <string name="error_send_watchdog_timeout">The request stayed at “%1$s” and produced no reply for too long, so it was stopped automatically. Check your network/proxy and the provider status, then try again.</string>
+  <!-- [P0] Stalled BEFORE the request was sent: this is a local stall, do not point the user at the network. -->
+  <string name="error_send_prerequest_timeout">The request stalled before it was ever sent: waited %2$d s locally and never left “%1$s”, so nothing reached the provider. This is a local issue, not a network or provider problem. Try again, and if it keeps happening please share tavern-runtime.log with the developer.</string>
+  <string name="error_send_watchdog_unknown_stage">preparing the request</string>
+  <string name="chat_generation_waiting_first_token">Waiting for the model to start replying…</string>
 </resources>

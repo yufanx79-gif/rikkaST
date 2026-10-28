@@ -278,6 +278,10 @@ class ChatVM(
         answer: Boolean = true,
         onPersisted: ((Boolean) -> Unit)? = null,
     ): Boolean {
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[send-entry] ChatVM.handleMessageSend conv=$_conversationId parts=${content.size} answer=$answer",
+        )
         if (content.isEmptyInputMessage()) {
             TavernRuntimeManager.appendLog(
                 "warn",

@@ -220,6 +220,16 @@ internal fun extractQuickPlainPreview(rawText: String): String {
         .replace(QUICK_STRIP_BLOCKS_RE, "")
         .replace(QUICK_STRIP_TAGS_RE, "")
         .replace(Regex("\n{3,}"), "\n\n")
+    // [P0 修复] 围栏本身也要剥掉。
+    // 面板常被包在 ```html 围栏里（GFM 会渲染成带语言标签的代码块 = 用户看到的"代码"）；
+    // 只剥标签、留下 ``` 的话预览依然会变成代码块（反例测试实证）。
+    text = text
+        .replace(Regex("""^\s*```[a-zA-Z0-9_+-]*\s*$""", RegexOption.MULTILINE), "")
+        .replace(Regex("""^\s*```\s*$""", RegexOption.MULTILINE), "")
+    // 4 空格/TAB 缩进在 CommonMark 里也是代码块，预览里必须压平，否则同样"显示成代码"。
+    text = text.lines().joinToString("\n") { line ->
+        if (line.startsWith("    ") || line.startsWith("\t")) line.trimStart() else line
+    }
     images.forEachIndexed { index, replacement ->
         text = text.replace("\u0001PIC$index\u0001", replacement)
             .replace("\u0001IMG$index\u0001", replacement)
@@ -466,7 +476,43 @@ private fun postProcessAssistantRenderedText(
     } else {
         regexed
     }
-    return convertUnhandledPicTagsToHtml(convertUnhandledDrawTagsToHtml(wrapperCleaned))
+    return convertUnhandledPicTagsToHtml(
+        convertUnhandledDrawTagsToHtml(stripOrphanScaffoldTags(wrapperCleaned))
+    )
+}
+
+/**
+ * 显示级脚手架清洗：把「不是合法 HTML 标签名」的卡内中间格式标记从**可见文本**里去掉。
+ *
+ * 背景（真机日志 tavern-runtime-10-14-14.log:23-89 证实）：酒馆卡在回复开头会先吐
+ * `<TASK_CHECK_PASS>` / `<TASK_FINAL>` 这类脚手架标记。它们是**流式中间态**，
+ * 卡的显示正则是按「成对开闭标签」写的，流式期间拿不到 `</TASK_FINAL>`，天然匹配不上，
+ * 于是这些尖括号串会被 GFM 当成普通文本 **转义后原样显示**（实测可见文本就是
+ * `<TASK_CHECK_PASS>`），用户看到的就是「点发送后界面变成一堆代码」。
+ *
+ * 为什么放在这里：`postProcessAssistantRenderedText` 是 ASSISTANT 侧唯一的显示收口，
+ * 同步快路 / 异步 / WebView formatter 三条路径全经过它，结果还会进 [StRegexTextCache]
+ * 按 text 缓存 —— 不是每 token 重算。同目录已经在做同性质的 `<pic>` / `[出图]` 视觉转换，
+ * 契约一致：**只影响显示，绝不写回存储，也不进 prompt**。
+ *
+ * 规则（严格白名单，避免砍到真内容）：
+ * - 只删**标签标记本身**，永不删内文；
+ * - 名字必须是 `<已知脚手架前缀>_<全大写尾段>`，前缀只放真机日志里实际出现过的
+ *   `TASK` / `SCENE` / `INTERLEAVE` / `CTX`（见 tavern-runtime-10-14-14.log:23-89）。
+ *   合法 HTML 标签名不含下划线，所以这些不可能是结构标签；
+ *   而「前缀不在白名单」的 `<A_B>` 这类模型自定义泛型/占位符（反例测试证明会被误伤）保持原样。
+ * - `TASK_FINAL`（只有一段后缀）与 `TASK_CHECK_PASS`（多段）都必须覆盖 ——
+ *   两者都是日志里出现频率最高的脚手架标记。
+ * - `scene` / `details` 等合法标签**不在此列**：MarkdownNew 会正常渲染它们，误删会毁掉卡的折叠面板。
+ */
+private val ORPHAN_SCAFFOLD_TAG_RE = Regex(
+    """</?(?:TASK|SCENE|INTERLEAVE|INTERLEAVING|CTX)_[A-Z0-9]+(?:_[A-Z0-9]+)*\s*>""",
+)
+
+internal fun stripOrphanScaffoldTags(text: String): String {
+    if (text.isEmpty() || !text.contains('_')) return text
+    if (!ORPHAN_SCAFFOLD_TAG_RE.containsMatchIn(text)) return text
+    return ORPHAN_SCAFFOLD_TAG_RE.replace(text, "")
 }
 
 private val UNHANDLED_PIC_RE = Regex(

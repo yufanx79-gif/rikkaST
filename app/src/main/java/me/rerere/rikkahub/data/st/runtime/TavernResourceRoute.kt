@@ -18,7 +18,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
@@ -95,7 +94,7 @@ object TavernResourceRoute {
         TavernRuntimeManager.appendLog("info", "[net] resource route mode=$newMode")
     }
 
-    /** WebView shouldInterceptRequest 入口：命中/成功返回本地响应，失败返回 null 走原生网络。 */
+    /** WebView shouldInterceptRequest 入口：命中缓存返回本地响应，未命中直接交回 WebView 原生网络。 */
     fun intercept(context: Context, uri: Uri, requestHeaders: Map<String, String>?): WebResourceResponse? {
         // shouldInterceptRequest 正常在后台线程；若被主线程调用，绝不阻塞 UI，直接交回原生网络。
         if (Looper.myLooper() == Looper.getMainLooper()) return null
@@ -112,12 +111,31 @@ object TavernResourceRoute {
             return responseFor(cached)
         }
 
-        val fetched = runCatching {
-            runBlocking {
-                withTimeoutOrNull(TOTAL_TIMEOUT_MS) { fetchToCache(context, url) }
+        // [P0 修复] **绝不**在 shouldInterceptRequest 里 runBlocking 等待网络。
+        //
+        // 旧实现在这里 `runBlocking { withTimeoutOrNull(12s) { fetchToCache(...) } }`，
+        // 而 shouldInterceptRequest 跑在 Chromium 全局共享的拦截线程上：一个慢图/失效外链
+        // 就会把该线程占满 12 秒，随后所有 WebView（包括主运行时）的资源与 XHR 请求一起排队，
+        // 表现为「面板/生成卡住、上游收不到请求」。
+        // 新策略：本函数只做**纯本地**的事（读磁盘缓存）。未命中就返回 null 让 WebView 走原生网络，
+        // 同时把「下载并写入缓存」作为**后台任务**发起（不阻塞调用线程）；该任务写完后，
+        // 用户下次滚动/重进面板即可命中缓存。这与 prefetchImages 走同一条后台通道。
+        if (url.startsWith("https://appassets.androidplatform.net", true) ||
+            url.startsWith("http://appassets.androidplatform.net", true)
+        ) {
+            return null
+        }
+        val appContext = context.applicationContext
+        // [P0 修复] 后台补缓存，但**避免无谓的协程膨胀**：
+        // shouldInterceptRequest 对同一张图可能被调用多次（多 WebView / 重试 / Range 探测），
+        // 如果每次都 launch 一个协程，20 图面板会瞬间造出上百个协程。
+        // 这里先用 inflight 做一次廉价预检：已有任务在跑就什么都不做。
+        if (!inflight.containsKey(cacheKey(url))) {
+            scope.launch {
+                runCatching { withTimeoutOrNull(TOTAL_TIMEOUT_MS) { fetchToCache(appContext, url) } }
             }
-        }.getOrNull() ?: return null
-        return responseFor(fetched)
+        }
+        return null
     }
 
     /** 供原生 Coil 图片使用：成功返回本地文件，失败返回 null（调用方保留原始 URL）。 */

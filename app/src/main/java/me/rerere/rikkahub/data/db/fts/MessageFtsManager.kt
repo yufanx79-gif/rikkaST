@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.data.db.fts
 
 import android.util.Log
+import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.rerere.ai.ui.UIMessage
@@ -30,15 +31,24 @@ class MessageFtsManager(private val database: AppDatabase) {
 
     private val db get() = database.openHelper.writableDatabase
 
+    /**
+     * 全量重建某会话的 FTS 行。
+     *
+     * **必须在一个事务里执行**：SQLite 默认每条语句一次 auto-commit，等于每行一次 fsync；
+     * FTS5 还要对每行做一次 jieba 分词。长会话（数百层楼 × 多 swipe）下旧实现是
+     * 「DELETE + 数百次独立 INSERT」，实测 800 行 4KB 文本耗时 4.4 秒（放进同一事务仅 50ms），
+     * 而它正好位于「点发送 → 发请求」的关键路径上
+     * （ChatService.sendQueuedMessage → saveConversation → ConversationRepository.updateConversation）。
+     * 这里用单事务包住，把 N 次 fsync 压成 1 次。
+     */
     suspend fun indexConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
         val conversationId = conversation.id.toString()
-        db.execSQL("DELETE FROM message_fts WHERE conversation_id = ?", arrayOf(conversationId))
+        val rows = ArrayList<Array<String>>(conversation.messageNodes.size)
         conversation.messageNodes.forEach { node ->
             node.messages.forEach { message ->
                 val text = message.extractFtsText()
                 if (text.isNotBlank()) {
-                    db.execSQL(
-                        "INSERT INTO message_fts(text, node_id, message_id, conversation_id, title, update_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    rows.add(
                         arrayOf(
                             text,
                             node.id.toString(),
@@ -49,6 +59,19 @@ class MessageFtsManager(private val database: AppDatabase) {
                         )
                     )
                 }
+            }
+        }
+        // 用 Room 的 withTransaction 而不是 openHelper.writableDatabase.beginTransaction()。
+        // 原因：前者会走 Room 的事务调度器（与其它 DAO 写操作串行），
+        // 后者绕过它 —— 并发时可能撞上 "cannot start a transaction within a transaction"
+        // 或 database is locked。这里只写 FTS 虚表，但仍应遵守同一把调度锁。
+        database.withTransaction {
+            db.execSQL("DELETE FROM message_fts WHERE conversation_id = ?", arrayOf(conversationId))
+            rows.forEach { args ->
+                db.execSQL(
+                    "INSERT INTO message_fts(text, node_id, message_id, conversation_id, title, update_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    args,
+                )
             }
         }
     }

@@ -48,6 +48,7 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
+import me.rerere.rikkahub.data.model.TAVERN_MAX_TOOL_STEPS
 import me.rerere.rikkahub.data.model.TavernCharacterData
 import me.rerere.rikkahub.data.model.ToolPolicy
 import me.rerere.rikkahub.data.model.effectiveMaxToolSteps
@@ -91,6 +92,86 @@ private data class DevLabResult(
     val logs: String = "",
 )
 
+/**
+ * 一次「发送轮」的判定结果。
+ *
+ * [P0 修正] 旧实现把「最后一条 S7 之后的记录」一律当成一轮发送，于是**停止动作**也会被当成发送轮：
+ * 用户点「停止」只产生 `S1(textLen=0, loading=true) → S7(status=STOPPED_BY_USER)`，
+ * 里面当然没有 S6，于是「上一次发送没有到达请求阶段」100% 假 FAIL —— 用户截图里那两条 FAIL
+ * 就是这么来的，它把真正的排查方向盖掉了。
+ */
+private enum class SendRoundVerdict {
+    /** 没有任何发送记录。 */
+    NoData,
+
+    /** 这一轮不是「发送」（例如只点了停止，或只有一条孤立的 S7）。判定应 SKIP，不许 FAIL。 */
+    NotASendRound,
+
+    /** 只插入消息、不触发生成（/sendas、测试台造数据）。没有 S6 是**预期**行为。判定应 SKIP。 */
+    InsertOnly,
+
+    /** 真正发出了请求（到达 S6）。 */
+    Passed,
+
+    /** 到达了请求阶段，但看门狗中止过。 */
+    WatchdogAborted,
+
+    /** 是发送轮，但没到达请求阶段就结束了 —— 这才是真正的失败。 */
+    FailedBeforeRequest,
+}
+
+/**
+ * 把一段诊断记录归到一次发送轮。
+ *
+ * 判据（按顺序，先命中先返回）：
+ * 1. 空列表 → [SendRoundVerdict.NoData]
+ * 2. 有 S1 且被标记为 stop（`action=stop`，或旧记录的 `textLen=0` + `loading=true`）→ 不是发送轮
+ * 3. 没有任何 S1 → 不是发送轮（孤立 S7 之类）
+ * 4. 有 S6 → 成功（若命中 WATCHDOG_ 则单独标记）
+ * 5. 有 S3 但明确 `answer=false` → 只插入
+ * 6. 其余（有 S1、无 S6）→ 请求阶段之前就失败了
+ *
+ * 注意：这里是**纯函数**，只读记录、不碰 UI，方便用探针直接覆盖用例矩阵。
+ */
+private fun classifySendRound(
+    records: List<TavernRuntimeManager.SendDiagnosticRecord>,
+): SendRoundVerdict {
+    if (records.isEmpty()) return SendRoundVerdict.NoData
+
+    val s1 = records.lastOrNull {
+        it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_1_SEND_CLICKED
+    }
+    val s6 = records.any {
+        it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT
+    }
+
+    // 2. 停止动作：新记录带 action=stop；旧记录只能靠 textLen=0 + loading=true 识别。
+    if (s1 != null) {
+        val d = s1.detail
+        val isStop = d.contains("action=stop") ||
+            (d.contains("textLen=0") && d.contains("loading=true"))
+        if (isStop) return SendRoundVerdict.NotASendRound
+    }
+
+    // 3. 没有 S1 就不是一次发送轮（例如只点了停止，只留下 S7）。
+    if (s1 == null) return SendRoundVerdict.NotASendRound
+
+    // 4. 到达请求阶段。
+    if (s6) {
+        val watchdog = records.any { it.detail.contains("WATCHDOG_") }
+        return if (watchdog) SendRoundVerdict.WatchdogAborted else SendRoundVerdict.Passed
+    }
+
+    // 5. 只插入不生成。
+    val s3 = records.lastOrNull {
+        it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED
+    }
+    if (s3 != null && s3.detail.contains("answer=false")) return SendRoundVerdict.InsertOnly
+
+    // 6. 真失败。
+    return SendRoundVerdict.FailedBeforeRequest
+}
+
 private val DEV_LAB_TESTS = listOf(
     DevLabTest("01", "交互", "面板按钮桥"),
     DevLabTest("02", "交互", "悬浮窗目标切换"),
@@ -102,6 +183,7 @@ private val DEV_LAB_TESTS = listOf(
     DevLabTest("08", "WebView 与网络", "VPN/直连资源竞速"),
     DevLabTest("09", "WebView 与网络", "1/5/10/20 面板压力预算"),
     DevLabTest("10", "性能与内存", "WebView 数量/内存报告"),
+    DevLabTest("11", "发送与删除", "发送链路阶段诊断"),
 )
 
 @Composable
@@ -404,6 +486,7 @@ private class DevLabRunner(
         "08" -> networkRace()
         "09" -> stressBudget()
         "10" -> webViewReport()
+        "11" -> sendPipelineDiagnostics()
         else -> DevLabResult(DevLabStatus.SKIP, summary = "未知测试 ID")
     }
 
@@ -631,20 +714,33 @@ private class DevLabRunner(
         val explicit = roleplay.copy(toolPolicy = ToolPolicy.AUTO, totalStepsLimit = 32)
         val required = roleplay.copy(toolPolicy = ToolPolicy.REQUIRED)
         val disabled = normal.copy(enableTools = false, toolPolicy = ToolPolicy.REQUIRED)
+        // [P0 修复] 期望值必须跟 Assistant.effectiveMaxToolSteps() 的真实实现对齐：
+        // 酒馆卡上限已从 2 放宽到 TAVERN_MAX_TOOL_STEPS=8（一次 step = 一次完整模型请求，
+        // 压到 2 只够「1 轮工具 + 1 次收尾」）。旧断言写死 2，导致内置自检 05 永远 FAIL，
+        // 反而掩盖了真正的问题。
+        val expectedTavernSteps = minOf(32, TAVERN_MAX_TOOL_STEPS)
         val pass = normal.effectiveToolPolicy() == ToolPolicy.AUTO &&
             roleplay.effectiveToolPolicy() == ToolPolicy.NONE &&
             explicit.effectiveToolPolicy() == ToolPolicy.AUTO &&
             required.effectiveToolPolicy() == ToolPolicy.REQUIRED &&
             disabled.effectiveToolPolicy() == ToolPolicy.NONE &&
-            roleplay.effectiveMaxToolSteps() == 2 &&
-            explicit.effectiveMaxToolSteps() == 2 &&
-            required.effectiveMaxToolSteps() == 2
+            roleplay.effectiveMaxToolSteps() == expectedTavernSteps &&
+            explicit.effectiveMaxToolSteps() == expectedTavernSteps &&
+            required.effectiveMaxToolSteps() == expectedTavernSteps &&
+            // [修正] 普通助手不裁剪，effectiveMaxToolSteps() == totalStepsLimit。
+            // 旧断言写死 16（Assistant.totalStepsLimit 的默认值），用户一旦把上限调成
+            // 其它值（例如 256），本项就会永久 FAIL，把真实问题掩盖掉。
+            normal.effectiveMaxToolSteps() == normal.totalStepsLimit.coerceAtLeast(1)
         return DevLabResult(
             if (pass) DevLabStatus.PASS else DevLabStatus.FAIL,
-            summary = "普通=auto；角色卡默认=none；显式开启=auto；必须=required；总开关关闭=none；角色卡单轮≤2",
+            summary = "普通=auto；角色卡默认=none；显式开启=auto；必须=required；总开关关闭=none；" +
+                "角色卡单轮≤$TAVERN_MAX_TOOL_STEPS",
             input = "assistant=${base.name}",
-            intermediate = "normal=${normal.effectiveToolPolicy()} roleplay=${roleplay.effectiveToolPolicy()} required=${required.effectiveToolPolicy()}",
-            result = "roleplayMaxSteps=${roleplay.effectiveMaxToolSteps()}",
+            intermediate = "normal=${normal.effectiveToolPolicy()} roleplay=${roleplay.effectiveToolPolicy()} " +
+                "required=${required.effectiveToolPolicy()} disabled=${disabled.effectiveToolPolicy()}",
+            result = "roleplayMaxSteps=${roleplay.effectiveMaxToolSteps()} expected=$expectedTavernSteps " +
+                "normalMaxSteps=${normal.effectiveMaxToolSteps()} " +
+                "normalTotalStepsLimit=${normal.totalStepsLimit}",
         )
     }
 
@@ -764,6 +860,115 @@ private class DevLabRunner(
             if (pass) DevLabStatus.PASS else DevLabStatus.FAIL,
             summary = if (pass) "估算内存预算内（≈${totalMb}MB，非 PSS）" else "估算内存预算超限（≈${totalMb}MB）",
             result = report,
+        )
+    }
+
+    /**
+     * [P0 新增] 发送链路阶段诊断。
+     *
+     * 用户唯一的体感是「点发送后一直转圈」。「开发者测试台显示没问题」的根因是：
+     * 台里的 10 项自检覆盖的是面板桥 / 长楼层落库 / 删除 / 工具策略 / 图片 / 预算，
+     * **没有任何一项检查「从点击发送到真正发出 HTTP 请求」的那 7 个阶段**，
+     * 所以它们全绿也不能说明发送链路是通的。
+     *
+     * 这一项直接把 [TavernRuntimeManager.SendDiagnosticStage] 的真实记录读出来，
+     * 明确回答三个问题：
+     *   1. 上一次发送停在哪个阶段？
+     *   2. 从「用户消息落库(S3)」到「请求发出(S6)」用了多久？
+     *   3. 是否出现过 watchdog 超时 / 钩子超时 / 取消？
+     */
+    private fun sendPipelineDiagnostics(): DevLabResult {
+        val records = TavernRuntimeManager.getSendDiagnosticRecords()
+        if (records.isEmpty()) {
+            return DevLabResult(
+                DevLabStatus.SKIP,
+                summary = "还没有发送记录：先在聊天页发一条消息，再回来运行本项",
+                input = "诊断来源 = tavern-runtime.log 的 [send-diag] 记录",
+            )
+        }
+        // 按会话分组取最近一次发送轮。
+        // 注意：一轮的边界是「上一条 S7 之后」——不能简单按会话过滤，
+        // 否则历史多轮会混在一起，`lastOrNull` 取到的是旧 S6、判断失真。
+        val lastConversation = records.lastOrNull()?.conversationId.orEmpty()
+        val conversationRecords = records.filter { it.conversationId == lastConversation }
+        val lastFinishedIndex = conversationRecords.indexOfLast {
+            it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED
+        }
+        val mine = if (lastFinishedIndex >= 0) {
+            conversationRecords.drop(lastFinishedIndex + 1).ifEmpty { conversationRecords.takeLast(1) }
+        } else {
+            conversationRecords
+        }
+        val stageNames = mine.joinToString(" → ") { "S${it.stage.stepNumber}" }
+        val s3 = mine.lastOrNull { it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_3_USER_MSG_PERSISTED }
+        val s6 = mine.lastOrNull { it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT }
+        val s7 = mine.lastOrNull { it.stage == TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED }
+        val prepareMs = if (s3 != null && s6 != null) s6.timestampMs - s3.timestampMs else -1L
+        val totalMs = if (s3 != null && s7 != null) s7.timestampMs - s3.timestampMs else -1L
+        val watchdogHits = mine.count { it.detail.contains("WATCHDOG_") }
+        // 真正的钩子超时：诊断 detail 里没有这种字样，钩子超时只在 [gen-hooks]/[ejs] 日志里，
+        // 这里统计 detail 中显式标注的 timeout/超时（避免用宽泛的小写匹配误算）。
+        val hookTimeoutHits = mine.count {
+            it.detail.contains("timeout", ignoreCase = true) || it.detail.contains("超时")
+        }
+        val abortedHits = mine.count {
+            it.detail.contains("ABORTED") || it.detail.contains("CANCELLED")
+        }
+        val reachedRequest = s6 != null
+        // [P0 修正] 判定交给纯函数：停止动作 / 只插入 / 无数据一律 SKIP，不再假 FAIL。
+        val verdict = classifySendRound(mine)
+        // 卡住的阶段 = 最后一条记录的阶段（而不是 s7 的阶段号，那个恒为 7，没有信息量）
+        val lastRecord = mine.lastOrNull()
+        val summary = when (verdict) {
+            SendRoundVerdict.NoData -> "没有可判定的一轮发送"
+            SendRoundVerdict.NotASendRound ->
+                "⏭️ 这不是一轮发送（用户点的是「停止生成」，或只有孤立的结束记录）——不作为发送失败统计"
+            SendRoundVerdict.InsertOnly ->
+                "⏭️ 这一轮只插入消息、未触发生成（answer=false），没有 S6 是预期行为"
+            SendRoundVerdict.Passed -> "✅ 上一次发送完整走到请求阶段，准备耗时 ${prepareMs}ms"
+            SendRoundVerdict.WatchdogAborted -> "⚠️ 到达了请求阶段，但触发过 ${watchdogHits} 次发送看门狗中止"
+            SendRoundVerdict.FailedBeforeRequest ->
+                if (lastRecord != null) {
+                    "❌ 上一次发送没有到达请求阶段就结束（停在 S${lastRecord.stage.stepNumber} ${lastRecord.stage.name}）——上游必然收不到"
+                } else {
+                    "❌ 上一次发送没有到达请求阶段（S6 缺失）——上游必然收不到"
+                }
+        }
+        val pass = when (verdict) {
+            SendRoundVerdict.Passed -> true
+            SendRoundVerdict.NotASendRound,
+            SendRoundVerdict.InsertOnly,
+            SendRoundVerdict.NoData,
+            -> true // 不适用，不算失败
+            SendRoundVerdict.WatchdogAborted,
+            SendRoundVerdict.FailedBeforeRequest,
+            -> false
+        }
+        val status = when (verdict) {
+            SendRoundVerdict.NotASendRound,
+            SendRoundVerdict.InsertOnly,
+            SendRoundVerdict.NoData,
+            -> DevLabStatus.SKIP
+            else -> if (pass) DevLabStatus.PASS else DevLabStatus.FAIL
+        }
+        val report = buildString {
+            appendLine("conversation=$lastConversation")
+            appendLine("阶段序列：$stageNames")
+            appendLine("S3→S6 准备耗时=${prepareMs}ms   S3→S7 总耗时=${totalMs}ms")
+            appendLine("reachedRequest=$reachedRequest watchdog=$watchdogHits hookTimeout=$hookTimeoutHits aborted=$abortedHits")
+            appendLine("verdict=$verdict（NotASendRound/InsertOnly/NoData 一律 SKIP，不算失败）")
+            appendLine("--- 最近 12 条 ---")
+            mine.takeLast(12).forEach { r ->
+                appendLine("#${r.seq} S${r.stage.stepNumber} ${r.stage.name} · ${r.detail}")
+            }
+        }
+        return DevLabResult(
+            status,
+            summary = summary,
+            input = "来源=tavern-runtime.log [send-diag]",
+            intermediate = "S3→S6=${prepareMs}ms verdict=$verdict",
+            result = report,
+            logs = "阶段 = ${TavernRuntimeManager.SendDiagnosticStage.entries.joinToString { "S${it.stepNumber}:${it.label}" }}",
         )
     }
 

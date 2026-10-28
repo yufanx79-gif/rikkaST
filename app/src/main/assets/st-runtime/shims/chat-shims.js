@@ -88,6 +88,14 @@ function toJsrChatMessage(raw, index, includeSwipes = false) {
         : {};
 
     if (includeSwipes) {
+        // [BUGFIX F7] MVU 的「切换聊天后重新初始化」会读 `t.swipes_data[o]`
+        // （mvu/bundle.js 里 `let r=(klona)(t.swipes_data[o])`）。
+        // 旧实现只返回 `data`（单条 swipes 的变量），没有 `swipes_data` 这个键 →
+        // `undefined[0]` 抛 `TypeError: Cannot read properties of undefined (reading '0')`，
+        // 被 MVU 的 catch 吞成一条 toast「[MVU]重新初始化失败」，于是每次进软件都弹一次。
+        // 语义对齐 JSR：`swipes_data` = 每个 swipe 各自的变量数组（与 `swipes` 一一对应），
+        // `data` 保留原含义（当前 swipe 的变量）。两者都提供，旧消费方不受影响。
+        const swipesData = swipes.map((_, sIdx) => (sIdx === swipeId ? deepClone(msgVars) : {}));
         return {
             message_id: index,
             name: String(raw.name ?? ''),
@@ -95,7 +103,8 @@ function toJsrChatMessage(raw, index, includeSwipes = false) {
             is_hidden: Boolean(raw.is_system),
             swipe_id: swipeId,
             swipes: deepClone(swipes),
-            data: swipes.map((_, sIdx) => (sIdx === swipeId ? deepClone(msgVars) : {})),
+            swipes_data: deepClone(swipesData),
+            data: deepClone(swipesData),
             extra: deepClone(raw.extra || {}),
         };
     }
@@ -227,6 +236,19 @@ export async function setChatMessages(messages, options = {}) {
             if (dataPayload && typeof dataPayload === 'object') {
                 rt.setMessageVariablesAt(id, dataPayload);
             }
+        }
+
+        // [诊断 F7] MVU 的 initvar 会写 `swipes_data`（多 swipe 各自的变量数组），
+        // 但本 shim 的写路径目前只认 `data`（单 swipe），也没有 `rt.setMessageVariablesAt`。
+        // 这里**不擅自改写**（整份 messageVars 覆写有数据风险），只把它显式记进日志，
+        // 避免「调用方以为写成功了、实际被静默丢弃」这种最难查的失败。
+        if (m.swipes_data !== undefined && !hasPatch) {
+            try {
+                console.warn(
+                    '[chat-shims] setChatMessages: swipes_data 未被写入（写路径暂不支持多 swipe 变量）' +
+                    ' message_id=' + id + ' swipes=' + (Array.isArray(m.swipes_data) ? m.swipes_data.length : '?'),
+                );
+            } catch (_e) { /* noop */ }
         }
 
         if (hasPatch) {

@@ -14,6 +14,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import me.rerere.ai.ui.finishReasoning
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.model.Conversation
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
@@ -250,8 +251,27 @@ class ConversationSession(
     fun currentGenerationEpoch(): Long = generationEpoch.get()
     private val _generationJob = MutableStateFlow<Job?>(null)
     private val activeJobs = mutableSetOf<Job>()
+    /**
+     * [D1] 「待补收口」的一次性令牌：记录被 cancelJobs() / setJob(null) 从当前槽位清掉的那个 job。
+     *
+     * 为什么需要它：这两个路径会先把 _generationJob 置 null，随后 job 完成时
+     * `compareAndSet(job, null)` 必然失败 → 旧实现会跳过 onGenerationFinished，
+     * 而它是全仓**唯一**的「生成结束后自动推进队列」入口。
+     *
+     * 为什么是「一次性令牌」而不是「记住最后一个」：
+     * activeJobs 里可能同时挂着多个 job（顶替时旧 job 尚未结束）。若只用「_generationJob 是否为空」
+     * 判断，每个被连带取消的 job 都会触发一次 onGenerationFinished（重复 pause / 重复派发）。
+     * 而如果长期记住某个 job，一旦它卡死很久才结束，又会在**后续轮次**里误触发。
+     * 所以：只认「取消那一刻记录的那一个」，且**消费一次立刻失效**，其余一律不收口。
+     */
+    private var pendingFinishJob: Job? = null
     val generationJob: StateFlow<Job?> = _generationJob.asStateFlow()
     val isGenerating: Boolean get() = _generationJob.value?.isActive == true
+
+    /** 仅供日志诊断：当前 generation job 的创建时间（0 表示当前没有 job）。 */
+    @Volatile
+    var generationJobStartedAtMs: Long = 0L
+        private set
     val isInUse: Boolean
         get() = refCount.get() > 0 || _generationJob.value != null ||
                 messageQueue.state.value.messages.isNotEmpty()
@@ -273,6 +293,15 @@ class ConversationSession(
             generationEpoch.incrementAndGet()
         }
         val previous = _generationJob.value
+        // setJob(null) 同样是「把当前 job 从槽位清掉」：记下它，保证它完成时仍会补一次收口。
+        if (job == null && previous != null) pendingFinishJob = previous
+        // 新 job 接管槽位 → 之前遗留的「待补收口」令牌作废：被顶替的旧 job 完成时不该推进新轮次。
+        if (job != null) pendingFinishJob = null
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[job-set] conv=$id job=${job?.hashCode() ?: "null"} cancelPrevious=$cancelPrevious prevActive=${previous?.isActive == true}",
+        )
+        generationJobStartedAtMs = if (job != null) System.currentTimeMillis() else 0L
         _generationJob.value = job
         if (cancelPrevious) previous?.cancel()
         if (job != null) activeJobs.add(job)
@@ -282,7 +311,34 @@ class ConversationSession(
                 // Also propagate cancellation when a queued coroutine never entered its body.
                 if (!cancelPrevious && cause is CancellationException) previous?.cancel()
                 // A replaced job must not clear or advance its successor.
-                if (_generationJob.compareAndSet(job, null)) {
+                val clearedGenerationJob = _generationJob.compareAndSet(job, null)
+                // [D1 修复] 「收口」不再只依赖 CAS 成功。
+                //
+                // cancelJobs() 会先把 _generationJob 置 null（见下方 cancelJobs），于是本回调里的
+                // compareAndSet(job, null) 必然失败 —— 旧实现因此**跳过 onGenerationFinished**。
+                // 而 onSessionGenerationFinished（ChatService:493-503）是全仓**唯一**的
+                // 「生成结束后自动派发队列」入口，跳过它意味着：被取消的那一轮永远不会自动推进队列。
+                //
+                // 只有同时满足三条才补收口，避免 onGenerationFinished 被多触发 / 跨轮次误触发：
+                //   1) CAS 失败（说明槽位不是被本 job 清掉的）；
+                //   2) 槽位**此刻仍为空**（没有新 job 接管；若已被顶替，本 job 属于「被替换」而非「被遗弃」）；
+                //   3) 本 job 正是取消那一刻记录的一次性令牌持有者。
+                // activeJobs 里其它被连带取消的旧 job 不算，保证每轮恰好一次收口。
+                val orphanedByCancel = !clearedGenerationJob &&
+                    _generationJob.value == null &&
+                    (job === pendingFinishJob)
+                if (clearedGenerationJob) {
+                    generationJobStartedAtMs = 0L
+                }
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[job-end] conv=$id cause=${cause?.javaClass?.simpleName ?: "success"} " +
+                        "activeJobs=${activeJobs.size} clearedGenerationJob=$clearedGenerationJob " +
+                        "orphanedByCancel=$orphanedByCancel",
+                )
+                if (clearedGenerationJob || orphanedByCancel) {
+                    // 令牌一次性消费：用过即失效，绝不会在后续轮次里再次命中。
+                    if (pendingFinishJob === job) pendingFinishJob = null
                     onGenerationFinished(id, cause)
                     if (refCount.get() <= 0) scheduleIdleCheck()
                 }
@@ -293,10 +349,21 @@ class ConversationSession(
 
     fun getJob(): Job? = _generationJob.value
 
+    /** 仅供日志诊断：当前存活 job 数（只读，不改变任何生命周期语义）。 */
+    @Synchronized
+    fun activeJobCount(): Int = activeJobs.size
+
     @Synchronized
     fun cancelJobs(): List<Job> = activeJobs.toList().also { jobs ->
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[job-cancel-all] conv=$id n=${jobs.size} actives=${jobs.map { it.isActive }}",
+        )
         generationEpoch.incrementAndGet()
+        // 记住「被清掉的那一个当前 job」：只有它需要在完成时补一次 onGenerationFinished。
+        pendingFinishJob = _generationJob.value
         _generationJob.value = null
+        generationJobStartedAtMs = 0L
         processingStatus.value = null
         // Cancel waiters first so a predecessor finishing cannot start the next approval.
         jobs.asReversed().forEach { it.cancel() }
@@ -329,7 +396,8 @@ class ConversationSession(
 
     @Synchronized
     fun cleanup() {
-        _generationJob.value = null
+        // 不要在这里先写 _generationJob.value = null：那会把「待补收口」令牌的取样来源清掉，
+        // 让随后 cancelJobs() 记下 null。cancelJobs() 自己就会把槽位置空。
         cancelJobs()
         idleCheckJob?.cancel()
         idleCheckJob = null

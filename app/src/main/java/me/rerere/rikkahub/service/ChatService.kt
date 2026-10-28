@@ -23,6 +23,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.completeWith
@@ -216,6 +217,38 @@ private const val TAG = "ChatService"
 
 /** [v240 W3] 表情立绘分类超时（毫秒）：分类失败/超时绝不能影响正常聊天 */
 private const val EXPRESSION_CLASSIFY_TIMEOUT_MS = 20_000L
+
+/**
+ * [P0 根治] 发送轮看门狗：**连续多久没有任何进展**才算卡死。
+ *
+ * 为什么是"无进展"而不是"总时长"：
+ * 一次正常的发送轮里，工具执行可以合法地跑满 `toolExecTimeout`（默认 **120 秒**），
+ * 慢模型的首 token 也可能要几十秒。用总时长做阈值必然误杀。
+ * 所以这里只看"最后一次观察到进展"到现在的间隔 —— 进展包括：
+ * 流式 token、工具卡片落库、processingStatus 变化、发送阶段推进。
+ *
+ * 取值依据：4 个 WebView 前置钩子最坏合计 36.2 秒（1.2+10+10+15），
+ * 加上落库与组装，一次"卡住但仍会自愈"的窗口最坏约 45 秒。
+ * 给 150 秒（> 工具默认 120 秒 + 余量）既能兜住真正的死锁，又不会误杀合法的长工具调用。
+ */
+private const val SEND_WATCHDOG_STALL_MS = 150_000L
+
+/** 看门狗轮询间隔：越短反应越快，越长越省电。1 秒对用户感知足够。 */
+private const val WATCHDOG_POLL_MS = 1_000L
+
+/**
+ * [P0] **请求前**硬截止：从发送轮开始到 STAGE_6（真正发出 HTTP）之间允许的最长时间。
+ *
+ * 为什么必须单独有这一条：
+ * [SEND_WATCHDOG_STALL_MS] 判的是「连续多久没有任何进展」，它天然无法区分
+ * 「已经发出请求、正在等模型吐字」和「压根没发出去」—— 后者才是用户最痛的
+ * 「转圈但上游零请求」。而用户真实体感是：转了几分钟，监控一条请求都没有。
+ *
+ * 取值依据：STAGE_3 → STAGE_6 之间**全是本地工作**（落库、组装 prompt、WebView 前置钩子），
+ * 4 个钩子最坏合计 36.2 秒（1.2+10+10+15），加上落库与组装最坏约 45 秒。
+ * 取 60 秒：正常路径远用不到，一旦超时就说明本地真的卡死了。
+ */
+private const val SEND_PREREQUEST_DEADLINE_MS = 60_000L
 
 internal fun shouldUseExternalWebSearch(assistant: Assistant, model: Model): Boolean {
     return assistant.enableWebSearch && BuiltInTools.Search !in model.tools
@@ -659,10 +692,30 @@ class ChatService(
     }
 
     private fun dispatchNextQueuedMessage(conversationId: Uuid): Job? {
-        val session = sessionManager.get(conversationId) ?: return null
+        val session = sessionManager.get(conversationId)
+        if (session == null) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[dispatch-blocked] reason=no-session conv=$conversationId",
+            )
+            return null
+        }
         synchronized(session) {
             val activeJob = session.getJob()
             if (activeJob != null) {
+                val startedAt = session.generationJobStartedAtMs
+                val jobAgeMs = if (startedAt > 0L) System.currentTimeMillis() - startedAt else -1L
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[dispatch-blocked] reason=activeJob isActive=${activeJob.isActive} jobAgeMs=$jobAgeMs " +
+                        "queued=${session.messageQueue.state.value.messages.size} " +
+                        "paused=${session.messageQueue.state.value.paused} " +
+                        "isExecutingSendTurn=${session.isExecutingSendTurn} " +
+                        "activeJobs=${session.activeJobCount()} " +
+                        "processingStatus=${session.processingStatus.value} " +
+                        "lastStage=${TavernRuntimeManager.lastSendStage(conversationId.toString())?.stage?.name} " +
+                        "conv=$conversationId",
+                )
                 return null
             }
             // [Bug B 修复] 仅在当前没有排队用户消息待覆盖、或最后一条消息确实处于待审批暂停且队列已暂停时才阻止自动调度；
@@ -670,10 +723,194 @@ class ChatService(
             // 由 sendQueuedMessage 首行 finishInterruptedPendingTools(conversationId) 清理残留未决工具，避免死锁。
             if (session.messageQueue.state.value.paused && session.state.value.currentMessages.any { message ->
                     message.parts.any { it is UIMessagePart.Tool && it.isPending }
-                }) return null
-            val next = session.messageQueue.takeNext() ?: return null
+                }) {
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[dispatch-blocked] reason=paused-pending-tool " +
+                        "queued=${session.messageQueue.state.value.messages.size} paused=true " +
+                        "isExecutingSendTurn=${session.isExecutingSendTurn} " +
+                        "activeJobs=${session.activeJobCount()} " +
+                        "processingStatus=${session.processingStatus.value} " +
+                        "lastStage=${TavernRuntimeManager.lastSendStage(conversationId.toString())?.stage?.name} " +
+                        "conv=$conversationId",
+                )
+                return null
+            }
+            val next = session.messageQueue.takeNext()
+            if (next == null) {
+                val queueState = session.messageQueue.state.value
+                val reason = if (queueState.paused) "queue-paused" else "queue-empty"
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[dispatch-blocked] reason=$reason queued=${queueState.messages.size} " +
+                        "paused=${queueState.paused} isExecutingSendTurn=${session.isExecutingSendTurn} " +
+                        "activeJobs=${session.activeJobCount()} " +
+                        "processingStatus=${session.processingStatus.value} " +
+                        "lastStage=${TavernRuntimeManager.lastSendStage(conversationId.toString())?.stage?.name} " +
+                        "conv=$conversationId",
+                )
+                return null
+            }
             session.submittingMessage = next
             return sendQueuedMessage(session, next)
+        }
+    }
+
+    /**
+     * [P0 根治] 通用生成轮看门狗：**任何**生成入口（发送 / 重试 / /continue / /trigger /
+     * /sysgen / /impersonate / swipe / regenerate …）都必须挂一个。
+     *
+     * 为什么必须通用：真机取证（2026-10-28 17:17）显示用户点「重试」后卡死，
+     * 日志停在 STAGE_5 之后 60 秒零输出，且**没有任何看门狗行** —— 因为旧实现只给
+     * `sendQueuedMessage` 装了看门狗，其余 8 个入口完全没有保护，只能无限转圈。
+     *
+     * 必须跑在 [Dispatchers.Default]：AppScope 默认是 Dispatchers.Main（RikkaHubApp.kt:344），
+     * 主线程一旦被同步阻塞，跑在 Main 上的看门狗连 delay 都恢复不了，形同不存在。
+     */
+    private fun startGenerationWatchdog(
+        session: ConversationSession,
+        job: Job,
+        titleRes: Int = R.string.error_title_send_message,
+    ): Job {
+        val conversationId = session.id
+        return appScope.launch(Dispatchers.Default) {
+
+            // [P0 根治] 看门狗必须是**基于活动**的，不能基于"最后一条消息有没有正文"。
+            //
+            // 为什么：`generateText` 的循环里，一次 step = 一次请求；
+            // 工具执行（`toolExecTimeout` 默认 **120 秒**）发生在 `generateInternal` **返回之后**
+            // （GenerationLoop.kt:519-543），此时 `lastSendStage` 仍然是上一轮的 STAGE_6。
+            // 如果按"有无正文"判定，纯工具轮（助手消息只有 Tool part、没有 Text）
+            // 会被误判成「没出字」→ 正常的长工具调用被看门狗干掉。
+            // 所以改为：只要**阈值内出现过任何进展**（token 流、工具状态、阶段推进）就重置计时；
+            // 只有连续 [SEND_WATCHDOG_STALL_MS] 完全没有进展，才判定真的卡死。
+            val stateFlow = session.state
+            val statusFlow = session.processingStatus
+            val turnStartedAt = System.currentTimeMillis()
+            var lastProgressAt = turnStartedAt
+            // [健壮性] 只认「本轮」的阶段记录。
+            //
+            // sendDiagnosticRecords 是跨轮次共用的环形缓冲，同一会话上一轮的 STAGE_6/STAGE_7 会一直留在
+            // 里面。正常发送路径上本轮一定会先写入 STAGE_1/STAGE_2，所以旧写法（直接 lastSendStage）
+            // 在**实测路径**上并没有出错；但一旦出现「本轮一条阶段记录都没有」的情况（例如未来有人
+            // 挪动埋点、或 STAGE_1/2 因异常未执行），旧写法会读到上一轮的 STAGE_6，
+            // 让 `reachedRequest` 恒为 true → 下面的硬截止永不触发 → 无上限转圈。
+            // 按轮次序号过滤后，判据在任何情况下都只描述本轮。
+            val turnStartSeq = TavernRuntimeManager.currentSendDiagnosticSeq()
+            var lastStage = TavernRuntimeManager.furthestSendStageSince(conversationId.toString(), turnStartSeq)?.stage
+
+            fun noteProgress() {
+                lastProgressAt = System.currentTimeMillis()
+            }
+
+            fun lastAssistantMessage(): UIMessage? =
+                session.state.value.messageNodes.lastOrNull()?.currentMessage
+
+            /** 当前是否正在执行工具（processingStatus 非空即「有可见活动」）。 */
+            fun isToolActive(): Boolean = session.processingStatus.value != null
+
+            // 进展信号 1：会话状态变化（流式 token、工具卡落库、消息增删）
+            val stateJob = launch {
+                stateFlow.collect { noteProgress() }
+            }
+            // 进展信号 2：处理状态变化（工具执行时会写明当前工具名）
+            val statusJob = launch {
+                statusFlow.collect { noteProgress() }
+            }
+            try {
+                while (job.isActive) {
+                    delay(WATCHDOG_POLL_MS)
+                    // 阶段推进也算进展
+                    val stage = TavernRuntimeManager.furthestSendStageSince(conversationId.toString(), turnStartSeq)?.stage
+                    if (stage != null && stage != lastStage) {
+                        lastStage = stage
+                        noteProgress()
+                    }
+                    // 正在执行工具（可能连续多个、每个最长 toolExecTimeout）：只要还有可见活动，
+                    // 就不算静默。工具执行由各自 withTimeout(toolExecTimeout) 兜底，不需要看门狗插手。
+                    if (isToolActive()) {
+                        noteProgress()
+                    }
+                    // 已经产出助手正文 → 交付完成，看门狗退出
+                    val last = lastAssistantMessage()
+                    if (last != null && last.role == MessageRole.ASSISTANT &&
+                        last.parts.any { it is UIMessagePart.Text && it.text.isNotBlank() }
+                    ) {
+                        return@launch
+                    }
+                    // [P0] 请求前硬截止：还没到 STAGE_6 就超时 → 本地卡死，必须给可见失败。
+                    //
+                    // 注意**不能**简单写成「没到 STAGE_6 就计时」：工具续跑轮
+                    // （GenerationLoop 里 pendingTools 非空的那些 step）**不会**调用 generateInternal，
+                    // 因而永远不会写 STAGE_6；而单个工具最长可跑 toolExecTimeout（默认 120 秒）。
+                    // 那种轮次是**合法的长时间运行**，不是卡死。
+                    //
+                    // 因此只有在「本轮从未到达过 STAGE_6，且当前没有可见的工具活动」时才启用硬截止。
+                    // 工具活动期间由 isToolActive() 走下面的「无进展」判据（150s）兜底。
+                    val reachedRequest = stage != null &&
+                        stage.stepNumber >= TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT.stepNumber
+                    val sinceStartMs = System.currentTimeMillis() - turnStartedAt
+                    if (!reachedRequest && !isToolActive() && sinceStartMs >= SEND_PREREQUEST_DEADLINE_MS) {
+                        TavernRuntimeManager.appendLog(
+                            "error",
+                            "[send-watchdog] 请求前超时：${sinceStartMs}ms 内未到达 STAGE_6（上游必然收不到）" +
+                                " stuckAt=${stage?.name ?: "UNKNOWN"} conv=$conversationId",
+                        )
+                        TavernRuntimeManager.recordSendDiagnostic(
+                            stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                            conversationId = conversationId.toString(),
+                            detail = "status=PREREQUEST_DEADLINE stuckAt=${stage?.name ?: "UNKNOWN"} elapsedMs=$sinceStartMs",
+                        )
+                        session.cancelJobs()
+                        // 文案只描述**事实**：本地已等待到上限、请求未发出。
+                        // 不再引导用户去查「网络/代理/服务商」—— 真机取证显示这类卡死发生在本机
+                        // （STAGE_5 之后 60 秒零日志），把用户引向网络方向是误导。
+                        addError(
+                            IllegalStateException(
+                                context.getString(
+                                    R.string.error_send_prerequest_timeout,
+                                    stage?.label ?: context.getString(R.string.error_send_watchdog_unknown_stage),
+                                    sinceStartMs / 1000,
+                                ),
+                            ),
+                            conversationId,
+                            title = context.getString(titleRes),
+                        )
+                        return@launch
+                    }
+
+                    val idleMs = System.currentTimeMillis() - lastProgressAt
+                    if (idleMs < SEND_WATCHDOG_STALL_MS) continue
+
+                    TavernRuntimeManager.appendLog(
+                        "error",
+                        "[send-watchdog] 连续 ${idleMs}ms 无任何进展（token/工具/阶段）stuckAt=" +
+                            "${stage?.name ?: "UNKNOWN"} conv=$conversationId",
+                    )
+                    TavernRuntimeManager.recordSendDiagnostic(
+                        stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
+                        conversationId = conversationId.toString(),
+                        detail = "status=WATCHDOG_STALL stuckAt=${stage?.name ?: "UNKNOWN"} idleMs=$idleMs",
+                    )
+                    session.cancelJobs()
+                    addError(
+                        IllegalStateException(
+                            context.getString(
+                                R.string.error_send_watchdog_timeout,
+                                stage?.label ?: context.getString(R.string.error_send_watchdog_unknown_stage),
+                            ),
+                        ),
+                        conversationId,
+                        title = context.getString(titleRes),
+                    )
+                    return@launch
+                }
+            } finally {
+                stateJob.cancel()
+                statusJob.cancel()
+            }
+                }.also { watchdog ->
+            job.invokeOnCompletion { watchdog.cancel() }
         }
     }
 
@@ -682,25 +919,56 @@ class ChatService(
         val content = queued.parts
         val answer = queued.answer
         session.isExecutingSendTurn = answer
+        var stageJobTag = 0
         val job = launchGenerationJob(
             conversationId = conversationId,
             keepAliveInBackground = answer,
         ) {
             session.isExecutingSendTurn = answer
             var userMessagePersisted = false
+            // [send-stage] 诊断：记录当前阶段，异常时能定位死在哪个 step。
+            var currentStep = "none"
+            var stepStartedAtMs = 0L
+            fun beginStep(step: String, detail: String = "") {
+                currentStep = step
+                stepStartedAtMs = System.currentTimeMillis()
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[send-stage] begin step=$step${if (detail.isEmpty()) "" else " $detail"} " +
+                        "conv=$conversationId job=$stageJobTag",
+                )
+            }
+
+            fun endStep(step: String, detail: String = "") {
+                val elapsedMs = if (stepStartedAtMs > 0L) System.currentTimeMillis() - stepStartedAtMs else -1L
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[send-stage] end step=$step elapsedMs=$elapsedMs" +
+                        "${if (detail.isEmpty()) "" else " $detail"} conv=$conversationId",
+                )
+            }
+
             try {
                 if (!session.isInitialized) {
+                    beginStep("initialize")
                     initializeConversation(conversationId)
+                    endStep("initialize")
                 }
+                beginStep("finishInterruptedPendingTools")
                 finishInterruptedPendingTools(conversationId)
+                endStep("finishInterruptedPendingTools")
 
+                beginStep("settings")
                 val currentConversation = session.state.value
                 val settings = settingsStore.settingsFlow.first()
                 val assistant = settings.getAssistantById(currentConversation.assistantId)
                     ?: settings.getCurrentAssistant()
+                endStep("settings")
+                beginStep("preprocess")
                 val processedContent = withContext(Dispatchers.Default) {
                     preprocessUserInputParts(content, assistant, settings, currentConversation.modeInjectionIds)
                 }
+                endStep("preprocess")
 
                 // 添加消息到列表并先行同步更新内存态（让 UI 与滚动立即感知新消息，不等 SQLite/FTS I/O）
                 val userMsg = UIMessage(
@@ -710,9 +978,21 @@ class ChatService(
                 val newConversation = currentConversation.copy(
                     messageNodes = currentConversation.messageNodes + userMsg.toMessageNode(),
                 )
+                beginStep("updateConversation")
                 updateConversation(conversationId, newConversation, checkFiles = false)
+                endStep("updateConversation")
                 session.submittingMessage = null
+                // [P0 修复] 落库保持在关键路径上（内存权威、语义简单、不会出现旧快照回写），
+                // 但落库本身已经不再是 O(整段会话)：
+                //   · ConversationRepository.updateConversation 仍是全删全插（正确性优先）；
+                //   · 真正的大头 FTS 重建已改为单事务（见 MessageFtsManager.indexConversation），
+                //     实测把 800 行 4KB 文本的 4.45s 压到 50ms 级；
+                //   · 并且 FTS 只在「节点/内容真的变化」时才重建。
+                // 之所以没有把落库整体丢到后台：saveConversation 会用传入快照覆盖内存，
+                // 异步执行时会用旧快照把流式新内容冲掉（本轮已在此处踩过一次）。
+                beginStep("saveConversation", detail = "nodes=${newConversation.messageNodes.size}")
                 saveConversation(conversationId, newConversation, checkFiles = false)
+                endStep("saveConversation", detail = "nodes=${newConversation.messageNodes.size}")
                 userMessagePersisted = true
                 queued.persisted?.complete(true)
                 TavernRuntimeManager.recordSendDiagnostic(
@@ -722,17 +1002,29 @@ class ChatService(
                 )
 
                 // 酒馆事件桥：用户消息已写入 → 通知 JS 运行时（MVU/脚本）
+                beginStep("fireEvent.message_sent")
                 if (TavernRuntimeManager.activeConversationId == conversationId.toString()) {
                     TavernRuntimeManager.fireEvent(
                         "message_sent",
                         "{\"args\":[${newConversation.currentMessages.lastIndex}]}",
                     )
                 }
+                endStep("fireEvent.message_sent")
 
                 // 开始补全
-                session.isExecutingSendTurn = false
+                // [P0 修复] isExecutingSendTurn 不能在 handleMessageComplete **之前**清掉。
+                // triggerGeneration 的防重入守卫是 `if (session.isExecutingSendTurn && ...) return`，
+                // 而 message_sent 事件（上方 fireEvent）走 mainHandler.post 异步派发、用户 QuickReply
+                // 也在 onPersisted 回调后异步执行 —— 它们完全可能在本行之后、handleMessageComplete
+                // 真正发出请求之前调用 /trigger。旧实现在这里就置 false，导致守卫失效，
+                // previousJob?.cancel() 把正在准备上下文的主发送协程直接掐断：
+                // 上游收不到请求，UI 只剩「转圈然后什么都没有」。
+                // 正确语义：整个发送轮（含 handleMessageComplete）期间都算「正在执行发送」，
+                // 由下方 finally 统一复位。
                 if (answer) {
+                    beginStep("handleMessageComplete")
                     handleMessageComplete(conversationId)
+                    endStep("handleMessageComplete")
                 }
 
                 queued.reply?.completeWith(runCatching {
@@ -749,6 +1041,10 @@ class ChatService(
                 // The ordinary autoplay collector must not read a late voice reply again.
                 if (queued.reply == null) _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
+                TavernRuntimeManager.appendLog(
+                    "error",
+                    "[send-stage] abort step=$currentStep error=${e.javaClass.simpleName}:${e.message} conv=$conversationId",
+                )
                 session.isExecutingSendTurn = false
                 if (!userMessagePersisted) queued.persisted?.complete(false)
                 queued.reply?.completeExceptionally(e)
@@ -772,6 +1068,7 @@ class ChatService(
                 session.isExecutingSendTurn = false
             }
         }
+        stageJobTag = job.hashCode()
         job.invokeOnCompletion { cause ->
             if (cause != null) {
                 queued.reply?.completeExceptionally(cause)
@@ -782,6 +1079,22 @@ class ChatService(
             }
         }
         session.setJob(job)
+        // [P0 根治] 发送轮看门狗（必须在 setJob 之后启动，否则 session.getJob() 还不是这个 job）。
+        //
+        // 用户能感知的只有「点发送之后一直转圈」。到达 STAGE_6（真正发出 HTTP）之前有太多
+        // 会无声挂住的路径：整份会话重写 + FTS 逐行 fsync（长会话数十秒到数分钟）、
+        // WebView 钩子漏回调（固定 15s）……；到达 STAGE_6 之后还有「上游连上了但一直不吐
+        // token」而 OkHttp readTimeout 是 10 分钟。与其在每一处零散补超时，不如在发送轮这一层兜底。
+        //
+        // 判据见 [SEND_WATCHDOG_STALL_MS]：连续多久完全没有进展才算卡死（不是总时长，
+        // 因为工具执行可以合法跑满 120 秒、慢模型首 token 也可能几十秒）。
+        // [P0 修复] 看门狗**必须**跑在 Default 而不是 AppScope 默认的 Dispatchers.Main。
+        //
+        // AppScope 的调度器是 Dispatchers.Main（RikkaHubApp.kt:344-350），发送 job 本身也在 Main 上跑。
+        // 只要发送链路上出现一次同步阻塞（落库、jieba 分词、WebView 同步桥、synchronized 争用），
+        // Main 线程就被占住，跑在 Main 上的看门狗连 delay 都无法恢复 → 看门狗形同不存在，
+        // 用户看到的就是「无限转圈」。放到 Default 上才能保证：**即使主线程死了，超时也能生效**。
+        val watchdog = startGenerationWatchdog(session, job)
         return job
     }
 
@@ -909,6 +1222,7 @@ class ChatService(
             }
         }
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     /**
@@ -1012,6 +1326,7 @@ class ChatService(
             }
         }
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     /**
@@ -1163,6 +1478,7 @@ class ChatService(
         }
 
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     // ---- 处理工具调用审批 ----
@@ -1255,6 +1571,7 @@ class ChatService(
         }
 
         session.setJob(job, cancelPrevious = false)
+        startGenerationWatchdog(session, job)
     }
 
     // ---- 继续上一条回复（官方 /continue） ----
@@ -1372,6 +1689,7 @@ class ChatService(
             }
         }
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     // ---- 生成你的发言草稿（官方 /impersonate） ----
@@ -1453,6 +1771,7 @@ class ChatService(
             }
         }
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     // ---- 安静生成（官方 /gen） ----
@@ -1647,6 +1966,7 @@ class ChatService(
             }
         }
         session.setJob(job)
+        startGenerationWatchdog(session, job)
     }
 
     // ---- 处理消息补全 ----
@@ -2011,7 +2331,19 @@ class ChatService(
                 }
             )
         )
-        saveConversation(conversationId, updatedConversation)
+        // [P0 修复] 这里也在发送关键路径上（sendQueuedMessage 首行）。
+        // 内存态必须先同步更新（后续组装 prompt 要看到「工具已收尾」），
+        // 落库改成后台写，避免同样的「整份会话重写 + FTS 全量重建」拖住发送。
+        updateConversation(conversationId, updatedConversation, checkFiles = false)
+        appScope.launch {
+            runCatching { persistLatestSnapshot(conversationId) }
+                .onFailure {
+                    TavernRuntimeManager.appendLog(
+                        "warn",
+                        "[send] 收尾未决工具的落库失败（内存态已更新）conv=$conversationId: ${it.message}",
+                    )
+                }
+        }
     }
 
     // ---- 生成标题 ----
@@ -2577,10 +2909,34 @@ class ChatService(
                 conversationRepo.updateConversation(updatedConversation)
             }
         }
-
         // 删除消息或切换分支也可能解除工具审批阻塞，保存成功后重新检查队列。
         // 调度器仍会检查当前生成任务、待审批工具、暂停状态及编辑占位。
         dispatchNextQueuedMessage(conversationId)
+    }
+
+    /**
+     * [P0 新增] 后台落库：始终写**执行时刻的最新内存状态**，绝不写调用时的旧快照。
+     *
+     * 为什么需要它：`saveConversation` 会先用传入的 conversation 覆盖内存，然后落库。
+     * 如果把它整个丢到后台，等到真正执行时内存里可能已经流入了新的 token，
+     * 用旧快照回写会把新内容冲掉（本轮已在这里踩过一次）。
+     * 所以后台落库必须「取最新状态再写」，这也是唯一安全的异步写法。
+     *
+     * 调用方必须先同步 `updateConversation(...)` 把变化写进内存。
+     */
+    private suspend fun persistLatestSnapshot(conversationId: Uuid) {
+        val session = sessionManager.get(conversationId) ?: return
+        withContext(Dispatchers.IO) {
+            // 取最新内存快照（含调用方刚刚写入的变化），而不是调用方传入的那份旧对象
+            val latest = session.state.value
+            val exists = conversationRepo.existsConversationById(latest.id)
+            if (!exists && latest.title.isBlank() && latest.messageNodes.isEmpty()) return@withContext
+            if (!exists) {
+                conversationRepo.insertConversation(latest)
+            } else {
+                conversationRepo.updateConversation(latest)
+            }
+        }
     }
 
     // ---- 翻译消息 ----

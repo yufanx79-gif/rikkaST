@@ -45,6 +45,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -705,6 +706,7 @@ internal object DetachedPanelWebViewCache {
         runCatching {
             (entry.container.parent as? ViewGroup)?.removeView(entry.container)
         }
+        // 与 parkContainer 的 onPause() 配对恢复该面板自身的渲染。
         runCatching { entry.mountState.webView?.onResume() }
         runCatching {
             entry.mountState.webView?.evaluateJavascript(
@@ -723,7 +725,14 @@ internal object DetachedPanelWebViewCache {
                 (container.parent as? ViewGroup)?.removeView(container)
             }
             map[key] = CachedPanelEntry(key = key, container = container, mountState = mountState)
-            // 离屏立即暂停定时器/动画/媒体，减少多个 WebView 同时占用主线程。
+            // 离屏立即暂停该面板自身的定时器/动画/媒体，减少多个 WebView 同时占用主线程。
+            //
+            // 边界说明（已按官方文档核实，勿改口径）：
+            // WebView.onPause() 的契约是"best-effort 暂停可安全暂停的处理"，官方明确写着
+            // **does not pause JavaScript；要全局停 JS 定时器必须用 pauseTimers()**。
+            // 本工程从未调用 pauseTimers()/resumeTimers()，因此这里**不会**影响同进程其他
+            // WebView（包括主运行时）的 setTimeout/Promise。
+            // 曾被怀疑为「上游收不到请求」的根因，但该因果链与官方文档冲突，已排除。
             runCatching { mountState.webView?.onPause() }
             while (map.size > MAX_DETACHED_WEBVIEWS) {
                 val it = map.entries.iterator()
@@ -811,6 +820,52 @@ internal fun PanelHibernatedPlaceholderCard(
             }
             TextButton(onClick = onWakeUp) {
                 Text("唤醒面板", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+/**
+ * 流式生成期间的 HTML 面板占位卡片。
+ *
+ * 为什么需要它：面板要等整条消息生成完才挂 WebView（streaming 期间每个 token 都重建面板代价太高），
+ * 但这段窗口里也**不能**把 HTML 原文扔给 MarkdownBlock —— 那会把 `<style>`/`<div>` 显示成代码。
+ * 所以：能抽出可读正文就显示正文预览（见 [StTextContent]），抽不出正文时显示这张卡片。
+ */
+@Composable
+internal fun PanelStreamingPlaceholderCard(
+    panelTitle: String,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ContainedLoadingIndicator(modifier = Modifier.size(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = panelTitle,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "正在生成界面内容，完成后自动渲染",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -1680,7 +1735,51 @@ internal fun StTextContent(
     isHistoricalFloor: Boolean = false,
 ) {
     val html = if (!loading) rememberAfterMarkdownHtml(content) else content
-    if (!loading && shouldRenderAsHtmlPanel(html)) {
+    val panelCandidate = shouldRenderAsHtmlPanel(html)
+    if (loading) {
+        // [P0 修复] 流式生成期间绝不能把 HTML 面板原文交给 MarkdownBlock。
+        //
+        // 旧行为：`if (!loading && shouldRenderAsHtmlPanel(html))` —— loading=true 时直接落到
+        // MarkdownBlock(content)。实测两种后果（用仓库真实依赖 markdown 0.7.3 + jsoup 复现）：
+        //   · 面板列首 0 缩进（酒馆卡标准形状）→ `<style>` 落进 Jsoup 的 DataNode，
+        //     而 MarkdownNew 只处理 Element/TextNode → CSS 被静默丢弃，只剩无样式平文本或空白；
+        //   · 面板带 4 空格/TAB 缩进或 ```html 围栏（含未闭合的流式态）→ 命中
+        //     Markdown.kt 的 HighlightCodeBlock → **整块显示成代码**（带语言标签和复制按钮）。
+        // 这就是用户说的「点发送后 WebView 界面概率变成代码」。
+        //
+        // 这里改为：流式期间命中面板就显示**剥标签后的可读正文预览**，既不出代码，
+        // 也不在 streaming 期间挂 WebView —— 后者不可行：PanelMountState.decideUpdateAction
+        // 对含 <script> 的面板一律 RELOAD_DOCUMENT，等于每个 token 全量重载 WebView。
+        // 预览计算必须离开组合期主线程（长开场白上 5 趟正则/每 token 会吃掉帧预算）。
+        if (panelCandidate) {
+            // [P0] 预览必须节流：content 每个 token 都变，若以 content 为 key，
+            // produceState 会每 token 重启一次协程并跑一遍正则（长开场白上等于逐字做重活）。
+            // 这里按「长度分桶」取样 + 120ms 去抖：视觉上仍然是持续增长的正文，
+            // 但计算次数从 O(字符数) 降到 O(秒数)。
+            var previewSource by remember(content) { mutableStateOf(content) }
+            LaunchedEffect(content) {
+                delay(120)
+                previewSource = content
+            }
+            val preview by produceState(initialValue = "", previewSource) {
+                value = withContext(Dispatchers.Default) { extractQuickPlainPreview(previewSource) }
+            }
+            Column(modifier = modifier.fillMaxWidth()) {
+                if (preview.isNotBlank()) {
+                    MarkdownBlock(
+                        content = preview,
+                        onClickCitation = onClickCitation,
+                    )
+                } else {
+                    PanelStreamingPlaceholderCard(panelTitle = extractPanelDisplayName(content, 0))
+                }
+            }
+            return
+        }
+        MarkdownBlock(content = content, modifier = modifier, onClickCitation = onClickCitation)
+        return
+    }
+    if (panelCandidate) {
         val pieces = remember(html) { splitMixedMessagePieces(html) }
         Column(
             modifier = modifier.fillMaxWidth(),

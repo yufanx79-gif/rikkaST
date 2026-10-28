@@ -9,6 +9,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -281,8 +282,19 @@ class GenerationLoop(
             payloadJson = "{\"args\":[]}",
             developerMode = settings.developerMode,
         )
+        // [P0 定位埋点] generation_started 之后到 STAGE_6 之间过去是**完全静默**的 700 行。
+        // 真机取证（2026-10-28 17:17/17:25/17:30 三次）显示日志停在 generation_started 后
+        // 整整 60 秒零输出，无法判断卡在哪一步。下面按段插桩，每一段都带耗时。
+        fun stageMark(tag: String, startedAtMs: Long) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[gen-stage] $tag elapsedMs=${System.currentTimeMillis() - startedAtMs}",
+            )
+        }
+        var __t = System.currentTimeMillis()
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
+        stageMark("provider-resolved", __t)
 
         var messages: List<UIMessage> = messages
         val toolPolicy = assistant.effectiveToolPolicy()
@@ -309,6 +321,8 @@ class GenerationLoop(
         }
         addAll(effectiveTools)
     }
+    stageMark("tools-built(count=${toolsInternal.size})", __t)
+    __t = System.currentTimeMillis()
     val statusTrackedTools: List<Tool> = toolsInternal.map { tool ->
         if (tool.name == "ask_user") tool else tool.copy(
             execute = { args ->
@@ -325,7 +339,9 @@ class GenerationLoop(
         )
     }
     // ── 预构建：system 消息列表（循环不变，移到外面）──
+    __t = System.currentTimeMillis()
     val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, effectiveTools, model, context, conversationRepo, conversationModeInjectionIds)
+    stageMark("systemPrompt-built(n=${prebuiltSystemMessages.size})", __t)
 
         for (stepIndex in 0 until effectiveMaxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
@@ -704,6 +720,13 @@ class GenerationLoop(
         /** 当前是否已是本次生成的最后一步：是则不允许再强制 REQUIRED，否则永远出不来正文。 */
         isFinalStep: Boolean = false,
     ) {
+        val __giStart = System.currentTimeMillis()
+        fun giMark(tag: String, from: Long) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[gen-stage] generateInternal:$tag elapsedMs=${System.currentTimeMillis() - from}",
+            )
+        }
         // 工具策略在本函数内解析（generateText 的 toolPolicy 不在此作用域）
         val toolPolicy = assistant.effectiveToolPolicy()
         // ST兼容（/hide）：隐藏消息不进入上下文与提示词（对齐 ST `coreChat = chat.filter(x => !x.is_system ...)`）
@@ -880,7 +903,34 @@ class GenerationLoop(
             } else {
                 base
             }
-        }.transforms(
+        }.let { __base ->
+            giMark("prompt-base-built(msgs=${__base.size})", __giStart)
+            __base
+        }.let { __baseForTransforms ->
+            // [P0 定位] 给 transforms 加独立超时 + 卡住时 dump 线程栈。
+            //
+            // 真机取证（2026-10-28 17:58 / 18:03）显示日志停在
+            // `[gen-stage] generateInternal:prompt-base-built` 之后整整 60 秒，
+            // 而 `transforms-done` 从未出现 —— 卡点确凿在这 14 个 transformer 的串行链内。
+            // 但只看「enter/done」埋点无法区分「卡在某个 transformer 内部」和「卡在等主线程」。
+            //
+            // 这里用独立协程在 20 秒后 dump 当前所有线程栈：若是纯 CPU 死循环，能看到具体方法；
+            // 若是挂起等待，能看到等待点。这一步能把「猜」变成「读」。
+            val __dumpJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default).launch {
+                kotlinx.coroutines.delay(20_000L)
+                val stacks = Thread.getAllStackTraces()
+                TavernRuntimeManager.appendLog("error", "[gen-stage] transforms 超过 20s 未返回，线程栈转储开始")
+                stacks.forEach { (thread, frames) ->
+                    val relevant = frames.take(14).joinToString(" <- ") { it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber }
+                    TavernRuntimeManager.appendLog(
+                        "error",
+                        "[gen-stage][thread] ${thread.name} state=${thread.state} $relevant",
+                    )
+                }
+                TavernRuntimeManager.appendLog("error", "[gen-stage] 线程栈转储结束")
+            }
+            try {
+                __baseForTransforms.transforms(
             transformers = transformers,
             context = context,
             model = model,
@@ -894,7 +944,12 @@ class GenerationLoop(
             generationType = generationType,
             chatUserMessageCount = visibleMessages.count { it.role == MessageRole.USER },
             chatMessageCount = limitedChat.size,
-        )
+                )
+            } finally {
+                __dumpJob.cancel()
+            }
+        }
+        giMark("transforms-done(msgs=${transformedMessages.size})", __giStart)
         // DeepSeek 缓存优化：把动态上下文（日期/记忆）追加为最后一条 user 消息，
         // 位于全部历史之后 —— 跨天/记忆更新时只有末尾新增部分失效，system+历史前缀全部命中缓存
         val postPresetCfg = parseActiveStPresetConfig(
@@ -981,6 +1036,8 @@ class GenerationLoop(
         //   return [chat, ...]  ← 改写后的结果继续用。ST-PT handler.ts:980 监听 SETTINGS_READY 并
         //   data.messages = await processGenerateAfter(data.messages)；MVU bundle 5 处监听（含 eventMakeLast）。
         // 仅对酒馆卡助手生效；WebView 未就绪 / 超时 / 无监听器 → null → 原样直通（零开销）。
+        giMark("preset-post-processed(msgs=${internalMessages.size})", __giStart)
+        val __tHooks = System.currentTimeMillis()
         if (assistant.tavernData != null || TavernRuntimeManager.isStarted) {
             var abortedByInterceptor = false
             runCatching {
@@ -1060,11 +1117,16 @@ class GenerationLoop(
                 params = params.copy(tools = rewritten.second)
             }
         }
+        giMark("gen-hooks-done(msgs=${internalMessages.size})", __tHooks)
+        giMark("about-to-send-request", __giStart)
         TavernRuntimeManager.recordSendDiagnostic(
             stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT,
             conversationId = conversationId?.toString().orEmpty(),
             detail = "model=${model.modelId} internalMessages=${internalMessages.size} stream=$stream",
         )
+        // [P0] 请求已发出但还没有第一个 token 的这段窗口，UI 上必须能看到「在等模型」，
+        // 否则用户只能看到一个没有文案的转圈，无法区分「正在请求上游」和「卡在本地」。
+        processingStatus.value = context.getString(R.string.chat_generation_waiting_first_token)
         try {
             if (stream) {
                 // 每次重试都从本次模型调用开始前的消息快照重新合并，避免将重试响应

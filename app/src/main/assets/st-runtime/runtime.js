@@ -219,7 +219,7 @@ const LOG_PREFIX = '[RikkaTavern]';
 
         const handleStatus = async () => {
             try {
-                const res = callBridge('chatCompletionStatus', '');
+                const res = callBridge('chatCompletionStatus');
                 if (typeof res === 'string' && res.length) return jsonResponse(res, 200);
             } catch (e) {
                 callBridge('log', 'warn', '[a1] chatCompletionStatus bridge failed: ' + String(e && e.message || e));
@@ -776,7 +776,11 @@ function callBridge(name, ...args) {
     try {
         return bridge[name](...args);
     } catch (e) {
-        safeWarn(`bridge.${name} failed`, e);
+        // [诊断] 把实参个数一起打出来：Android @JavascriptInterface 按「方法名 + 实参个数」解析，
+        // 名字对但个数不对时抛的是 "Method not found"（极易被误判成「桥没注入 / R8 删了方法」）。
+        // 真机取证（2026-10-28）：getMessageVariablesJson 被传了 1 个实参而 Kotlin 侧是 0 形参，
+        // 于是面板启动时变量同步静默失败、面板空白；改成 0 实参后恢复。日志里带上 argc 可一眼定位。
+        safeWarn(`bridge.${name} failed (argc=${args.length})`, e);
         return undefined;
     }
 }
@@ -1102,7 +1106,7 @@ function pullCharacter() {
 
 function syncMessageVariablesOnly() {
     try {
-        const mvRaw = callBridge('getMessageVariablesJson', '') || '[]';
+        const mvRaw = callBridge('getMessageVariablesJson') || '[]';
         const mv = JSON.parse(mvRaw);
         if (!Array.isArray(mv)) return;
         if (!Array.isArray(state.chat) || state.chat.length === 0) {
@@ -2759,14 +2763,30 @@ window.__rikkaAbortActiveGeneration = function __rikkaAbortActiveGeneration(reas
     }
 };
 
+// [P0 修复] 宿主 runGenerationHooks 用 CompletableDeferred 等这个回调，超时 15s。
+// 旧实现的所有「提前 return」分支都**不回调** → 每次生成在发出请求前固定空转满 15 秒，
+// 用户看到的就是「转圈、上游收不到」。这里统一用 settle 保证任何分支都恰好回调一次。
 window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq, messagesJson) {
     const startEpoch = window.__rikkaGenerationAbortEpoch || 0;
+    let settled = false;
+    const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        try {
+            if (window.RikkaBridge && typeof window.RikkaBridge.onGenerationHooksResult === 'function') {
+                window.RikkaBridge.onGenerationHooksResult(seq, JSON.stringify(value == null ? null : value));
+            }
+        } catch (_e) { /* noop */ }
+    };
     try {
         const parsedInput = JSON.parse(messagesJson || '[]');
         const rawMessages = Array.isArray(parsedInput)
             ? parsedInput
             : (parsedInput && Array.isArray(parsedInput.messages) ? parsedInput.messages : null);
-        if (!Array.isArray(rawMessages)) return null;
+        if (!Array.isArray(rawMessages)) {
+            settle(null);
+            return null;
+        }
 
         let activeMessages = rawMessages.map((m) => {
             const contentStr = m && typeof m.content === 'string' ? m.content : String((m && m.mes) ?? '');
@@ -2924,14 +2944,17 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
         });
 
         const json = aborted ? JSON.stringify({ messages: normalized, aborted: true }) : JSON.stringify(normalized);
-        try {
-            if (window.RikkaBridge && typeof window.RikkaBridge.onGenerationHooksResult === 'function') {
-                window.RikkaBridge.onGenerationHooksResult(seq, JSON.stringify(json));
-            }
-        } catch (_e) { /* noop */ }
+        // settle() 内部会再做一次 JSON.stringify —— 这是**刻意**的，用来与旧实现保持一致的
+        // 传输形状：旧代码是 `onGenerationHooksResult(seq, JSON.stringify(json))`，
+        // 而 json 本身已是字符串，于是 JS 侧发出的是「再包一层的字符串字面量」，
+        // Kotlin 侧用 `jsonPrimitive.content` 恰好剥掉那一层，拿回真正的 JSON 文本。
+        // 这里沿用同一形状，避免改变宿主解析行为。
+        settle(json);
         return json;
     } catch (e) {
         console.error('[RikkaTavern] __rikkaRunGenerationHooks failed:', (e && e.stack) || e);
+        // 异常分支也必须回调，否则宿主固定卡满 15s 超时。
+        settle(null);
         return null;
     }
 };
@@ -3121,20 +3144,27 @@ window.__rikkaEvalEjsBatch = async function __rikkaEvalEjsBatch(seq, textsJson) 
     let texts = [];
     try { texts = JSON.parse(textsJson); } catch (_e) { texts = []; }
     if (!Array.isArray(texts)) texts = [];
-    refreshAll();
     const out = [];
-    const data = buildEjsContext();
-    for (const t of texts) {
-        const src = (t === null || t === undefined) ? '' : String(t);
-        if (!ejsRender.containsEjs(src)) { out.push(src); continue; }
-        try {
-            out.push(await ejsRender.renderEjsText(src, data));
-        } catch (e) {
-            const brief = String((e && e.message) || e).slice(0, 300);
-            safeWarn(`[ejs] render failed: ${brief}`);
-            try { callBridge('log', 'error', `[ejs] render failed: ${brief}`); } catch (_e2) { /* noop */ }
-            out.push(src); // 失败保留原文，不破坏 prompt
+    try {
+        refreshAll();
+        const data = buildEjsContext();
+        for (const t of texts) {
+            const src = (t === null || t === undefined) ? '' : String(t);
+            if (!ejsRender.containsEjs(src)) { out.push(src); continue; }
+            try {
+                out.push(await ejsRender.renderEjsText(src, data));
+            } catch (e) {
+                const brief = String((e && e.message) || e).slice(0, 300);
+                safeWarn(`[ejs] render failed: ${brief}`);
+                try { callBridge('log', 'error', `[ejs] render failed: ${brief}`); } catch (_e2) { /* noop */ }
+                out.push(src); // 失败保留原文，不破坏 prompt
+            }
         }
+    } catch (e) {
+        // [P0 修复] 旧实现没有这层兜底：refreshAll/buildEjsContext 抛错时宿主收不到
+        // onEjsResult，会白等满 10 秒超时。
+        safeWarn('[ejs] batch aborted: ' + String((e && e.message) || e));
+        while (out.length < texts.length) out.push(String(texts[out.length] ?? ''));
     }
     try { callBridge('onEjsResult', seq, JSON.stringify(out)); } catch (_e) { /* noop */ }
     return out;

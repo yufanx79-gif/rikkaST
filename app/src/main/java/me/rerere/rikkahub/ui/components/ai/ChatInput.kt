@@ -120,6 +120,7 @@ import me.rerere.rikkahub.data.files.SkillManager
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.QuickMessage
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.script.StSlashParser
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.service.MessageQueueState
@@ -260,21 +261,43 @@ fun ChatInput(
         val rawText = state.textContent.text.toString()
         val text = rawText.trimStart()
         val wasEmpty = state.isEmpty()
+        val startsWithSlash = text.startsWith("/")
+        val action = when {
+            loading && startsWithSlash -> "slash"
+            loading && wasEmpty -> "stop"
+            else -> "send"
+        }
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[send-entry] source=ChatInput textLen=${rawText.length} wasEmpty=$wasEmpty " +
+                "loading=$loading startsWithSlash=$startsWithSlash parts=${state.getContents().size} " +
+                "conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+        )
         me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.recordSendDiagnostic(
             stage = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.SendDiagnosticStage.STAGE_1_SEND_CLICKED,
             conversationId = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.activeConversationId.orEmpty(),
-            detail = "source=ChatInput textLen=${rawText.length} media=${state.messageContent.size} isEditing=${state.isEditing()} loading=$loading",
+            detail = "source=ChatInput action=$action textLen=${rawText.length} media=${state.messageContent.size} isEditing=${state.isEditing()} loading=$loading",
         )
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
         if (loading) {
             // 生成中：斜杠命令不打断当前生成（官方 waitUntilCondition 语义），提示等待；普通消息仍可取消
-            if (text.startsWith("/")) {
+            if (startsWithSlash) {
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[send-swallowed] reason=slash-during-loading textLen=${rawText.length} " +
+                        "conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+                )
                 toaster.show(slashContext.getString(R.string.slash_toast_generating))
                 return
             }
             // 输入框为空时点击发送 = 停止生成；有内容时走官方消息队列（onSendClick）。
             if (wasEmpty) {
+                TavernRuntimeManager.appendLog(
+                    "info",
+                    "[send-swallowed] reason=loading-wasEmpty textLen=${rawText.length} " +
+                        "conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+                )
                 onCancelClick()
                 return
             }
@@ -339,7 +362,15 @@ fun ChatInput(
     fun sendMessageWithoutAnswer() {
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
-        if (loading && state.isEmpty()) onCancelClick() else onLongSendClick()
+        if (loading && state.isEmpty()) {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[send-swallowed] reason=longpress-stop conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+            )
+            onCancelClick()
+        } else {
+            onLongSendClick()
+        }
     }
 
     val asr = LocalASRState.current
@@ -601,12 +632,24 @@ fun ChatInput(
                                         onClick = {
                                             if (!isStopping) {
                                                 isStopping = true
+                                                // [诊断] 这是「输入框还有内容时点停止」的主路径：
+                                                // 它**不经过** sendMessage()，旧版因此完全不留痕。
+                                                TavernRuntimeManager.appendLog(
+                                                    "info",
+                                                    "[send-swallowed] reason=stop-button textLen=${state.textContent.text.length} " +
+                                                        "conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+                                                )
                                                 onCancelClick()
                                             }
                                         },
                                         onLongClick = {
                                             if (!isStopping) {
                                                 isStopping = true
+                                                TavernRuntimeManager.appendLog(
+                                                    "info",
+                                                    "[send-swallowed] reason=stop-button-longpress textLen=${state.textContent.text.length} " +
+                                                        "conv=${TavernRuntimeManager.activeConversationId.orEmpty()}",
+                                                )
                                                 onCancelClick()
                                             }
                                         },

@@ -453,6 +453,48 @@ object TavernRuntimeManager {
         return if (conversationId == null) all else all.filter { it.conversationId == conversationId }
     }
 
+    /** 该会话最后一条发送阶段记录（看门狗/开发者测试台用它判断「卡在哪一阶段」）。 */
+    fun lastSendStage(conversationId: String?): SendDiagnosticRecord? {
+        if (conversationId.isNullOrBlank()) return null
+        return sendDiagnosticRecords.toList().lastOrNull { it.conversationId == conversationId }
+    }
+
+    /** 当前诊断序号（单调递增）。用于把「本轮的阶段记录」和上一轮的残留区分开。 */
+    fun currentSendDiagnosticSeq(): Long = sendDiagnosticSeq.get()
+
+    /**
+     * 该会话在 [sinceSeq] **之后**产生的最后一条发送阶段记录。
+     *
+     * 用途：让发送看门狗只根据**本轮**的阶段记录判断「有没有真的发出请求」。
+     * `sendDiagnosticRecords` 是跨轮次共用的环形缓冲，上一轮的 STAGE_6/STAGE_7 会一直留在里面；
+     * 正常路径下本轮必先写入 STAGE_1/STAGE_2 因而无碍，但按序号过滤可以让判据在
+     * 「本轮一条记录都没有」时也不会被上一轮的残留误导。
+     */
+    fun lastSendStageSince(conversationId: String?, sinceSeq: Long): SendDiagnosticRecord? {
+        if (conversationId.isNullOrBlank()) return null
+        return sendDiagnosticRecords.toList()
+            .lastOrNull { it.conversationId == conversationId && it.seq > sinceSeq }
+    }
+
+    /**
+     * 该会话在本轮内**推进得最远**的阶段（按 stepNumber 取最大），而不是「最后写入的那一条」。
+     *
+     * 为什么不能用「最后一条」：STAGE_4（触发列表滚动）是 **UI 侧**埋点，由 ChatPage 在
+     * `onSendClick` 之后异步写入，天然晚于 ChatService 内的 STAGE_5。真机日志实证（2026-10-28 17:30）：
+     *   #30 S5 STAGE_5_GENERATION_STARTED  18.093
+     *   #31 S4 STAGE_4_SCROLL_TRIGGERED    18.103   ← 序号更大、写入更晚
+     * 于是「最后一条」= STAGE_4，看门狗把卡点误报成「卡在触发列表滚动」，
+     * 用户被引导去查网络/代理，而真实卡点在 STAGE_5 之后。
+     *
+     * 用 stepNumber 取最大后，卡点只会是「本轮真正到达过的最远阶段」，不会被 UI 埋点带偏。
+     */
+    fun furthestSendStageSince(conversationId: String?, sinceSeq: Long): SendDiagnosticRecord? {
+        if (conversationId.isNullOrBlank()) return null
+        return sendDiagnosticRecords.toList()
+            .filter { it.conversationId == conversationId && it.seq > sinceSeq }
+            .maxByOrNull { it.stage.stepNumber }
+    }
+
     fun clearSendDiagnosticRecords() {
         sendDiagnosticRecords.clear()
     }
@@ -2207,11 +2249,29 @@ object TavernRuntimeManager {
         val seq = genHookSeqCounter.incrementAndGet()
         val deferred = CompletableDeferred<String>()
         pendingGenHooks[seq] = deferred
+        val seqArg = seq.toString()
+        val jsonArg = JSONObject.quote(messagesJson)
         mainHandler.post {
-            wv.evaluateJavascript(
-                "window.__rikkaRunGenerationHooks && window.__rikkaRunGenerationHooks($seq, ${JSONObject.quote(messagesJson)});",
-                null,
-            )
+            // [P0 修复] 双保险：JS 侧 async 函数内部已保证任何分支都回调 settle()（见 runtime.js），
+            // 这里再兜住「函数不存在 / 同步抛异常 / 返回 rejected Promise」三种失效模式。
+            // 旧实现只写 `window.__rikkaRunGenerationHooks && ...`：函数缺失时静默什么都不做，
+            // 宿主必然空等满 15 秒超时，表现为「点发送后转圈、上游收不到请求」。
+            runCatching {
+                wv.evaluateJavascript(
+                    "(function(){" +
+                        "var done=function(v){try{if(window.RikkaBridge&&window.RikkaBridge.onGenerationHooksResult)" +
+                        "window.RikkaBridge.onGenerationHooksResult($seqArg,v);}catch(e){}};" +
+                        "try{" +
+                        "if(typeof window.__rikkaRunGenerationHooks!=='function'){done('null');return;}" +
+                        "var r=window.__rikkaRunGenerationHooks($seqArg,$jsonArg);" +
+                        "if(r&&typeof r.then==='function'){r.catch(function(e){done('null');});}" +
+                        "}catch(e){done('null');}" +
+                        "})()",
+                    null,
+                )
+            }.onFailure {
+                pendingGenHooks.remove(seq)?.complete("null")
+            }
         }
         return try {
             val raw = withTimeoutOrNull(timeoutMs) { deferred.await() }

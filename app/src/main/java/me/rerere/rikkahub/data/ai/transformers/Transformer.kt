@@ -106,8 +106,25 @@ suspend fun List<UIMessage>.transforms(
         chatMessageCount = chatMessageCount,
         swipeMeta = swipeMeta,
     )
-    return transformers.fold(this) { acc, transformer ->
-        transformer.transform(ctx, acc)
+    // [P0 定位埋点] 逐个 transformer 计时。
+    // 真机取证（2026-10-28 17:58 / 18:03）显示：日志停在 `[gen-stage] generateInternal:prompt-base-built`
+    // 之后整整 60 秒零输出，而 `transforms-done` 从未打印 —— 说明卡在这 14 个 transformer 的串行链里。
+    // 每个 transformer 单独计时后，下一次复现能直接指出是哪一个。
+    return transformers.foldIndexed(this) { idx, acc, transformer ->
+        val __name = transformer::class.simpleName ?: "?"
+        // 进入也记一条：若卡在某个 transformer 内部，日志会停在「enter」而没有「done」。
+        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+            "info",
+            "[transformer] #$idx enter $__name msgs=${acc.size}",
+        )
+        val __t0 = System.currentTimeMillis()
+        val __out = transformer.transform(ctx, acc)
+        val __elapsed = System.currentTimeMillis() - __t0
+        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+            "info",
+            "[transformer] #$idx done  $__name elapsedMs=$__elapsed out=${__out.size}",
+        )
+        __out
     }
 }
 
