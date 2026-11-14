@@ -1095,8 +1095,22 @@ data class StGenerationHookResult(
     val aborted: Boolean = false,
 )
 
-/** 解析生成钩子返回结果（兼容 `[...]` 数组与 `{"messages":[...],"aborted":true}` 对象两种形状）。 */
-fun parseStGenerationHookResult(json: String): StGenerationHookResult? {
+/**
+ * 解析生成钩子返回结果（兼容 `[...]` 数组与 `{"messages":[...],"aborted":true}` 对象两种形状）。
+ *
+ * [base] 非空时按索引把改写结果**合并回原消息**：只替换文本，保留 Reasoning / Tool 等非文本部件。
+ *
+ * 为什么必须合并：钩子协议本身只有 `{role, content, name}`，是不带部件的纯文本视图。
+ * 若直接用它整体替换内部消息列表，会同时抹掉 assistant 的 `reasoning_content` 与 `tool_calls`：
+ *  - DeepSeek thinking 模式工具续轮缺 reasoning_content → 400
+ *    "The `reasoning_content` in the thinking mode must be passed back to the API."
+ *  - tool_calls 与 tool 结果失去配对 → 工具链断裂，模型看不到执行结果
+ * 只有长度与角色序列完全对齐时才逐条合并；对不上说明扩展真的增删了消息，退回纯文本语义。
+ */
+fun parseStGenerationHookResult(
+    json: String,
+    base: List<me.rerere.ai.ui.UIMessage>? = null,
+): StGenerationHookResult? {
     return runCatching {
         val root = Json.parseToJsonElement(json)
         val aborted = (root as? JsonObject)?.get("aborted")?.let { (it as? JsonPrimitive)?.contentOrNull == "true" } ?: false
@@ -1124,8 +1138,59 @@ fun parseStGenerationHookResult(json: String): StGenerationHookResult? {
                 name = name,
             )
         }
-        StGenerationHookResult(messages = msgs, aborted = aborted)
+        val merged = if (base != null && base.size == msgs.size && base.indices.all { base[it].role == msgs[it].role }) {
+            msgs.mapIndexed { i, rewritten -> mergeHookRewriteOntoBase(base[i], rewritten) }
+        } else {
+            msgs
+        }
+        StGenerationHookResult(messages = merged, aborted = aborted)
     }.getOrNull()
+}
+
+/**
+ * 把钩子改写后的纯文本消息合并回原始消息：文本替换，非文本部件（Reasoning / Tool / Image …）原样保留。
+ *
+ * 文本未变且名字未变时直接返回原消息，避免无谓的重建。
+ */
+internal fun mergeHookRewriteOntoBase(
+    base: me.rerere.ai.ui.UIMessage,
+    rewritten: me.rerere.ai.ui.UIMessage,
+): me.rerere.ai.ui.UIMessage {
+    // toText() 用 "\n" 拼接所有部件，非文本部件贡献空串但仍占分隔符，
+    // 于是 [Reasoning, Text, Tool] 会得到 "\n正文\n"。这里按行收敛，避免把空行写回消息。
+    val newText = rewritten.toText().trim('\n')
+    val newName = rewritten.name ?: base.name
+    if (base.toText().trim('\n') == newText && base.name == newName) return base
+
+    val hasNonText = base.parts.any { it !is me.rerere.ai.ui.UIMessagePart.Text }
+    if (!hasNonText) {
+        return base.copy(
+            parts = if (newText.isEmpty()) emptyList() else listOf(me.rerere.ai.ui.UIMessagePart.Text(newText)),
+            name = newName,
+        )
+    }
+
+    // 保留非文本部件的相对顺序；把首个文本部件替换成合并后的文本，其余文本部件丢弃。
+    //
+    // 注意不能把 newText 直接塞进第一个 Text 位置就完事：base 里可能有多个 Text 部件，
+    // 而 newText 是 toText() 用 "\n" 拼接多个 Text 得到的，重复写入会产生多余空行。
+    // 这里只保留一个 Text 部件承载全部文本。
+    val out = ArrayList<me.rerere.ai.ui.UIMessagePart>(base.parts.size)
+    var textPlaced = false
+    for (part in base.parts) {
+        if (part is me.rerere.ai.ui.UIMessagePart.Text) {
+            if (!textPlaced) {
+                if (newText.isNotEmpty()) out += me.rerere.ai.ui.UIMessagePart.Text(newText)
+                textPlaced = true
+            }
+        } else {
+            out += part
+        }
+    }
+    if (!textPlaced && newText.isNotEmpty()) {
+        out.add(0, me.rerere.ai.ui.UIMessagePart.Text(newText))
+    }
+    return base.copy(parts = out, name = newName)
 }
 
 /** 反序列化改写结果；字段缺失/role 非法时返回 null（调用方保留原文）。 */

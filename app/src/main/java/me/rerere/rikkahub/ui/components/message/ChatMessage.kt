@@ -378,6 +378,21 @@ private fun MessagePartsBlock(
 
     // Render parts in original order (group thinking/tool as chain-of-thought)
     val groupedParts = remember(parts) { parts.groupMessageParts() }
+    // [P0 修复] 崩溃：IllegalStateException: Asking for intrinsic measurements of SubcomposeLayout
+    //
+    // 工具卡片（BuiltinToolUIs 的 LazyColumn / FlowRow / ChatMessageTools 的 LazyRow、FlowRow）
+    // 全部建立在 SubcomposeLayout 之上，而「助手气泡贴合内容」开关会走
+    // Modifier.width(IntrinsicSize.Max)，Compose 在测宽度时会递归查询子级内在高度 ——
+    // 一旦子级是 SubcomposeLayout 就直接抛异常整页崩溃。
+    //
+    // 真机复现：测试 A 调用 memory_* 工具后崩溃两次，栈顶是
+    // ColumnMeasurePolicy.maxIntrinsicHeight -> NoIntrinsicsMeasurePolicy。
+    //
+    // 修法：只要这条消息含工具调用/思考链（这些块必然渲染工具卡片），就不做贴合内容，
+    // 退化为满宽气泡 —— 与面板 HTML 的处理方式一致。纯文本消息行为完全不变。
+    val hasToolOrThinkingBlock = remember(groupedParts) {
+        groupedParts.any { it is MessagePartBlock.ThinkingBlock || it is MessagePartBlock.ChartBlock }
+    }
     groupedParts.fastForEach { block ->
         when (block) {
             is MessagePartBlock.ThinkingBlock -> {
@@ -555,7 +570,10 @@ private fun MessagePartsBlock(
                                         bubbleOpacity = settings.displaySetting.bubbleOpacity,
                                         showAssistantBubble = settings.displaySetting.showAssistantBubble,
                                         modifier = if (segIsPanelHtml) bubbleModifier else bubbleModifier.animateContentSize(),
-                                        wrapContent = msgStyle.assistantBubbleWrapContent && !segIsPanelHtml,
+                                        // 含工具/思考链时禁止贴合内容：工具卡片内部是 SubcomposeLayout，
+                                        // 与 width(IntrinsicSize.Max) 冲突会直接崩溃（见 hasToolOrThinkingBlock）
+                                        wrapContent = msgStyle.assistantBubbleWrapContent &&
+                                            !segIsPanelHtml && !hasToolOrThinkingBlock,
                                         onClick = if (role == MessageRole.USER) {
                                             { onUserMessageClick?.invoke() }
                                         } else {

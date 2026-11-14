@@ -1,26 +1,36 @@
 {
-  "version": "2.5.10",
-  "versionCode": 243,
+  "version": "2.5.16",
+  "versionCode": 244,
   "packageName": "me.rerere.rikkahub.st",
   "minAndroidSdk": 26,
-  "publishedAt": "2026-10-28T00:00:00Z",
+  "publishedAt": "2026-11-15T00:00:00Z",
   "artifactStatus": "READY",
-  "targetArtifactName": "rikkaST-2.5.10-public-20261028.apk",
-  "changelog": "修复了发消息会被本地卡住的问题",
+  "targetArtifactName": "rikkast-2.5.16-1115.apk",
+  "changelog": "1. 修复工具调用问题，移除 Python 3 的误导提示（应用内置 Python 3.12，在 workspace 里需要 Python 3 可开 VPN 让 AI 安装并写入记忆）2. 新增主动记忆提醒，支持自定义提醒提示词，优化记忆功能3. 修复一键导入助手只能选一个文件的问题4. 新增 rikkahub 备份兼容，可导入 rikkahub 备份包，但不支持 SSH 远程工作区",
   "downloads": [
     {
-      "name": "rikkaST-2.5.10-public-20261028.apk",
-      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261028/rikkaST-2.5.10-public-20261028.apk",
-      "size": "66,957,418 bytes (约 67.0 MB)",
+      "name": "rikkast-2.5.16-1115.apk",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.16/rikkast-2.5.16-1115.apk",
+      "size": "67,009,666 bytes (约 63.9 MB)",
       "abi": "arm64-v8a",
-      "sha256": "15ea34ec705bbb5dd66d2715c20a764d88b9254acf4424cfb96932131400f56b",
+      "sha256": "f290b43a1268e8da29aa9fb9bcfa4315111d47fbb33dff879b5d15c185bba37f",
       "status": "ready",
-      "targetReleaseName": "v2.5.10-public-20261028",
-      "version": "2.5.10",
-      "versionCode": 243
+      "targetReleaseName": "v2.5.16",
+      "version": "2.5.16",
+      "versionCode": 244
     }
   ],
   "historicalArtifacts": [
+    {
+      "name": "rikkaST-2.5.10-public-20261028.apk",
+      "version": "2.5.10",
+      "versionCode": 243,
+      "status": "historical-reference",
+      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.10-public-20261028/rikkaST-2.5.10-public-20261028.apk",
+      "size": "66,957,418 bytes (约 67.0 MB)",
+      "abi": "arm64-v8a",
+      "sha256": "15ea34ec705bbb5dd66d2715c20a764d88b9254acf4424cfb96932131400f56b"
+    },
     {
       "name": "rikkaST-2.5.10-public-20261027.apk",
       "version": "2.5.10",

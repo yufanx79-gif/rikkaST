@@ -16,7 +16,9 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,6 +27,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.launch
@@ -447,10 +450,18 @@ private fun createSettingsDataStore(context: Context): DataStore<Preferences> {
     )
 }
 
-class SettingsStore(
-    context: Context,
-    scope: AppScope,
+/**
+ * 设置仓库。
+ *
+ * 主构造函数接收 [DataStore]，用于单测注入内存 / 带闸门的假盘；
+ * 生产代码走 [SettingsStore] 的 (Context, AppScope) 重载。
+ */
+class SettingsStore internal constructor(
+    private val dataStore: DataStore<Preferences>,
+    private val scope: CoroutineScope,
 ) : KoinComponent {
+    constructor(context: Context, scope: AppScope) : this(context.settingsStore, scope)
+
     companion object {
         // 版本号
         val VERSION = intPreferencesKey("data_version")
@@ -472,10 +483,15 @@ class SettingsStore(
         val FAST_MODEL = stringPreferencesKey("fast_model")
         val TITLE_MODEL = stringPreferencesKey("title_model")
         val FAST_MODEL_REASONING_LEVEL = stringPreferencesKey("fast_model_reasoning_level")
+        val MEMORY_MODEL = stringPreferencesKey("memory_model")
+        val MEMORY_MODEL_REASONING_LEVEL = stringPreferencesKey("memory_model_reasoning_level")
         val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
         val ENABLE_SUGGESTION = booleanPreferencesKey("enable_suggestion")
         val SUGGESTION_MODEL = stringPreferencesKey("suggestion_model")
         val IMAGE_GENERATION_MODEL = stringPreferencesKey("image_generation_model")
+        val ENABLE_AUTO_TITLE = booleanPreferencesKey("enable_auto_title")
+        val ENABLE_AUTO_COMPRESS = booleanPreferencesKey("enable_auto_compress")
+        val AUTO_COMPRESS_THRESHOLD = floatPreferencesKey("auto_compress_threshold")
         val TITLE_PROMPT = stringPreferencesKey("title_prompt")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
         val TRANSLATE_THINKING_BUDGET = intPreferencesKey("translate_thinking_budget")
@@ -621,6 +637,9 @@ class SettingsStore(
                     preferences[SUGGESTION_MODEL] = it.toString()
                 } ?: preferences.remove(SUGGESTION_MODEL)
                 preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
+                preferences[ENABLE_AUTO_TITLE] = settings.enableAutoTitle
+                preferences[ENABLE_AUTO_COMPRESS] = settings.enableAutoCompress
+                preferences[AUTO_COMPRESS_THRESHOLD] = settings.autoCompressThreshold
                 preferences[TITLE_PROMPT] = settings.titlePrompt
                 preferences[TRANSLATION_PROMPT] = settings.translatePrompt
                 preferences[TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
@@ -712,8 +731,6 @@ class SettingsStore(
         }
     }
 
-    private val dataStore = context.settingsStore
-
     val settingsFlowRaw = dataStore.data
         .retryWhen { cause, attempt ->
             val shouldRetry = cause is IOException && cause !is CorruptionException && attempt < READ_MAX_RETRIES
@@ -723,11 +740,22 @@ class SettingsStore(
             }
             shouldRetry
         }.map { preferences ->
+            // 搜索服务列表与选中下标必须**同时**收敛，否则会出现「下标越界」的脏值。
+            // 历史问题：写盘时 coerceIn 了，读盘时却直接 preferences[SEARCH_SELECTED] ?: 0，
+            // 于是盘上留着的越界下标（例如 3）会被原样读出来。等以后搜索服务变多、
+            // 这个下标重新落回范围内时，用户选中的搜索服务会莫名其妙变掉（真机 2026-11-15 排查）。
+            val loadedSearchServices = decodeListResilient<SearchServiceOptions>(
+                preferences[SEARCH_SERVICES], "searchServices",
+            ).ifEmpty { listOf(SearchServiceOptions.DEFAULT) }
             Settings(
                 favoriteModels = decodeListResilient<Uuid>(preferences[FAVORITE_MODELS], "favoriteModels"),
                 chatModelId = parseUuidOrDefault(preferences[SELECT_MODEL], DEFAULT_AUTO_MODEL_ID),
                 fastModelId = parseUuidOrDefault(preferences[FAST_MODEL], DEFAULT_AUTO_MODEL_ID),
                 fastModelReasoningLevel = preferences[FAST_MODEL_REASONING_LEVEL]
+                    ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
+                    ?: ReasoningLevel.AUTO,
+                memoryModelId = parseUuidOrNull(preferences[MEMORY_MODEL]),
+                memoryModelReasoningLevel = preferences[MEMORY_MODEL_REASONING_LEVEL]
                     ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
                     ?: ReasoningLevel.AUTO,
                 titleModelId = parseUuidOrNull(preferences[TITLE_MODEL]),
@@ -737,6 +765,9 @@ class SettingsStore(
                 tavernEjsRendering = preferences[TAVERN_EJS_RENDERING] ?: true,
                 suggestionModelId = parseUuidOrNull(preferences[SUGGESTION_MODEL]),
                 imageGenerationModelId = parseUuidOrDefault(preferences[IMAGE_GENERATION_MODEL], Uuid.random()),
+                enableAutoTitle = preferences[ENABLE_AUTO_TITLE] ?: true,
+                enableAutoCompress = preferences[ENABLE_AUTO_COMPRESS] ?: false,
+                autoCompressThreshold = preferences[AUTO_COMPRESS_THRESHOLD] ?: 0.8f,
                 titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
                 translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
                 translateThinkingBudget = preferences[TRANSLATE_THINKING_BUDGET] ?: 0,
@@ -775,10 +806,11 @@ class SettingsStore(
                 displaySetting = decodeObjectOrDefault(preferences[DISPLAY_SETTING], DisplaySetting()),
                 messageStyle = decodeMessageStyle(preferences[MESSAGE_STYLE]),
                 networkSetting = decodeObjectOrDefault(preferences[NETWORK_SETTING], NetworkSetting()),
-                searchServices = decodeListResilient<SearchServiceOptions>(preferences[SEARCH_SERVICES], "searchServices")
-                    .ifEmpty { listOf(SearchServiceOptions.DEFAULT) },
+                searchServices = loadedSearchServices,
                 searchCommonOptions = decodeObjectOrDefault(preferences[SEARCH_COMMON], SearchCommonOptions()),
-                searchServiceSelected = preferences[SEARCH_SELECTED] ?: 0,
+                // 与写盘时同样的收敛规则，保证读出来的下标一定落在 searchServices 范围内。
+                searchServiceSelected = (preferences[SEARCH_SELECTED] ?: 0)
+                    .coerceIn(0, (loadedSearchServices.size - 1).coerceAtLeast(0)),
                 mcpServers = decodeListResilient<McpServerConfig>(preferences[MCP_SERVERS], "mcpServers"),
                 webDavConfig = decodeObjectOrDefault(preferences[WEBDAV_CONFIG], WebDavConfig()),
                 s3Config = decodeObjectOrDefault(preferences[S3_CONFIG], S3Config()),
@@ -792,7 +824,16 @@ class SettingsStore(
                 defaultTTSPlaybackSpeed = preferences[DEFAULT_TTS_PLAYBACK_SPEED]?.coerceIn(0.5f, 2.0f) ?: 1.0f,
                 asrProviders = decodeListResilient<ASRProviderSetting>(preferences[ASR_PROVIDERS], "asrProviders"),
                 selectedASRProviderId = parseUuidOrNull(preferences[SELECTED_ASR_PROVIDER]),
-                modeInjections = decodeListResilient<PromptInjection.ModeInjection>(preferences[MODE_INJECTIONS], "modeInjections"),
+                // 首次安装时 MODE_INJECTIONS 这个 key 还不存在，decodeListResilient(null) 返回空列表。
+                // 但 Settings.modeInjections 的默认值是 DEFAULT_MODE_INJECTIONS（内置 Learning Mode），
+                // 所以这里必须用「key 不存在」来区分「用户主动清空」和「从没写过」：
+                //   - key 不存在 → 给内置默认值（新用户能看到 Learning Mode）
+                //   - key 存在但为 "[]" → 尊重用户清空（不能又塞回去）
+                modeInjections = if (preferences.contains(MODE_INJECTIONS)) {
+                    decodeListResilient<PromptInjection.ModeInjection>(preferences[MODE_INJECTIONS], "modeInjections")
+                } else {
+                    DEFAULT_MODE_INJECTIONS
+                },
                 promptInjections = decodeListResilient<PromptInjection.ModeInjection>(preferences[PROMPT_INJECTIONS], "promptInjections"),
                 tavernPresets = preferences[TAVERN_PRESETS] ?: "{}",
                 tavernGlobalScripts = preferences[TAVERN_GLOBAL_SCRIPTS] ?: "[]",
@@ -945,7 +986,11 @@ class SettingsStore(
                 .catch { t ->
                     Log.e(TAG, "settingsFlow collect failed: ${t.javaClass.simpleName}: ${t.message}")
                     if (settingsFlow.value.init) {
-                        settingsFlow.value = Settings().normalized()
+                        // 兜底也要保证 awaitLoaded() 能结束等待：
+                        // 即使 normalized() 本身抛异常，也必须把 init 置为 false，
+                        // 否则所有依赖 awaitLoaded() 的 update()/patch() 会永远挂住。
+                        settingsFlow.value = runCatching { Settings().normalized() }
+                            .getOrElse { Settings().copy(init = false) }
                     }
                 }
                 .collect { incoming ->
@@ -967,19 +1012,58 @@ class SettingsStore(
             TavernRuntimeManager.appendLog("warn", "[settings] update rejected: dummy (init=true)")
             return
         }
+        // 注意：这里**不要**调用 normalized()。
+        //
+        // 曾经试过在写回前统一规范化，结果破坏了「未改动的对象保持引用不变」的约定：
+        // normalized() 每次都会 copy() 出新对象（providers/assistants/ttsProviders），
+        // 于是 SettingsStoreTest 的 `objects that an update did not touch keep their identity` 失败。
+        // 上层（Compose 重组、Koin 缓存）依赖未改动对象引用稳定，无谓地换新对象会导致整片重组。
+        //
+        // 规范化仍然存在，但只在两处生效：
+        //   1. 读盘后的兜底（collect 的 catch 分支）
+        //   2. 调用方显式需要时自行 normalized()
         val previous = settingsFlow.value
         markLocalWrite(settings)
         fireSettingsEvents(previous, settings)
-        persistSettings(dataStore, settings)
+        // 内存状态已经改好，落盘这一步必须跑完。
+        // 否则「用户改完设置立刻退出页面/切走」时 viewModelScope 被取消，
+        // 这次修改只停留在内存里，重启后就丢了（真机 2026-11-15 排查）。
+        withContext(NonCancellable) {
+            persistSettings(dataStore, settings)
+        }
     }
 
+    /**
+     * 基于**当前已加载**的设置做一次变换后写回。
+     *
+     * ## 为什么这里要 awaitLoaded()
+     *
+     * 旧实现直接取 `settingsFlow.value`。应用刚启动、磁盘还没读完时，这个值是
+     * [Settings.dummy]（`init = true`）。此时调用本方法的后果有两种，都很糟：
+     *   - 走 [update] 的重载后被 `init` 检查拦下 → **用户的修改被静默丢弃**
+     *   - 绕过检查 → 用 dummy 覆盖盘上已有的真实设置 → **数据丢失**
+     * 真机复现（2026-11-15）：启动早期改设置，重启后改动不见了。
+     *
+     * 改为先等首帧加载完成再变换，语义就是「在已存设置之上应用这次修改」。
+     * [awaitLoaded] 依赖 init 块里的 collector，构造后即启动，不会死锁；
+     * 若读取失败，catch 分支会把 init 置为 false，同样能返回。
+     */
     suspend fun update(fn: (Settings) -> Settings) {
-        update(fn(settingsFlow.value))
+        // 已加载时直接用当前值（不额外等一次，保持原有调用时序）；
+        // 尚未加载时才等待，避免拿 dummy 当基底覆盖盘上数据。
+        val base = if (settingsFlow.value.init) awaitLoaded() else settingsFlow.value
+        update(fn(base))
     }
 
-    /** CAS 原子更新当前 Settings（基于最新 settingsFlow.value）。 */
+    /**
+     * CAS 原子更新当前 Settings（基于最新 settingsFlow.value）。
+     *
+     * 与 [update] 的区别：已加载时直接用当前值（保持原有的「读最新、立刻改」语义），
+     * 只有**尚未加载完成**时才等一次，避免拿 dummy 当基底把盘上数据覆盖掉。
+     */
     suspend fun patch(fn: (Settings) -> Settings) {
-        update(fn(settingsFlow.value))
+        val base = if (settingsFlow.value.init) awaitLoaded() else settingsFlow.value
+        update(fn(base))
     }
 
     private suspend fun patchKey(
@@ -998,8 +1082,11 @@ class SettingsStore(
         markLocalWrite(next)
         settingsFlow.value = next
         fireSettingsEvents(current, next)
-        dataStore.edit { preferences ->
-            preferences[key] = encode(next)
+        // 同 update(): 内存已更新，落盘不能被取消，否则改动会丢。
+        withContext(NonCancellable) {
+            dataStore.edit { preferences ->
+                preferences[key] = encode(next)
+            }
         }
         return true
     }

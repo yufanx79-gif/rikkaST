@@ -2,7 +2,6 @@ package me.rerere.rikkahub.data.ai.tools
 
 import android.content.Context
 import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import kotlinx.serialization.json.*
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
@@ -18,7 +17,13 @@ fun createCalculatorTool(context: Context): Tool = Tool(
         "Use this tool when you need to:\n" +
         "- Complex math: physics formulas, finance (NPV, IRR, Black-Scholes), statistics (ANOVA, PCA, regression)\n" +
         "- Matrix operations: add, mul, det, inv, eigenvalues\n" +
-        "- Calculus: derivative, integral, ODE (RK4), gradient descent\n" +
+        "- Calculus (NUMERICAL ONLY - the integrand/function must be a QUOTED STRING in x):\n" +
+        "    derivative(\"x^2\", 3)              -> 6.0        # f'(x) at x=3\n" +
+        "    integral(\"x^2\", 0, 1)            -> 0.3333...  # definite integral over [0,1]\n" +
+        "    integral(\"exp(-x^2)\", 0, 5, 10000)            # optional 4th arg = step count\n" +
+        "    ode_rk4(\"x+y\", 0, 1, 0.1, 100)    -> solve dy/dx = f(x,y)\n" +
+        "  There is NO symbolic integration. `integrate` is NOT a function; use `integral`.\n" +
+        "  Passing `integral(x^2, x, 0, 1)` fails - the integrand must be a string and there is no variable argument.\n" +
         "- Number theory: is_prime, factorize, gcd/lcm, CRT\n" +
         "- Astronomy: stellar/coordinate/cosmology calculations\n" +
         "- Physics: kinematics, relativity (Lorentz, time dilation), quantum, orbital mechanics\n" +
@@ -61,14 +66,9 @@ fun createCalculatorTool(context: Context): Tool = Tool(
 
         val executor = Executors.newSingleThreadExecutor()
         try {
-            // Python must be started on main thread (Chaquopy requirement)
-            if (!Python.isStarted()) {
-                kotlinx.coroutines.runBlocking {
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        Python.start(AndroidPlatform(context))
-                    }
-                }
-            }
+            // Chaquopy 要求在主线程启动；并行调用必须串行化，否则第二个起会抛
+            // "Python already started"（真机：模型并行发 5 个 calculator，4 个失败）
+            PythonRuntime.ensureStartedBlocking(context)
 
             val future = executor.submit<String> {
                 try {

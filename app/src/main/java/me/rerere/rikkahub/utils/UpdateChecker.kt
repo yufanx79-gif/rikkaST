@@ -26,7 +26,15 @@ private const val TAG = "UpdateChecker"
 private const val API_URL = "https://raw.githubusercontent.com/yufanx79-gif/rikkaST/main/update.json"
 private val SHA256_HEX_RE = Regex("^[a-fA-F0-9]{64}$")
 private val SEMVER_TAG_RE = Regex("""(?<!\d)(\d+\.\d+\.\d+)(?!\d)""")
-private val EMBEDDED_SEMVER_RE = Regex("\\b(\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?)\\b")
+// 注意：这里**不能**再用一个「带 prerelease 分支」的宽松正则去抓文件名里的版本号。
+//
+// 曾经写成 Regex("\\b(\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?\\b")，prerelease 分支
+// [0-9A-Za-z.-]+ 是贪婪的，会把 -universal-release.apk 整段吞进版本号：
+//     rikkaST-2.5.9-universal-release.apk  ->  "2.5.9-universal-release.apk"
+// 于是与期望版本 "2.5.9" 比较必然不等，isDownloadable() 对所有 APK 都返回 false，
+// availableDownloads() 恒为空 —— 应用内更新功能整体失效（真机 2026-11-15 复现）。
+//
+// 统一复用 SEMVER_TAG_RE：用前后否定断言精确锁定 x.y.z，不吃后缀。
 private val ACTIVE_DOWNLOAD_STATUSES = setOf("", "ready", "available", "active", "released", "published")
 
 class UpdateChecker(
@@ -186,11 +194,11 @@ data class UpdateDownload(
             if (version.isNotBlank() && version.trim().removePrefix("v").removePrefix("V") != expVer) {
                 return false
             }
-            val nameVersions = EMBEDDED_SEMVER_RE.findAll(cleanName).map { it.groupValues[1] }.toList()
+            val nameVersions = SEMVER_TAG_RE.findAll(cleanName).map { it.groupValues[1] }.toList()
             if (nameVersions.isNotEmpty() && nameVersions.any { it != expVer }) {
                 return false
             }
-            val urlVersions = EMBEDDED_SEMVER_RE.findAll(cleanUrl.substringBefore('?')).map { it.groupValues[1] }.toList()
+            val urlVersions = SEMVER_TAG_RE.findAll(cleanUrl.substringBefore('?')).map { it.groupValues[1] }.toList()
             if (urlVersions.isNotEmpty() && urlVersions.any { it != expVer }) {
                 return false
             }

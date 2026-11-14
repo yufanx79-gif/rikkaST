@@ -257,9 +257,9 @@ internal object SpresetChatSquashEngine {
 
     private fun substituteNames(value: String, userName: String, charName: String): String {
         return value
-            .replace(Regex("\\{\\{trim}}", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\{\\{user}}", RegexOption.IGNORE_CASE)) { userName }
-            .replace(Regex("\\{\\{char}}", RegexOption.IGNORE_CASE)) { charName }
+            .replace(Regex("\\{\\{trim\\}\\}", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\{\\{user\\}\\}", RegexOption.IGNORE_CASE)) { userName }
+            .replace(Regex("\\{\\{char\\}\\}", RegexOption.IGNORE_CASE)) { charName }
     }
 
     private fun applyStopStrings(text: String, cfg: StSpresetChatSquash): String {

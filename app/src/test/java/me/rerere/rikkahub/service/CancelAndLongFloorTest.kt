@@ -96,6 +96,7 @@ class CancelAndLongFloorTest {
         }
         val conv500 = Conversation(
             id = convId,
+            assistantId = Uuid.random(),
             title = "500 Floor Perf Test",
             messageNodes = nodes,
         )
@@ -137,6 +138,7 @@ class CancelAndLongFloorTest {
         )
         val convBefore = Conversation(
             id = convId,
+            assistantId = Uuid.random(),
             title = "Swipe Cache Invalidation Test",
             messageNodes = listOf(
                 MessageNode(

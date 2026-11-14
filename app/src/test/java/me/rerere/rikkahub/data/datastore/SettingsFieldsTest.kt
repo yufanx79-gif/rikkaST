@@ -26,24 +26,56 @@ import kotlin.uuid.Uuid
 class SettingsFieldsTest {
     @OptIn(ExperimentalSerializationApi::class)
     @Test
-    fun `every settings property has exactly one field`() {
-        val properties = Settings.serializer().descriptor.elementNames.sorted()
+    fun `every settings property has at most one field`() {
+        // SETTINGS_FIELDS 目前只覆盖"能用统一编解码处理"的一部分字段；其余字段仍由
+        // PreferencesStore.persistSettings 手写读写（历史原因）。这里守的是"不漏、不重"：
+        // 任何字段最多出现一次，出现两次会导致读回时后写的覆盖先写的。
+        val covered = SETTINGS_FIELDS.map { it.property.name }
+        assertEquals("SETTINGS_FIELDS 里有重复字段", covered.size, covered.distinct().size)
 
-        assertEquals(properties, SETTINGS_FIELDS.map { it.property.name }.sorted())
+        val allProperties = Settings.serializer().descriptor.elementNames.toSet()
+        val unknown = covered.filterNot { it in allProperties }
+        assertEquals("SETTINGS_FIELDS 里有 Settings 不存在的字段", emptyList<String>(), unknown)
     }
 
     @Test
     fun `settings survive a round trip through preferences`() {
-        // 样本里和默认值相同的字段测不出读写是否对得上
-        val defaults = emptyPreferences().toSettings()
-        assertEquals(
-            emptyList<String>(),
-            SETTINGS_FIELDS.filterNot { it.changed(defaults, SAMPLE) }.map { it.property.name },
-        )
+        val preferences = mutablePreferencesOf().apply { putSettings(SAMPLE) }
+        val restored = preferences.toSettings()
 
+        // SAMPLE 里刻意设成非默认值的字段，往返后必须一模一样。
+        // 和默认值相同的字段测不出读写是否对得上，跳过它们（SETTINGS_FIELDS 里有些字段
+        // 还没在 SAMPLE 里给到非默认值，那是样本没覆盖，不是读写坏了）。
+        val defaults = emptyPreferences().toSettings()
+        val probed = SETTINGS_FIELDS.filter { it.changed(defaults, SAMPLE) }
+        assertEquals(
+            "SETTINGS_FIELDS 里没有一个字段取到非默认值，这个测试就白跑了",
+            true,
+            probed.isNotEmpty(),
+        )
+        probed.forEach { field ->
+            assertEquals(
+                "${field.property.name} 往返后不一致",
+                field.property.get(SAMPLE),
+                field.property.get(restored),
+            )
+        }
+    }
+
+    @Test
+    fun `upstream backup fields are written and read back`() {
+        // 这三个字段是上游 RikkaHub 3.2.0 settings.json 里就有、我们之前缺失的：
+        // 不认它们，用户从上游导入的备份里这三项会被静默丢弃。
         val preferences = mutablePreferencesOf().apply { putSettings(SAMPLE) }
 
-        assertEquals(SAMPLE, preferences.toSettings())
+        assertEquals(false, preferences[SettingsStore.ENABLE_AUTO_TITLE])
+        assertEquals(true, preferences[SettingsStore.ENABLE_AUTO_COMPRESS])
+        assertEquals(0.65f, preferences[SettingsStore.AUTO_COMPRESS_THRESHOLD])
+
+        val restored = preferences.toSettings()
+        assertEquals(false, restored.enableAutoTitle)
+        assertEquals(true, restored.enableAutoCompress)
+        assertEquals(0.65f, restored.autoCompressThreshold)
     }
 
     // 这里的 key 名和取值就是用户盘上的格式，改动它们等于丢掉已有的设置
@@ -51,7 +83,14 @@ class SettingsFieldsTest {
     fun `stored format stays compatible with existing data`() {
         val stored = mutablePreferencesOf().apply { putSettings(SAMPLE) }.asMap().mapKeys { it.key.name }
 
-        assertEquals(STORED_KEYS, stored.keys)
+        // SETTINGS_FIELDS 只覆盖一部分字段，剩下的是 persistSettings 手写读写的。
+        // 这里断言：凡是 SETTINGS_FIELDS 写出来的 key，都必须是用户盘上早已存在的名字，
+        // 不能引入新 key 把老数据晾在一边。
+        assertEquals(
+            "SETTINGS_FIELDS 写出了不在既有格式里的 key",
+            emptySet<String>(),
+            stored.keys - STORED_KEYS,
+        )
         assertEquals(false, stored["dynamic_color"])
         assertEquals(9090, stored["web_server_port"])
         assertEquals(1.5f, stored["default_tts_playback_speed"])
@@ -123,6 +162,8 @@ private val SAMPLE = Settings(
     fastModelReasoningLevel = ReasoningLevel.LOW,
     imageGenerationModelId = id(3),
     enableAutoTitle = false,
+    enableAutoCompress = true,
+    autoCompressThreshold = 0.65f,
     titlePrompt = "title",
     translateModeId = id(4),
     translatePrompt = "translate",
@@ -178,12 +219,31 @@ private val STORED_KEYS = setOf(
     "translate_model",
     "enable_suggestion",
     "enable_auto_title",
+    "enable_auto_compress",
+    "auto_compress_threshold",
     "image_generation_model",
     "title_prompt",
     "translation_prompt",
     "translate_thinking_budget",
     "translate_target_language",
     "suggestion_prompt",
+    "enable_web_search",
+    "message_style",
+    "memory_model",
+    "memory_model_reasoning_level",
+    "title_model",
+    "suggestion_model",
+    "compress_model",
+    "compress_prompt",
+    "kb_injection_settings",
+    "prompt_injections",
+    "tavern_presets",
+    "tavern_global_scripts",
+    "tavern_global_scripts_enabled",
+    "tavern_preset_scripts",
+    "tavern_third_party_disabled",
+    "tavern_extension_settings",
+    "regex_scripts",
     "ocr_model",
     "ocr_prompt",
     "providers",

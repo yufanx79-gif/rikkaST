@@ -136,7 +136,20 @@ private fun buildWorkspacePrompt(
     appendLine("- All paths passed to workspace tools must be absolute and inside the Rootfs (for example `/workspace/notes.md`).")
     if (distro != null) {
         appendLine("- The Rootfs distribution is $distro. Use its native package manager when you need to install missing tools.")
+    } else {
+        // 读不到 /etc/os-release 时不能让整条环境说明消失 —— 否则模型不知道自己在什么环境、
+        // 也不知道可以自己装包，只会得出「这个环境什么都没有」的错误结论。
+        // 默认镜像就是 ubuntu-base，按它的已知情况给兜底说明。
+        appendLine("- This Rootfs is a minimal base image; most developer tools are NOT preinstalled. Use its native package manager (apt-get on Ubuntu/Debian, apk on Alpine) when you need to install missing tools.")
     }
+    // 精简镜像不带 python3。必须显式说明，否则模型在 shell 里遇到 `python3: command not found`
+    // 会误以为整个应用没有 Python，从而放弃所有 Python 能力。
+    appendLine(
+        "- python3 is NOT preinstalled in this Rootfs. If you need Python, prefer the separate " +
+            "`execute_python` tool (a built-in Python 3.12 interpreter on the app side, nothing to install). " +
+            "Only run `apt-get update && apt-get install -y python3` when you specifically need Python " +
+            "inside a shell pipeline; note that `execute_python` cannot see files under /workspace."
+    )
     if (shell == "/bin/bash") {
         appendLine("- `workspace_shell` runs commands with `/bin/bash`.")
     } else {

@@ -57,8 +57,8 @@ android {
         applicationId = "me.rerere.rikkahub.st"  // 独立包名：可与官方 RikkaHub 共存，互不覆盖（debug 变体自动加 .debug 后缀）
         minSdk = 26
         targetSdk = 37
-        versionCode = 243 // 2.5.10-public-20261027：P0 生成静默失败修复（> 242）
-        versionName = "2.5.10"
+        versionCode = 244 // 2.5.16-20261115：工具调用修复 + 主动记忆 + 一键导入 + rikkahub 备份兼容（> 243）
+        versionName = "2.5.16"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -123,6 +123,23 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    testOptions {
+        unitTests {
+            /*
+             * JVM 单测里 android.* / org.json 默认全都是抛异常的桩：
+             *   java.lang.RuntimeException: Method quote in org.json.JSONObject not mocked.
+             *   java.lang.RuntimeException: Method w in android.util.Log not mocked.
+             * 结果是 SettingsStoreTest / JsMacroBridgeTest / ProviderAccountManagerTest 这些
+             * **纯逻辑**测试一条都跑不起来，看起来像功能坏了，其实只是方法体没实现。
+             *
+             * isReturnDefaultValues = true 让这些桩返回 0/null/false 而不是抛异常。
+             * 注意它不会让 Context / Looper 之类真的能用 —— 需要它们的测试仍然要用
+             * Robolectric 或改成可注入的纯函数，别指望这一行兜住。
+             */
+            isReturnDefaultValues = true
+        }
     }
     buildFeatures {
         compose = true

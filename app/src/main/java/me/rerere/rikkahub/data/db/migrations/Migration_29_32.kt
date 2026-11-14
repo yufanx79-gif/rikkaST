@@ -90,23 +90,12 @@ internal fun executeIdempotentUpgradeTo32(db: SupportSQLiteDatabase, fromVersion
             }
             val now = System.currentTimeMillis()
             memories.forEach { (assistantId, contents) ->
-                val lines = contents
-                    .map { it.lines().joinToString(" ") { line -> line.trim() }.trim() }
-                    .filter { it.isNotEmpty() }
-                if (lines.isNotEmpty()) {
-                    val profile = buildString {
-                        appendLine("---")
-                        appendLine("name: profile")
-                        appendLine("description: Who the user is")
-                        appendLine("---")
-                        appendLine()
-                        lines.forEach { appendLine("- [stated] $it") }
-                    }
-                    db.execSQL(
-                        "INSERT OR IGNORE INTO memory_file (assistant_id, path, content, updated_at) VALUES (?, ?, ?, ?)",
-                        arrayOf<Any?>(assistantId, "profile.md", profile, now)
-                    )
-                }
+                // 拼接规则与 27->28 共用同一份实现，避免两条迁移路径写出不同格式的 profile
+                val profile = legacyMemoriesToProfile(contents) ?: return@forEach
+                db.execSQL(
+                    "INSERT OR IGNORE INTO memory_file (assistant_id, path, content, updated_at) VALUES (?, ?, ?, ?)",
+                    arrayOf<Any?>(assistantId, "profile.md", profile, now)
+                )
             }
         }
 

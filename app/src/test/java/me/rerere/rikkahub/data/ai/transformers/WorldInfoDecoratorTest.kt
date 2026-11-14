@@ -366,7 +366,7 @@ class WorldInfoDecoratorTest {
             substituteRegex = 1,
         )
         val renderedDepth0 = me.rerere.rikkahub.ui.components.message.computeStRegexedText(
-            text = "SECRET",
+            rawInputText = "SECRET",
             scripts = listOf(displayRx),
             assistant = assistant,
             scope = me.rerere.rikkahub.data.model.AssistantAffectScope.ASSISTANT,
@@ -375,7 +375,7 @@ class WorldInfoDecoratorTest {
             userName = "Bob",
         )
         val renderedDepth1 = me.rerere.rikkahub.ui.components.message.computeStRegexedText(
-            text = "SECRET",
+            rawInputText = "SECRET",
             scripts = listOf(displayRx),
             assistant = assistant,
             scope = me.rerere.rikkahub.data.model.AssistantAffectScope.ASSISTANT,

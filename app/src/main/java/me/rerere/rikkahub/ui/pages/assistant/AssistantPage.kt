@@ -372,11 +372,14 @@ private fun AssistantCreationSheet(
 
                     val navController = LocalNavController.current
                     AssistantImporter(
-                        onImport = { result ->
-                            val bound = vm.importAndActivateAssistant(result, activateAsCurrent = true)
-                            update(bound)
-                            state.dismiss()
-                            navController.navigate(Screen.Chat(id = Uuid.random().toString()))
+                        // onImport 是 suspend：批量写入完成后才关弹窗，避免"助手还没落库就进聊天"
+                        onImport = { results ->
+                            val bound = vm.importAndActivateAssistants(results, activateAsCurrent = true)
+                            bound.lastOrNull()?.let { update(it) }
+                            if (bound.isNotEmpty()) {
+                                state.dismiss()
+                                navController.navigate(Screen.Chat(id = Uuid.random().toString()))
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
                     )

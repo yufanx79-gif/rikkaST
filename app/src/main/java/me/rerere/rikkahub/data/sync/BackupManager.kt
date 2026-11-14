@@ -19,6 +19,7 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.migration.SettingsJsonMigrator
 import me.rerere.rikkahub.data.db.AppDatabaseFactory
+import me.rerere.rikkahub.data.db.BackupSchemaGuard
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.SQLiteConfiguration
 import me.rerere.rikkahub.data.files.FileFolders
@@ -125,6 +126,11 @@ class BackupManager(
                     require(!stagedWal.exists() || stagedDatabase.exists()) { "Backup WAL has no matching database" }
                     if (stagedDatabase.exists()) {
                         DatabaseBackup.normalize(context, stagedDatabase)
+                        // 结构预检：备份里若出现当前版本不认识的列，说明它来自更新的应用，
+                        // 直接给出一句人话并中止（原库不动），不要等 Room 抛栈。
+                        BackupSchemaGuard.findUnknownColumns(context, stagedDatabase)?.let { problem ->
+                            throw IllegalStateException(problem)
+                        }
                         // Reject unsupported schemas before publishing; run supported old migrations on the copy.
                         val room = AppDatabaseFactory.create(context, stagedDatabase.absolutePath)
                         try {
@@ -132,6 +138,18 @@ class BackupManager(
                         } finally {
                             room.close()
                         }
+                        // 备份里的文件引用是绝对路径，指向**导出时那个安装的包名**。
+                        // 本应用是独立包名（me.rerere.rikkahub.st），目录不同，
+                        // 不改写的话头像/聊天背景/消息附件全部加载失败。
+                        // 文件本身在备份里是齐的，只是路径写错。
+                        //
+                        // 注意：此刻附件还在暂存区 payload/files，尚未落到 filesDir，
+                        // 所以存在性检查必须指向暂存区，否则会被「文件不存在」全部跳过。
+                        BackupPathHealer.healDatabase(
+                            context = context,
+                            databaseFile = stagedDatabase,
+                            filesRoot = File(payload, "files"),
+                        )
                         DatabaseBackup.removeSidecars(stagedDatabase)
                     }
 
@@ -140,8 +158,16 @@ class BackupManager(
                         val migrated = SettingsJsonMigrator.migrate(settingsFile.readText())
                         val settings = json.decodeFromString<Settings>(migrated)
                         require(!settings.init) { "Backup contains uninitialized settings" }
+                        // 同样把 settings 里的绝对路径改写成本机路径（头像、聊天背景、用户头像）。
+                        // 存在性检查同样指向暂存区。
+                        val stagedFiles = File(payload, "files")
+                        val rebased = BackupPathHealer.rewriteText(
+                            text = json.encodeSettings(settings, json.launchCountOf(migrated)),
+                            currentPackage = context.packageName,
+                            filesDirAbsolute = context.filesDir.absolutePath,
+                        ) { relative -> File(stagedFiles, relative).exists() }
                         // Persist the migrated value once, including generated IDs, for restart/retry consistency.
-                        PendingRestore.writeDurably(settingsFile, json.encodeSettings(settings, json.launchCountOf(migrated)))
+                        PendingRestore.writeDurably(settingsFile, rebased)
                     }
                     currentCoroutineContext().ensureActive()
                     restore.publish(staging)

@@ -187,6 +187,17 @@ fun WorkspaceDetailPage(id: String) {
 
     val onFilesTab = pagerState.currentPage == WorkspaceDetailTab.FILES.ordinal
 
+    // 上游 rikkahub 支持「远程 SSH 工作区」（workspaces.type = REMOTE），本分支未实现。
+    // 恢复上游备份后这类工作区会出现在列表里；绝不能当成本地路径去访问（root 是 SSH 目标，
+    // 不是本机目录，强行读取只会得到空目录或报错），直接给出明确说明。
+    if (state.workspace?.isRemote == true) {
+        RemoteWorkspaceUnsupportedScaffold(
+            workspaceName = state.workspace?.name.orEmpty(),
+            onBack = { navController.popBackStack() },
+        )
+        return
+    }
+
     BackHandler(enabled = onFilesTab && state.path.isNotBlank()) {
         vm.goUp()
     }
@@ -1097,3 +1108,66 @@ internal fun String.toShellStatusLabel(): String = when (this) {
 
 private const val DEFAULT_ROOTFS_URL =
     "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-arm64.tar.gz"
+
+/**
+ * 远程 SSH 工作区（上游 rikkahub 的 `workspaces.type = REMOTE`）在当前版本不可用时的说明页。
+ *
+ * 为什么需要单独一个页面而不是直接不显示：恢复上游备份后，这类工作区会真实出现在列表里。
+ * 如果静默隐藏，用户会以为数据丢了；如果按本地工作区打开，`root` 是 SSH 目标字符串，
+ * 会被当成路径去访问，表现为「空目录」或报错，用户同样困惑。
+ * 明确说明「这是新版功能，当前版本打不开，其他数据不受影响」是唯一不会误导的处理方式。
+ */
+@Composable
+private fun RemoteWorkspaceUnsupportedScaffold(
+    workspaceName: String,
+    onBack: () -> Unit,
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        text = workspaceName.ifBlank { stringResource(R.string.workspace_detail_title) },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                navigationIcon = { BackButton() },
+                colors = CustomColors.topBarColors,
+            )
+        },
+        containerColor = CustomColors.topBarColors.containerColor,
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(
+                imageVector = HugeIcons.ComputerTerminal01,
+                contentDescription = null,
+                modifier = Modifier.size(48.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.size(16.dp))
+            Text(
+                text = stringResource(R.string.workspace_remote_unsupported_title),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.size(8.dp))
+            Text(
+                text = stringResource(R.string.workspace_remote_unsupported_body),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.size(24.dp))
+            Button(onClick = onBack) {
+                Text(stringResource(R.string.back))
+            }
+        }
+    }
+}

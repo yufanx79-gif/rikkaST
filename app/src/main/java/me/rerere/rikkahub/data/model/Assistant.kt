@@ -89,7 +89,6 @@ data class Assistant(
     val messageStyleOverride: MessageStyleOverride? = null,
     val enableTools: Boolean = true,                    // 助手级工具总开关
     val toolPolicy: ToolPolicy? = null,                 // null=自动（酒馆卡默认关闭，普通助手 auto）
-    val enableParallelToolExecution: Boolean = true,    // 并行执行多个工具调用
     val toolRecurringLimit: Int = 2,                    // 单批同工具调用上限
     val totalStepsLimit: Int = 16,                      // 总工具调用轮数上限
     val toolExecTimeout: Int = 120,                     // 单工具执行超时(秒)
@@ -99,8 +98,17 @@ data class Assistant(
     val talkativeness: Float = 0.5f,                    // 群聊发言倾向 (0-1)，酒馆对齐
     val embeddingModelId: Uuid? = null,                  // 专用embedding模型（null=使用全局/聊天模型）
     val enableAutoCompact: Boolean = true,               // 自动压缩对话历史（token过多时）
-    val enableAutoMemoryExtract: Boolean = true,          // [新增] 自动从对话提取记忆（独立开关，不依赖 enableMemory）
-    val autoMemoryExtractInterval: Int = 5,                // 每 N 轮对话提取一次记忆
+    /**
+     * 主动记忆提醒：开启后每隔 [proactiveMemoryInterval] 条用户消息，在主对话里追加一条
+     * 「检查是否有值得长期记住的信息」的提醒，让模型在对话中及时写入。
+     *
+     * 与后台整理（[autoConsolidateMemory]）互补：这条负责及时，后台负责补漏和去重。
+     * 间隔由代码控制而不是写进提示词，模型数不准轮次。
+     */
+    val enableProactiveMemory: Boolean = false,
+    val proactiveMemoryInterval: Int = 5,
+    /** 空 = 用内置默认提示词 */
+    val proactiveMemoryPrompt: String = "",
 )
 
 /** 解析实际生效的工具策略：未显式设置时，酒馆角色卡默认关闭，普通助手保持 auto。 */
@@ -117,11 +125,27 @@ fun Assistant.effectiveMaxToolSteps(): Int {
     // [P0 修复] 旧实现把酒馆卡硬压到 2 步。一次 step 等于一次完整模型请求，
     // 压到 2 只够「1 轮工具 + 1 次收尾」，模型连续两轮要工具就直接没有正文。
     // 上限保留但放宽到 8，与「防频繁调工具」的目标仍然一致（默认 ToolPolicy 仍是 NONE）。
-    return if (tavernData != null) base.coerceAtMost(TAVERN_MAX_TOOL_STEPS) else base
+    //
+    // [P0 修复 256 步] 这里过去**没有绝对上限**，`totalStepsLimit` 可以被设成 256，
+    // 模型一旦进入「反复调工具」的循环就会真的发 256 次请求（真机日志：
+    // `[final-turn] no narration after 256 step(s)`）。非酒馆助手也要有天花板。
+    return if (tavernData != null) {
+        base.coerceAtMost(TAVERN_MAX_TOOL_STEPS)
+    } else {
+        base.coerceAtMost(ABSOLUTE_MAX_TOOL_STEPS)
+    }
 }
 
 /** 酒馆卡单轮允许的模型往返次数上限（含工具轮）。 */
 const val TAVERN_MAX_TOOL_STEPS: Int = 8
+
+/**
+ * 非酒馆助手单轮允许的模型往返次数**绝对**上限。
+ *
+ * 只是防呆：正常多步任务 5~15 步就够。设成 256 这种值会让模型一旦陷入工具循环
+ * 就真的发 256 次请求，既烧钱又永远出不来正文。
+ */
+const val ABSOLUTE_MAX_TOOL_STEPS: Int = 40
 
 @Serializable
 data class QuickMessage(

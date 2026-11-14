@@ -172,9 +172,10 @@ fun OnboardingPage(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     AssistantImporter(
-                        onImport = { result ->
-                            assistantVM.importAndActivateAssistant(result, activateAsCurrent = true)
-                            if (readiness.hasSelectedChatModel) {
+                        // 批量导入只触发一次导航，避免多选后连开多个聊天页
+                        onImport = { results ->
+                            val bound = assistantVM.importAndActivateAssistants(results, activateAsCurrent = true)
+                            if (bound.isNotEmpty() && readiness.hasSelectedChatModel) {
                                 context.writeBooleanPreference("onboarding_dismissed", true)
                                 navigateToChatPage(navController, chatId = Uuid.random())
                             }

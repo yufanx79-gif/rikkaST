@@ -4,6 +4,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
 import me.rerere.rikkahub.data.db.dao.MemoryDAO
+import me.rerere.rikkahub.data.db.entity.MemoryEntity
 import me.rerere.rikkahub.data.db.entity.MemoryFileEntity
 
 internal class FakeMemoryDAO : MemoryDAO {
@@ -31,5 +32,43 @@ internal class FakeMemoryDAO : MemoryDAO {
 
     override suspend fun deleteFilesOfAssistant(assistantId: String) {
         files.value = files.value.filterNot { it.assistantId == assistantId }
+    }
+
+    // --- rikkaST legacy MemoryEntity 部分：记忆库已迁到 memory_file，这里只是接口占位 ---
+    private val legacy = MutableStateFlow<List<MemoryEntity>>(emptyList())
+
+    override fun getMemoriesOfAssistantFlow(assistantId: String): Flow<List<MemoryEntity>> =
+        legacy.map { all -> all.filter { it.assistantId == assistantId } }
+
+    override suspend fun getMemoriesOfAssistant(assistantId: String): List<MemoryEntity> =
+        legacy.value.filter { it.assistantId == assistantId }
+
+    override fun getAllMemoriesFlow(): Flow<List<MemoryEntity>> = legacy
+
+    override suspend fun getAllMemories(): List<MemoryEntity> = legacy.value
+
+    override suspend fun getMemoryById(id: Int): MemoryEntity? =
+        legacy.value.find { it.id == id }
+
+    override suspend fun insertMemory(memory: MemoryEntity): Long {
+        val assigned = if (memory.id == 0) (legacy.value.maxOfOrNull { it.id } ?: 0) + 1 else memory.id
+        legacy.value = legacy.value + memory.copy(id = assigned)
+        return assigned.toLong()
+    }
+
+    override suspend fun insertMemories(memories: List<MemoryEntity>) {
+        memories.forEach { insertMemory(it) }
+    }
+
+    override suspend fun updateMemory(memory: MemoryEntity) {
+        legacy.value = legacy.value.map { if (it.id == memory.id) memory else it }
+    }
+
+    override suspend fun deleteMemory(id: Int) {
+        legacy.value = legacy.value.filterNot { it.id == id }
+    }
+
+    override suspend fun deleteMemoriesOfAssistant(assistantId: String) {
+        legacy.value = legacy.value.filterNot { it.assistantId == assistantId }
     }
 }

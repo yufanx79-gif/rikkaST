@@ -30,6 +30,9 @@ object MemoryToolNames {
 
     /** 会改动记忆库的工具 */
     val WRITES = setOf(WRITE, STR_REPLACE, APPEND, DELETE)
+
+    /** 全部工具名，用于「这个工具清单里是否已经带了记忆工具」的判断 */
+    val ALL = setOf(READ, WRITE, STR_REPLACE, APPEND, DELETE, LIST)
 }
 
 private const val MAX_READ_PATHS = 20

@@ -197,10 +197,17 @@ fun createFileTools(workspaceDir: String = "/storage/emulated/0/Download"): List
                         val path = resolveDestPath(rawPath)
                         path.parentFile?.mkdirs()
                         path.writeText(content)
-                        listOf(UIMessagePart.Text("OK: wrote ${content.length} bytes to ${path.absolutePath}"))
+                        // content.length 是 UTF-16 字符数, 不是字节数（中文差 3 倍）。
+                        // 写完直接读文件真实大小, 避免误导模型判断写入是否完整。
+                        listOf(UIMessagePart.Text("OK: wrote ${path.length()} bytes to ${path.absolutePath}"))
                     }
                     "list" -> {
-                        val dirPath = obj["dir"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: defaultDir
+                        // Schema 里 path 的描述写着 "Used by: read, write, list, mkdir, delete"，
+                        // 但实现只读 dir，模型按 Schema 传 path 会被静默忽略，列出来的是默认目录
+                        // （于是"文件明明在、却显示另一个同名文件/0 B"）。dir 优先以保持兼容。
+                        val dirPath = obj["dir"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() }
+                            ?: obj["path"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() }
+                            ?: defaultDir
                         val dir = resolveFile(dirPath)
                         if (!dir.exists()) error("Directory not found: $dirPath")
                         if (!dir.isDirectory) error("Not a directory: $dirPath")
@@ -331,8 +338,21 @@ fun createFileTools(workspaceDir: String = "/storage/emulated/0/Download"): List
                         val pattern = obj["pattern"]?.jsonPrimitive?.contentOrNull ?: error("pattern required")
                         val root = obj["root"]?.jsonPrimitive?.contentOrNull ?: defaultDir
                         val maxResults = (obj["max_results"]?.jsonPrimitive?.intOrNull ?: 20).coerceIn(1, 100)
-                        val rootDir = File(root)
-                        if (!rootDir.exists()) error("Directory not found: $root")
+                        // 与 list 保持一致地解析路径（相对路径落到 defaultDir）。
+                        val rootDir = resolveFile(root)
+                        if (!rootDir.exists()) {
+                            // /workspace 是 rootfs 内部路径，属于 workspace_* 工具的命名空间，
+                            // file 工具访问不到。给一句能直接指导行动的提示，而不是笼统的 not found。
+                            if (root == "/workspace" || root.startsWith("/workspace/")) {
+                                error(
+                                    "Directory not found: $root\n" +
+                                        "/workspace lives inside the workspace Rootfs and is not visible to the `file` tool. " +
+                                        "Use workspace_read_file / workspace_shell for Rootfs paths, " +
+                                        "or use an Android path such as /storage/emulated/0/Download."
+                                )
+                            }
+                            error("Directory not found: $root")
+                        }
                         if (!rootDir.isDirectory) error("Not a directory: $root")
 
                         if (mode == "name") {
@@ -365,7 +385,7 @@ fun createFileTools(workspaceDir: String = "/storage/emulated/0/Download"): List
                             } else {
                                 Regex(Regex.escape(pattern), RegexOption.IGNORE_CASE)
                             }
-                            val fileFilter = if (fileGlob.isNotBlank()) fileGlob.toGlobRegexForFile() else null
+                            val fileFilter = if (fileGlob.isNotBlank()) fileGlob.toGlobRegex() else null
                             val results = mutableListOf<String>()
                             val sb = StringBuilder()
                             try {
@@ -415,16 +435,31 @@ private fun formatSize(bytes: Long): String = when {
     else -> "${bytes / (1024 * 1024)} MB"
 }
 
-private fun String.toGlobRegex(): Regex {
-    val pattern = Regex.escape(this)
-        .replace("\\*", ".*")
-        .replace("\\?", ".")
-    return Regex("^${pattern}$", RegexOption.IGNORE_CASE)
-}
-
-private fun String.toGlobRegexForFile(): Regex {
-    val pattern = Regex.escape(this)
-        .replace("\\*", ".*")
-        .replace("\\?", ".")
-    return Regex("^${pattern}$", RegexOption.IGNORE_CASE)
+/**
+ * 把 glob 通配符转成正则。
+ *
+ * ## 为什么不能写成 `Regex.escape(this).replace("\\*", ".*")`
+ *
+ * Kotlin 的 `Regex.escape("rikka*")` 返回 **`\Qrikka*\E`** —— 它把整个字符串
+ * 包进 `\Q...\E` 里，里面的字符全部按字面量处理。
+ * 此时字符串中只有一个 `*`，并没有「反斜杠 + 星号」这个两字符序列，
+ * 所以 `.replace("\\*", ".*")` **一次都匹配不到**，替换静默失效。
+ *
+ * 结果是正则变成 `^\Qrikka*\E$`，要求文件名里真的含有字面量 `rikka*`。
+ * 真机实测（2026-11-15）：`rikka*`、`*.txt`、`a?b`、`file[1].txt`
+ * **全部匹配失败**，`file` 工具的 name 搜索和 content 搜索的 file_pattern 双双失效。
+ *
+ * 正确做法是逐字符转换：只有 `*` 和 `?` 变通配，其余字符逐个转义。
+ */
+internal fun String.toGlobRegex(): Regex {
+    val sb = StringBuilder("^")
+    for (ch in this) {
+        when (ch) {
+            '*' -> sb.append(".*")
+            '?' -> sb.append(".")
+            else -> sb.append(Regex.escape(ch.toString()))
+        }
+    }
+    sb.append('$')
+    return Regex(sb.toString(), RegexOption.IGNORE_CASE)
 }

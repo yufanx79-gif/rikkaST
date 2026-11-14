@@ -29,6 +29,11 @@
   <string name="assistant_extensions_page_tab_quick_messages">Quick Messages</string>
   <string name="assistant_extensions_page_tab_skills">Skills</string>
   <string name="assistant_extensions_page_title">Extensions</string>
+  <string name="assistant_importer_single_success">Imported assistant: %s</string>
+  <string name="assistant_importer_progress">Importing… (%1$d/%2$d)</string>
+  <string name="assistant_importer_batch_success">Imported %d assistants</string>
+  <string name="assistant_importer_batch_partial">Imported %1$d assistants, %2$d file(s) failed</string>
+  <string name="assistant_importer_batch_all_failed">Import failed: %s</string>
   <string name="assistant_importer_import_failed">Import failed</string>
   <string name="assistant_importer_import_tavern_json">Import Tavern Character Card (JSON)</string>
   <string name="assistant_importer_import_tavern_png">Import Tavern Character Card (PNG)</string>
@@ -901,6 +906,8 @@
   <string name="setting_model_page_chat_model">Chat Model</string>
   <string name="setting_model_page_chat_model_desc">Global default chat model</string>
   <string name="setting_model_page_compress_model">Compress Model</string>
+    <string name="setting_model_page_memory_model">Memory model</string>
+  <string name="setting_model_page_memory_model_desc">Used to organize memory in the background. Must support tool calling; falls back to the fast model, then the chat model</string>
   <string name="setting_model_page_fast_model">Fast Model</string>
   <string name="setting_model_page_fast_model_desc">Model used for titles, chat suggestions, and other fast or background tasks</string>
   <string name="setting_model_page_compress_model_desc">Model for compressing conversation history</string>
@@ -1572,7 +1579,7 @@
   <string name="web_search_enabled">Web search enabled</string>
   <string name="setting_theme_page_delete_theme_title">Delete Theme</string>
   <string name="setting_theme_page_delete_theme_message">Are you sure you want to delete this theme?</string>
-<string name="assistant_importer_import_success">Character card imported successfully</string>
+  <string name="assistant_importer_import_success">Character card imported successfully</string>
   <string name="prompt_page_secondary_keys_label">Optional Filter</string>
   <string name="prompt_page_selective">Selective Mode</string>
   <string name="prompt_page_selective_desc">Use secondary keywords for advanced trigger logic</string>
@@ -1809,7 +1816,7 @@
   <string name="prompt_page_apply_to_group">Apply to %d entries</string>
   <string name="prompt_page_add_content">Tap to add injection content</string>
   <string name="impersonate">Reply as User</string>
-<string name="skills_page_import_from_file">Import from File</string>
+  <string name="skills_page_import_from_file">Import from File</string>
   <string name="skills_page_add_manually">Add manually</string>
   <string name="setting_model_page_tab_model">Model</string>
   <string name="setting_model_page_tab_prompt">Prompts</string>
@@ -1833,6 +1840,8 @@
   <string name="workspace_page_empty">No workspaces yet</string>
   <string name="workspace_page_empty_desc">Create one to use file tools and sandbox environments</string>
   <string name="workspace_page_name">Name</string>
+  <string name="workspace_remote_unsupported_title">Remote workspace not supported</string>
+  <string name="workspace_remote_unsupported_body">This workspace is a remote SSH workspace from a newer version of the app. The current version cannot open it, but your other data is unaffected.</string>
   <string name="workspace_detail_title">Workspace Details</string>
   <string name="workspace_detail_tab_basic">Basic</string>
   <string name="workspace_detail_tab_files">Files</string>
@@ -2377,9 +2386,9 @@
     <string name="chat_page_sort_by_update_time">By last updated</string>
     <string name="chat_page_sort_by_create_time">By date created</string>
     <string name="memory_dreaming">Dreaming…</string>
-    <string name="memory_dream_title">Dreaming</string>
+    <string name="memory_dream_title">Memory tidy-up</string>
     <string name="memory_dream_notification_text">Turning your chats into memories</string>
-    <string name="assistant_page_memory_dream_now">Dream now</string>
+    <string name="assistant_page_memory_dream_now">Tidy up now</string>
     <string name="assistant_page_memory_dream_retry">Retry</string>
     <string name="assistant_page_memory_dream_pending">New turns waiting: %d</string>
     <string name="assistant_page_memory_dream_hint">Turns your chats into memories once they pause</string>
@@ -2405,7 +2414,21 @@
     <string name="memory_file_page_path">Path</string>
     <string name="chat_message_tool_read_memory">Read memory</string>
     <string name="chat_message_tool_list_memory">Listed memories</string>
-    <string name="memory_file_page_title">Title</string>
+  <string name="assistant_page_memory_proactive">Proactive memory reminder</string>
+  <string name="assistant_page_memory_proactive_desc">Periodically reminds the model to check this turn for information worth keeping long term. Complements auto-organize: this is timely, auto-organize backfills and merges. 5-10 turns works well; shorter wastes tokens</string>
+  <string name="assistant_page_memory_proactive_interval">Reminder interval (turns)</string>
+  <string name="assistant_page_memory_proactive_interval_value">Every %d turns</string>
+  <string name="assistant_page_memory_proactive_interval_label">Turns</string>
+  <string name="assistant_page_memory_proactive_interval_hint">1-20 turns, default 5</string>
+  <string name="assistant_page_memory_proactive_prompt">Custom reminder prompt</string>
+    <string name="assistant_page_memory_proactive_prompt_fill_default">Insert built-in default</string>
+  <string name="assistant_page_memory_proactive_prompt_reset">Clear (use default)</string>
+  <string name="assistant_page_memory_proactive_prompt_help">Empty = use the built-in prompt. Tap "Insert built-in default" to load the text and edit it; tap "Clear" to go back to the default.</string>
+<string name="assistant_page_memory_proactive_prompt_desc">Leave empty to use the built-in prompt</string>
+  <string name="assistant_page_memory_merge_desc">Merge duplicate memory lines while organizing and keep the history of state changes</string>
+  <string name="assistant_page_memory_organize">Organize memory</string>
+  <string name="assistant_page_memory_organize_desc">Scan all new conversations and merge duplicate memories</string>
+  <string name="memory_file_page_title">Title</string>
     <string name="memory_file_page_edit_warning">Try not to edit memories by hand. Ask the AI in chat to remember or change things for you instead.</string>
     <string name="setting_provider_page_context_length">Context Length</string>
     <string name="setting_provider_page_context_length_custom">Custom</string>
@@ -2437,8 +2460,8 @@
     <string name="media_creation_page_saved_files_partial">Saved %1$d files, %2$d failed: %3$s</string>
     <string name="chat_input_edit_reasoning">Edit reasoning</string>
     <string name="chat_input_reasoning_placeholder">Reasoning content</string>
-    <string name="assistant_page_memory_auto_dream">Auto dream</string>
-    <string name="assistant_page_memory_auto_dream_desc">Turn chats into memories in the background once they pause. When off, this only happens when you tap Dream now</string>
+    <string name="assistant_page_memory_auto_dream">Auto tidy-up</string>
+    <string name="assistant_page_memory_auto_dream_desc">Once a chat pauses, fold the new turns into memory and merge duplicates. When off this only runs when you tap Tidy up now</string>
     <string name="chat_message_usage_title">Usage</string>
     <string name="chat_message_usage_steps">%1$d steps</string>
     <string name="chat_message_usage_context_short">%1$s ctx</string>

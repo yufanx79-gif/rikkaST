@@ -112,18 +112,18 @@ suspend fun List<UIMessage>.transforms(
     // 每个 transformer 单独计时后，下一次复现能直接指出是哪一个。
     return transformers.foldIndexed(this) { idx, acc, transformer ->
         val __name = transformer::class.simpleName ?: "?"
-        // 进入也记一条：若卡在某个 transformer 内部，日志会停在「enter」而没有「done」。
-        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
-            "info",
-            "[transformer] #$idx enter $__name msgs=${acc.size}",
-        )
         val __t0 = System.currentTimeMillis()
         val __out = transformer.transform(ctx, acc)
         val __elapsed = System.currentTimeMillis() - __t0
-        me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
-            "info",
-            "[transformer] #$idx done  $__name elapsedMs=$__elapsed out=${__out.size}",
-        )
+        // 不再为每个 transformer 进出写日志：visualTransforms 在每个流式 token 上都会跑一遍，
+        // 一个 token 就是 8 行，日志被彻底淹没（真机上一分钟几万行）。
+        // 只保留「慢 transformer」这一条，它才是真正需要定位卡顿时看的信息。
+        if (__elapsed >= 50L) {
+            me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+                "warn",
+                "[transformer] slow #$idx $__name ${__elapsed}ms msgs=${acc.size}",
+            )
+        }
         __out
     }
 }

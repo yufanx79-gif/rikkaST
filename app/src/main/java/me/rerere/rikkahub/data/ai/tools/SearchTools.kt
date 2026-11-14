@@ -63,6 +63,14 @@ fun createSearchTools(settings: Settings): Set<Tool> {
                     val options = settings.searchServices.getOrElse(
                         index = settings.searchServiceSelected,
                         defaultValue = { SearchServiceOptions.DEFAULT })
+                    // 未配置凭据时直接给出可操作的错误，不要带着空 Bearer 头发请求拿 401 ——
+                    // 那会让模型误判成「搜索服务坏了 / 网络故障」。
+                    if (!options.isConfigured) {
+                        error(
+                            "搜索服务「${options.displayName}」尚未配置 API key。" +
+                                "请到 设置 → 搜索 里填写，或改用不需要 key 的 Bing 本地搜索。"
+                        )
+                    }
                     val service = SearchService.getService(options)
                     val result = service.search(
                         params = it.jsonObject,
@@ -111,6 +119,12 @@ fun createSearchTools(settings: Settings): Set<Tool> {
                         val options = settings.searchServices.getOrElse(
                             index = settings.searchServiceSelected,
                             defaultValue = { SearchServiceOptions.DEFAULT })
+                        if (!options.isConfigured) {
+                            error(
+                                "抓取服务「${options.displayName}」尚未配置 API key。" +
+                                    "请到 设置 → 搜索 里填写，或改用 web_fetch 直接抓取网页。"
+                            )
+                        }
                         val service = SearchService.getService(options)
                         val result = service.scrape(
                             params = it.jsonObject,

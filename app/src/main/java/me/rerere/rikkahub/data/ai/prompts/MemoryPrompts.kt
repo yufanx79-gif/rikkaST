@@ -126,6 +126,17 @@ private val MEMORY_CONSOLIDATION_WORKFLOW = """
     4. For existing files: memory_read first, then memory_str_replace or memory_append. For new files: memory_write with if_version="new". The version attribute on profile and preferences can be passed as if_version directly.
     5. Only touch files you are adding new facts to. While you are in such a file you may also merge lines that say the same thing and correct lines the new turns made outdated. Leave every other file alone.
 
+    ## Merging duplicates
+
+    Before appending, check whether the file already says the same thing. If it does, do not add another line:
+    - New fact adds detail to an existing line: rewrite that line to include the detail.
+    - New fact contradicts an existing line: replace it, keeping the history in parentheses,
+      e.g. "- [stated] on the infra team (previously on search)".
+    - Two existing lines assert the same fact: merge them into one, keeping the more specific wording.
+
+    Only merge lines that assert the same fact. Lines that are merely related, or that describe
+    different aspects of the same topic, stay separate.
+
     ## Reading the conversations
 
     - A line like "[assistant updated memory: memory_str_replace /topics/food.md]" is a change the user explicitly asked for during the conversation. It is already done: do not undo it and do not record the same thing again.
@@ -149,6 +160,58 @@ private val MEMORY_FULL_REVIEW_PROMPT = """
 
     Rule 5 of the workflow does not apply to this part. Everything else does: do not drop a fact because it looks unimportant, do not rewrite wording that is already fine, and do not add anything that is not already in the store or in the new turns. Changing nothing is a valid outcome.
 """.trimIndent()
+
+/** 主动记忆提醒的默认文案：用户没自定义时用这段 */
+private val PROACTIVE_MEMORY_REMINDER = """
+    <proactive_memory_reminder>
+    你在和用户聊天。留意对方透露的、跨对话仍然成立的稳定信息：
+    称呼与语言偏好、长期习惯、重要关系、正在进行的项目与决定、明确表达的喜好与厌恶。
+
+    判断标准：如果换一个新对话、不知道这件事，你的回答会明显变差，就值得记。
+
+    现在检查本轮对话：
+    - 若有值得记的新信息，用记忆工具写入对应文件，一条信息一次写入；已经记过的不要再写一遍。
+    - 若没有，什么都不要做，也不要告诉用户你在检查记忆。
+    - 本次对话的临时上下文、你推断但用户没确认的结论、可以随时查到的公开信息，都不用记。
+    </proactive_memory_reminder>
+""".trimIndent()
+
+/** 内置默认提示词，设置页的"恢复默认"要把原文填回去，所以对外暴露 */
+internal val DEFAULT_PROACTIVE_MEMORY_REMINDER: String
+    get() = PROACTIVE_MEMORY_REMINDER
+
+/**
+ * 主动记忆提醒：满足"开了记忆 + 开了主动提醒 + 模型有工具 + 到达注入间隔"时，
+ * 作为**末尾追加**的一条消息注入，而不是塞进 system prompt。
+ *
+ * 放末尾是为了不破坏前缀缓存：不注入的轮次前缀完全不变，注入的轮次只在末尾多一段。
+ *
+ * @param customPrompt 助手自定义提示词，空则用内置默认
+ */
+internal fun buildProactiveMemoryReminder(customPrompt: String): String =
+    customPrompt.trim().ifEmpty { PROACTIVE_MEMORY_REMINDER }
+
+/**
+ * 这一轮要不要注入主动记忆提醒。
+ *
+ * 纯函数，便于单测覆盖"隔 N 轮"的边界；间隔由代码控制而不是写进提示词，
+ * 模型数不准轮次，写在提示词里反而会变成"每轮都觉得该写"。
+ *
+ * @param userTurnCount 当前对话里用户消息的条数（含本轮刚发出的这条）
+ * @param interval 每 N 轮提醒一次，越界时收敛到 1..20
+ */
+internal fun shouldInjectProactiveMemory(
+    enableMemory: Boolean,
+    enableProactiveMemory: Boolean,
+    hasTools: Boolean,
+    userTurnCount: Int,
+    interval: Int,
+): Boolean {
+    if (!enableMemory || !enableProactiveMemory || !hasTools) return false
+    if (userTurnCount <= 0) return false
+    val safeInterval = interval.coerceIn(1, 20)
+    return userTurnCount % safeInterval == 0
+}
 
 /** 后台记忆整理的 system prompt；[fullReview] 时除了提取新对话，还把整个记忆库清理一遍 */
 internal fun buildMemoryConsolidationPrompt(fullReview: Boolean): String = buildString {
@@ -210,19 +273,65 @@ internal fun buildMemoryConsolidationInput(
     }
 }.trimEnd()
 
+/**
+ * 短记忆文件正文直接注入的上限（字符数）。
+ *
+ * ## 为什么需要正文注入
+ *
+ * 旧实现只注入 `<memory_listing>`（路径 + 一句话描述 + 别名），正文要模型自己调
+ * `memory_read` 才拿得到。真机验证（2026-11-14 测试 B）暴露了两个问题：
+ *   1. 新对话里模型**答不出**「用户的宠物叫什么」——它只看得到「有个宠物话题文件」，
+ *      看不到里面写了「豆豆」；
+ *   2. 描述与实际内容可能不一致时，模型会按描述猜，猜错。
+ *
+ * 记忆本来就是给模型当背景知识用的，让模型每次先读一遍既慢又费 token。
+ * 但全量注入会撑爆上下文（用户可能有几十个长文件），所以按体量分档：
+ *   · 总正文 ≤ [INLINE_BODY_BUDGET_CHARS] 的文件：注入完整正文，模型开箱即知；
+ *   · 超出预算的文件：仍只进清单，需要时用 `memory_read` 取。
+ * 预算按「整份文件」粒度累加，不做截断 —— 半截正文比没有更危险（模型会当全文用）。
+ */
+private const val INLINE_BODY_BUDGET_CHARS = 12_000
+
 private fun StringBuilder.appendMemoryState(files: List<MemoryFile>) {
     appendPinnedFile("profile", files.find { it.path == MemoryFile.PROFILE_PATH })
     appendLine()
     appendPinnedFile("preferences", files.find { it.path == MemoryFile.PREFERENCES_PATH })
     appendLine()
-    appendLine("<memory_listing>")
     val listed = files.filter { it.path != MemoryFile.PROFILE_PATH && it.path != MemoryFile.PREFERENCES_PATH }
+    // 按 updatedAt 倒序优先注入最近更新的文件，让预算花在最新信息上
+    val inlineCandidates = listed.sortedByDescending { it.updatedAt }
+    val inlined = LinkedHashMap<String, MemoryFile>()
+    var used = 0
+    for (file in inlineCandidates) {
+        val body = file.body.trim()
+        if (body.isEmpty()) continue
+        if (used + body.length > INLINE_BODY_BUDGET_CHARS) continue
+        inlined[file.path] = file
+        used += body.length
+    }
+    appendLine("<memory_listing>")
     if (listed.isEmpty()) {
         appendLine("(no files yet)")
     } else {
         listed.forEach { appendLine(it.toListingLine()) }
     }
     appendLine("</memory_listing>")
+    if (inlined.isNotEmpty()) {
+        appendLine()
+        appendLine("<memory_files>")
+        // 保持与清单一致的顺序，便于模型把清单项和正文对上
+        listed.filter { it.path in inlined }.forEach { file ->
+            appendLine("<file path=\"" + file.path + "\" version=\"" + file.version + "\">")
+            appendLine(file.body.trim())
+            appendLine("</file>")
+        }
+        appendLine("</memory_files>")
+        val remaining = listed.size - inlined.size
+        if (remaining > 0) {
+            appendLine()
+            appendLine("($remaining file(s) omitted for length; call memory_read to load them)")
+        }
+    }
 }
 
 private fun StringBuilder.appendPinnedFile(tag: String, file: MemoryFile?) {

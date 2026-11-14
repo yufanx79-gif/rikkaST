@@ -216,13 +216,16 @@ class OreNoKanojoFirstMesRegressionTest {
             name = "早川",
             tavernData = TavernCharacterData(
                 name = "早川",
-                description = "回复模板：
-〔
-</base>...
-〕
-或
-〖</txt>...
-</txt>〗",
+                description = """
+                    回复模板：
+                    〔
+                    </base>...
+                    〕
+                    或
+                    〖
+                    </txt>...
+                    </txt>〗
+                """.trimIndent(),
             ),
         )
         val rawReply = """

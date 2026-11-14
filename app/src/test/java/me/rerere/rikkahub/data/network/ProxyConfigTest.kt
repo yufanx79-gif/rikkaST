@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.data.network
 
+import me.rerere.rikkahub.data.remote.toProxyOrNull
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test

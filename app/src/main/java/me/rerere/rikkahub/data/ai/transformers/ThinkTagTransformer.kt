@@ -18,8 +18,15 @@ internal val THINKING_TAG_REGEX = Regex(
     RegexOption.IGNORE_CASE,
 )
 
+/**
+ * 正文中间出现的思维链块：**必须**有闭合标签才算。
+ *
+ * 早先这里允许"没有闭合标签就吃到文末"，结果正文里任何一句提到 `<think>` 的话
+ * （例如 "The literal `<think>` tag should stay visible."）都会被整段吞成 Reasoning，
+ * 用户的正文凭空消失。只有 [THINKING_TAG_REGEX]（要求位于开头、允许流式未闭合）才配这种兜底。
+ */
 internal val ANYWHERE_THINKING_BLOCK_REGEX = Regex(
-    "<(think|thinking|thought)\\b[^>]*>([\\s\\S]*?)(?:</\\1>|\\z)",
+    "<(think|thinking|thought)\\b[^>]*>([\\s\\S]*?)</\\1>",
     RegexOption.IGNORE_CASE,
 )
 
@@ -71,7 +78,14 @@ internal fun List<UIMessage>.transformThinkTags(
                 if (part.text.isNotBlank() &&
                     (part.text.contains("<think", ignoreCase = true) || part.text.contains("<thought", ignoreCase = true))
                 ) {
-                    val match = THINKING_TAG_REGEX.find(part.text) ?: ANYWHERE_THINKING_BLOCK_REGEX.find(part.text)
+                    // THINKING_TAG_REGEX 带 \A 锚点，但它是**逐 part** 跑的；
+                    // 只有消息的第一段正文才该被当成"开头思维链"，后面段落里出现的
+                    // <think> 是用户正文的一部分（比如在讨论这个标签本身），不能吞成 Reasoning。
+                    val isFirstTextPart = message.parts
+                        .takeWhile { it !== part }
+                        .none { it is UIMessagePart.Text && it.text.isNotBlank() }
+                    val match = (if (isFirstTextPart) THINKING_TAG_REGEX.find(part.text) else null)
+                        ?: ANYWHERE_THINKING_BLOCK_REGEX.find(part.text)
                     if (match != null) {
                         val openTag = match.groupValues[1].lowercase()
                         val fullMatch = match.value

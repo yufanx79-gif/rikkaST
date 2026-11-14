@@ -651,4 +651,100 @@ class TavernScriptsTest {
         assertTrue(res2!!.aborted)
         assertEquals(1, res2.messages.size)
     }
+
+    /**
+     * 回归：生成钩子回传的是只有 {role, content, name} 的纯文本视图。
+     * 若直接整体替换内部消息，会抹掉 assistant 的 reasoning 与 tool_calls：
+     *  - DeepSeek thinking 模式续轮缺 reasoning_content → 400
+     *  - tool_calls 与 tool 结果失去配对 → 工具链断裂
+     * 传入 base 后必须只替换文本、保留非文本部件。
+     */
+    @Test
+    fun parseStGenerationHookResultPreservesReasoningAndToolsWhenBaseProvided() {
+        val base = listOf(
+            me.rerere.ai.ui.UIMessage(
+                role = MessageRole.ASSISTANT,
+                parts = listOf(
+                    me.rerere.ai.ui.UIMessagePart.Reasoning(reasoning = "我先算一下 1+1"),
+                    me.rerere.ai.ui.UIMessagePart.Text("我来计算。"),
+                    me.rerere.ai.ui.UIMessagePart.Tool(
+                        toolCallId = "call_1",
+                        toolName = "calculator",
+                        input = """{"expression":"1+1"}""",
+                        output = listOf(me.rerere.ai.ui.UIMessagePart.Text("2")),
+                    ),
+                ),
+            ),
+            me.rerere.ai.ui.UIMessage(
+                role = MessageRole.USER,
+                parts = listOf(me.rerere.ai.ui.UIMessagePart.Text("继续")),
+            ),
+        )
+
+        // 扩展只改了 assistant 的正文，消息条数与角色序列不变
+        val rewritten = """[
+            {"role":"assistant","content":"我来计算（已改写）。"},
+            {"role":"user","content":"继续"}
+        ]"""
+
+        val res = parseStGenerationHookResult(rewritten, base)
+        assertNotNull(res)
+        val msgs = res!!.messages
+        assertEquals(2, msgs.size)
+
+        val assistant = msgs[0]
+        // 文本被替换（toText() 会把非文本部件也算作空行，这里只取 Text 部件断言）
+        val assistantText = assistant.parts
+            .filterIsInstance<me.rerere.ai.ui.UIMessagePart.Text>()
+            .joinToString("") { it.text }
+        assertEquals("我来计算（已改写）。", assistantText)
+        // reasoning 必须还在（否则 DeepSeek thinking 模式续轮 400）
+        val reasoning = assistant.parts.filterIsInstance<me.rerere.ai.ui.UIMessagePart.Reasoning>()
+        assertEquals(1, reasoning.size)
+        assertEquals("我先算一下 1+1", reasoning[0].reasoning)
+        // tool_calls 必须还在（否则工具链断裂）
+        val tools = assistant.parts.filterIsInstance<me.rerere.ai.ui.UIMessagePart.Tool>()
+        assertEquals(1, tools.size)
+        assertEquals("calculator", tools[0].toolName)
+        assertEquals("call_1", tools[0].toolCallId)
+        assertTrue("工具结果不能丢", tools[0].isExecuted)
+        assertEquals("2", (tools[0].output.first() as me.rerere.ai.ui.UIMessagePart.Text).text)
+
+        // 未改动的消息原样保留
+        assertEquals("继续", msgs[1].toText())
+    }
+
+    /** 扩展增删消息（长度对不上）时退回纯文本语义，不能因为合并不上而丢消息。 */
+    @Test
+    fun parseStGenerationHookResultFallsBackToPlainTextWhenLengthDiffers() {
+        val base = listOf(
+            me.rerere.ai.ui.UIMessage(
+                role = MessageRole.ASSISTANT,
+                parts = listOf(
+                    me.rerere.ai.ui.UIMessagePart.Reasoning(reasoning = "思考"),
+                    me.rerere.ai.ui.UIMessagePart.Text("原文"),
+                ),
+            ),
+        )
+        val rewritten = """[
+            {"role":"system","content":"注入的表格"},
+            {"role":"assistant","content":"原文"}
+        ]"""
+        val res = parseStGenerationHookResult(rewritten, base)
+        assertNotNull(res)
+        assertEquals(2, res!!.messages.size)
+        assertEquals(MessageRole.SYSTEM, res.messages[0].role)
+        assertEquals("注入的表格", res.messages[0].toText())
+    }
+
+    /** base 为空时行为保持不变（兼容既有调用与测试）。 */
+    @Test
+    fun parseStGenerationHookResultWithoutBaseKeepsOldBehavior() {
+        val rewritten = """[{"role":"assistant","content":"纯文本"}]"""
+        val res = parseStGenerationHookResult(rewritten)
+        assertNotNull(res)
+        assertEquals(1, res!!.messages.size)
+        assertEquals("纯文本", res.messages[0].toText())
+        assertTrue(res.messages[0].parts.all { it is me.rerere.ai.ui.UIMessagePart.Text })
+    }
 }

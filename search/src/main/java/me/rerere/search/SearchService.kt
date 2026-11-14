@@ -147,6 +147,20 @@ sealed class SearchServiceOptions {
     open val displayName: String
         get() = TYPES[this::class] ?: "Unknown"
 
+    /**
+     * 是否已配置可用的凭据。
+     *
+     * 需要 API key 的 provider 在 `apiKey` 为空时必须报「未配置」，而不是带着
+     * `Authorization: Bearer ` 空头发请求 —— 那会拿到 401 并让模型把原因归咎于网络/服务故障。
+     * 真机现象（2026-11-14）：`search_web` / `scrape_web` 都返回
+     * `#401 Authentication Fails (auth header format should be Bearer sk-...)`，
+     * 模型据此误报「搜索服务配置坏了」，而真实原因只是没填 key。
+     *
+     * 不需要 key 的 provider（Bing 本地、SearXNG 自建、Ollama、自定义 JS 等）返回 true。
+     */
+    open val isConfigured: Boolean
+        get() = true
+
     companion object {
         val DEFAULT = BingLocalOptions()
 
@@ -185,7 +199,10 @@ sealed class SearchServiceOptions {
     data class ZhipuOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("doubao")
@@ -193,7 +210,10 @@ sealed class SearchServiceOptions {
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
         val mode: DoubaoSearchMode = DoubaoSearchMode.CUSTOM,
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("tavily")
@@ -201,14 +221,20 @@ sealed class SearchServiceOptions {
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
         val depth: String = "advanced",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("exa")
     data class ExaOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("searxng")
@@ -227,28 +253,40 @@ sealed class SearchServiceOptions {
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
         val depth: String = "standard",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("brave")
     data class BraveOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("metaso")
     data class MetasoOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("ollama")
     data class OllamaOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("perplexity")
@@ -257,14 +295,20 @@ sealed class SearchServiceOptions {
         val apiKey: String = "",
         val maxTokens: Int? = null,
         val maxTokensPerPage: Int? = null,
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("firecrawl")
     data class FirecrawlOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("jina")
@@ -273,7 +317,10 @@ sealed class SearchServiceOptions {
         val apiKey: String = "",
         val searchUrl: String = "https://s.jina.ai/",
         val scrapeUrl: String = "https://r.jina.ai/",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("bocha")
@@ -281,7 +328,10 @@ sealed class SearchServiceOptions {
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
         val summary: Boolean = true,
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("rikkahub")
@@ -289,7 +339,10 @@ sealed class SearchServiceOptions {
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
         val depth: String = "standard",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("grok")
@@ -299,28 +352,40 @@ sealed class SearchServiceOptions {
         val model: String = "grok-4-1-fast-non-reasoning",
         val customUrl: String = "https://api.x.ai/v1/responses",
         val systemPrompt: String = "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("tinyfish")
     data class TinyfishOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("serper")
     data class SerperOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("deepseek")
     data class DeepSeekOptions(
         override val id: Uuid = Uuid.random(),
         val apiKey: String = "",
-    ) : SearchServiceOptions()
+    ) : SearchServiceOptions() {
+        override val isConfigured: Boolean
+            get() = apiKey.isNotBlank()
+    }
 
     @Serializable
     @SerialName("custom_js")

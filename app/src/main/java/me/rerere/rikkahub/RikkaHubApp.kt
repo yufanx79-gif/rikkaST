@@ -115,6 +115,10 @@ class RikkaHubApp : Application() {
         // sync upload files to DB
         syncManagedFiles()
 
+        // 修复「指向别的包名」的绝对路径（旧版本恢复官方备份后头像/背景/附件会全部空白）。
+        // 幂等：路径已是本机包名、或目标文件不存在时都不动。
+        healBackupPaths()
+
         // Extract builtin skills from assets after install/update
         extractBuiltinSkills()
 
@@ -239,6 +243,35 @@ class RikkaHubApp : Application() {
                 get<FilesManager>().syncFolder()
             }.onFailure {
                 Log.e(TAG, "syncManagedFiles failed", it)
+            }
+        }
+    }
+
+    /**
+     * 修复旧版本从官方 RikkaHub 备份恢复后留下的错误路径。
+     *
+     * 备份里的文件引用是绝对路径，含**导出时那个安装的包名**；
+     * 本应用是独立包名（me.rerere.rikkahub.st），目录不同，
+     * 不改写的话头像、聊天背景、消息附件都加载不出来。
+     *
+     * 2.5.15 起恢复时会直接改写，这里兜底处理「已经用旧版本恢复过」的用户，
+     * 让他们升级后无需重新恢复即可自愈。
+     */
+    private fun healBackupPaths() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                val settingsStore = get<me.rerere.rikkahub.data.datastore.SettingsStore>()
+                settingsStore.awaitLoaded()
+                val settingsFixed = me.rerere.rikkahub.data.sync.BackupPathHealer
+                    .healSettings(applicationContext, settingsStore)
+                val databaseFile = getDatabasePath(me.rerere.rikkahub.data.db.SQLiteConfiguration.DATABASE_NAME)
+                val rowsFixed = me.rerere.rikkahub.data.sync.BackupPathHealer
+                    .healDatabase(applicationContext, databaseFile)
+                if (settingsFixed > 0 || rowsFixed > 0) {
+                    Log.i(TAG, "healBackupPaths: fixed settings=$settingsFixed rows=$rowsFixed")
+                }
+            }.onFailure {
+                Log.e(TAG, "healBackupPaths failed", it)
             }
         }
     }

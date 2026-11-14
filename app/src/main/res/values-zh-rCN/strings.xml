@@ -69,4 +69,6 @@
   <string name="error_send_prerequest_timeout">请求在发出前就卡住了：已在本机等待 %2$d 秒，仍停在「%1$s」，没有向服务商发出任何请求，已自动停止。这是本地问题，与网络和服务商无关；请重试，若反复出现请把 tavern-runtime.log 提供给开发者。</string>
   <string name="error_send_watchdog_unknown_stage">准备请求</string>
   <string name="chat_generation_waiting_first_token">已发出请求，等待模型开始回复…</string>
+<string name="workspace_remote_unsupported_title">当前版本不支持远程工作区</string>
+<string name="workspace_remote_unsupported_body">这个工作区来自更新版本的应用（远程 SSH 工作区）。当前版本无法打开它，你的其他数据不受影响。</string>
 </resources>

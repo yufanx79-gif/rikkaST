@@ -101,6 +101,7 @@ val appModule = module {
             skillManager = get(),
             knowledgeBaseTransformer = get(),
             folderRepository = get(),
+            memoryConsolidationScheduler = get(),
         )
     }
     single {

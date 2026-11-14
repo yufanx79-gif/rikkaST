@@ -41,6 +41,7 @@ import me.rerere.rikkahub.data.db.entity.KnowledgeSourceEntity
 import me.rerere.rikkahub.data.knowledge.KnowledgeBaseService
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.ToolPolicy
+import me.rerere.rikkahub.data.model.effectiveMaxToolSteps
 import me.rerere.rikkahub.data.model.effectiveToolPolicy
 import me.rerere.rikkahub.ui.components.ai.ModelSelector
 import me.rerere.rikkahub.ui.components.nav.BackButton
@@ -205,23 +206,9 @@ private fun AssistantLocalToolContent(
                                 )
                             }
                         }
-                        Text("已配置 ${assistant.localTools.size} 个本地工具；当前策略为「${if (assistant.effectiveToolPolicy() == ToolPolicy.NONE) "关闭" else "启用"}」，酒馆角色卡默认关闭且单轮最多 2 次工具轮次。")
+                        Text("已配置 ${assistant.localTools.size} 个本地工具；当前策略为「${if (assistant.effectiveToolPolicy() == ToolPolicy.NONE) "关闭" else "启用"}」。酒馆角色卡默认关闭工具，开启后单轮最多 ${assistant.effectiveMaxToolSteps()} 步。")
                     }
                 },
-            )
-            item(
-                headlineContent = {
-                    Text("并行执行工具")
-                },
-                supportingContent = {
-                    Text("同时执行多个工具调用，加速搜索、文件操作等")
-                },
-                trailingContent = {
-                    Switch(
-                        checked = assistant.enableParallelToolExecution,
-                        onCheckedChange = { onUpdate(assistant.copy(enableParallelToolExecution = it)) }
-                    )
-                }
             )
             item(
                 headlineContent = { Text("工具重复调用上限") },

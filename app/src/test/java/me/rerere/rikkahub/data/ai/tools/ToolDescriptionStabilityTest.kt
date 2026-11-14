@@ -1,46 +1,60 @@
 package me.rerere.rikkahub.data.ai.tools
 
-import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.data.datastore.Settings
-import me.rerere.rikkahub.data.model.AssistantMemory
-import org.junit.Assert.assertFalse
+import me.rerere.rikkahub.data.repository.FakeMemoryDAO
+import me.rerere.rikkahub.data.repository.MemoryRepository
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * DeepSeek 缓存优化：工具描述稳定性测试
+ * DeepSeek 前缀缓存：发给模型的工具定义必须跨请求字节稳定。
  *
- * 校验点：
- * 1. stableDate=true 时 memory_tool 描述不含动态日期（跨请求字节稳定，不破坏前缀缓存）
- * 2. 默认（stableDate=false）保持旧行为（含 "Today is ..." 日期）
- * 3. Settings.deepseekCacheOptimization 默认开启
+ * 历史：记忆工具描述里曾经拼 `Today is <日期>`，日期一变 system 前缀就变，整段 prompt 缓存全失效。
+ * 记忆工具重写后（`buildMemoryTools(repository, assistantId)`）动态日期被整体移除，
+ * `json` / `stableDate` / `onCreation` 这些参数也一并消失。
+ *
+ * 这个测试守住回归：工具描述只由常量构成，同一份输入连调两次必须逐字节相同。
  */
 class ToolDescriptionStabilityTest {
 
-    private fun memoryToolDescription(stableDate: Boolean): String =
-        buildMemoryTools(
-            json = Json,
-            onCreation = { content -> AssistantMemory(id = 1, content = content) },
-            onUpdate = { id, content -> AssistantMemory(id = id, content = content) },
-            onDelete = {},
-            stableDate = stableDate,
-        ).first().description
+    private val tools = buildMemoryTools(
+        repository = MemoryRepository(FakeMemoryDAO()),
+        assistantId = "assistant",
+    )
 
     @Test
-    fun stableDateStripsDynamicDateFromMemoryToolDescription() {
-        val desc = memoryToolDescription(stableDate = true)
-        assertTrue("应指向末尾的上下文提醒", desc.contains("context reminder"))
-        assertFalse("不应包含动态日期文本", desc.contains("Today is "))
+    fun `memory tool descriptions are byte-stable across builds`() {
+        // 隔一小段时间再建一次，模拟"跨请求"：任何随当前时间变化的内容都会暴露
+        val first = tools.map { it.name to it.description }
+        Thread.sleep(5)
+        val second = buildMemoryTools(
+            repository = MemoryRepository(FakeMemoryDAO()),
+            assistantId = "assistant",
+        ).map { it.name to it.description }
+
+        assertEquals("工具描述必须跨请求逐字节稳定", first, second)
     }
 
     @Test
-    fun defaultKeepsLegacyDynamicDate() {
-        val desc = memoryToolDescription(stableDate = false)
-        assertTrue("默认保留旧行为（含日期）", desc.contains("Today is "))
+    fun `memory tool descriptions contain no dynamic date`() {
+        val dateText = java.time.LocalDate.now().toString() // yyyy-MM-dd
+        tools.forEach { tool ->
+            assertTrue(
+                "${tool.name} 的描述不应含动态日期：${tool.description.take(80)}",
+                !tool.description.contains("Today is ") && !tool.description.contains(dateText),
+            )
+        }
     }
 
     @Test
-    fun settingsDefaultEnablesDeepseekCacheOptimization() {
+    fun `all memory tools are described`() {
+        assertEquals(MemoryToolNames.ALL, tools.map { it.name }.toSet())
+        tools.forEach { assertTrue("${it.name} 缺少描述", it.description.isNotBlank()) }
+    }
+
+    @Test
+    fun `settingsDefaultEnablesDeepseekCacheOptimization`() {
         assertTrue(Settings().deepseekCacheOptimization)
     }
 }

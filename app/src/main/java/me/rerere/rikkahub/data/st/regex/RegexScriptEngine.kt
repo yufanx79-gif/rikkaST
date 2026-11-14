@@ -58,7 +58,20 @@ object RegexScriptEngine {
     /** [v214] 不定长 lookbehind 降级成功诊断钩子（tavern-runtime.log 可见降级后 pattern）。 */
     @Volatile var onCompileDegraded: ((String) -> Unit)? = null
 
-    internal const val MIN_CATASTROPHIC_INPUT_LENGTH = 16
+    /**
+     * 静态「疑似灾难性正则」预检的最小输入长度。
+     *
+     * 曾经是 16 —— 结果是正常长度的聊天消息（几乎每条都 >16 字符）只要卡片里的正则
+     * 看起来"像"危险模式，就整条跳过不执行，用户看到的是「脚本明明开了却完全没有效果」，
+     * 日志里刷满 `[regex] skipped potentially catastrophic regex on input (18 chars)`。
+     *
+     * 真正的兜底是下面 [BoundedRegexCharSequence]：它在 Matcher 每次 `charAt` 时计步 + 计时，
+     * 超预算就抛 [RegexExecutionBudgetExceededException] 中止回溯 —— 行为上已经安全。
+     * 所以静态预检退化成"超大输入才拒绝"，只为避免把一个几十 KB 的文本喂给可疑正则。
+     *
+     * 保留字面量检测不变：真正病态的模式在任何长度下都不该跑。
+     */
+    internal const val MIN_CATASTROPHIC_INPUT_LENGTH = 4096
     internal const val MAX_CATASTROPHIC_INPUT_LENGTH = 4096
     internal const val MAX_REGEX_CHAR_ACCESS_STEPS = 250_000
     internal const val MAX_REGEX_EXECUTION_NANOS = 50_000_000L // 50ms per script invocation

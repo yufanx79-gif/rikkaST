@@ -29,8 +29,24 @@ if not hasattr(_random, '_traced_calls'):
 import sys
 import json
 import os
+import ast
+import threading
 from io import StringIO
 import traceback
+
+# ── 跨调用持久的执行命名空间 ───────────────────────────────────────────
+# 旧实现把 exec() 放在 execute() 函数体里, 赋值的变量落在函数局部作用域,
+# 函数返回后即销毁。于是「先 import, 下一次调用再使用」必然 NameError。
+# 这里放到模块级字典, 让变量在同一次应用进程内跨调用保留。
+_NAMESPACE = {
+    "__name__": "__main__",
+    "__builtins__": __builtins__,
+}
+
+# executor 会改写全局 sys.stdout / sys.stderr 并 chdir, 这两者都是进程级状态。
+# 即使上层已改为串行执行工具, 这里仍加锁, 防止将来任何并发调用互相污染
+# （实测: 两个并发调用时, 后者的输出会丢到真实 stdout, 前者拿到 TextIOWrapper 后崩溃）。
+_EXEC_LOCK = threading.RLock()
 
 # Bridge to Android services - set from Kotlin via execute() parameter
 _bridge = None
@@ -151,6 +167,12 @@ def update_setting(key, value):
 
 def execute(code: str, workdir: str, bridge=None) -> str:
     """Execute Python code, return JSON with results."""
+    with _EXEC_LOCK:
+        return _execute_locked(code, workdir, bridge)
+
+
+def _execute_locked(code: str, workdir: str, bridge=None) -> str:
+    """[execute] 的实际实现; 调用方必须已持有 _EXEC_LOCK。"""
     global _bridge
     _bridge = bridge
     old_stdout = sys.stdout
@@ -186,11 +208,25 @@ def execute(code: str, workdir: str, bridge=None) -> str:
         pass
 
     try:
-        try:
-            result = eval(code)
-        except SyntaxError:
-            exec(code)
-            result = None
+        # ── 用 AST 分段执行 ────────────────────────────────────────────
+        # 旧实现是「先 eval(整段), 失败再 exec(整段)」。这有两个硬伤:
+        #   1) eval 只接受单个表达式, 一旦是语句就抛 SyntaxError;
+        #   2) exec 不返回任何值, 所以最后一条表达式的值永远丢失
+        #      （`mu = 5` 换行 `mu * 2` 期望 10, 实际返回 None）。
+        # 改为: 除最后一条语句外全部 exec; 最后一条若是表达式, 用 eval 取值。
+        tree = ast.parse(code, filename="<execute_python>", mode="exec")
+        body = tree.body
+        if body:
+            for node in body[:-1]:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "<execute_python>", "exec"), _NAMESPACE)
+            last = body[-1]
+            if isinstance(last, ast.Expr):
+                expr = ast.Expression(body=last.value)
+                ast.fix_missing_locations(expr)
+                result = eval(compile(expr, "<execute_python>", "eval"), _NAMESPACE)
+            else:
+                exec(compile(ast.Module(body=[last], type_ignores=[]), "<execute_python>", "exec"), _NAMESPACE)
+                result = None
 
         # Auto-save matplotlib figures
         try:

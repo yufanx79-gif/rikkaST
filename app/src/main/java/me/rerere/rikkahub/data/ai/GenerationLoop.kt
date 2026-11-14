@@ -5,8 +5,6 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -46,10 +44,13 @@ import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
 import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
+import me.rerere.rikkahub.data.ai.tools.duplicateToolNames
+import me.rerere.rikkahub.data.ai.tools.mergeToolsWithMemory
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
+import me.rerere.rikkahub.data.model.MemoryFile
 import me.rerere.rikkahub.data.model.assembleContext
 import me.rerere.rikkahub.data.model.assembleCharacterCardMessages
 import me.rerere.rikkahub.data.model.assembleMainPrompt
@@ -75,6 +76,15 @@ import kotlin.uuid.Uuid
 private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+// 输出为空的工具会被当成没执行过（UIMessagePart.Tool.isExecuted == output.isNotEmpty()），
+// 之后每一步都会再执行一次。上游 AgentLoop 用同一句占位文本兜住这种情况。
+private const val EMPTY_TOOL_OUTPUT = "(no output)"
+// 连续这么多步模型只调工具、一个字正文都没写，就解除 REQUIRED 并提示它收口出正文。
+private const val MAX_CONSECUTIVE_TOOL_ONLY_STEPS = 3
+// 连续这么多步工具「没有任何新产出」（输出与上一步实质相同），直接熔断跳出，
+// 交给收尾请求出正文。这是 256 步死循环的真正刹车 —— 光靠步数上限不够，
+// 模型换着参数反复 ls 时签名去重也救不了。
+private const val MAX_NO_PROGRESS_STEPS = 6
 private const val MAX_PROVIDER_NETWORK_RETRIES = 3
 private const val INITIAL_PROVIDER_RETRY_DELAY_MS = 1_000L
 
@@ -127,6 +137,10 @@ class GenerationLoop(
         context: android.content.Context,
         conversationRepo: me.rerere.rikkahub.data.repository.ConversationRepository,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
+        /** 用户上下文（记忆摘要 + 当前日期）。并进 system 正文，绝不伪造 user 消息。 */
+        userContext: String? = null,
+        /** memory_file 表里的记忆文件；非空时注入完整记忆提示词。 */
+        memoryFiles: List<MemoryFile> = emptyList(),
     ): List<UIMessage> {
         val activePersona = settings.personas
             .find { it.id == settings.activePersonaId }
@@ -195,16 +209,22 @@ class GenerationLoop(
         } else {
             val assemblerContext = me.rerere.rikkahub.data.ai.prompts.PromptContext(
                 identitySection = mainIdentity,
+                // [P0 修复] 这里曾经手写死 11 个工具名，其中 5 个根本不存在
+                // （workspace_read / workspace_write / workspace_edit / web_search / memory_tool）。
+                // 模型照着提示词去找，全都找不到，只能退而求其次乱试——
+                // 这正是「明明装了 31 个工具，却只用 shell」的直接原因。
+                // 改成按真实 tools 列表生成：以后加/改工具，提示词自动跟着变，不可能再写错。
                 leadInInstructions = if (tools.isEmpty()) "" else buildString {
                     appendLine("<tool_selection>")
-                    appendLine("Workspace files → workspace_read/write/edit (/workspace/...)")
-                    appendLine("Workspace shell → workspace_shell (git, builds, Unix tools in sandbox)")
-                    appendLine("Device files → file action=\"read/write/patch/list/search/copy/move/delete\" (Download/skills dirs)")
-                    appendLine("Device shell → execute_command (logcat, device info only)")
-                    appendLine("Python → execute_python (data processing, API)")
-                    appendLine("Math → calculator (NOT execute_python)")
-                    appendLine("Web → web_search / web_fetch")
-                    appendLine("Memory → memory_tool")
+                    tools.forEach { tool ->
+                        // 描述只取第一行，避免把整段多行描述塞进提示词
+                        val oneLine = tool.description.lineSequence()
+                            .firstOrNull { it.isNotBlank() }
+                            .orEmpty()
+                            .trim()
+                            .take(160)
+                        appendLine(if (oneLine.isEmpty()) "- ${tool.name}" else "- ${tool.name} → $oneLine")
+                    }
                     appendLine("</tool_selection>")
                     appendLine()
                     appendLine("<work_ethic>")
@@ -212,7 +232,18 @@ class GenerationLoop(
                     appendLine("❌ Do NOT stop after writing a stub — complete then report")
                     appendLine("❌ Do NOT fabricate results — if a tool fails, say so")
                     appendLine("❌ Do NOT use shell when a dedicated tool exists")
-                    appendLine("❌ Do NOT use execute_python for math (use calculator)")
+                    // 按实际可用工具动态生成，避免指向不存在的工具（这里曾经硬编码过
+                    // execute_python，一旦该工具被移除就变成误导）。
+                    val hasPython = tools.any { it.name == "execute_python" }
+                    val hasCalculator = tools.any { it.name == "calculator" }
+                    if (hasCalculator) {
+                        appendLine("❌ Do NOT use execute_python for simple math (use calculator)")
+                    }
+                    if (hasPython) {
+                        // 关键：模型常在 workspace_shell 里敲 python3 然后失败，
+                        // 误以为整个应用没有 Python。必须明确区分两个环境。
+                        appendLine("✅ A Python 3.12 interpreter IS built in — use `execute_python`, never `python3` inside workspace_shell")
+                    }
                     appendLine("✅ If you need user input, use ask_user directly")
                     appendLine("</work_ethic>")
                     appendLine()
@@ -235,9 +266,26 @@ class GenerationLoop(
                 }
             }
         }
+        // 把 userContext 并进 system 正文（追加在末尾，不新建 user 消息）
+        // buildUserContext 自带 <system-reminder> 包裹，这里直接拼，不要再套一层
+        val mainTextWithContext = if (userContext.isNullOrBlank()) {
+            mainText
+        } else {
+            mainText + "\n\n" + userContext
+        }
+        // [P0 修复 记忆全空] 注入 memory_file 里的真实记忆。
+        // 上游 `buildMemoryPrompt(files)` 会全文注入 profile/preferences，其余文件给清单；
+        // 过去这个函数只在死代码 ChatRequestFactory 里被调用过，主链路 GenerationLoop 完全没接，
+        // 于是模型每次看到的记忆都是空的。
+        val mainTextWithMemory = if (assistant.enableMemory && memoryFiles.isNotEmpty()) {
+            mainTextWithContext + "\n\n" +
+                me.rerere.rikkahub.data.ai.prompts.buildMemoryPrompt(memoryFiles)
+        } else {
+            mainTextWithContext
+        }
         return buildList {
-            if (mainText.isNotBlank()) {
-                add(UIMessage.system(prompt = mainText))
+            if (mainTextWithMemory.isNotBlank()) {
+                add(UIMessage.system(prompt = mainTextWithMemory))
             }
             // 官方拆分：角色卡字段独立消息（按预设 prompt_order 插槽顺序与启停控制装配 charDescription/charPersonality/scenario）
             if (useOfficialSplit && !conversationOverride) {
@@ -261,6 +309,14 @@ class GenerationLoop(
         outputTransformers: List<OutputMessageTransformer> = emptyList(),
         assistant: Assistant,
         memories: List<AssistantMemory>? = null,
+        /**
+         * 记忆库里的 Markdown 文件（memory_file 表）。
+         *
+         * [memories] 是旧的扁平记忆（memoryentity 表，已废弃、永远是空的）；
+         * 真正的内容在这里。过去只读了旧表，导致模型每次拿到的记忆都是空的，
+         * 表现就是「调 memory_list 看一眼，然后什么都不写」。
+         */
+        memoryFiles: List<MemoryFile> = emptyList(),
         tools: List<Tool> = emptyList(),
         maxSteps: Int = 16,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
@@ -297,6 +353,13 @@ class GenerationLoop(
         stageMark("provider-resolved", __t)
 
         var messages: List<UIMessage> = messages
+        // 本轮内已经执行过的工具调用签名。只挡"工具名 + 归一化参数"完全相同的调用，
+        // 跨轮清零，避免误伤用户明确要求"再做一次"的场景。
+        val executedCallSignatures = mutableSetOf<String>()
+        var consecutiveToolOnlySteps = 0
+        // 无进展熔断：记录连续多少步的工具输出与上一步实质相同
+        var lastToolOutputFingerprint: String? = null
+        var noProgressSteps = 0
         val toolPolicy = assistant.effectiveToolPolicy()
         val effectiveTools = if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.NONE) emptyList<Tool>() else tools
         val effectiveMaxSteps = assistant.effectiveMaxToolSteps().let {
@@ -304,23 +367,28 @@ class GenerationLoop(
         }.coerceAtLeast(1)
 
     // ── 预构建：tools + systemPrompt（循环不变，移到外面）──
-    val toolsInternal: List<Tool> = buildList {
-        Log.i(TAG, "generateInternal: build tools($assistant) enabled=${toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE}")
-        if (assistant?.enableMemory == true && toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE) {
-            val memoryAssistantId = if (assistant.useGlobalMemory) {
-                MemoryRepository.GLOBAL_MEMORY_ID
-            } else {
-                assistant.id.toString()
-            }
-            addAll(
-                buildMemoryTools(
-                    repository = memoryRepo,
-                    assistantId = memoryAssistantId,
-                )
-            )
-        }
-        addAll(effectiveTools)
+    // [P0 修复] 工具清单的唯一汇聚点。原实现在这里**无条件**再 addAll(buildMemoryTools(...))，
+    // 而上游 ChatToolFactory.createTools() 在 assistant.enableMemory 时已经注入过同一组 6 个
+    // memory_* 工具 —— 于是每次请求都带 6 个重名工具。DeepSeek 等 Provider 对同名工具直接拒单
+    // （"Tool names must be unique."），整个请求 400，用户看到的就是「一点发送就失败」。
+    //
+    // 但不能简单删掉这段：群聊路径（ChatService.generateForAssistant）是手写工具清单、
+    // 不走 ChatToolFactory，它的记忆工具本来就靠这里补上。所以改成「缺了才补」+ 末尾按名去重。
+    val memoryAssistantId = if (assistant.useGlobalMemory) {
+        MemoryRepository.GLOBAL_MEMORY_ID
+    } else {
+        assistant.id.toString()
     }
+    val toolsInternal: List<Tool> = mergeToolsWithMemory(
+        existing = effectiveTools,
+        includeMemory = assistant.enableMemory &&
+            toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE,
+        memoryTools = { buildMemoryTools(repository = memoryRepo, assistantId = memoryAssistantId) },
+    )
+    duplicateToolNames(effectiveTools).forEach { name ->
+        TavernRuntimeManager.appendLog("warn", "[tools] dropped duplicate tool name: $name")
+    }
+    Log.i(TAG, "generateInternal: build tools($assistant) enabled=${toolPolicy != me.rerere.rikkahub.data.model.ToolPolicy.NONE}")
     stageMark("tools-built(count=${toolsInternal.size})", __t)
     __t = System.currentTimeMillis()
     val statusTrackedTools: List<Tool> = toolsInternal.map { tool ->
@@ -339,9 +407,54 @@ class GenerationLoop(
         )
     }
     // ── 预构建：system 消息列表（循环不变，移到外面）──
+    // [P0 修复 空消息] userContext（记忆摘要 + 当前日期）在这里算一次，直接并进 system 正文。
+    // 过去它是以「伪造一条 user 消息」的形式追加到消息列表末尾，模型会把它当成用户新发的一句空话，
+    // 工具审批续跑时更是直接判定「用户发了空消息」而反问。现在改成拼 system，消息列表里不再有合成 user。
+    val userContextForSystem: String? = if (assistant.tavernData == null) {
+        buildUserContext(memories ?: emptyList(), assistant, settings).ifBlank { null }
+    } else {
+        null
+    }
     __t = System.currentTimeMillis()
-    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(assistant, settings, messages, memories ?: emptyList(), conversationSystemPrompt, effectiveTools, model, context, conversationRepo, conversationModeInjectionIds)
+    val prebuiltSystemMessages: List<UIMessage> = buildCachedSystemPrompt(
+        assistant = assistant,
+        settings = settings,
+        messages = messages,
+        memories = memories ?: emptyList(),
+        conversationSystemPrompt = conversationSystemPrompt,
+        tools = effectiveTools,
+        model = model,
+        context = context,
+        conversationRepo = conversationRepo,
+        conversationModeInjectionIds = conversationModeInjectionIds,
+        userContext = userContextForSystem,
+        memoryFiles = memoryFiles,
+    )
     stageMark("systemPrompt-built(n=${prebuiltSystemMessages.size})", __t)
+
+    // 主动记忆提醒：整轮只算一次，再传给每一步。
+    // 按"当前对话里用户消息条数 % 间隔"判断，每个对话独立计算、重启后行为一致。
+    // 必须放在步骤循环外面：同一轮里的工具步骤会反复进 generateInternal，
+    // 在里面判断会每步都追加一遍，既浪费 token 又催模型反复写记忆。
+    val proactiveMemoryReminder: String? = run {
+        val userTurnCount = messages.count { it.role == MessageRole.USER }
+        if (!me.rerere.rikkahub.data.ai.prompts.shouldInjectProactiveMemory(
+                enableMemory = assistant.enableMemory,
+                enableProactiveMemory = assistant.enableProactiveMemory,
+                hasTools = effectiveTools.isNotEmpty(),
+                userTurnCount = userTurnCount,
+                interval = assistant.proactiveMemoryInterval,
+            )
+        ) {
+            return@run null
+        }
+        TavernRuntimeManager.appendLog(
+            "info",
+            "[proactive-memory] inject reminder at user turn $userTurnCount " +
+                "(every ${assistant.proactiveMemoryInterval.coerceIn(1, 20)})",
+        )
+        me.rerere.rikkahub.data.ai.prompts.buildProactiveMemoryReminder(assistant.proactiveMemoryPrompt)
+    }
 
         for (stepIndex in 0 until effectiveMaxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
@@ -401,6 +514,9 @@ class GenerationLoop(
                     maxTokensOverride = maxTokensOverride,
                     swipeMeta = swipeMeta,
                     isFinalStep = stepIndex == effectiveMaxSteps - 1,
+                    // 连续多步只有工具没有正文时解除 REQUIRED：否则模型被强制一直调工具、永远出不来正文
+                    forceToolsAuto = consecutiveToolOnlySteps >= MAX_CONSECUTIVE_TOOL_ONLY_STEPS,
+                    proactiveMemoryReminder = proactiveMemoryReminder,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -432,13 +548,52 @@ class GenerationLoop(
                 )
                 emit(GenerationChunk.Messages(messages))
 
-                val toolCalls = messages.last().getTools().filter { !it.isExecuted }
+                var toolCalls = messages.last().getTools().filter { !it.isExecuted }
+                if (toolCalls.isEmpty() && toolsInternal.isNotEmpty()) {
+                    // 模型把工具调用写进了正文（DeepSeek 系常见）：保守识别并提升成真正的工具调用，
+                    // 否则工具不执行、调用文本还会留在聊天记录里。
+                    val promoted = ToolTextFallback.extractToolCall(
+                        message = messages.last(),
+                        availableToolNames = toolsInternal.mapTo(mutableSetOf()) { it.name },
+                        json = json,
+                    )
+                    if (promoted != null) {
+                        val (name, args) = promoted
+                        val synthetic = UIMessagePart.Tool(
+                            toolCallId = "text-fallback-${Uuid.random()}",
+                            toolName = name,
+                            input = args,
+                        )
+                        Log.w(TAG, "Promoted text-embedded tool call to real call: $name")
+                        TavernRuntimeManager.appendLog(
+                            "warn",
+                            "[tool-text-fallback] model wrote a tool call as text, promoted: $name",
+                        )
+                        val last = messages.last()
+                        // 去掉原始调用文本：它不是回复正文，留在消息里既占 token 又会误导模型
+                        messages = messages.dropLast(1) + last.copy(
+                            parts = last.parts.filterNot {
+                                it is UIMessagePart.Text && it.text.isNotBlank()
+                            } + synthetic,
+                        )
+                        emit(GenerationChunk.Messages(messages))
+                        toolCalls = listOf(synthetic)
+                    }
+                }
                 if (toolCalls.isEmpty()) {
                     // no tool calls, break
                     break
                 }
+                // 这一步模型有没有写正文：连续多步只调工具说明它陷入了工具循环。
+                // 连续到阈值时解除 REQUIRED（见 forceToolsAuto），避免"必须调用工具"把模型锁死在工具里；
+                // 整轮结束时仍没有正文的，由下面"收尾请求"补一次不带工具的生成。
+                if (messages.last().parts.any { it is UIMessagePart.Text && it.text.isNotBlank() }) {
+                    consecutiveToolOnlySteps = 0
+                } else {
+                    consecutiveToolOnlySteps++
+                }
 
-                // 1. Deduplicate tools: same (toolName, input) only execute once
+                // 1. 去重：同一批里完全相同的调用只执行一次（原有行为）
                 val seenTools = mutableSetOf<Pair<String, String>>()
                 val uniqueTools = toolCalls.filter { tool ->
                     val key = tool.toolName to tool.input
@@ -512,7 +667,59 @@ class GenerationLoop(
                     break
                 }
 
-                toolsToProcess = uniqueForExecution
+                // 4. 跨步骤去重：本轮前面已经执行过完全相同的「工具名 + 归一化参数」时不再执行，
+                //    但必须回填一条明确的工具结果，否则模型会以为没执行、继续重试。
+                val repeatedTools = ArrayList<UIMessagePart.Tool>()
+                val freshTools = ArrayList<UIMessagePart.Tool>(uniqueForExecution.size)
+                for (tool in uniqueForExecution) {
+                    val signature = toolCallSignature(tool, json)
+                    if (executedCallSignatures.add(signature)) {
+                        freshTools += tool
+                    } else {
+                        Log.w(TAG, "Skipped repeated tool call across steps: ${tool.toolName}")
+                        TavernRuntimeManager.appendLog(
+                            "warn",
+                            "[dedupe] skipped repeated tool call in this turn: ${tool.toolName}",
+                        )
+                        repeatedTools += tool
+                    }
+                }
+                toolsToProcess = freshTools
+                if (repeatedTools.isNotEmpty()) {
+                    // 直接把"重复"作为工具输出写回消息，这样它也是 isExecuted，不会被再次当作待执行
+                    val lastMessage = messages.last()
+                    val repeatedIds = repeatedTools.associateBy { it.toolCallId }
+                    val updatedParts = lastMessage.parts.map { part ->
+                        if (part is UIMessagePart.Tool && repeatedIds.containsKey(part.toolCallId)) {
+                            part.copy(
+                                output = listOf(
+                                    UIMessagePart.Text(
+                                        json.encodeToString(
+                                            buildJsonObject {
+                                                put(
+                                                    "error",
+                                                    JsonPrimitive(
+                                                        "This exact tool call was already executed earlier in this turn. " +
+                                                            "Use the previous result instead of calling it again."
+                                                    )
+                                                )
+                                            }
+                                        )
+                                    )
+                                )
+                            )
+                        } else {
+                            part
+                        }
+                    }
+                    messages = messages.dropLast(1) + lastMessage.copy(parts = updatedParts)
+                    emit(GenerationChunk.Messages(messages))
+                    if (freshTools.isEmpty()) {
+                        // 这一批全是重复调用：错误结果已经写回消息，直接进入下一步让模型看到它并收口，
+                        // 不能落到下面的 "executedTools.isEmpty() -> break"，否则模型永远看不到这条错误。
+                        continue
+                    }
+                }
             } else {
                 // Resuming after user interaction - use the resumable tools directly.
                 Log.i(TAG, "generateText: resuming with ${pendingTools.size} resumable tools")
@@ -532,35 +739,26 @@ class GenerationLoop(
 
             // Handle tools (execute approved tools, handle denied tools)
             val executedTools = arrayListOf<UIMessagePart.Tool>()
-            val isParallel = assistant.enableParallelToolExecution && toolsToProcess.size > 1
 
-            if (isParallel) {
-                // 并行执行所有工具
-                coroutineScope {
-                    val deferreds = toolsToProcess.map { tool ->
-                        async {
-                            tool to runCatching {
-                                kotlinx.coroutines.withTimeout(assistant.toolExecTimeout * 1000L) {
-                                    executeToolCall(tool, toolsInternal, json)
-                                }
-                            }
-                        }
-                    }
-                    deferreds.forEach { deferred ->
-                        val (tool, result) = deferred.await()
-                        addToolResult(executedTools, tool, result, json)
+            // 严格按模型给出的顺序**逐个**执行，对齐上游 AgentLoop.executeTools()。
+            //
+            // 曾经这里有一条「并行执行」分支（assistant.enableParallelToolExecution），
+            // 默认开启，只要一批里超过 1 个工具就全部并发。它带来了一类**无法靠重试解决**的
+            // 错误顺序问题（真机 2026-11-15 复现）：
+            //   - memory_delete 后紧接 memory_list  → list 抢先执行，仍列出已删除的文件
+            //   - workspace_edit_file 后紧接 workspace_read_file → read 抢先执行，读到旧内容
+            //     （而同一时刻 workspace_shell 里 cat 能看到新内容，证明写入本身是成功的）
+            //   - execute_python 并发时 executor 改了全局 sys.stdout / os.chdir，互相污染，
+            //     甚至把输出丢到真实 stdout 后崩溃
+            // 模型在同一批里发出的调用通常有隐含先后关系，并发执行会破坏它。
+            // 串行执行的开销在手机场景可以忽略，正确性收益远大于此。
+            toolsToProcess.forEach { tool ->
+                val result = runCatching {
+                    kotlinx.coroutines.withTimeout(assistant.toolExecTimeout * 1000L) {
+                        executeToolCall(tool, toolsInternal, json)
                     }
                 }
-            } else {
-                // 顺序执行（原版行为）
-                toolsToProcess.forEach { tool ->
-                    val result = runCatching {
-                        kotlinx.coroutines.withTimeout(assistant.toolExecTimeout * 1000L) {
-                            executeToolCall(tool, toolsInternal, json)
-                        }
-                    }
-                    addToolResult(executedTools, tool, result, json)
-                }
+                addToolResult(executedTools, tool, result, json)
             }
 
             if (executedTools.isEmpty()) {
@@ -573,6 +771,27 @@ class GenerationLoop(
                 }
                 // No results to add (all tools were pending)
                 break
+            }
+
+            // [P0 修复] 写操作改变世界状态后，必须清空「本 turn 已执行调用」去重集合。
+            //
+            // 旧实现只按「工具名 + 参数」判定重复，完全不感知状态变化。真机复现（2026-11-14）：
+            // 模型先 memory_list → memory_delete 删掉一个文件 → 再 memory_list 验证删除是否生效，
+            // 第二次 list 参数完全相同，被当成冗余调用拦下，模型只能退而用 memory_read 逐路径探测。
+            // 同类问题：写入文件后想重新读、创建任务后想重新 list。
+            //
+            // 修法：一旦本批里执行过**可能改变状态**的工具，就认为此前记录的调用签名全部失效。
+            // 只读工具（list/read/search/计算等）仍按原逻辑去重，循环保护不受影响。
+            val stateChanged = executedTools.any { it.toolName in STATEFUL_TOOL_NAMES }
+            if (stateChanged) {
+                if (executedCallSignatures.isNotEmpty()) {
+                    TavernRuntimeManager.appendLog(
+                        "debug",
+                        "[dedupe] state changed by ${executedTools.map { it.toolName }.distinct()}; " +
+                            "cleared ${executedCallSignatures.size} recorded call signature(s)",
+                    )
+                }
+                executedCallSignatures.clear()
             }
 
             // 2.5.6 上游新增：工具输出过长时落盘并截断（仅在有 shell 访问时）
@@ -597,6 +816,34 @@ class GenerationLoop(
                 } else part
             }
             messages = messages.dropLast(1) + lastMessage.copy(parts = updatedParts)
+
+            // ── [P0 修复 256 步死循环] 无进展熔断 ──────────────────────────
+            // 只看「这一步拿到的工具输出」和上一步是不是实质相同。
+            // 模型换着参数反复 ls 同一片区域时，签名去重（工具名+参数）救不了，
+            // 但输出指纹能——它看到的东西一直没变，就说明在空转。
+            run {
+                val fingerprint = finalExecutedTools
+                    .joinToString("\u0001") { tool ->
+                        tool.toolName + "=" + tool.output
+                            .filterIsInstance<UIMessagePart.Text>()
+                            .joinToString("") { it.text }
+                            .take(2000)
+                    }
+                if (fingerprint == lastToolOutputFingerprint) {
+                    noProgressSteps++
+                } else {
+                    lastToolOutputFingerprint = fingerprint
+                    noProgressSteps = 0
+                }
+                if (noProgressSteps >= MAX_NO_PROGRESS_STEPS) {
+                    TavernRuntimeManager.appendLog(
+                        "warn",
+                        "[loop-guard] aborted after $noProgressSteps steps with identical tool output",
+                    )
+                    break
+                }
+            }
+
             emit(
                 GenerationChunk.Messages(
                     messages.transforms(
@@ -627,10 +874,21 @@ class GenerationLoop(
                 "info",
                 "[final-turn] no narration after ${effectiveMaxSteps} step(s), requesting a tool-free completion",
             )
+            // [P0 修复 空消息] 收尾时必须追加一条明确的合成 user 指令。
+            // 否则 messages 的最后一条是 assistant（带一堆 tool parts），
+            // 模型看到「最后是我自己在调工具、没有任何用户输入」，
+            // 会判定「用户发来的是空消息」然后反问/寒暄，把原始需求整个丢掉。
+            // 真机证据：模型思考里出现 "The user has sent an empty message? ... no actual question"。
+            // isSynthetic = true 保证它不落库、不显示在聊天记录里。
+            val wrapUpMessages = messages + UIMessage.user(
+                prompt = "工具阶段已结束。请只基于上面已经拿到的结果，用正文回答我最初的请求；" +
+                    "不要再调用任何工具，也不要反问。如果确实缺少关键信息，就直接说明缺什么。",
+            ).copy(isSynthetic = true)
+
             generateInternal(
                 assistant = assistant,
                 settings = settings,
-                messages = messages,
+                messages = wrapUpMessages,
                 onUpdateMessages = {
                     messages = it.transforms(
                         transformers = outputTransformers,
@@ -719,6 +977,16 @@ class GenerationLoop(
         swipeMeta: Map<Uuid, me.rerere.rikkahub.data.model.SwipeMeta> = emptyMap(),
         /** 当前是否已是本次生成的最后一步：是则不允许再强制 REQUIRED，否则永远出不来正文。 */
         isFinalStep: Boolean = false,
+        /** 连续多步只有工具调用没有正文时置 true：解除 REQUIRED，逼模型本轮写出正文。 */
+        forceToolsAuto: Boolean = false,
+        /**
+         * 本轮要追加的主动记忆提醒，null = 不注入。
+         *
+         * 由 [generateText] 在进入步骤循环**之前**算一次再传下来：同一轮里的工具步骤会反复进
+         * [generateInternal]，如果在这里按消息数判断会每步都追加一遍，既浪费 token 又会催模型
+         * 反复写记忆。
+         */
+        proactiveMemoryReminder: String? = null,
     ) {
         val __giStart = System.currentTimeMillis()
         fun giMark(tag: String, from: Long) {
@@ -735,8 +1003,6 @@ class GenerationLoop(
             !msg.isHidden || (tools.isNotEmpty() && msg.parts.any { it is UIMessagePart.Tool })
         }
         val limitedChat = visibleMessages.limitContext(assistant.contextMessageLimit)
-        // DeepSeek 缓存优化：暂存动态 userContext，在 transforms 之后追加到消息列表末尾（保持前缀缓存稳定）
-        var deepseekTailInjection: String? = null
         val transformedMessages = buildList {
             val fallbackSystem = buildString {
                 // ── s10: 使用 SystemPromptAssembler 替代硬编码 ──
@@ -811,19 +1077,7 @@ class GenerationLoop(
                 )
             }
 
-            // ── s10: getUserContext — 用户上下文通过 <system-reminder> UserMessage 注入 ──
-            // 酒馆角色卡模式（assistant.tavernData != null）下不插入 <system-reminder> UserMessage，
-            // 避免隔断 prebuiltSystemMessages 与 new_chat_prompt 导致 squash_system_messages 失效。
-            if (assistant.tavernData == null) {
-                val userContext = buildUserContext(memories, assistant, settings)
-                if (userContext.isNotBlank()) {
-                    if (settings.deepseekCacheOptimization) {
-                        deepseekTailInjection = userContext
-                    } else {
-                        add(UIMessage.user(prompt = userContext))
-                    }
-                }
-            }
+            // 用户上下文已在 generateText 里算好并拼进 system，这里不再插入任何合成 user 消息。
 
             val activeGroupChat = settings.groupChats.firstOrNull { gc ->
                 (conversationId != null && gc.conversationId == conversationId) || assistant.id in gc.memberIds
@@ -956,10 +1210,14 @@ class GenerationLoop(
             settings.tavernPresets,
             enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
         )
-        var internalMessages = deepseekTailInjection
-            ?.takeIf { settings.deepseekCacheOptimization }
-            ?.let { transformedMessages + UIMessage.user(prompt = it) }
-            ?: transformedMessages
+        var internalMessages = transformedMessages
+        // 主动记忆提醒放在末尾而不是 system：不注入的轮次前缀完全不变，注入的轮次只在末尾多一段，
+        // 不会被 DeepSeek 的前缀缓存判成整段失效。
+        if (proactiveMemoryReminder != null) {
+            internalMessages = internalMessages +
+                UIMessage.user(prompt = proactiveMemoryReminder).copy(isSynthetic = true)
+        }
+
         val postGroupChat = settings.groupChats.firstOrNull { gc ->
             (conversationId != null && gc.conversationId == conversationId) || assistant.id in gc.memberIds
         }
@@ -1044,7 +1302,10 @@ class GenerationLoop(
                 val payload = me.rerere.rikkahub.data.st.runtime.buildStMessagesJson(internalMessages)
                 val rewritten = me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.runGenerationHooks(payload)
                 if (rewritten != null) {
-                    val hookOutcome = runCatching { me.rerere.rikkahub.data.st.runtime.parseStGenerationHookResult(rewritten) }.getOrNull()
+                    // base = 改写前的内部消息：让解析器只替换文本，保住 Reasoning / Tool 部件
+                    val hookOutcome = runCatching {
+                        me.rerere.rikkahub.data.st.runtime.parseStGenerationHookResult(rewritten, internalMessages)
+                    }.getOrNull()
                     if (hookOutcome != null && hookOutcome.aborted) {
                         abortedByInterceptor = true
                         TavernRuntimeManager.appendLog("info", "[gen-hooks] generation aborted by extension generate_interceptor")
@@ -1081,7 +1342,7 @@ class GenerationLoop(
             tools = tools,
             // [P0 修复] REQUIRED 最后一步必须切回 AUTO：循环唯一的正常出口是「本轮没有 tool call」，
             // 每步都强制工具就永远拿不到叙事正文。
-            toolChoice = if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.REQUIRED && !isFinalStep) {
+            toolChoice = if (toolPolicy == me.rerere.rikkahub.data.model.ToolPolicy.REQUIRED && !isFinalStep && !forceToolsAuto) {
                 me.rerere.ai.provider.ToolChoice.REQUIRED
             } else {
                 me.rerere.ai.provider.ToolChoice.AUTO
@@ -1334,6 +1595,75 @@ class GenerationLoop(
 }
 
 /**
+ * 工具调用签名：工具名 + 归一化后的参数 JSON。
+ *
+ * 归一化用解析后再序列化，抹平键顺序和空白差异；参数本身不是合法 JSON 时退回原始文本 trim。
+ * 只用于"本轮内完全相同的调用"判定，不做语义近似，避免误伤用户明确要求重复执行的场景。
+ */
+/**
+ * 会**改变世界状态**的工具名集合。
+ *
+ * 这些工具执行后，此前记录的「已执行调用」去重签名必须失效 —— 因为同样的参数
+ * 在新状态下会得到不同结果（删了文件再 list、写完文件再 read、建完任务再 list）。
+ *
+ * 只读/纯计算类工具（*_list、*_read、search_web、web_fetch、calculator、
+ * get_time_info、eval_javascript 等）**不在**此列，它们仍受去重保护，
+ * 避免模型把同一个查询重复发几十遍打转。
+ */
+internal val STATEFUL_TOOL_NAMES: Set<String> = setOf(
+    // 记忆
+    "memory_write",
+    "memory_append",
+    "memory_str_replace",
+    "memory_delete",
+    // 工作区 / 文件
+    "workspace_write_file",
+    "workspace_edit_file",
+    "workspace_shell",
+    "file",
+    "execute_command",
+    "execute_python",
+    // 任务
+    "task_create",
+    "task_mgmt",
+    // 世界书 / 数据库
+    "database_query",
+    // 用户交互
+    "ask_user",
+    "clipboard_tool",
+)
+
+internal fun toolCallSignature(
+    tool: UIMessagePart.Tool,
+    json: Json,
+): String {
+    val normalizedInput = runCatching {
+        canonicalJson(json.parseToJsonElement(tool.input.ifBlank { "{}" }))
+    }.getOrDefault(tool.input.trim())
+    return tool.toolName + "\u0000" + normalizedInput
+}
+
+/**
+ * 规范化 JSON 文本：对象键递归排序、去掉多余空白。
+ *
+ * kotlinx.serialization 的 `JsonObject.toString()` 保留插入顺序，
+ * 所以 `{"a":1,"b":2}` 和 `{"b":2,"a":1}` 序列化结果不同，不能直接拿来当调用签名。
+ */
+internal fun canonicalJson(element: kotlinx.serialization.json.JsonElement): String =
+    when (element) {
+        is kotlinx.serialization.json.JsonObject -> element.entries
+            .sortedBy { it.key }
+            .joinToString(separator = ",", prefix = "{", postfix = "}") { (k, v) ->
+                kotlinx.serialization.json.JsonPrimitive(k).toString() + ":" + canonicalJson(v)
+            }
+
+        is kotlinx.serialization.json.JsonArray ->
+            element.joinToString(separator = ",", prefix = "[", postfix = "]") { canonicalJson(it) }
+
+        else -> element.toString()
+    }
+
+/**
  * 执行单个工具调用（提取逻辑以避免并行/串行分支重复）
  */
 private suspend fun executeToolCall(
@@ -1381,7 +1711,9 @@ private suspend fun executeToolCall(
 
             val result = toolDef.execute(args)
 
-            tool.copy(output = result)
+            // 空输出必须占位：isExecuted 靠 output.isNotEmpty() 判定，返回空列表会被当成
+            // 「没执行过」而在下一步再执行一次（重复调用 + token 浪费的根因之一）。
+            tool.copy(output = result.ifEmpty { listOf(UIMessagePart.Text(EMPTY_TOOL_OUTPUT)) })
         }
     }
 }
@@ -1454,13 +1786,10 @@ private fun buildUserContext(
 ): String {
     val contextMap = linkedMapOf<String, String>()
 
-    // 对标 CC getUserContext: claudeMd (CLAUDE.md content)
-    if (assistant.enableMemory && memories.isNotEmpty()) {
-        val memoryText = memories.joinToString("\n") { memory ->
-            "- ${memory.content.take(200)}"
-        }
-        contextMap["memories"] = memoryText
-    }
+    // [P0 修复 记忆全空] 旧记忆分支已删除。
+    // 这里读的是 memoryentity（扁平旧表），迁移到 memory_file 后那张表永远是空的；
+    // 真实记忆现在由 buildCachedSystemPrompt 用 buildMemoryPrompt(memoryFiles) 注入，
+    // 两处都留会重复注入同一份内容。
 
     // 对标 CC getUserContext: currentDate
     contextMap["currentDate"] = "Today's date is ${java.time.LocalDate.now()}."

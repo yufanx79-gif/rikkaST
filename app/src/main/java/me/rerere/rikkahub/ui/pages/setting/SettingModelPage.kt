@@ -131,6 +131,19 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
             )
         }
         item {
+            ModelSettingItem(
+                title = stringResource(R.string.setting_model_page_memory_model),
+                description = stringResource(R.string.setting_model_page_memory_model_desc),
+                modelId = settings.memoryModelId,
+                providers = settings.providers,
+                onSelect = { vm.updateSettings(settings.copy(memoryModelId = it.id)) },
+                reasoningLevel = settings.memoryModelReasoningLevel,
+                onUpdateReasoningLevel = {
+                    vm.updateSettings(settings.copy(memoryModelReasoningLevel = it))
+                },
+            )
+        }
+        item {
             SuggestionSettingItem(
                 settings = settings,
                 vm = vm,
@@ -180,6 +193,17 @@ private fun SuggestionSettingItem(
 
     Column {
         CardGroup(title = { Text(title) }) {
+            item(
+                headlineContent = { Text(stringResource(R.string.setting_model_page_enable_auto_title)) },
+                trailingContent = {
+                    Switch(
+                        checked = settings.enableAutoTitle,
+                        onCheckedChange = {
+                            vm.patchSettings { s -> s.copy(enableAutoTitle = it) }
+                        }
+                    )
+                },
+            )
             item(
                 headlineContent = { Text(stringResource(R.string.setting_model_page_enable_suggestion)) },
                 trailingContent = {

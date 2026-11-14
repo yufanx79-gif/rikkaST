@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import com.dokar.sonner.ToastType
 import com.dokar.sonner.ToasterState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,10 +69,57 @@ data class TavernImportResult(
     val newLorebooks: List<Lorebook> = emptyList(),  // 从内嵌世界书创建的新Lorebook
 )
 
+/**
+ * 角色卡文件类型判定结果。
+ *
+ * 扩展名优先、MIME 兜底：不少文件管理器会把 `.json` 标成 `text/plain`、
+ * 把 `.charx` 标成 `application/octet-stream`，只看 MIME 会把能导的文件判成不支持。
+ */
+internal enum class CardFileKind { PNG, JSON, CHARX, BYAF, UNSUPPORTED }
+
+/** 纯函数，无 Android 依赖，可直接 JVM 单测。 */
+internal fun resolveCardFileKind(displayName: String?, mimeType: String?): CardFileKind {
+    val ext = displayName
+        ?.substringAfterLast('.', "")
+        ?.lowercase()
+        ?.takeIf { it.isNotBlank() && it != displayName }
+    when (ext) {
+        "png" -> return CardFileKind.PNG
+        "json" -> return CardFileKind.JSON
+        "charx" -> return CardFileKind.CHARX
+        "byaf" -> return CardFileKind.BYAF
+    }
+    val mime = mimeType?.lowercase()?.substringBefore(';')?.trim()
+    return when (mime) {
+        "image/png" -> CardFileKind.PNG
+        "application/json", "text/json" -> CardFileKind.JSON
+        "application/x-charx", "application/charx" -> CardFileKind.CHARX
+        // .charx 本质是 zip；没有扩展名时沿用旧行为按 charx 解析
+        "application/zip", "application/x-zip-compressed" -> CardFileKind.CHARX
+        "application/x-byaf" -> CardFileKind.BYAF
+        else -> CardFileKind.UNSUPPORTED
+    }
+}
+
+/** 单个文件导入失败的原因，用于批量导入后汇总提示。 */
+data class CardImportFailure(
+    val displayName: String,
+    val reason: String,
+)
+
+/** 一次批量导入的结果：成功项与失败项分开，单条失败不影响其他文件。 */
+data class CardImportReport(
+    val successes: List<TavernImportResult> = emptyList(),
+    val failures: List<CardImportFailure> = emptyList(),
+) {
+    val importedCount: Int get() = successes.size
+    val failedCount: Int get() = failures.size
+}
+
 @Composable
 fun AssistantImporter(
     modifier: Modifier = Modifier,
-    onImport: (TavernImportResult) -> Unit,
+    onImport: suspend (List<TavernImportResult>) -> Unit,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -84,31 +132,63 @@ fun AssistantImporter(
 
 @Composable
 private fun SillyTavernImporter(
-    onImport: (TavernImportResult) -> Unit
+    onImport: suspend (List<TavernImportResult>) -> Unit
 ) {
     val context = LocalContext.current
     val filesManager: FilesManager = koinInject()
     val scope = rememberCoroutineScope()
     val toaster = LocalToaster.current
-    var isLoading by remember { mutableStateOf(false) }
+
+    // null = 空闲；非 null = 正在导入，pair 是 (已完成, 总数)
+    var progress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    val isLoading = progress != null
+
+    fun startImport(uris: List<Uri>) {
+        if (uris.isEmpty() || progress != null) return
+        val unique = uris.distinctBy { it.toString() }
+        if (unique.isEmpty()) return
+        progress = 0 to unique.size
+        scope.launch {
+            try {
+                val report = importSelectedCards(
+                    context = context,
+                    uris = unique,
+                    filesManager = filesManager,
+                ) { done, total -> progress = done to total }
+                notifyImportResult(context, toaster, report)
+                if (report.successes.isNotEmpty()) {
+                    onImport(report.successes)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                e.printStackTrace()
+                toaster.show(e.message ?: context.getString(R.string.assistant_importer_import_failed))
+            } finally {
+                progress = null
+            }
+        }
+    }
 
     val pngPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let { importFile(context, uri, onImport, filesManager, toaster, scope) { isLoading = it } }
-    }
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> startImport(uris) }
 
     val jsonPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let { importFile(context, uri, onImport, filesManager, toaster, scope) { isLoading = it } }
-    }
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> startImport(uris) }
 
     val unifiedCardPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let { importFile(context, uri, onImport, filesManager, toaster, scope) { isLoading = it } }
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> startImport(uris) }
+
+    val current = progress
+    val progressText = current?.let {
+        stringResource(R.string.assistant_importer_progress, it.first, it.second)
     }
+    val unifiedLabel = progressText ?: "一键导入角色卡 (.png / .json / .charx / .byaf)"
+    val pngLabel = progressText ?: stringResource(R.string.assistant_importer_import_tavern_png)
+    val jsonLabel = progressText ?: stringResource(R.string.assistant_importer_import_tavern_json)
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedButton(
@@ -116,69 +196,104 @@ private fun SillyTavernImporter(
             enabled = !isLoading
         ) {
             AutoAIIcon(name = "tavern", modifier = Modifier.padding(end = 8.dp))
-            Text(if (isLoading) stringResource(R.string.assistant_importer_importing)
-                 else "一键导入角色卡 (.png / .json / .charx / .byaf)")
+            Text(unifiedLabel)
         }
         OutlinedButton(
             onClick = { pngPickerLauncher.launch(arrayOf("image/png")) },
             enabled = !isLoading
         ) {
             AutoAIIcon(name = "tavern", modifier = Modifier.padding(end = 8.dp))
-            Text(if (isLoading) stringResource(R.string.assistant_importer_importing)
-                 else stringResource(R.string.assistant_importer_import_tavern_png))
+            Text(pngLabel)
         }
         OutlinedButton(
             onClick = { jsonPickerLauncher.launch(arrayOf("application/json")) },
             enabled = !isLoading
         ) {
             AutoAIIcon(name = "tavern", modifier = Modifier.padding(end = 8.dp))
-            Text(if (isLoading) stringResource(R.string.assistant_importer_importing)
-                 else stringResource(R.string.assistant_importer_import_tavern_json))
+            Text(jsonLabel)
         }
     }
 }
 
-private fun importFile(
-    context: Context, uri: Uri,
-    onImport: (TavernImportResult) -> Unit,
-    filesManager: FilesManager, toaster: ToasterState,
-    scope: kotlinx.coroutines.CoroutineScope,
-    setLoading: (Boolean) -> Unit
-) {
-    setLoading(true)
-    scope.launch {
-        try {
-            runCatching {
-                importFromUri(context, uri, filesManager, onImport, toaster)
-            }.onFailure { e ->
-                e.printStackTrace()
-                toaster.show(e.message ?: context.getString(R.string.assistant_importer_import_failed))
+/**
+ * 逐个解析选中的角色卡，单个文件失败只记录不影响其他文件。
+ *
+ * 顺序解析而不是并行：PNG / CHARX 可能很大，并行会放大内存占用与 ContentResolver 并发压力。
+ * 解析阶段不回调调用方，避免一次多选触发多次页面跳转。
+ */
+private suspend fun importSelectedCards(
+    context: Context,
+    uris: List<Uri>,
+    filesManager: FilesManager,
+    onProgress: (completed: Int, total: Int) -> Unit,
+): CardImportReport = withContext(Dispatchers.IO) {
+    val successes = mutableListOf<TavernImportResult>()
+    val failures = mutableListOf<CardImportFailure>()
+    uris.forEachIndexed { index, uri ->
+        val displayName = runCatching { filesManager.getFileNameFromUri(uri) }.getOrNull()
+            ?: uri.lastPathSegment
+            ?: uri.toString()
+        runCatching { parseCardFromUri(context, uri, filesManager) }
+            .onSuccess { (assistant, lorebooks) ->
+                // [v240 W3] V3 角色卡 assets 里的内嵌立绘 → filesDir/sprites/<assistantId>/<label>.*
+                // best-effort：失败不影响角色卡导入本身
+                runCatching {
+                    SpriteRepository.syncFromCardAssets(
+                        context = context,
+                        assistantId = assistant.id,
+                        assets = assistant.tavernData?.assets.orEmpty(),
+                    )
+                }
+                successes += TavernImportResult(assistant = assistant, newLorebooks = lorebooks)
             }
-        } finally { setLoading(false) }
+            .onFailure { e ->
+                e.printStackTrace()
+                failures += CardImportFailure(
+                    displayName = displayName,
+                    reason = e.message ?: e.javaClass.simpleName,
+                )
+            }
+        onProgress(index + 1, uris.size)
     }
+    CardImportReport(successes = successes, failures = failures)
 }
 
-private suspend fun importFromUri(
-    context: Context, uri: Uri, filesManager: FilesManager,
-    onImport: (TavernImportResult) -> Unit, toaster: ToasterState
+private fun notifyImportResult(
+    context: Context,
+    toaster: ToasterState,
+    report: CardImportReport,
 ) {
-    val (assistant, lorebooks) = parseCardFromUri(context, uri, filesManager)
-    // [v240 W3] V3 角色卡 assets 里的内嵌立绘 → filesDir/sprites/<assistantId>/<label>.*
-    // best-effort：失败不影响角色卡导入本身
-    runCatching {
-        SpriteRepository.syncFromCardAssets(
-            context = context,
-            assistantId = assistant.id,
-            assets = assistant.tavernData?.assets.orEmpty(),
-        )
+    val ok = report.importedCount
+    val bad = report.failedCount
+    when {
+        // 单文件成功保持原有提示，避免用户体感变化
+        bad == 0 && ok == 1 ->
+            toaster.show(
+                context.getString(
+                    R.string.assistant_importer_single_success,
+                    report.successes.first().assistant.name,
+                ),
+                type = ToastType.Success,
+            )
+        bad == 0 ->
+            toaster.show(
+                context.getString(R.string.assistant_importer_batch_success, ok),
+                type = ToastType.Success,
+            )
+        ok == 0 ->
+            toaster.show(
+                context.getString(
+                    R.string.assistant_importer_batch_all_failed,
+                    report.failures.joinToString("; ") { "${it.displayName}: ${it.reason}" },
+                ),
+                type = ToastType.Error,
+            )
+        else ->
+            toaster.show(
+                context.getString(R.string.assistant_importer_batch_partial, ok, bad),
+                type = ToastType.Warning,
+            )
     }
-    toaster.show(context.getString(R.string.app_name, assistant.name))
-    onImport(
-        TavernImportResult(
-            assistant = assistant,
-            newLorebooks = lorebooks,
-        )
-    )
 }
 
 /**
@@ -189,17 +304,14 @@ private suspend fun importFromUri(
 internal suspend fun parseCardFromUri(
     context: Context, uri: Uri, filesManager: FilesManager
 ): Pair<Assistant, List<Lorebook>> {
+    // 扩展名优先、MIME 兜底；file:// URI（归档导入）拿不到 DISPLAY_NAME 时回退到路径末段
+    val displayName = withContext(Dispatchers.IO) { filesManager.getFileNameFromUri(uri) }
+        ?: uri.lastPathSegment
     val mime = withContext(Dispatchers.IO) { filesManager.getFileMimeType(uri) }
-        ?: when (uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase()) {
-            "png" -> "image/png"
-            "json" -> "application/json"
-            "charx" -> "application/x-charx"
-            "byaf" -> "application/x-byaf"
-            else -> null
-        }
+    val kind = resolveCardFileKind(displayName, mime)
     return withContext(Dispatchers.IO) {
-        when (mime) {
-            "image/png" -> {
+        when (kind) {
+            CardFileKind.PNG -> {
                 val result = ImageUtils.getTavernCharacterMeta(context, uri)
                 val (jsonString, backgroundStr, avatarUri) = result.map { base64Data ->
                     val json = String(Base64.decode(base64Data, Base64.DEFAULT))
@@ -212,24 +324,29 @@ internal suspend fun parseCardFromUri(
                 val json = Json.parseToJsonElement(jsonString).jsonObject
                 parseCardJson(json, backgroundStr, avatarUri, context)
             }
-            "application/json" -> {
+            CardFileKind.JSON -> {
                 val jsonString = context.contentResolver.openInputStream(uri)?.bufferedReader()
                     .use { it?.readText() }
                     ?: error(context.getString(R.string.assistant_importer_read_json_failed))
                 val json = Json.parseToJsonElement(jsonString).jsonObject
                 parseCardJson(json, null, null, context)
             }
-            "application/x-charx", "application/zip" -> {
+            CardFileKind.CHARX -> {
                 val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: error(context.getString(R.string.assistant_importer_read_json_failed))
                 parseCharxBytes(bytes, context)
             }
-            "application/x-byaf" -> {
+            CardFileKind.BYAF -> {
                 val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: error(context.getString(R.string.assistant_importer_read_json_failed))
                 parseByafBytes(bytes, context)
             }
-            else -> error(context.getString(R.string.assistant_importer_unsupported_file_type, mime ?: "unknown"))
+            CardFileKind.UNSUPPORTED -> error(
+                context.getString(
+                    R.string.assistant_importer_unsupported_file_type,
+                    mime ?: displayName ?: "unknown",
+                )
+            )
         }
     }
 }

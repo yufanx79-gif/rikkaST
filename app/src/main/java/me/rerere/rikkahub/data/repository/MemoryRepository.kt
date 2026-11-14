@@ -76,15 +76,26 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
         }
     }
 
-    /** 在文件末尾追加一行 */
+    /**
+     * 在文件末尾追加一行。
+     *
+     * 确定性去重：和文件里已有的某一行**规范化后完全相同**时直接返回成功、不写入。
+     * 这是零 token 成本的一层，专门挡"模型把同一句话写了两遍"这类重复；
+     * 语义近似（换一种说法）不在这里处理，交给后台整理的合并指令。
+     */
     suspend fun appendToFile(
         assistantId: String,
         path: String,
         line: String,
         ifVersion: String?,
     ): MemoryWriteResult = update(assistantId, path, ifVersion) { current ->
+        val trimmed = line.trimEnd('\n', '\r')
+        if (containsEquivalentLine(current, trimmed)) {
+            // 直接返回当前内容：调用方拿到 Success，模型不会认为写入失败而重试
+            return@update Edit.Content(current)
+        }
         val separator = if (current.isEmpty() || current.endsWith("\n")) "" else "\n"
-        Edit.Content(current + separator + line.trimEnd('\n', '\r') + "\n")
+        Edit.Content(current + separator + trimmed + "\n")
     }
 
     suspend fun deleteFile(
@@ -200,6 +211,32 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
         memoryDAO.deleteMemory(id)
     }
 }
+
+/**
+ * 判断 [content] 里是否已经有一行和 [candidate] 等价。
+ *
+ * 规范化只做"标点/空白/全半角"级别的归一：太激进的近似（去词、同义词）会把不同的记忆误判成重复。
+ */
+internal fun containsEquivalentLine(content: String, candidate: String): Boolean {
+    val target = normalizeMemoryLine(candidate)
+    if (target.isEmpty()) return false
+    return content.lineSequence().any { normalizeMemoryLine(it) == target }
+}
+
+internal fun normalizeMemoryLine(line: String): String = line
+    .trim()
+    .trimStart('-', '*', '+')
+    .trim()
+    .replace("[stated]", "", ignoreCase = true)
+    .replace(Regex("\\s+"), " ")
+    .trim()
+    .trimEnd('.', '。', '!', '！', ';', '；', ',', '，')
+    .lowercase()
+    // 全角 ASCII 转半角，避免"Ｒｉｋｋａ"和"Rikka"被判成两条
+    .map { c ->
+        if (c.code in 0xFF01..0xFF5E) (c.code - 0xFEE0).toChar() else c
+    }
+    .joinToString("")
 
 /** 助手读写的记忆库：开启全局记忆后所有助手共用一份 */
 val Assistant.memoryId: String

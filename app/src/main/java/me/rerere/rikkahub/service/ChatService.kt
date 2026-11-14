@@ -323,6 +323,7 @@ class ChatService(
     private val skillManager: SkillManager,
     private val knowledgeBaseTransformer: KnowledgeBaseTransformer,
     private val folderRepository: FolderRepository,
+    private val memoryConsolidationScheduler: MemoryConsolidationScheduler? = null,
 ) {
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
@@ -354,6 +355,10 @@ class ChatService(
         store = conversationStore,
         createInitialConversation = ::newConversation,
         onGenerationFinished = ::onSessionGenerationFinished,
+        onSessionRemoved = { conversationId ->
+            // 用户离开对话：不会马上有新消息，不必等到空闲计时结束
+            memoryConsolidationScheduler?.onConversationLeft(conversationId)
+        },
     )
 
     private val database: AppDatabase by lazy {
@@ -2120,10 +2125,24 @@ class ChatService(
                 workspaceCwd = conversation.workspaceCwd,
                 conversationId = conversation.id,
                 swipeMeta = conversation.swipeMetaByMessageId,
+                // [P0 修复 记忆全空] 旧实现只读 memoryentity（扁平旧表），迁移到 memory_file 后
+                // 那张表再没写过，所以模型每次拿到的记忆都是空的。
+                // 这里同时传：memories 保留旧通道（兼容），memoryFiles 才是真实内容。
                 memories = if (assistant.useGlobalMemory) {
                     memoryRepository.getGlobalMemories()
                 } else {
                     memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
+                },
+                memoryFiles = if (assistant.enableMemory) {
+                    memoryRepository.getFiles(
+                        if (assistant.useGlobalMemory) {
+                            me.rerere.rikkahub.data.repository.MemoryRepository.GLOBAL_MEMORY_ID
+                        } else {
+                            assistant.id.toString()
+                        },
+                    )
+                } else {
+                    emptyList()
                 },
                 inputTransformers = buildList {
                     addAll(inputTransformers)
@@ -2252,6 +2271,14 @@ class ChatService(
             sessionManager.launchWithSession(conversationId) {
                 generateSuggestion(conversationId, finalConversation)
             }
+            // 记忆自动整理：这一轮真正结束了（不是等审批）才通知调度器。
+            // 没有这一步，自动整理永远不会被触发，只剩手动"立即整理"。
+            val finishedAssistant = runCatching {
+                settingsStore.awaitLoaded().getAssistantById(finalConversation.assistantId)
+            }.getOrNull()
+            if (finishedAssistant?.enableMemory == true) {
+                memoryConsolidationScheduler?.onTurnFinished(finalConversation)
+            }
         }
     }
 
@@ -2362,6 +2389,10 @@ class ChatService(
 
         runCatching {
             val settings = settingsStore.settingsFlow.first()
+            // 关掉自动生成后只跳过对话结束时的自动调用，手动重新生成（force）照常执行。
+            // [备份兼容] enable_auto_title 是上游 RikkaHub 3.2.0 就有的设置项，之前我们不认识它，
+            // 从上游导入的备份里这项会被忽略。
+            if (!force && !settings.enableAutoTitle) return@runCatching
             val model = settings.findModelById(settings.fastModelId)
                 ?: throw IllegalStateException(context.getString(R.string.error_fast_model_not_found))
             val provider = model.findProvider(settings.providers)
@@ -2566,6 +2597,18 @@ class ChatService(
                 memoryRepository.getGlobalMemories()
             } else {
                 memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
+            },
+            // 真实记忆内容在 memory_file 表（群聊路径同样要传）
+            memoryFiles = if (assistant.enableMemory) {
+                memoryRepository.getFiles(
+                    if (assistant.useGlobalMemory) {
+                        me.rerere.rikkahub.data.repository.MemoryRepository.GLOBAL_MEMORY_ID
+                    } else {
+                        assistant.id.toString()
+                    },
+                )
+            } else {
+                emptyList()
             },
             tools = if (!assistant.effectiveToolsEnabled()) emptyList<Tool>() else buildList {
                 if (assistant.localTools.contains(LocalToolOption.FileTools)) {
@@ -3071,6 +3114,10 @@ class ChatService(
         val forkConversation = createForkConversation(currentConversation, copiedNodes, existingTitles)
 
         saveConversation(forkConversation.id, forkConversation)
+        // 分叉出来的对话里，复制过来的轮次由原对话负责整理，这里把它们标记为已整理，
+        // 否则同一批对话会在两个对话里各整理一次、写出重复记忆。
+        runCatching { memoryConsolidationScheduler?.onConversationForked(forkConversation) }
+            .onFailure { Log.w(TAG, "forkConversationAtMessage: mark fork consolidated failed", it) }
         return forkConversation
     }
 

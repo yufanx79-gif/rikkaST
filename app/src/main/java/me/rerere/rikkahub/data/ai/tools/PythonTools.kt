@@ -2,7 +2,6 @@ package me.rerere.rikkahub.data.ai.tools
 
 import android.content.Context
 import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonPrimitive
@@ -25,27 +24,39 @@ import java.io.File
 
 fun createPythonTool(context: Context, timeoutSec: Int = 30): Tool = Tool(
     name = "execute_python",
-    description = "Execute Python code for data processing, API calls, or file generation.\n\n" +
-        "Use this tool when you need programmatic logic — loops, conditionals, API integration — that goes beyond simple math.\n\n" +
+    description = "Execute Python 3.12 code. The interpreter is BUILT INTO the app and always available — " +
+        "you never need to install Python, and `python3` inside workspace_shell is a DIFFERENT, unrelated environment.\n\n" +
+        "Runtime: Python 3.12 with the standard library plus requests, beautifulsoup4, markdown, pypdf, " +
+        "openpyxl, markdownify, tabulate, python-dateutil, pytz.\n\n" +
+        "IMPORTANT — two separate environments, do not confuse them:\n" +
+        "- `execute_python` (this tool): runs on the app side. Its working directory is the app's private " +
+        "storage, NOT /workspace. Files you wrote into the workspace Rootfs are NOT visible here.\n" +
+        "- `workspace_shell`: runs inside the Linux Rootfs. It is a minimal Ubuntu base image, so python3 " +
+        "is NOT preinstalled there. Install it with `apt-get update && apt-get install -y python3` only if " +
+        "you truly need to run a Python script inside a shell pipeline.\n\n" +
+        "Code style — full scripts are supported:\n" +
+        "- Multiple lines, imports, function/class definitions, loops and conditionals all work.\n" +
+        "- Variables persist between calls in the same app session, so you can import once and reuse later.\n" +
+        "- If the last statement is an expression, its value is returned as `result`.\n" +
+        "- Use print() for anything you want to see in `stdout`.\n\n" +
         "When to use:\n" +
-        "- Data processing and transformation (CSV, JSON)\n" +
+        "- Data processing and transformation (CSV, JSON, spreadsheets)\n" +
         "- API calls to external services\n" +
-        "- File generation (CSV, JSON, images)\n" +
-        "- Complex computations that calculator cannot handle\n\n" +
+        "- File generation (CSV, JSON, XLSX, images)\n" +
+        "- Multi-step computations that calculator cannot handle\n\n" +
         "When NOT to use:\n" +
         "- Simple math (use calculator)\n" +
-        "- Shell commands (use execute_command)\n" +
-        "- File operations (use file tools)\n\n" +
+        "- Shell commands inside the Rootfs (use workspace_shell)\n" +
+        "- Android file operations (use the file tool)\n\n" +
         "Args:\n" +
-        "- code: Python code to execute. Last expression value returned. Use print() for debugging.\n" +
-        "Code runs in an isolated Python environment on the device.",
+        "- code: Python source to execute. Full multi-line scripts are supported.",
     needsApproval = { false },
     parameters = {
         InputSchema.Obj(
             properties = buildJsonObject {
                 put("code", buildJsonObject {
                     put("type", "string")
-                    put("description", "Python code to execute. Last expression value is returned. Use print() for debugging.")
+                    put("description", "Python 3.12 source code. Multi-line scripts, imports and function definitions are supported. Last expression value is returned; use print() for output.")
                 })
             },
             required = listOf("code"),
@@ -55,12 +66,8 @@ fun createPythonTool(context: Context, timeoutSec: Int = 30): Tool = Tool(
         val code = args.jsonObject["code"]?.jsonPrimitive?.content
             ?: error("code parameter is required")
 
-        // Start Python if needed (must be on main thread for Chaquopy init)
-        if (!Python.isStarted()) {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                Python.start(AndroidPlatform(context))
-            }
-        }
+        // 并行调用必须串行化启动，否则并发第二个起会抛 "Python already started"
+        PythonRuntime.ensureStarted(context)
 
         val py = Python.getInstance()
         val executor = py.getModule("executor")

@@ -25,16 +25,22 @@ class MemoryPromptTest {
     private fun String.block(tag: String) = substringAfter("<$tag").substringAfter(">").substringBefore("</$tag>").trim()
 
     @Test
-    fun `profile is injected in full with its version and other files only appear in the listing`() {
+    fun `profile is injected in full with its version and listed files also get their body inlined`() {
         val prompt = buildMemoryPrompt(listOf(profile, food))
 
         assertTrue(prompt.contains("<profile version=\"${profile.version}\">"))
         assertEquals("- [stated] Name is Lin", prompt.block("profile"))
 
+        // 清单里不能出现 profile（它已经单独成块）
         val listing = prompt.block("memory_listing")
         assertTrue(listing.startsWith("/topics/food.md | What the user eats and avoids | aliases: diet, 饮食 | updated: "))
         assertFalse(listing.contains(MemoryFile.PROFILE_PATH))
-        assertFalse(prompt.contains("Allergic to peanuts"))
+
+        // [2026-11-14] 短文件的正文现在也会注入到 <memory_files>：
+        // 只给清单会让模型答不出文件里的事实（真机测试 B：问宠物名字答「不知道」）。
+        assertTrue(prompt.contains("<memory_files>"))
+        assertTrue(prompt.contains("<file path=\"/topics/food.md\""))
+        assertTrue(prompt.contains("Allergic to peanuts"))
     }
 
     @Test

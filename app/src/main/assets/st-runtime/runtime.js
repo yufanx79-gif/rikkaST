@@ -2943,6 +2943,42 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
             return outObj;
         });
 
+        // [P0 修复] 只有扩展**真的改了内容**才回传。
+        //
+        // 旧实现无条件 settle(normalized)，而 normalized 只保留 {role, content, name}：
+        // 于是每一轮请求的消息都被这个 hook 重写一遍，reasoning 与 tool 部件被整体抹掉。
+        // 后果（真机已复现）：
+        //   1) DeepSeek thinking 模式工具续轮缺 reasoning_content → 400
+        //      "The `reasoning_content` in the thinking mode must be passed back to the API."
+        //   2) assistant 的 tool_calls 消失、tool 结果失去配对 → 工具链断裂，模型看不到执行结果
+        //   3) 上下文只剩纯文本 → 模型把工具结果当成"用户说了空话"
+        // 内容未变时返回 null，宿主保留原始 UIMessage 列表（部件完整）。
+        const originalNormalized = (Array.isArray(rawMessages) ? rawMessages : []).map((m) => {
+            if (!m || typeof m !== 'object') {
+                return { role: 'user', content: String(m ?? '') };
+            }
+            const role = String(m.role || (m.is_system ? 'system' : (m.is_user === false ? 'assistant' : 'user')));
+            const content = typeof m.content === 'string'
+                ? m.content
+                : String((m && m.mes) ?? '');
+            const outObj = { role, content };
+            if (m.name) outObj.name = String(m.name);
+            return outObj;
+        });
+        const contentChanged = aborted ||
+            originalNormalized.length !== normalized.length ||
+            originalNormalized.some((m, i) => {
+                const n = normalized[i];
+                if (!n) return true;
+                return m.role !== n.role || m.content !== n.content || (m.name || '') !== (n.name || '');
+            });
+
+        if (!contentChanged) {
+            // 无改写：返回 null，宿主保留原始消息（reasoning / tool_calls / tool 结果全部完好）。
+            settle(null);
+            return null;
+        }
+
         const json = aborted ? JSON.stringify({ messages: normalized, aborted: true }) : JSON.stringify(normalized);
         // settle() 内部会再做一次 JSON.stringify —— 这是**刻意**的，用来与旧实现保持一致的
         // 传输形状：旧代码是 `onGenerationHooksResult(seq, JSON.stringify(json))`，

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -38,6 +39,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -169,6 +171,104 @@ private fun MemorySettingsTab(
 ) {
     var showTimeReminderIntervalDialog by remember(assistant.id) { mutableStateOf(false) }
     var timeReminderIntervalInput by remember(assistant.id) { mutableStateOf("") }
+    var showProactiveIntervalDialog by remember(assistant.id) { mutableStateOf(false) }
+    var proactiveIntervalInput by remember(assistant.id) { mutableStateOf("") }
+    var showProactivePromptDialog by remember(assistant.id) { mutableStateOf(false) }
+    var proactivePromptInput by remember(assistant.id) { mutableStateOf("") }
+
+    if (showProactiveIntervalDialog) {
+        val interval = proactiveIntervalInput.toIntOrNull()?.takeIf { it in 1..20 }
+        AlertDialog(
+            onDismissRequest = { showProactiveIntervalDialog = false },
+            title = { Text(stringResource(R.string.assistant_page_memory_proactive_interval)) },
+            text = {
+                TextField(
+                    value = proactiveIntervalInput,
+                    onValueChange = { proactiveIntervalInput = it },
+                    label = { Text(stringResource(R.string.assistant_page_memory_proactive_interval_label)) },
+                    supportingText = { Text(stringResource(R.string.assistant_page_memory_proactive_interval_hint)) },
+                    isError = interval == null,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = interval != null,
+                    onClick = {
+                        interval?.let {
+                            onUpdateAssistant(assistant.copy(proactiveMemoryInterval = it))
+                        }
+                        showProactiveIntervalDialog = false
+                    },
+                ) { Text(stringResource(R.string.assistant_page_save)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showProactiveIntervalDialog = false }) {
+                    Text(stringResource(R.string.assistant_page_cancel))
+                }
+            },
+        )
+    }
+
+    if (showProactivePromptDialog) {
+        AlertDialog(
+            onDismissRequest = { showProactivePromptDialog = false },
+            title = { Text(stringResource(R.string.assistant_page_memory_proactive_prompt)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextField(
+                        value = proactivePromptInput,
+                        onValueChange = { proactivePromptInput = it },
+                        label = { Text(stringResource(R.string.assistant_page_memory_proactive_prompt_desc)) },
+                        placeholder = {
+                            Text(
+                                me.rerere.rikkahub.data.ai.prompts.DEFAULT_PROACTIVE_MEMORY_REMINDER,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 8,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                        minLines = 6,
+                        maxLines = 14,
+                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            onClick = {
+                                // 把内置提示词填进输入框，用户可以直接在上面改
+                                proactivePromptInput =
+                                    me.rerere.rikkahub.data.ai.prompts.DEFAULT_PROACTIVE_MEMORY_REMINDER
+                            },
+                        ) { Text(stringResource(R.string.assistant_page_memory_proactive_prompt_fill_default)) }
+                        TextButton(
+                            onClick = { proactivePromptInput = "" },
+                        ) { Text(stringResource(R.string.assistant_page_memory_proactive_prompt_reset)) }
+                    }
+                    Text(
+                        text = stringResource(R.string.assistant_page_memory_proactive_prompt_help),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onUpdateAssistant(assistant.copy(proactiveMemoryPrompt = proactivePromptInput.trim()))
+                        showProactivePromptDialog = false
+                    },
+                ) { Text(stringResource(R.string.assistant_page_save)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showProactivePromptDialog = false }) {
+                    Text(stringResource(R.string.assistant_page_cancel))
+                }
+            },
+        )
+    }
 
     if (showTimeReminderIntervalDialog) {
         val interval = timeReminderIntervalInput.toIntOrNull()?.takeIf { it > 0 }
@@ -253,6 +353,54 @@ private fun MemorySettingsTab(
                 supportingContent = { Text(stringResource(R.string.assistant_page_memory_auto_dream_desc)) },
                 headlineContent = { Text(stringResource(R.string.assistant_page_memory_auto_dream)) },
             )
+            switchItem(
+                checked = assistant.enableProactiveMemory,
+                onCheckedChange = {
+                    onUpdateAssistant(
+                        assistant.copy(
+                            enableProactiveMemory = it
+                        )
+                    )
+                },
+                enabled = assistant.enableMemory,
+                supportingContent = { Text(stringResource(R.string.assistant_page_memory_proactive_desc)) },
+                headlineContent = { Text(stringResource(R.string.assistant_page_memory_proactive)) },
+            )
+            if (assistant.enableMemory && assistant.enableProactiveMemory) {
+                item(
+                    headlineContent = { Text(stringResource(R.string.assistant_page_memory_proactive_interval)) },
+                    trailingContent = {
+                        Text(
+                            text = stringResource(
+                                R.string.assistant_page_memory_proactive_interval_value,
+                                assistant.proactiveMemoryInterval,
+                            ),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    },
+                    onClick = {
+                        proactiveIntervalInput = assistant.proactiveMemoryInterval.toString()
+                        showProactiveIntervalDialog = true
+                    },
+                )
+                item(
+                    headlineContent = { Text(stringResource(R.string.assistant_page_memory_proactive_prompt)) },
+                    supportingContent = {
+                        Text(
+                            if (assistant.proactiveMemoryPrompt.isBlank()) {
+                                stringResource(R.string.assistant_page_memory_proactive_prompt_desc)
+                            } else {
+                                assistant.proactiveMemoryPrompt.take(60)
+                            }
+                        )
+                    },
+                    onClick = {
+                        proactivePromptInput = assistant.proactiveMemoryPrompt
+                        showProactivePromptDialog = true
+                    },
+                )
+            }
             switchItem(
                 checked = assistant.enableRecentChatsReference,
                 onCheckedChange = {

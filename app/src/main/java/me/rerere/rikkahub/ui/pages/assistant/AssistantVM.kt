@@ -61,6 +61,37 @@ class AssistantVM(
         return boundAssistant
     }
 
+    /**
+     * 批量导入并激活：所有成功解析的助手 + 世界书只做**一次** Settings 更新，
+     * 避免多文件循环调用 [importAndActivateAssistant] 时多个协程用旧快照互相覆盖。
+     *
+     * 默认把最后一个成功导入的助手设为当前助手（与逐个导入时"最后导入的那个生效"一致）。
+     */
+    suspend fun importAndActivateAssistants(
+        results: List<me.rerere.rikkahub.ui.pages.assistant.detail.TavernImportResult>,
+        activateAsCurrent: Boolean = true,
+    ): List<Assistant> {
+        if (results.isEmpty()) return emptyList()
+        val bound = results.map { result ->
+            val lorebookIds = result.newLorebooks.map { it.id }.toSet()
+            if (lorebookIds.isEmpty()) {
+                result.assistant
+            } else {
+                result.assistant.copy(lorebookIds = result.assistant.lorebookIds + lorebookIds)
+            }
+        }
+        val allLorebooks = results.flatMap { it.newLorebooks }
+        val activeId = bound.last().id
+        settingsStore.update { current ->
+            current.copy(
+                lorebooks = if (allLorebooks.isEmpty()) current.lorebooks else current.lorebooks + allLorebooks,
+                assistants = current.assistants.filterNot { existing -> bound.any { it.id == existing.id } } + bound,
+                assistantId = if (activateAsCurrent) activeId else current.assistantId,
+            )
+        }
+        return bound
+    }
+
     fun importAndActivateAssistant(
         result: me.rerere.rikkahub.ui.pages.assistant.detail.TavernImportResult,
         activateAsCurrent: Boolean = true,
