@@ -287,33 +287,54 @@ fun ChatPage(
         // ST 的 mesId 是楼层下标；宿主的 forkConversationAtMessage 要 UIMessage.id，
         // 这里做下标 → 节点 → 消息 id 的映射（与 ChatList 的 onForkMessage 同一条链路）。
         TavernRuntimeManager.conversationBrancher = { messageIndex, swipeId, title ->
-            runCatching {
-                val conv = tavernLatestConversation.value
-                val node = conv.messageNodes.getOrNull(messageIndex)
-                    ?: return@runCatching """{"ok":false,"error":"message index out of range"}"""
-                // swipeId >= 0 时优先取该 swipe 的消息；否则用当前选中消息
+            // ⚠️ 这个 lambda 在 JavaBridge 线程被调用（@JavascriptInterface）。
+            // 项目既有铁律（见本文件 :1367 的注释）：严禁在这里 runBlocking 访问 Room/WebView，
+            // 否则会阻塞 WebView 的 JS 线程造成死锁/ANR。
+            // 做法：在独立协程里做 fork，结果经 CompletableDeferred 回传。
+            val conv = tavernLatestConversation.value
+            val node = conv.messageNodes.getOrNull(messageIndex)
+            if (node == null) {
+                """{"ok":false,"error":"message index out of range"}"""
+            } else {
                 val msg = if (swipeId >= 0) node.messages.getOrNull(swipeId) else node.currentMessage
                 val target = msg ?: node.currentMessage
-                    ?: return@runCatching """{"ok":false,"error":"no message at index"}"""
-                val fork = kotlinx.coroutines.runBlocking { vm.forkMessage(target) }
-                // 标题：ST 的书签带 title，宿主 fork 后按需改名
-                if (title.isNotBlank()) {
-                    vm.renameConversation(fork, title)
+                if (target == null) {
+                    """{"ok":false,"error":"no message at index"}"""
+                } else {
+                    val result = java.util.concurrent.CompletableFuture<String>()
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        runCatching {
+                            val fork = vm.forkMessage(target)
+                            if (title.isNotBlank()) vm.renameConversation(fork, title)
+                            """{"ok":true,"id":"${fork.id}"}"""
+                        }.onSuccess { result.complete(it) }
+                            .onFailure { e ->
+                                TavernRuntimeManager.appendLog("warn", "[branch] fork failed: ${e.message}")
+                                result.complete("""{"ok":false,"error":"${e.message ?: "fork failed"}"}""")
+                            }
+                    }
+                    // 最多等 8 秒；超时返回失败而不是无限阻塞 JS 线程
+                    runCatching { result.get(8, java.util.concurrent.TimeUnit.SECONDS) }
+                        .getOrElse {
+                            TavernRuntimeManager.appendLog("warn", "[branch] fork timeout after 8s")
+                            """{"ok":false,"error":"branch timeout"}"""
+                        }
                 }
-                """{"ok":true,"id":"${fork.id}"}"""
-            }.getOrElse { e ->
-                TavernRuntimeManager.appendLog("warn", "[branch] fork failed: ${e.message}")
-                """{"ok":false,"error":"${e.message ?: "fork failed"}"}"""
             }
         }
         // [v247] 图片描述（ST extensions/caption 的落点）：走宿主 OCR 管线，
         // 与 OcrTransformer 用同一个模型、同一份用量记账。
         TavernRuntimeManager.imageCaptioner = { imageUrl, prompt ->
-            runCatching {
-                kotlinx.coroutines.runBlocking {
+            // 同样在 JavaBridge 线程：禁止 runBlocking（见上面 brancher 的说明）。
+            // performCaption 是 suspend 且要走网络，必须放到 IO 协程并设超时。
+            val result = java.util.concurrent.CompletableFuture<String>()
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
                     me.rerere.rikkahub.data.ai.transformers.OcrTransformer.performCaption(imageUrl, prompt)
-                }
-            }.getOrDefault("")
+                }.onSuccess { result.complete(it) }
+                    .onFailure { result.complete("") }
+            }
+            runCatching { result.get(60, java.util.concurrent.TimeUnit.SECONDS) }.getOrDefault("")
         }
         // [v247] 切换会话（ST openCharacterChat 语义）
         TavernRuntimeManager.conversationOpener = { conversationId ->
