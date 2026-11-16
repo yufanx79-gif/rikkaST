@@ -283,6 +283,46 @@ fun ChatPage(
                 )
             )
         }
+        // [v247] 聊天分支：ST bookmarks.js 的 branchChat/createBranch 落点。
+        // ST 的 mesId 是楼层下标；宿主的 forkConversationAtMessage 要 UIMessage.id，
+        // 这里做下标 → 节点 → 消息 id 的映射（与 ChatList 的 onForkMessage 同一条链路）。
+        TavernRuntimeManager.conversationBrancher = { messageIndex, swipeId, title ->
+            runCatching {
+                val conv = tavernLatestConversation.value
+                val node = conv.messageNodes.getOrNull(messageIndex)
+                    ?: return@runCatching """{"ok":false,"error":"message index out of range"}"""
+                // swipeId >= 0 时优先取该 swipe 的消息；否则用当前选中消息
+                val msg = if (swipeId >= 0) node.messages.getOrNull(swipeId) else node.currentMessage
+                val target = msg ?: node.currentMessage
+                    ?: return@runCatching """{"ok":false,"error":"no message at index"}"""
+                val fork = kotlinx.coroutines.runBlocking { vm.forkMessage(target) }
+                // 标题：ST 的书签带 title，宿主 fork 后按需改名
+                if (title.isNotBlank()) {
+                    vm.renameConversation(fork, title)
+                }
+                """{"ok":true,"id":"${fork.id}"}"""
+            }.getOrElse { e ->
+                TavernRuntimeManager.appendLog("warn", "[branch] fork failed: ${e.message}")
+                """{"ok":false,"error":"${e.message ?: "fork failed"}"}"""
+            }
+        }
+        // [v247] 图片描述（ST extensions/caption 的落点）：走宿主 OCR 管线，
+        // 与 OcrTransformer 用同一个模型、同一份用量记账。
+        TavernRuntimeManager.imageCaptioner = { imageUrl, prompt ->
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    me.rerere.rikkahub.data.ai.transformers.OcrTransformer.performCaption(imageUrl, prompt)
+                }
+            }.getOrDefault("")
+        }
+        // [v247] 切换会话（ST openCharacterChat 语义）
+        TavernRuntimeManager.conversationOpener = { conversationId ->
+            runCatching {
+                val id = kotlinx.uuid.Uuid.parse(conversationId)
+                scope.launch { navigateToChatPage(navController, chatId = id) }
+                true
+            }.getOrDefault(false)
+        }
         // [v208] 世界书名列表（ST world_names / selected_world_info）
         TavernRuntimeManager.worldNamesSupplier = {
             buildWorldNamesJson(

@@ -82,6 +82,50 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
         }
     }
 
+    /**
+     * [v247] 带自定义提问的图片描述（ST `extensions/caption` 的落点）。
+     *
+     * 与 [performOcr] 的唯一差别是 system prompt 由调用方给（caption 扩展让用户
+     * 自己填「这张图里有什么」之类的问题），其余管线完全一致：
+     * 同一个 OCR 模型、同一份 UsageRecorder 记账、同一个 LRU 缓存。
+     *
+     * 注意：缓存键带上 prompt 前缀，避免「不同问题拿到同一份答案」。
+     */
+    suspend fun performCaption(imageUrl: String, prompt: String): String = runCatching {
+        val url = imageUrl.trim()
+        if (url.isEmpty()) return ""
+        val cacheKey = "caption::$prompt::$url"
+        cache.get(cacheKey)?.let { return it }
+        val settings = get<SettingsStore>().settingsFlow.value
+        val model = settings.findModelById(settings.ocrModelId) ?: return ""
+        val providerSetting = model.findProvider(settings.providers) ?: return ""
+        val provider = get<UsageRecorder>().wrap(
+            get<ProviderManager>().getProviderByType(providerSetting),
+            UsageTag(UsageSource.OCR),
+        )
+        val result = provider.generateText(
+            providerSetting = providerSetting,
+            messages = listOf(
+                UIMessage.system(prompt.ifBlank { settings.ocrPrompt }),
+                UIMessage(
+                    role = MessageRole.USER,
+                    parts = listOf(UIMessagePart.Image(url))
+                )
+            ),
+            params = TextGenerationParams(
+                model = model,
+                customHeaders = model.customHeaders,
+                customBody = model.customBodies,
+            ),
+        )
+        val content = result.message.toText().trim()
+        if (content.isNotEmpty()) cache.put(cacheKey, content)
+        content
+    }.getOrElse { e ->
+        Log.w(TAG, "performCaption failed: ${e.message}")
+        ""
+    }
+
     suspend fun performOcr(part: UIMessagePart.Image): String = runCatching {
         // Check cache first
         cache.get(part.url)?.let { cachedResult ->

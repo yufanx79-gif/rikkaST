@@ -874,6 +874,33 @@ object TavernRuntimeManager {
     @Volatile var chatDeleter: ((String) -> Boolean)? = null
 
     /**
+     * [v247] 聊天分支：从指定楼层分叉出新会话。
+     *
+     * 入参 (messageIndex, swipeId, title)：
+     *  - messageIndex：要分叉的楼层（含该楼层）
+     *  - swipeId：-1 表示用当前 swipe，否则用指定 swipe
+     *  - title：书签标题（空串 = 普通分支）
+     * 返回 `{"ok":true,"id":"<新会话uuid>"}` 或 `{"ok":false,"error":"..."}`。
+     *
+     * 对应 ST `public/scripts/bookmarks.js:452 branchChat()` / `createBranch()`。
+     */
+    @Volatile var conversationBrancher: ((Int, Int, String) -> String)? = null
+
+    /**
+     * [v247] 切换到指定会话（ST `openCharacterChat(fileName)` 语义）。
+     * 入参 = 会话 id 字符串；返回是否成功。
+     */
+    @Volatile var conversationOpener: ((String) -> Boolean)? = null
+
+    /**
+     * [v247] 图片描述（ST `extensions/caption` 语义）。
+     *
+     * 入参 (imageUrlOrDataUrl, prompt)，返回描述文本；未接线/失败返回空串。
+     * 宿主侧走已有 OCR 管线（`OcrTransformer.kt` + `Settings.ocrModelId/ocrPrompt`）。
+     */
+    @Volatile var imageCaptioner: ((String, String) -> String)? = null
+
+    /**
      * [v243 BUGFIX A3] 由 UI 层注入：JSR 世界书条目写入
      * （bookName, payloadJson = {upsert:[...],delete:[uid],replaceAll:bool} → 是否受理）。
      */
@@ -3264,6 +3291,45 @@ object TavernRuntimeManager {
         fun saveTavernPreset(name: String, rawJson: String): Boolean {
             val updater = tavernPresetUpdater ?: return false
             return runCatching { updater(name, rawJson) }.getOrDefault(false)
+        }
+
+        /**
+         * [v247] 创建聊天分支（ST `bookmarks.js:452 branchChat` 的落点）。
+         *
+         * ST 分支 = 在文件系统写新 `.jsonl` 并打开；我们是 Room 里的 Conversation，
+         * 所以返回新会话 id 当作 ST 的 fileName。
+         */
+        @JavascriptInterface
+        fun branchConversation(messageIndex: Int, swipeId: Int, title: String): String {
+            val brancher = conversationBrancher ?: return """{"ok":false,"error":"brancher not wired"}"""
+            return runCatching { brancher(messageIndex, swipeId, title) }
+                .getOrElse { e ->
+                    appendLog("warn", "[branch] failed: ${e.message}")
+                    """{"ok":false,"error":"${e.message ?: "branch failed"}"}"""
+                }
+        }
+
+        /**
+         * [v247] 图片描述（ST `extensions/caption` 语义）。
+         *
+         * ST 真源走 `/api/backends/chat-completions/generate` 的多模态分支；
+         * 我们复用宿主的 OCR 管线（OcrTransformer.kt），它已经接了
+         * OpenAI / Google / Anthropic 三条多模态通道。
+         */
+        @JavascriptInterface
+        fun captionImage(image: String, prompt: String): String {
+            val captioner = imageCaptioner ?: return ""
+            return runCatching { captioner(image, prompt) }.getOrElse { e ->
+                appendLog("warn", "[caption] failed: ${e.message}")
+                ""
+            }
+        }
+
+        /** [v247] 切换会话（ST `openCharacterChat` 语义）。 */
+        @JavascriptInterface
+        fun openConversation(conversationId: String): Boolean {
+            val opener = conversationOpener ?: return false
+            return runCatching { opener(conversationId) }.getOrDefault(false)
         }
 
         /** 卡内嵌世界书读取（JSR `loadWorldInfo` 语义）。 */
