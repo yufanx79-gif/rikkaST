@@ -61,11 +61,39 @@ fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
             flattenTree(arr.toList()).forEach { add(it) }
         }
         // 3) 预设脚本（JSR preset；仅装载「当前助手已启用预设组」旗下的）
+        //
+        // ⚠️ [v247 BUGFIX] 预设脚本有**两个**可能的位置，必须都读：
+        //  a) `Settings.tavernPresetScripts`（用户在本应用 UI 里手动挂的脚本桶）
+        //  b) `Settings.tavernPresets[group]` 里 `extensions.tavern_helper.scripts`
+        //     —— **这才是预设文件自带脚本的真实位置**（TRANS-AM 7 个 / Meowssiah 2 个都在这里）
+        //
+        // 此前只读 (a)。而预设导入时从不写 (a)，于是「导入成功但脚本一个都不装载」：
+        // 端到端测试 `transAmScriptsAreLoadable` 实测脚本数 = 0，就是这么暴露的。
         val groups = enabledPresetGroups(assistant, settings)
         if (groups.isNotEmpty()) {
             val buckets = parsePresetBucketsRaw(settings?.tavernPresetScripts)
+            val presetRoot = runCatching {
+                Json.parseToJsonElement(settings?.tavernPresets ?: "{}") as? JsonObject
+            }.getOrNull()
             groups.forEach { g ->
+                // (a) UI 手动挂的脚本桶
                 flattenTree(buckets[g].orEmpty()).forEach { add(it) }
+                // (b) 预设文件自带脚本（extensions.tavern_helper.scripts）
+                val rawPreset = when (val el = presetRoot?.get(g)) {
+                    is JsonPrimitive -> el.contentOrNull
+                    is JsonObject -> el.toString()
+                    else -> null
+                }
+                if (!rawPreset.isNullOrBlank()) {
+                    val helperObj = runCatching {
+                        (Json.parseToJsonElement(rawPreset) as? JsonObject)
+                            ?.get("extensions")?.let { it as? JsonObject }
+                            ?.get("tavern_helper")?.let { it as? JsonObject }
+                    }.getOrNull()
+                    (helperObj?.get("scripts") as? JsonArray)?.let { arr ->
+                        flattenTree(arr.toList()).forEach { add(it) }
+                    }
+                }
             }
         }
     }
