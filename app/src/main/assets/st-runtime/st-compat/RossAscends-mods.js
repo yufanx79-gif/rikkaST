@@ -23,7 +23,14 @@ export async function favsToHotswap() {
     // no-op by design（宿主用 Compose 渲染收藏列表）
 }
 
-export const isMobile = true;
+/**
+ * [v247 BUGFIX] ST 的 `isMobile` 是**函数**（RossAscends-mods.js:143），
+ * 我们导出成了布尔常量 `true` → 脚本 `isMobile()` 直接崩。
+ * 宿主是 Android 手机/平板 → 恒返回 true（与 ST 的 platform.type ∈ {mobile, tablet} 等价）。
+ */
+export function isMobile() {
+    return true;
+}
 
 export function shouldSendOnEnter() {
     return false;

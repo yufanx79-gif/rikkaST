@@ -37,7 +37,15 @@ export function t(...args) {
     return '';
 }
 
-export const translate = t;
+/**
+ * [v247 BUGFIX] ST 的 `translate` 是**函数**（i18n.js 的 `export function translate(...)`），
+ * 我们导出成了 `const translate = t`（若 t 不是函数则是对象/字符串）→ 调用即崩。
+ * 这里保证它一定是函数。
+ */
+export function translate(text, ...args) {
+    try { return typeof t === 'function' ? t(text, ...args) : String(text ?? ''); }
+    catch (_e) { return String(text ?? ''); }
+}
 
 // ---- [ST 1.19.0 Full Export Parity] ----
 export function addLocaleData(..._args) { return null; }
