@@ -212,4 +212,50 @@ class PresetEndToEndTest {
             }
         }
     }
+
+    // ------------------------------------------------- 跨语言：Kotlin 产物 → Node 执行
+
+    /**
+     * 把 [buildTavernScriptsJson] 的**真实产物**落盘，供 `dev-scripts/run_kotlin_scripts.mjs`
+     * 用真实 Tavern Helper 运行时执行。
+     *
+     * 为什么需要：`run_real_scripts.mjs` 原先自己从预设原文里挖 `type === 'script'` 的节点，
+     * 于是 `buildTavernScriptsJson` 里的 bug（预设脚本一个都不装载）**永远不会被它发现**。
+     * 这个测试把 Kotlin 的产物导出来，让 Node 侧只认 Kotlin 说什么，链路才闭合。
+     *
+     * 产物写到 `build/tavern-e2e/<group>.json`，不污染源码树。
+     */
+    @Test
+    fun exportKotlinScriptsForNodeRunner() {
+        val outDir = File("build/tavern-e2e").apply { mkdirs() }
+        val presets = listOf(
+            "Meowssiah-2.0.11.json" to "Meowssiah",
+            "TRANS-AM-4A版-v1.1.2.3.json" to "TRANS-AM-4A",
+            "TRANS-AM-4H版-v1.0.0.1.json" to "TRANS-AM-4H",
+        )
+        val index = mutableListOf<String>()
+        presets.forEach { (file, group) ->
+            val ctx = contextFor(file, group)
+            val scriptsJson = buildTavernScriptsJson(ctx.assistant, ctx.settings)
+            val presetJson = buildTavernPresetJson(ctx.assistant, ctx.settings)
+            val regexJson = buildTavernRegexScriptsJson(mergeActiveRegexScripts(ctx.settings, ctx.assistant))
+
+            val bundle = JsonObject(
+                mapOf(
+                    "group" to JsonPrimitive(group),
+                    "scriptsJson" to JsonPrimitive(scriptsJson),
+                    "presetJson" to JsonPrimitive(presetJson),
+                    "regexJson" to JsonPrimitive(regexJson),
+                )
+            )
+            File(outDir, "$group.json").writeText(bundle.toString())
+            index.add(group)
+
+            // 基本自检：产物必须真的含脚本，否则 Node 侧无从执行
+            val scripts = obj(scriptsJson)["tavern_helper"]!!.jsonObject["scripts"]!!.jsonArray
+            assertTrue("$group: 导出的脚本不应为空", scripts.isNotEmpty())
+        }
+        File(outDir, "_index.json").writeText(JsonArray(index.map { JsonPrimitive(it) }).toString())
+        assertTrue("应导出 3 个预设产物", index.size == 3)
+    }
 }

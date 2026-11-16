@@ -64,8 +64,8 @@ export const oai_settings = {
     show_thoughts: true,
     n: 1,
 };
-export const openai_settings = [];
-export const openai_setting_names = {};
+export let openai_settings = [];
+export let openai_setting_names = [];
 
 /**
  * 对齐 ST 1.15+ / 1.19.0 `getChatCompletionModel(settings)`，同时向后兼容 `< 1.15.0` 的 `(source)` 字符串调用。
@@ -368,7 +368,41 @@ export function getPresetApplicationPromise() {
 }
 
 export const isImageInliningSupported = () => false;
+/**
+ * 代理预设列表。
+ *
+ * 上游是 ST 的「反向代理」列表（`proxies` 全局），由 `/api/settings/get` 填充。
+ * 我们对应的是宿主 `Settings.providers`（中转站配置），由 `RikkaBridge.getProxyPresetNamesJson()` 提供。
+ *
+ * 为什么必须是活数组而不是 `[]`：
+ * TH 的 `rikkast-entry.js` 里是 **直接读模块级 `proxies`**（`proxies.find(...)` / `proxies.map(...)`），
+ * 不经过 `getProxyPresetNames()`。导出空数组会让「按代理预设名匹配自定义 API」永远返回 undefined，
+ * 用户配置的中转站全部失效。这里在模块加载 + 每次 `rikka-st-refresh` 时原位同步（引用恒定）。
+ */
 export const proxies = [];
+
+function __rikkaSyncProxies() {
+    try {
+        if (typeof window === 'undefined') return;
+        const bridge = window.RikkaBridge;
+        if (!bridge || typeof bridge.getProxyPresetNamesJson !== 'function') return;
+        const raw = bridge.getProxyPresetNamesJson();
+        if (typeof raw !== 'string' || !raw) return;
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return;
+        // 原位更新，保持引用不变
+        proxies.length = 0;
+        for (const name of arr) {
+            if (typeof name === 'string') proxies.push({ name, url: '', password: '' });
+        }
+    } catch (_e) { /* noop */ }
+}
+
+__rikkaSyncProxies();
+if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('rikka-st-refresh', __rikkaSyncProxies);
+}
+export { __rikkaSyncProxies as __rikkaSyncProxiesForTest };
 export function parseExampleIntoIndividual(text) { return [String(text == null ? '' : text)]; }
 export function setOpenAIMessages() {}
 export function setOpenAIMessageExamples() {}

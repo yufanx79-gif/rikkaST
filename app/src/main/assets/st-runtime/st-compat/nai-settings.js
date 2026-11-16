@@ -1,7 +1,7 @@
 // rikkaST st-compat: scripts/nai-settings.js
 export const nai_settings = { model_novel: 'clio-v1', temperature: 1.0 };
-export const novelai_settings = [];
-export const novelai_setting_names = {};
+export let novelai_settings = [];
+export let novelai_setting_names = [];
 export function adjustNovelInstructionPrompt(p) { return String(p ?? ''); }
 export function convertNovelPreset(p) { return p || {}; }
 export async function generateNovelWithStreaming() { return () => ({}); }

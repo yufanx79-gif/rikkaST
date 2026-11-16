@@ -90,7 +90,21 @@ export const comment_avatar = 'img/quill.png';
 export const default_user_avatar = 'img/user-default.png';
 export const systemUserName = 'SillyTavern System';
 export const neutralCharacterName = 'Assistant';
-export const system_message_types = { ASSISTANT: 'assistant', USER: 'user', SYSTEM: 'system' };
+export const system_message_types = {
+    HELP: 'help',
+    WELCOME: 'welcome',
+    EMPTY: 'empty',
+    GENERIC: 'generic',
+    NARRATOR: 'narrator',
+    COMMENT: 'comment',
+    SLASH_COMMANDS: 'slash_commands',
+    FORMATTING: 'formatting',
+    HOTKEYS: 'hotkeys',
+    MACROS: 'macros',
+    WELCOME_PROMPT: 'welcome_prompt',
+    ASSISTANT_NOTE: 'assistant_note',
+    ASSISTANT_MESSAGE: 'assistant_message',
+};
 
 // ---------------------------------------------------------------- 函数转发器
 function fwd(path, fallback) {
@@ -541,7 +555,35 @@ export function createLazyFields(..._args) { return null; }
 export function createModelIcon(..._args) { return null; }
 export async function createOrEditCharacter(..._args) { return null; }
 export function createRawPrompt(..._args) { return null; }
-export const create_save = {};
+/**
+ * 角色卡编辑器的工作副本。
+ * 对齐 ST `public/script.js:create_save` 的字段结构（上游同样是一个可变对象，被表单直接读写）。
+ * 导出 `{}` 会让读 `.talkativeness` / `.extensions` / `.alternate_greetings` 的脚本拿到 undefined。
+ */
+export const create_save = {
+    name: '',
+    description: '',
+    creator_notes: '',
+    post_history_instructions: '',
+    character_version: '',
+    system_prompt: '',
+    tags: '',
+    creator: '',
+    personality: '',
+    first_message: '',
+    /** @type {FileList|null} */
+    avatar: null,
+    scenario: '',
+    mes_example: '',
+    world: '',
+    talkativeness: 0.5,
+    alternate_greetings: [],
+    depth_prompt_prompt: '',
+    depth_prompt_depth: 4,
+    depth_prompt_role: 'system',
+    extensions: {},
+    extra_books: [],
+};
 export async function deleteCharacterChatByName(..._args) { return null; }
 export async function deleteItemizedPrompts() {}
 export async function deleteSwipe(..._args) { return null; }
@@ -577,18 +619,57 @@ export async function getUserAvatars() { return []; }
 export function groupToEntity(..._args) { return null; }
 export async function handleDeleteCharacter(..._args) { return null; }
 export async function importCharacterChat(..._args) { return null; }
-export const itemizedParams = {};
+/**
+ * 对齐 ST `scripts/itemized-prompts.js` 的 `itemizedParams(itemizedPrompts, thisPromptSet, incomingMesId)`。
+ *
+ * 上游依赖 DOM（`#rm_api_block`）与 tokenizer 服务，这里给出结构化等价实现：
+ * 返回同样的字段名，token 数用字符长度近似（宿主不做分词时不阻塞调用方）。
+ * 关键是**它必须是函数**——导出成 `{}` 会让任何 `itemizedParams(...)` 直接 TypeError。
+ */
+export async function itemizedParams(itemizedPrompts = [], thisPromptSet = 0, incomingMesId = undefined) {
+    const approx = (v) => (typeof v === 'string' ? Math.ceil(v.length / 4) : 0);
+    const p = itemizedPrompts?.[thisPromptSet] ?? {};
+    const chat = (typeof window !== 'undefined' && window.SillyTavern?.getContext?.()?.chat) || [];
+    const params = {
+        charDescriptionTokens: approx(p.charDescription),
+        charPersonalityTokens: approx(p.charPersonality),
+        scenarioTextTokens: approx(p.scenarioText),
+        userPersonaStringTokens: approx(p.userPersona),
+        worldInfoStringTokens: approx(p.worldInfoString),
+        allAnchorsTokens: approx(p.allAnchors),
+        summarizeStringTokens: approx(p.summarizeString),
+        authorsNoteStringTokens: approx(p.authorsNoteString),
+        smartContextStringTokens: approx(p.smartContextString),
+        beforeScenarioAnchorTokens: approx(p.beforeScenarioAnchor),
+        afterScenarioAnchorTokens: approx(p.afterScenarioAnchor),
+        zeroDepthAnchorTokens: approx(p.zeroDepthAnchor),
+        thisPrompt_padding: p.padding,
+        this_main_api: p.main_api,
+        chatInjects: approx(p.chatInjects),
+        chatVectorsStringTokens: approx(p.chatVectorsString),
+        dataBankVectorsStringTokens: approx(p.dataBankVectorsString),
+        modelUsed: chat?.[incomingMesId]?.extra?.model,
+        apiUsed: chat?.[incomingMesId]?.extra?.api,
+        presetName: p.presetName || '(Unknown)',
+        messagesCount: String(p.messagesCount ?? ''),
+        examplesCount: String(p.examplesCount ?? ''),
+    };
+    params.finalPromptTokens = approx(p.finalPrompt);
+    params.thisPrompt_max_context = p.this_max_context;
+    params.selectedTokenizer = p.tokenizer || '';
+    return params;
+}
 export const itemizedPrompts = [];
-export const koboldai_setting_names = [];
-export const koboldai_settings = {};
-export const lastSwipeInfo = {};
+export let koboldai_setting_names = [];
+export let koboldai_settings = [];
+export const lastSwipeInfo = { now: (typeof performance !== 'undefined' ? performance.now() : Date.now()), direction: 'right' };
 export async function loadItemizedPrompts() {}
 export let menu_type = '';
 export const mesForShowdownParse = {};
 export async function messageEdit(..._args) { return null; }
 export async function newAssistantChat(..._args) { return null; }
-export const novelai_setting_names = [];
-export const novelai_settings = {};
+export let novelai_setting_names = [];
+export let novelai_settings = [];
 export async function openCharacterChat(..._args) { return null; }
 export async function pingServer(..._args) { return null; }
 export async function processDroppedFiles(..._args) { return null; }

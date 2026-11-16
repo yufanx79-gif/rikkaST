@@ -118,4 +118,21 @@ export const enumIcons = {
     group: 'users',
     persona: 'user-pen',
 };
-export const commonEnumMatchProviders = {};
+export const commonEnumMatchProviders = {
+    /**
+     * Provides autocomplete matching for folder-like enum values.
+     * Matches if the input starts with the check or vice versa (case-insensitive).
+     * @param {string} input - The input string to match against
+     * @param {string} check - The check string to match with
+     * @param {object} [options={}] - Options
+     * @param {boolean} [options.trueOnEmpty=true] - Whether to return true when input is empty
+     * @returns {boolean} - True if the strings match according to the folder matching rules
+     */
+    folderEnum: (input, check, { trueOnEmpty = true } = {}) => {
+        if (!check) return false;
+        if (!input) return trueOnEmpty;
+        const inputLower = input.toLowerCase();
+        const checkLower = check.toLowerCase();
+        return inputLower.startsWith(checkLower) || checkLower.startsWith(inputLower);
+    },
+};
