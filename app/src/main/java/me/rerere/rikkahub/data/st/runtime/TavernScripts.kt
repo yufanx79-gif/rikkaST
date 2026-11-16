@@ -1400,3 +1400,148 @@ fun updateWorldNameInExtensionsRaw(extensionsRaw: String?, worldName: String?): 
     return JsonObject(map).toString()
 }
 
+
+// ============================================================
+// [v247 B 组] 角色卡 / 人设数据源（JSR `characters[]` / `power_user.personas`）
+// ============================================================
+
+/**
+ * 全部角色卡 → ST `characters[]` 数组 JSON。
+ *
+ * 为什么需要：JSR 的 `getCharacterNames()` / `getCharacterIds()` 直接读
+ * `characters.map(c => c.name)`（`src/function/character.ts:63-69`）。
+ * 此前 runtime 只把**当前**角色塞进 `state.characters`，于是：
+ *  - `getCharacterNames()` 永远只有一个名字（或者空）；
+ *  - `RawCharacter.findIndex(name)` 找不到别的卡（`character.ts:95-101`）；
+ *  - `getPersona` / 世界书按卡绑定等一切「按名字查卡」的 API 全部失效。
+ *
+ * 形状与 [buildCharacterJson] 完全一致（同一个 v1CharData 契约），
+ * 只多一个 `__index` 便于宿主侧定位；ST 侧不读该字段，无副作用。
+ *
+ * @param settings 宿主设置（提供 `assistants` 全量列表）
+ * @param currentAssistantId 当前会话的助手 id；命中者放在数组首位并把 `this_chid` 定为 0
+ */
+fun buildTavernCharactersJson(settings: Settings?, currentAssistantId: String?): String {
+    if (settings == null) return "[]"
+    val all = settings.assistants
+    if (all.isEmpty()) return "[]"
+    val currentIdx = all.indexOfFirst { it.id.toString() == currentAssistantId }
+    // ST 语义：characters[this_chid] 就是当前角色。把当前卡放首位 → this_chid 恒为 0，
+    // 与 runtime 里 `state.characterId = 0` 一致，避免两处下标漂移。
+    val ordered = if (currentIdx > 0) listOf(all[currentIdx]) + all.filterIndexed { i, _ -> i != currentIdx } else all
+    return buildJsonArray {
+        ordered.forEach { assistant ->
+            val raw = buildCharacterJson(assistant)
+            val obj = runCatching { Json.parseToJsonElement(raw) as? JsonObject }.getOrNull()
+            if (obj != null) add(obj)
+        }
+    }.toString()
+}
+
+/**
+ * 全部人设 → ST `power_user.personas` + `power_user.persona_descriptions` JSON。
+ *
+ * JSR 的数据模型（`src/function/persona.ts:9-22, 108-140`）：
+ * ```
+ * power_user.personas[avatar_id] = 名字           // 头像 id → 名字
+ * power_user.persona_descriptions[avatar_id] = {  // 头像 id → 描述对象
+ *     description, position, depth, role, lorebook, connections, title
+ * }
+ * power_user.default_persona = avatar_id
+ * user_avatar = avatar_id                          // 当前人设
+ * ```
+ * 我们用 `Persona.id`（Uuid）当 `avatar_id`——ST 用文件名，本质都是稳定字符串键。
+ *
+ * `position` 数值按 ST `persona_description_positions`（personas.js:88-98）：
+ * IN_PROMPT=0 / AFTER_CHAR=1 / TOP_AN=2 / BOTTOM_AN=3 / AT_DEPTH=4 / NONE=9。
+ * `role` 数值按 ST 的 `extension_prompt_roles`：SYSTEM=0 / USER=1 / ASSISTANT=2。
+ */
+fun buildTavernPersonasJson(settings: Settings?): String {
+    if (settings == null) return """{"personas":{},"persona_descriptions":{},"default_persona":null,"user_avatar":"","user_name":""}"""
+    val personasObj = linkedMapOf<String, JsonElement>()
+    val descriptionsObj = linkedMapOf<String, JsonElement>()
+    settings.personas.forEach { p ->
+        val key = p.id.toString()
+        personasObj[key] = JsonPrimitive(p.name)
+        descriptionsObj[key] = buildJsonObject {
+            put("description", p.description)
+            put("position", personaPositionToStNumber(p.position))
+            put("depth", p.depth)
+            put("role", personaRoleToStNumber(p.role))
+            put("lorebook", "")
+            put("connections", buildJsonArray {})
+            put("title", p.title)
+        }
+    }
+    val active = settings.personas.firstOrNull { it.id == settings.activePersonaId }
+    val defaultPersona = settings.personas.firstOrNull { it.enabled } ?: settings.personas.firstOrNull()
+    return buildJsonObject {
+        put("personas", JsonObject(personasObj))
+        put("persona_descriptions", JsonObject(descriptionsObj))
+        put("default_persona", JsonPrimitive(defaultPersona?.id?.toString()))
+        // user_avatar：当前生效人设；未选时退回默认人设（ST 里 user_avatar 永不为空）
+        put("user_avatar", JsonPrimitive((active ?: defaultPersona)?.id?.toString() ?: ""))
+        // user_name：ST `name1`。GenerationLoop 用 activePersona.name 作 {{user}}，这里同源
+        put("user_name", JsonPrimitive(active?.name?.takeIf { it.isNotBlank() } ?: ""))
+    }.toString()
+}
+
+/** ST `persona_description_positions` 数值映射（personas.js:88-98）。 */
+internal fun personaPositionToStNumber(pos: me.rerere.rikkahub.data.model.PersonaInjectionPosition): Int =
+    when (pos) {
+        me.rerere.rikkahub.data.model.PersonaInjectionPosition.IN_PROMPT -> 0
+        me.rerere.rikkahub.data.model.PersonaInjectionPosition.TOP_OF_CHAT -> 2   // TOP_AN
+        me.rerere.rikkahub.data.model.PersonaInjectionPosition.BOTTOM_OF_CHAT -> 3 // BOTTOM_AN
+        me.rerere.rikkahub.data.model.PersonaInjectionPosition.AT_DEPTH -> 4
+        me.rerere.rikkahub.data.model.PersonaInjectionPosition.NONE -> 9
+    }
+
+/** ST `extension_prompt_roles` 数值映射（script.js:87-91）。 */
+internal fun personaRoleToStNumber(role: MessageRole): Int = when (role) {
+    MessageRole.SYSTEM -> 0
+    MessageRole.USER -> 1
+    MessageRole.ASSISTANT -> 2
+    MessageRole.TOOL -> 0 // ST 无 tool 角色，按 system 兜底
+}
+
+// ============================================================
+// [v247 D 组] 正则数据源（JSR `getTavernRegexes` / ST `extension_settings.regex`）
+// ============================================================
+
+/**
+ * 当前生效的全部 ST 正则脚本 → `RegexScriptData[]`（ST `char-data.js` 形状）。
+ *
+ * 消费方：
+ *  - `st-compat/regex-engine.js` 的 `getRegexedString()` 读 `globalThis.__rikkahub_regex_scripts__`；
+ *  - JSR `getTavernRegexes()`（`src/function/tavern_regex.ts:120-135`）读
+ *    `extension_settings.regex` / 卡内 `data.extensions.regex_scripts` / 预设 `extensions.regex_scripts`。
+ *
+ * 字段名用 ST 的 camelCase（`scriptName` / `findRegex` / `replaceString` / `trimStrings` /
+ * `placement` / `disabled` / `markdownOnly` / `promptOnly` / `runOnEdit` / `substituteRegex` /
+ * `minDepth` / `maxDepth`），与 `char-data.js` 的 `RegexScriptData` 逐字对齐。
+ *
+ * @param scripts [mergeActiveRegexScripts] 的合并结果（全局 → 预设 → 卡片，已去重）
+ */
+fun buildTavernRegexScriptsJson(scripts: List<me.rerere.rikkahub.data.st.regex.RegexScript>): String =
+    buildJsonArray {
+        scripts.forEach { s ->
+            add(buildJsonObject {
+                put("id", s.id)
+                put("scriptName", s.scriptName)
+                put("findRegex", s.findRegex)
+                put("replaceString", s.replaceString)
+                put("trimStrings", buildJsonArray { s.trimStrings.forEach { add(JsonPrimitive(it)) } })
+                put("placement", buildJsonArray { s.placement.forEach { add(JsonPrimitive(it)) } })
+                put("disabled", s.disabled)
+                put("markdownOnly", s.markdownOnly)
+                put("promptOnly", s.promptOnly)
+                put("runOnEdit", s.runOnEdit)
+                put("substituteRegex", s.substituteRegex)
+                // ST 真源用 null 表示「不限深度」；JSON null 才能让 JS 的 `typeof === 'number'` 判定为 false
+                put("minDepth", s.minDepth?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("maxDepth", s.maxDepth?.let { JsonPrimitive(it) } ?: JsonNull)
+                // 来源标记（ST 无此字段，但 JSR 的 scope 语义需要它；不影响 ST 侧消费）
+                s.sourcePresetGroup?.let { put("__presetGroup", JsonPrimitive(it)) }
+            })
+        }
+    }.toString()

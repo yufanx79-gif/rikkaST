@@ -909,6 +909,8 @@ const state = {
     name1: 'User',
     name2: 'AI',
     modelName: '',
+    // [v247 B 组] ST `user_avatar`（当前人设的头像 id）。personas.js 的 getUserAvatar() 读 ctx.userAvatar。
+    userAvatar: '',
 };
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
@@ -1066,6 +1068,61 @@ function pullThirdPartySettings(force) {
     } catch (_ePu) { /* noop */ }
 }
 
+// ---------------------------------------------------------------- [v247 B 组] 人设数据源
+// JSR 的人设 API 全部建立在 ST 的双表结构上（src/function/persona.ts:108-140）：
+//   power_user.personas[avatar_id] = 名字
+//   power_user.persona_descriptions[avatar_id] = { description, position, depth, role, lorebook, connections, title }
+//   power_user.default_persona = avatar_id ; user_avatar = avatar_id
+// 此前 `power_user.personas` 恒为 `{}` → getPersonaNames() 返回 []、getPersona() 抛
+// 「persona 'xxx' 不存在或名称不唯一」、getCurrentPersonaName() 恒 null。
+function pullPersonas() {
+    let parsed = null;
+    try { parsed = JSON.parse(callBridge('getPersonasJson') || 'null'); } catch (_e) { parsed = null; }
+    if (!parsed || typeof parsed !== 'object') return;
+    try {
+        const pu = stCompatPowerUser;
+        if (parsed.personas && typeof parsed.personas === 'object') {
+            // 原位覆盖而不是替换引用：power_user 是 st-compat 的 live 对象，
+            // 换引用会让已持有 `power_user` 的模块（personas.js / ST-PT）读到旧表。
+            Object.keys(pu.personas || {}).forEach((k) => { delete pu.personas[k]; });
+            if (!pu.personas || typeof pu.personas !== 'object') pu.personas = {};
+            Object.assign(pu.personas, parsed.personas);
+        }
+        if (parsed.persona_descriptions && typeof parsed.persona_descriptions === 'object') {
+            if (!pu.persona_descriptions || typeof pu.persona_descriptions !== 'object') pu.persona_descriptions = {};
+            Object.keys(pu.persona_descriptions).forEach((k) => { delete pu.persona_descriptions[k]; });
+            Object.assign(pu.persona_descriptions, parsed.persona_descriptions);
+        }
+        if ('default_persona' in parsed) pu.default_persona = parsed.default_persona;
+        if (typeof parsed.user_avatar === 'string') state.userAvatar = parsed.user_avatar;
+        // {{user}} 宏的名字：ST 里 user_avatar 对应 power_user.personas[user_avatar]。
+        // 有生效人设就用它，否则保持宿主原有的 name1（不要在没人设时把它清空）。
+        const uname = (typeof parsed.user_name === 'string' && parsed.user_name)
+            ? parsed.user_name
+            : (parsed.user_avatar && pu.personas ? pu.personas[parsed.user_avatar] : '');
+        if (uname) state.name1 = String(uname);
+    } catch (e) { safeWarn('pullPersonas failed', e); }
+}
+
+// ---------------------------------------------------------------- [v247 D 组] 正则数据源
+// `st-compat/regex-engine.js` 的 getRegexedString() 读 `globalThis.__rikkahub_regex_scripts__`；
+// JSR 的 getTavernRegexes() 读 `extension_settings.regex`（src/function/tavern_regex.ts:120-135）。
+// 此前两处都没人写 → getTavernRegexes() 恒 []、formatAsTavernRegexedString() 退化成恒等。
+function pullRegexScripts() {
+    let list = null;
+    try { list = JSON.parse(callBridge('getRegexScriptsJson') || '[]'); } catch (_e) { list = null; }
+    if (!Array.isArray(list)) list = [];
+    try { globalThis.__rikkahub_regex_scripts__ = list; } catch (_e) { /* noop */ }
+    try { window.__rikkahub_regex_scripts__ = list; } catch (_e) { /* noop */ }
+    // ST 真源位置：extension_settings.regex 是全局正则表（tavern_regex.ts:124）。
+    // 这里写的是**合并后**的全量（全局+预设+卡片），与 getRegexedString 的数据源保持一致，
+    // 避免 JSR 侧统计到的条数和实际生效条数不同（脚本会按条数做 UI 展示）。
+    try {
+        ensureStStateShapes();
+        if (state.thirdPartySettings) state.thirdPartySettings.regex = list;
+    } catch (_e) { /* noop */ }
+}
+
 // 角色信息（ST `characters[i]` / v1CharData 语义）
 //   ⚠️ v204 事故：这里曾经只塞 `{ name, data: { extensions: { world } } }`，
 //   于是 ST-Prompt-Template 的 `getCharacterDefine()` 在 `char.mes_example.trim()` 处炸掉，
@@ -1079,8 +1136,22 @@ function pullCharacter() {
     const char = normalizeStCharacter(obj);
 
     if (char.name) state.name2 = char.name;
-    state.characters = char.name ? [char] : [];
     state.characterId = 0;
+
+    // [v247 B 组] `state.characters` 必须是**全部**角色卡，不能只有当前这张。
+    // 依据：JSR `getCharacterNames()` 是 `characters.map(c => c.name)`
+    // （src/function/character.ts:63-69），`RawCharacter.findIndex(name)` 也遍历整张表
+    // （同文件 :95-101）。此前只塞当前卡 → 多卡场景下「按名字查另一张卡」全部失效。
+    // 宿主已把**当前卡排在首位**（buildTavernCharactersJson），所以 `characters[0]` 仍是当前角色，
+    // 与 `state.characterId = 0` 保持一致；st-compat 里所有 `characters[this_chid]` 读法不受影响。
+    let list = null;
+    try { list = JSON.parse(callBridge('getCharactersJson') || '[]'); } catch (_e) { list = null; }
+    if (Array.isArray(list) && list.length > 0) {
+        state.characters = list.map((c) => normalizeStCharacter(c));
+    } else {
+        // 桥未接线（面板模式 / 早期启动）时退回「只有当前卡」，保证旧行为不变。
+        state.characters = char.name ? [char] : [];
+    }
 
     // [v208] 世界书名列表 + 全局启用书（P0-3：此前 world_names/selected_world_info 恒为空）
     try {
@@ -1135,6 +1206,8 @@ function refreshForPanelMode() {
     pullSettings();
     pullThirdPartySettings(false);
     pullCharacter();
+    pullPersonas();
+    pullRegexScripts();
     const cid = callBridge('getActiveConversationId');
     if (typeof cid === 'string') state.chatId = cid;
     syncMessageVariablesOnly();
@@ -1154,6 +1227,8 @@ function refreshAll() {
     pullSettings();
     pullThirdPartySettings(false);
     pullCharacter();
+    pullPersonas();
+    pullRegexScripts();
     const cid = callBridge('getActiveConversationId');
     if (typeof cid === 'string') state.chatId = cid;
     // [v215] 刷新后保证 ST 契约形状（ST-PT / JSR 全局变量读写依赖）
@@ -1684,6 +1759,20 @@ const stCtx = {
     get extensionSettings() { ensureStStateShapes(); return state.thirdPartySettings; },
     get characters() { return state.characters; },
     get characterId() { return state.characterId; },
+    // [v247 B 组] ST st-context.js 的 userAvatar / personas 面。
+    // st-compat/personas.js 的 getUserAvatar() 读 `ctx.userAvatar`；JSR persona.ts 走 power_user，
+    // 但第三方扩展（ST-PT 等）读 ctx.personas —— 两边都要有。
+    get userAvatar() { return state.userAvatar || ''; },
+    get personas() {
+        try {
+            const pu = stCompatPowerUser;
+            return Object.keys(pu.personas || {}).map((avatarId) => ({
+                avatar: avatarId,
+                avatar_id: avatarId,
+                name: String(pu.personas[avatarId] ?? ''),
+            }));
+        } catch (_e) { return []; }
+    },
     // [v208] ST world_names / world_info / selected_world_info（st-compat/world-info.js 的 refresh 从这里取）
     get world_names() { return state.worldNames; },
     get world_info() { return state.worldInfo; },
@@ -2130,6 +2219,8 @@ try {
             eventSource: eventSource,
             event_types: event_types,
             extensionSettings: state.thirdPartySettings,
+            // [v247 B 组]
+            userAvatar: state.userAvatar || '',
         }),
     });
 } catch (_e) { /* noop */ }

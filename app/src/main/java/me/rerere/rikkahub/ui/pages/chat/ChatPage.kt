@@ -62,6 +62,10 @@ import me.rerere.rikkahub.data.st.extensions.listExtensions
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
 import me.rerere.rikkahub.data.st.runtime.buildCharacterJson
+import me.rerere.rikkahub.data.st.runtime.buildTavernCharactersJson
+import me.rerere.rikkahub.data.st.runtime.buildTavernPersonasJson
+import me.rerere.rikkahub.data.st.runtime.buildTavernRegexScriptsJson
+import me.rerere.rikkahub.data.st.regex.mergeActiveRegexScripts
 import me.rerere.rikkahub.data.st.runtime.buildLorebookJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernChatJson
 import kotlinx.serialization.json.Json
@@ -256,6 +260,27 @@ fun ChatPage(
         TavernRuntimeManager.tavernCharacterSupplier = {
             buildCharacterJson(
                 tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId)
+            )
+        }
+        // [v247 B 组] 全部角色卡 + 人设：JSR 的 getCharacterNames()/RawCharacter.findIndex() 遍历整张表，
+        // 只喂当前卡会让「按名字查另一张卡」的 API 全部失效。
+        TavernRuntimeManager.charactersSupplier = {
+            buildTavernCharactersJson(
+                tavernLatestSettings.value,
+                tavernLatestConversation.value.assistantId.toString(),
+            )
+        }
+        TavernRuntimeManager.personasSupplier = {
+            buildTavernPersonasJson(tavernLatestSettings.value)
+        }
+        // [v247 D 组] 正则：全局 → 预设内嵌 → 卡片内嵌（mergeActiveRegexScripts 已按 ST 顺序去重）。
+        // runtime.js 会把它写进 globalThis.__rikkahub_regex_scripts__ 供 regex-engine 消费。
+        TavernRuntimeManager.regexScriptsSupplier = {
+            buildTavernRegexScriptsJson(
+                mergeActiveRegexScripts(
+                    tavernLatestSettings.value,
+                    tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId),
+                )
             )
         }
         // [v208] 世界书名列表（ST world_names / selected_world_info）

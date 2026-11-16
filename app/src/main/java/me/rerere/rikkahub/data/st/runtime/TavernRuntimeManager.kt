@@ -782,6 +782,38 @@ object TavernRuntimeManager {
     /** [v246] 由 UI 层注入：可用模型 id 列表 JSON（JSR `getModelList` 简化版）。 */
     @Volatile var modelListSupplier: (() -> String)? = null
 
+    /**
+     * [v247 B 组] 由 UI 层注入：全部角色卡 → ST `characters[]` 数组 JSON。
+     *
+     * 为什么需要：JSR `getCharacterNames()` / `getCharacterIds()` 直接 `characters.map(...)`
+     * （`src/function/character.ts:63-69`），`RawCharacter.findIndex(name)` 也遍历它
+     * （同文件 :95-101）。此前 runtime 只把**当前**角色塞进 `state.characters`，
+     * 于是所有「按名字查别的卡」的 API 全部失效（多卡场景下 `getCharacter('另一张卡')` 抛错）。
+     */
+    @Volatile var charactersSupplier: (() -> String)? = null
+
+    /**
+     * [v247 B 组] 由 UI 层注入：人设数据 → ST `power_user.personas` 形状 JSON。
+     *
+     * JSR 的人设 API 全部建立在 ST 的 `power_user.personas[avatar_id] = name` +
+     * `power_user.persona_descriptions[avatar_id] = {...}` 双表结构上
+     * （`src/function/persona.ts:108-140`）。我们的 `Persona` 模型字段完整，
+     * 但存储形态不同，必须在这里做形状映射。
+     */
+    @Volatile var personasSupplier: (() -> String)? = null
+
+    /**
+     * [v247 D 组] 由 UI 层注入：当前生效的全部 ST 正则脚本（`RegexScriptData[]` 形状）。
+     *
+     * 消费方有两处：
+     *  1. runtime.js 把它写进 `globalThis.__rikkahub_regex_scripts__`，
+     *     供 `st-compat/regex-engine.js` 的 `getRegexedString()` 使用；
+     *  2. JSR `getTavernRegexes()`（`src/function/tavern_regex.ts:120-135`）读 `extension_settings.regex`。
+     *
+     * 数据源 = `mergeActiveRegexScripts(settings, assistant)`（全局 → 预设内嵌 → 卡片内嵌，已去重）。
+     */
+    @Volatile var regexScriptsSupplier: (() -> String)? = null
+
     /** 由 UI 层注入：已安装第三方扩展装载列表 JSON（文件夹/入口文件；供 runtime 注入）。 */
     @Volatile var thirdPartyExtensionsSupplier: (() -> String)? = null
 
@@ -2132,6 +2164,17 @@ object TavernRuntimeManager {
      */
     const val TAVERN_ST_COMPAT_VERSION = "1.19.0"
 
+    /**
+     * [v247 B 组] 空人设骨架。
+     *
+     * JSR `toPersona()`（`src/function/persona.ts:108-140`）做
+     * `{ ...getDefaultDescriptor(), ...power_user.persona_descriptions[avatar_id] }`，
+     * 缺 `persona_descriptions` 会直接 `Cannot convert undefined or null to object`。
+     * 所以「没有人设」也必须返回完整骨架，不能返回 `{}`。
+     */
+    private const val EMPTY_PERSONAS_JSON =
+        """{"personas":{},"persona_descriptions":{},"default_persona":null,"user_avatar":"","user_name":""}"""
+
     // ==================== 执行 / 事件 ====================
 
     fun eval(script: String, callback: ((String) -> Unit)? = null) {
@@ -3234,6 +3277,42 @@ object TavernRuntimeManager {
         /** [v208] 可用世界书名列表（ST world_names / selected_world_info / world_info）。 */
         @JavascriptInterface
         fun getWorldNamesJson(): String = worldNamesSupplier?.invoke() ?: "{}"
+
+        /**
+         * [v247 B 组] 全部角色卡（ST `characters[]` 形状）。
+         *
+         * 返回 `[]` 而不是 `{}`：JSR 侧直接 `characters.map(...)` / `characters.findIndex(...)`，
+         * 对象会让 `.map is not a function` 立刻炸。
+         */
+        @JavascriptInterface
+        fun getCharactersJson(): String {
+            val supplier = charactersSupplier ?: return "[]"
+            return runCatching { supplier() }.getOrElse { "[]" }
+        }
+
+        /**
+         * [v247 B 组] 人设双表（ST `power_user.personas` + `persona_descriptions`）。
+         *
+         * 必须始终返回完整骨架：JSR `toPersona()` 直接
+         * `{ ...getDefaultDescriptor(), ...power_user.persona_descriptions[avatar_id] }`，
+         * 缺 `persona_descriptions` 会 `Cannot convert undefined or null to object`。
+         */
+        @JavascriptInterface
+        fun getPersonasJson(): String {
+            val supplier = personasSupplier ?: return EMPTY_PERSONAS_JSON
+            return runCatching { supplier() }.getOrElse { EMPTY_PERSONAS_JSON }
+        }
+
+        /**
+         * [v247 D 组] 当前生效的正则脚本（ST `RegexScriptData[]` 形状）。
+         *
+         * 返回 `[]` 而不是 `{}`：`getRegexedString()` 会 `for (const script of allRegex)`。
+         */
+        @JavascriptInterface
+        fun getRegexScriptsJson(): String {
+            val supplier = regexScriptsSupplier ?: return "[]"
+            return runCatching { supplier() }.getOrElse { "[]" }
+        }
 
         /** ST `chat_metadata`（含 variables）。 */
         @JavascriptInterface

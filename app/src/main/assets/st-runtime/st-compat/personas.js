@@ -8,6 +8,38 @@ const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.S
 
 export let user_avatar = 'user-default.png';
 
+/**
+ * [v247 BUGFIX] `user_avatar` 必须跟随宿主当前人设，否则 JSR 的人设 API 全部错位。
+ *
+ * 依据（ST 真源）：`user_avatar` 是 `public/scripts/personas.js` 的模块级 let，
+ * ST 在 `initUserAvatar()` / `setUserAvatar()` 里更新它。Tavern Helper 的
+ * `src/function/persona.ts:72-80` 直接读这个 live binding：
+ *   getCurrentPersonaId()   -> user_avatar || null
+ *   getCurrentPersonaName() -> power_user.personas[user_avatar] ?? null
+ *   findPersonaId('current')-> user_avatar
+ *
+ * 我们此前从不更新它 → 恒为 `'user-default.png'` → 上面三个 API 全部返回错误值
+ * （`getCurrentPersonaId()` 返回一个根本不存在的头像 id，
+ *   `getPersona('current')` 抛「persona 'current' 不存在」）。
+ *
+ * 修法：宿主经 `ctx.userAvatar` 下发（runtime.js 的 pullPersonas() 写入），
+ * 这里在模块初始化 + 每次 `rikka-st-refresh` 时同步。**只新增同步逻辑**，
+ * 不改变原有导出语义（`setUserAvatar()` 仍然可以主动覆盖）。
+ */
+function __rikkaSyncUserAvatar() {
+    try {
+        const ctx = st();
+        const next = ctx && typeof ctx.userAvatar === 'string' ? ctx.userAvatar : '';
+        if (next) user_avatar = next;
+    } catch (_e) { /* noop */ }
+}
+__rikkaSyncUserAvatar();
+try {
+    if (typeof window !== 'undefined' && window.addEventListener) {
+        window.addEventListener('rikka-st-refresh', __rikkaSyncUserAvatar);
+    }
+} catch (_e) { /* noop */ }
+
 export function getUserAvatar() {
     const ctx = st();
     return (ctx && ctx.userAvatar) || user_avatar || 'user-default.png';
