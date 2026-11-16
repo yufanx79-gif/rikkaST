@@ -901,6 +901,18 @@ object TavernRuntimeManager {
     @Volatile var imageCaptioner: ((String, String) -> String)? = null
 
     /**
+     * [v247] Instruct 序列模板（ST `power_user.instruct` 语义）。
+     *
+     * 数据源：当前助手的 `Assistant.instructTemplate`（`InstructTemplate.kt:24-49`，
+     * 字段与 ST 的 `instruct` 一一对应）。
+     *
+     * 为什么需要：`st-compat/instruct-mode.js` 的 `formatInstructModePrompt()` 是
+     * Instruct 模式的核心格式化函数，扩展会用它组装 prompt。没有数据源时它只能返回原文，
+     * 表现是「Instruct 开了但没生效」。
+     */
+    @Volatile var instructTemplateSupplier: (() -> String)? = null
+
+    /**
      * [v243 BUGFIX A3] 由 UI 层注入：JSR 世界书条目写入
      * （bookName, payloadJson = {upsert:[...],delete:[uid],replaceAll:bool} → 是否受理）。
      */
@@ -3307,6 +3319,13 @@ object TavernRuntimeManager {
                     appendLog("warn", "[branch] failed: ${e.message}")
                     """{"ok":false,"error":"${e.message ?: "branch failed"}"}"""
                 }
+        }
+
+        /** [v247] Instruct 序列模板（ST `power_user.instruct`）。 */
+        @JavascriptInterface
+        fun getInstructTemplateJson(): String {
+            val supplier = instructTemplateSupplier ?: return "{}"
+            return runCatching { supplier() }.getOrElse { "{}" }
         }
 
         /**

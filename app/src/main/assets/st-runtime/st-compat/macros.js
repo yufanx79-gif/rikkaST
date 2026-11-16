@@ -119,16 +119,43 @@ export function getLastMessageId({ exclude_swipe_in_propress = true, filter = nu
 
 export function initMacros() {}
 
-export function evaluateMacros(text, env = {}) {
+/**
+ * 宏替换（ST macros.js:610 `evaluateMacros(content, env, postProcessFn)`）。
+ *
+ * ⚠️ [v247] 补上第三个参数 `postProcessFn`：
+ * ST 在替换完所有宏后会把它当后处理钩子跑一遍（`:615` `postProcessFn = typeof ... : (x => x)`）。
+ * 少了它，调用方传进来的「替换后清洗」（如 ST-PT 的 HTML 修复）会被静默丢弃，
+ * 表现是「宏替换对了，但输出格式不对」。
+ *
+ * @param {string} text
+ * @param {object} [env]
+ * @param {(s: string) => string} [postProcessFn]
+ * @returns {string}
+ */
+export function evaluateMacros(text, env = {}, postProcessFn) {
     const s = String(text ?? '');
+    // ST :611-613 —— 空内容直接返回空串（不跑后处理）
+    if (!s) return '';
+    // ST :615 —— 后处理钩子，非法值退化为恒等
+    const post = typeof postProcessFn === 'function' ? postProcessFn : ((x) => x);
+
+    let out = s;
     try {
         if (typeof window !== 'undefined' && window.RikkaBridge && typeof window.RikkaBridge.substituteParams === 'function') {
-            return String(window.RikkaBridge.substituteParams(s, JSON.stringify(env || {})) ?? s);
+            out = String(window.RikkaBridge.substituteParams(s, JSON.stringify(env || {})) ?? s);
+        } else {
+            const c = st();
+            if (c && typeof c.substituteParams === 'function') {
+                out = String(c.substituteParams(s) ?? s);
+            }
         }
-        const c = st();
-        if (c && typeof c.substituteParams === 'function') {
-            return String(c.substituteParams(s) ?? s);
-        }
-    } catch (_e) { /* noop */ }
-    return s;
+    } catch (_e) { /* out 保持原值 */ }
+
+    // 关键：替换完再跑后处理（顺序与 ST 一致：先所有宏，最后 postProcessFn）
+    try {
+        const processed = post(out);
+        return processed == null ? out : String(processed);
+    } catch (_e) {
+        return out;
+    }
 }

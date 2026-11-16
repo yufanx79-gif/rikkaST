@@ -1545,3 +1545,57 @@ fun buildTavernRegexScriptsJson(scripts: List<me.rerere.rikkahub.data.st.regex.R
             })
         }
     }.toString()
+
+// ============================================================
+// [v247] Instruct 序列模板 → ST `power_user.instruct` 形状
+// ============================================================
+
+/**
+ * 当前助手的 Instruct 模板 → ST `power_user.instruct` 形状 JSON。
+ *
+ * 消费方：`st-compat/instruct-mode.js` 的 `formatInstructModePrompt()` /
+ * `getInstructMacros()` / `getInstructStoppingSequences()`。
+ *
+ * 字段名用 ST 的 **snake_case**（ST instruct-mode.js 直接读 `instruct.input_sequence` 等），
+ * 同时保留 camelCase 别名（我们自己 JS 侧两种都认）。
+ *
+ * `names_behavior` 数值按 ST `names_behavior_types`：
+ * NONE=0 / FORCE=1 / ALWAYS=2 / NEVER=3（instruct-mode.js 顶部）。
+ */
+fun buildInstructTemplateJson(assistant: Assistant?): String {
+    val t = assistant?.instructTemplate ?: return "{}"
+    return buildJsonObject {
+        put("enabled", t.enabled)
+        put("story_string_prefix", t.storyStringPrefix)
+        put("story_string_suffix", t.storyStringSuffix)
+        put("system_sequence", t.systemSequence)
+        put("system_suffix", t.systemSuffix)
+        put("input_sequence", t.inputSequence)
+        put("input_suffix", t.inputSuffix)
+        put("first_input_sequence", t.firstInputSequence)
+        put("last_input_sequence", t.lastInputSequence)
+        put("output_sequence", t.outputSequence)
+        put("output_suffix", t.outputSuffix)
+        put("first_output_sequence", t.firstOutputSequence)
+        put("last_output_sequence", t.lastOutputSequence)
+        put("wrap", t.wrap)
+        put("macro", t.macro)
+        put("names_behavior", instructNamesBehaviorToStNumber(t.namesBehavior))
+        put("system_same_as_user", t.systemSameAsUser)
+        put("skip_examples", t.skipExamples)
+        put("activation_regex", t.activationRegex)
+        // camelCase 别名（我们自己的 JS 侧两种写法都认，方便脚本读）
+        put("storyStringPrefix", t.storyStringPrefix)
+        put("systemSequence", t.systemSequence)
+        put("inputSequence", t.inputSequence)
+        put("outputSequence", t.outputSequence)
+    }.toString()
+}
+
+/** ST `names_behavior_types`（instruct-mode.js 顶部）：NONE=0 / FORCE=1 / ALWAYS=2 / NEVER=3。 */
+internal fun instructNamesBehaviorToStNumber(b: me.rerere.rikkahub.data.model.InstructNamesBehavior): Int =
+    when (b) {
+        me.rerere.rikkahub.data.model.InstructNamesBehavior.NONE -> 0
+        me.rerere.rikkahub.data.model.InstructNamesBehavior.FORCE -> 1
+        me.rerere.rikkahub.data.model.InstructNamesBehavior.ALWAYS -> 2
+    }

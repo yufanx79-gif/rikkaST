@@ -53,15 +53,50 @@ export function getUserAvatars() {
     return [getUserAvatar()];
 }
 
-export async function setUserAvatar(avatarOrName) {
-    if (!avatarOrName) return;
-    user_avatar = String(avatarOrName);
+/**
+ * 切换当前人设。
+ *
+ * 语义对齐 ST `personas.js:154-168`：
+ * ```
+ * export async function setUserAvatar(imgfile, { toastPersonaNameChange = true, navigateToCurrent = false } = {})
+ * ```
+ * ST 会做：改 user_avatar → reloadUserAvatar → updatePersonaUIStates →
+ * selectCurrentPersona → retriggerFirstMessageOnEmptyChat → saveSettingsDebounced →
+ * **emit(PERSONA_CHANGED)**。
+ *
+ * 我们必须保留的关键行为：
+ *  - 同一人设不重复处理（ST :157 `if (currentUserAvatar === user_avatar) return;`）
+ *  - **发 PERSONA_CHANGED 事件** —— 脚本靠它感知人设切换（ST-PT / 卡片脚本都会订阅）
+ *  - 把切换动作转给宿主（`/persona` 斜杠命令），让 Compose UI 同步
+ *
+ * @param {string} avatarOrName 人设头像 id 或名字
+ * @param {{toastPersonaNameChange?: boolean, navigateToCurrent?: boolean}} [options]
+ */
+export async function setUserAvatar(avatarOrName, { toastPersonaNameChange = true, navigateToCurrent = false } = {}) {
+    const next = avatarOrName == null ? '' : String(avatarOrName);
+    if (!next) return;
+    const prev = user_avatar;
+    if (prev === next) return;   // ST :157 同一人设直接返回
+    user_avatar = next;
     try {
         const ctx = st();
         if (ctx && typeof ctx.executeSlashCommandsWithOptions === 'function') {
-            await ctx.executeSlashCommandsWithOptions(`/persona ${avatarOrName}`);
+            await ctx.executeSlashCommandsWithOptions(`/persona ${next}`);
         }
     } catch (_e) { /* noop */ }
+    // ST :168 —— 通知所有订阅者
+    try {
+        const ctx = st();
+        const es = ctx && ctx.eventSource;
+        const et = (ctx && (ctx.eventTypes || ctx.event_types)) || {};
+        if (es && typeof es.emit === 'function') {
+            await es.emit(et.PERSONA_CHANGED || 'persona_changed', next);
+        }
+    } catch (_e) { /* noop */ }
+    // 这两个参数在 ST 里控制 UI 行为（是否 toast / 是否导航到当前会话）。
+    // 我们由 Compose 承担，但要显式消费掉以免被误认为未实现。
+    void toastPersonaNameChange;
+    void navigateToCurrent;
 }
 
 export async function getUserPersona() {

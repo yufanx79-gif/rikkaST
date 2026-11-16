@@ -62,6 +62,7 @@ import me.rerere.rikkahub.data.st.extensions.listExtensions
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
 import me.rerere.rikkahub.data.st.runtime.buildCharacterJson
+import me.rerere.rikkahub.data.st.runtime.buildInstructTemplateJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernCharactersJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernPersonasJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernRegexScriptsJson
@@ -268,6 +269,13 @@ fun ChatPage(
             buildTavernCharactersJson(
                 tavernLatestSettings.value,
                 tavernLatestConversation.value.assistantId.toString(),
+            )
+        }
+        // [v247] Instruct 序列模板：st-compat/instruct-mode.js 的 formatInstructModePrompt
+        // 靠它组装 prompt。缺了就只能返回原文，表现是「Instruct 开了但没生效」。
+        TavernRuntimeManager.instructTemplateSupplier = {
+            buildInstructTemplateJson(
+                tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId)
             )
         }
         TavernRuntimeManager.personasSupplier = {

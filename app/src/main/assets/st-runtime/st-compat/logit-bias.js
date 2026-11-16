@@ -82,9 +82,14 @@ export function getLogitBiasListResult(biasPreset, tokenizerType, getBiasObject)
  * @param {object[]} logitBias
  * @returns {{id: string, text: string, value: number}}
  */
-export function createNewLogitBiasEntry(logitBias) {
+export function createNewLogitBiasEntry(logitBias, containerSelector) {
     const entry = { id: uuidv4(), text: '', value: 0 };
     if (Array.isArray(logitBias)) logitBias.push(entry);
+    // ST 语义（logit-bias.js:60-66）：新条目要同步渲染到 DOM 列表，
+    // 并清掉该容器的 token 缓存（否则新条目的 token 会命中旧缓存）。
+    if (containerSelector) {
+        try { BIAS_CACHE.delete(containerSelector); } catch (_e) { /* noop */ }
+    }
     return entry;
 }
 

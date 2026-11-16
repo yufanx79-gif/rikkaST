@@ -1075,6 +1075,21 @@ function pullThirdPartySettings(force) {
 //   power_user.default_persona = avatar_id ; user_avatar = avatar_id
 // 此前 `power_user.personas` 恒为 `{}` → getPersonaNames() 返回 []、getPersona() 抛
 // 「persona 'xxx' 不存在或名称不唯一」、getCurrentPersonaName() 恒 null。
+// ---------------------------------------------------------------- [v247] Instruct 模板
+// st-compat/instruct-mode.js 的 formatInstructModePrompt() 读 ctx.instructTemplate。
+// 数据源 = 宿主 Assistant.instructTemplate（字段与 ST power_user.instruct 一一对应）。
+function pullInstructTemplate() {
+    let parsed = null;
+    try { parsed = JSON.parse(callBridge('getInstructTemplateJson') || 'null'); } catch (_e) { parsed = null; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    try { stCtx.instructTemplate = parsed; } catch (_e) { /* noop */ }
+    // 同时镜像到 power_user.instruct（ST 真源位置，脚本可能直接读）
+    try {
+        const pu = stCompatPowerUser;
+        pu.instruct = Object.assign({}, pu.instruct || {}, parsed);
+    } catch (_e) { /* noop */ }
+}
+
 function pullPersonas() {
     let parsed = null;
     try { parsed = JSON.parse(callBridge('getPersonasJson') || 'null'); } catch (_e) { parsed = null; }
@@ -1208,6 +1223,7 @@ function refreshForPanelMode() {
     pullCharacter();
     pullPersonas();
     pullRegexScripts();
+    pullInstructTemplate();
     const cid = callBridge('getActiveConversationId');
     if (typeof cid === 'string') state.chatId = cid;
     syncMessageVariablesOnly();
@@ -1229,6 +1245,7 @@ function refreshAll() {
     pullCharacter();
     pullPersonas();
     pullRegexScripts();
+    pullInstructTemplate();
     const cid = callBridge('getActiveConversationId');
     if (typeof cid === 'string') state.chatId = cid;
     // [v215] 刷新后保证 ST 契约形状（ST-PT / JSR 全局变量读写依赖）

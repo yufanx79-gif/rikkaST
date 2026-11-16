@@ -61,6 +61,7 @@ class TavernWiringAuditTest {
         Wiring("modelListSupplier", "getModelListJson", jsCalls = true),
         Wiring("charactersSupplier", "getCharactersJson", jsCalls = true),
         Wiring("personasSupplier", "getPersonasJson", jsCalls = true),
+        Wiring("instructTemplateSupplier", "getInstructTemplateJson", jsCalls = true),
         Wiring("regexScriptsSupplier", "getRegexScriptsJson", jsCalls = true),
         Wiring("tavernCharacterSupplier", "getCharacterJson", jsCalls = true),
         Wiring("tavernLorebookSupplier", "getLorebookJson", jsCalls = true),

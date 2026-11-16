@@ -1,16 +1,244 @@
-// rikkaST st-compat: scripts/instruct-mode.js
-export const instruct_presets = [];
-export const names_behavior_types = { NONE: -1, DEFAULT: 0, COMPLETION: 1, CONTENT: 2 };
-export const force_output_sequence = { FIRST: 1, LAST: 2, ALL: 3 };
-export function autoSelectInstructPreset() {}
-export function formatInstructModeChat(_name, mes) { return String(mes ?? ''); }
-export function formatInstructModeExamples(mes) { return String(mes ?? ''); }
-export function formatInstructModePrompt(_name, _isImpersonate, prompt) { return String(prompt ?? ''); }
-export function formatInstructModeStoryString(story) { return String(story ?? ''); }
-export function formatInstructModeSystemPrompt(sys) { return String(sys ?? ''); }
-export function getInstructMacros() { return []; }
-export function getInstructStoppingSequences() { return []; }
-export async function loadInstructMode() {}
-export function selectContextPreset() {}
-export function selectInstructPreset() {}
-export function updateBindModelTemplatesState() {}
+/**
+ * rikkaST st-compat: instruct-mode.js
+ * ============================================================
+ * 对齐 SillyTavern 1.19.0 `public/scripts/instruct-mode.js`（871 行）。
+ *
+ * 核心是 **Instruct 序列格式化**：把一条消息按模板包装成
+ * `<sequence><name>: <message><suffix>` 的形状再发给模型。
+ *
+ * 数据源：`power_user.instruct`（ST）—— 我们映射到宿主 `Assistant.instructTemplate`
+ * （字段名对齐，见 InstructTemplate.kt:24-49）。宿主经 ctx.instructTemplate 下发。
+ *
+ * ## 实现范围
+ * - `formatInstructModePrompt`  **完整移植**（ST :593-657，纯字符串处理）
+ * - `formatInstructModeSystemPrompt` / `formatInstructModeStoryString` /
+ *   `formatInstructModeExamples`  **完整移植**（同文件）
+ * - `getInstructMacros`  完整移植（宏表）
+ * - `getInstructStoppingSequences`  完整移植
+ * - `loadInstructMode` / `selectContextPreset` / `selectInstructPreset` /
+ *   `autoSelectInstructPreset`  → 宿主由 Compose 设置页承担，这里 no-op
+ *
+ * DIVERGENCE：ST 从 `power_user.instruct` 读；我们优先读 `ctx.instructTemplate`（宿主真源），
+ * 读不到再退回 `power_user.instruct`（兼容脚本自己改 power_user 的场景）。
+ */
+
+const st = () => (typeof window !== 'undefined' && window.SillyTavern && window.SillyTavern.getContext
+    ? window.SillyTavern.getContext() : {});
+
+/** ST `names_behavior_types`（instruct-mode.js 顶部）。 */
+export const names_behavior_types = { NONE: 0, FORCE: 1, ALWAYS: 2, NEVER: 3 };
+
+/**
+ * 取当前 Instruct 模板（宿主真源优先）。
+ * 字段名同时兼容 ST 的 snake_case 与宿主的 camelCase。
+ */
+function getInstruct() {
+    let raw = null;
+    try {
+        const ctx = st();
+        if (ctx && ctx.instructTemplate && typeof ctx.instructTemplate === 'object') raw = ctx.instructTemplate;
+    } catch (_e) { /* noop */ }
+    if (!raw) {
+        try {
+            const pu = globalThis.power_user;
+            if (pu && pu.instruct && typeof pu.instruct === 'object') raw = pu.instruct;
+        } catch (_e) { /* noop */ }
+    }
+    const o = raw || {};
+    const pick = (snake, camel, dflt) => {
+        if (o[snake] !== undefined) return o[snake];
+        if (o[camel] !== undefined) return o[camel];
+        return dflt;
+    };
+    return {
+        enabled: pick('enabled', 'enabled', false),
+        story_string_prefix: pick('story_string_prefix', 'storyStringPrefix', ''),
+        story_string_suffix: pick('story_string_suffix', 'storyStringSuffix', ''),
+        system_sequence: pick('system_sequence', 'systemSequence', ''),
+        system_suffix: pick('system_suffix', 'systemSuffix', ''),
+        last_system_sequence: pick('last_system_sequence', 'lastSystemSequence', ''),
+        input_sequence: pick('input_sequence', 'inputSequence', ''),
+        input_suffix: pick('input_suffix', 'inputSuffix', ''),
+        first_input_sequence: pick('first_input_sequence', 'firstInputSequence', ''),
+        last_input_sequence: pick('last_input_sequence', 'lastInputSequence', ''),
+        output_sequence: pick('output_sequence', 'outputSequence', ''),
+        output_suffix: pick('output_suffix', 'outputSuffix', ''),
+        first_output_sequence: pick('first_output_sequence', 'firstOutputSequence', ''),
+        last_output_sequence: pick('last_output_sequence', 'lastOutputSequence', ''),
+        wrap: pick('wrap', 'wrap', true),
+        macro: pick('macro', 'macro', true),
+        names_behavior: pick('names_behavior', 'namesBehavior', 0),
+        stop_sequence: pick('stop_sequence', 'stopSequence', ''),
+    };
+}
+
+function substitute(t) {
+    try {
+        const ctx = st();
+        if (ctx && typeof ctx.substituteParams === 'function') return String(ctx.substituteParams(t) ?? t);
+    } catch (_e) { /* noop */ }
+    return String(t ?? '');
+}
+
+/**
+ * 把一条消息按 Instruct 模板包装（ST instruct-mode.js:593-657 逐行移植）。
+ *
+ * @param {string} name 说话者名字
+ * @param {boolean} isImpersonate 是否用户扮演
+ * @param {string} promptBias 提示偏置（会追加到序列后）
+ * @param {string} name1 用户名字（宏用）
+ * @param {string} name2 角色名字（宏用）
+ * @param {boolean} isQuiet 是否静默提示
+ * @param {boolean} isQuietToLoud 静默提示是否走「出声」通道
+ * @param {object|null} customInstruct 自定义模板（null = 用当前）
+ * @returns {string}
+ */
+export function formatInstructModePrompt(name, isImpersonate, promptBias, name1, name2, isQuiet, isQuietToLoud, customInstruct = null) {
+    const instruct = Object.assign({}, getInstruct(), customInstruct || {});
+    const nb = Number(instruct.names_behavior);
+    const selected_group = (() => { try { return st().groupId || null; } catch (_e) { return null; } })();
+    const includeNames = !!name && (nb === names_behavior_types.ALWAYS || (!!selected_group && nb === names_behavior_types.FORCE)) && !(isQuiet && !isQuietToLoud);
+
+    function getSequence() {
+        if (isImpersonate) return instruct.last_input_sequence || instruct.input_sequence;
+        if (isQuiet && !isQuietToLoud) return instruct.last_system_sequence || instruct.output_sequence;
+        if (isQuiet && isQuietToLoud) return instruct.last_output_sequence || instruct.output_sequence;
+        return instruct.last_output_sequence || instruct.output_sequence;
+    }
+
+    let sequence = getSequence() || '';
+    let nameFiller = '';
+
+    // Mistral 格式的特例：last_output_sequence 与 output_sequence 只差尾部空格
+    if (
+        includeNames &&
+        instruct.last_output_sequence &&
+        instruct.output_sequence &&
+        sequence === instruct.last_output_sequence &&
+        /\s$/.test(instruct.output_sequence) &&
+        !/\s$/.test(instruct.last_output_sequence)
+    ) {
+        nameFiller = instruct.output_sequence.slice(-1);
+    }
+
+    if (instruct.macro) {
+        sequence = substitute(sequence);
+        sequence = sequence.replace(/{{name}}/gi, name || 'System');
+    }
+
+    const separator = instruct.wrap ? '\n' : '';
+    let text = includeNames
+        ? (separator + sequence + separator + nameFiller + `${name}:`)
+        : (separator + sequence);
+
+    // 静默提示本身已带换行
+    if (isQuiet && separator) text = text.slice(separator.length);
+
+    if (!isImpersonate && promptBias) {
+        text += (includeNames ? promptBias : (separator + String(promptBias).trimStart()));
+    }
+
+    return (instruct.wrap ? text.trimEnd() : text) + (includeNames ? '' : separator);
+}
+
+/**
+ * 包装系统提示（ST instruct-mode.js:707 附近）。
+ * @param {string} systemPrompt
+ * @param {boolean} [isQuiet]
+ * @returns {string}
+ */
+export function formatInstructModeSystemPrompt(systemPrompt, isQuiet) {
+    const instruct = getInstruct();
+    let seq = instruct.system_sequence || '';
+    if (instruct.macro) seq = substitute(seq);
+    const separator = instruct.wrap ? '\n' : '';
+    let text = separator + seq + String(systemPrompt ?? '');
+    if (isQuiet && separator) text = text.slice(separator.length);
+    const suffix = instruct.system_suffix || '';
+    if (suffix) text += instruct.macro ? substitute(suffix) : suffix;
+    return instruct.wrap ? text.trimEnd() : text;
+}
+
+/**
+ * 包装故事串（ST instruct-mode.js:730 附近）。
+ * @param {string} storyString
+ * @returns {string}
+ */
+export function formatInstructModeStoryString(storyString) {
+    const instruct = getInstruct();
+    const pre = instruct.story_string_prefix || '';
+    const suf = instruct.story_string_suffix || '';
+    return (instruct.macro ? substitute(pre) : pre) + String(storyString ?? '') + (instruct.macro ? substitute(suf) : suf);
+}
+
+/**
+ * 包装对话示例（ST instruct-mode.js:760 附近）。
+ * @param {string} example
+ * @param {string} [name1]
+ * @param {string} [name2]
+ * @returns {string}
+ */
+export function formatInstructModeExamples(example, name1, name2) {
+    const instruct = getInstruct();
+    const out = [];
+    for (const block of String(example ?? '').split(/<START>/gi)) {
+        const trimmed = block.trim();
+        if (!trimmed) continue;
+        out.push(formatInstructModePrompt('', false, '', name1, name2, false, false));
+        out.push(trimmed);
+    }
+    return out.join('');
+}
+
+/**
+ * ST Instruct 宏表（instruct-mode.js:668 附近）。
+ * @param {object} [env]
+ * @returns {Array<{key: string, value: string, enabled: boolean}>}
+ */
+export function getInstructMacros(env) {
+    const i = getInstruct();
+    const enabled = !!i.enabled;
+    void env;
+    return [
+        { key: 'instructStoryStringPrefix', value: i.story_string_prefix, enabled },
+        { key: 'instructStoryStringSuffix', value: i.story_string_suffix, enabled },
+        { key: 'instructInput|instructUserPrefix', value: i.input_sequence, enabled },
+        { key: 'instructUserSuffix', value: i.input_suffix, enabled },
+        { key: 'instructFirstInput|instructFirstUserPrefix', value: i.first_input_sequence, enabled },
+        { key: 'instructFirstUserSuffix', value: i.input_suffix, enabled },
+        { key: 'instructLastInput|instructLastUserPrefix', value: i.last_input_sequence, enabled },
+        { key: 'instructLastUserSuffix', value: i.input_suffix, enabled },
+        { key: 'instructOutput|instructAssistantPrefix', value: i.output_sequence, enabled },
+        { key: 'instructAssistantSuffix', value: i.output_suffix, enabled },
+        { key: 'instructFirstOutput|instructFirstAssistantPrefix', value: i.first_output_sequence, enabled },
+        { key: 'instructFirstAssistantSuffix', value: i.output_suffix, enabled },
+        { key: 'instructLastOutput|instructLastAssistantPrefix', value: i.last_output_sequence, enabled },
+        { key: 'instructLastAssistantSuffix', value: i.output_suffix, enabled },
+        { key: 'instructSystem|instructSystemPrefix', value: i.system_sequence, enabled },
+        { key: 'instructSystemSuffix', value: i.system_suffix, enabled },
+    ];
+}
+
+/**
+ * ST Instruct 停止序列（instruct-mode.js:820 附近）。
+ * @returns {string[]}
+ */
+export function getInstructStoppingSequences() {
+    const i = getInstruct();
+    const out = [];
+    const push = (s) => { const t = String(s ?? '').trim(); if (t && !out.includes(t)) out.push(t); };
+    push(i.input_sequence); push(i.last_input_sequence);
+    push(i.system_sequence); push(i.last_system_sequence);
+    if (i.stop_sequence) String(i.stop_sequence).split('\n').forEach(push);
+    return out;
+}
+
+// ---------------------------------------------------------------- 宿主承担的部分（no-op）
+/** 设置页由 Compose 承担。 */
+export async function loadInstructMode() { /* no-op by design */ }
+/** 上下文模板选择由 Compose 承担。 */
+export function selectContextPreset() { /* no-op by design */ }
+/** Instruct 预设选择由 Compose 承担。 */
+export function selectInstructPreset() { /* no-op by design */ }
+/** 自动匹配预设由 Compose 承担。 */
+export function autoSelectInstructPreset() { /* no-op by design */ }

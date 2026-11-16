@@ -120,13 +120,35 @@ export async function saveBase64AsFile(base64Data, characterName, filename, exte
     return '';
 }
 
-export async function download(data, filename) {
+/**
+ * 触发下载（ST utils.js:405-412）。
+ *
+ * ⚠️ [v247] 两个语义修正：
+ *  1. ST 是**同步函数**，我们之前写成 `async` —— 调用方 `download(...)` 拿到 Promise，
+ *     若随后立刻 `URL.revokeObjectURL` 就会在文件写完前撤销。这里改回同步。
+ *  2. 补上 ST 的第三个参数 `contentType`（MIME）—— 少了它 Blob 类型永远是默认值，
+ *     导出的 .json / .png 在系统里会被识别成纯文本。
+ *
+ * @param {string|Blob|ArrayBuffer} content
+ * @param {string} fileName
+ * @param {string} [contentType] MIME 类型
+ */
+export function download(content, fileName, contentType) {
+    const name = String(fileName == null ? 'download' : fileName);
     try {
-        const blob = (data instanceof Blob) ? data : new Blob([data]);
+        // 优先走宿主桥：WebView 里 a.click() 对 blob URL 不可靠
+        const b = globalThis.RikkaBridge;
+        if (b && typeof b.downloadFile === 'function' && typeof content === 'string') {
+            const type = String(contentType == null ? 'text/plain' : contentType);
+            if (b.downloadFile(name, type, content) === true) return;
+        }
+    } catch (_e) { /* fall through */ }
+    try {
+        const blob = (content instanceof Blob) ? content : new Blob([content], { type: contentType || undefined });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = String(filename || 'download');
+        a.download = name;
         document.body.appendChild(a);
         a.click();
         a.remove();
