@@ -1415,11 +1415,50 @@ window.__rikkaInvokeJsFunctionTool = async (name, argsJson, seq) => {
     }
 };
 
+/**
+ * ST `ToolManager` 契约（public/scripts/tool-calling.js:242-263）。
+ *
+ * ⚠️ [v247 BUGFIX] 此前这里缺 `tools` getter。ST 真源是 **static class**：
+ * ```
+ * static #tools = new Map();
+ * static get tools() { return Array.from(this.#tools.values()); }   // :261-263
+ * ```
+ * 脚本对它的用法是直接当数组操作：
+ *   TRANS-AM ta-transport: `st.ToolManager.tools.some(tool => tool.toFunctionOpenAI()...)`
+ *   TRANS-AM 独立决策抽签:  `st.ToolManager.tools.find(...)`
+ * 缺这个 getter → `Cannot read properties of undefined (reading 'tools')`
+ * → **两个脚本整体加载失败**（输出开关、决策抽签功能全灭）。
+ *
+ * 我们内部用 Map 存（stFunctionToolRegistry），这里按 ST 语义暴露成数组快照。
+ * `toFunctionOpenAI()` 是 ToolDefinition 的方法（tool-calling.js:100 附近），
+ * 脚本会调用它取 OpenAI function 形状 —— 一并补上，否则 .some() 里仍会炸。
+ */
+function stToolDefinitionView(def) {
+    return {
+        ...def,
+        toFunctionOpenAI() {
+            return {
+                type: 'function',
+                function: {
+                    name: String(def.name || ''),
+                    description: String(def.description || ''),
+                    parameters: def.parameters || { type: 'object', properties: {} },
+                },
+            };
+        },
+    };
+}
+
 const toolManagerStub = {
     isToolCallingSupported: () => true,
     canPerformToolCalls: () => true,
     registerFunctionTool: registerStFunctionTool,
     unregisterFunctionTool: unregisterStFunctionTool,
+    // ST :261-263 `static get tools()` —— 每次读都是新数组快照（与 ST 一致）
+    get tools() {
+        try { return Array.from(stFunctionToolRegistry.values()).map(stToolDefinitionView); }
+        catch (_e) { return []; }
+    },
 };
 
 const chatCompletionSettingsStub = {
@@ -1788,6 +1827,16 @@ const stCtx = {
     get event_types() { return event_types; },
     get chatCompletionSettings() { return chatCompletionSettingsStub; },
     POPUP_TYPE, POPUP_RESULT,
+    // ST st-context.js:183-186 —— ToolManager 的四个实例方法在 ctx 上**直接可用**：
+    //   registerFunctionTool / unregisterFunctionTool / isToolCallingSupported / canPerformToolCalls
+    // 依据：ST 真源 `getContext()` 返回对象里就是 `ToolManager.registerFunctionTool.bind(ToolManager)`。
+    // 脚本按 ctx 调用：TRANS-AM ta-transport 用 `context().registerFunctionTool(...)`；
+    // 此前 ctx 只有 ToolManager 对象、没有这四个平铺方法 → "registerFunctionTool is not a function"
+    // → 输出开关脚本整体加载失败。
+    registerFunctionTool: registerStFunctionTool,
+    unregisterFunctionTool: unregisterStFunctionTool,
+    isToolCallingSupported: () => true,
+    canPerformToolCalls: () => true,
     ToolManager: toolManagerStub,
     saveChat,
     saveMetadataDebounced,
