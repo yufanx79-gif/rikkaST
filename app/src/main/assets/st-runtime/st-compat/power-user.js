@@ -24,7 +24,15 @@ const persona_description_positions_enum = {
 export const persona_description_positions = persona_description_positions_enum;
 
 /** Power User 设置（与宿主 extensionSettings 双向原位镜像）。 */
-export const power_user = {
+const __powerUserRawBase = {
+    /**
+     * ST `power_user.request_token_probabilities`（power-user.js:188，默认 false）。
+     *
+     * ST 的 openai.js:2856 用它决定是否在请求里加 `logprobs: 5`。
+     * 我们这边由宿主 `TextGenerationParams.logprobs` 承接：
+     * 脚本/设置把它置 true 后，通过 RikkaBridge.setRequestTokenProbabilities 通知宿主。
+     */
+    request_token_probabilities: false,
     persona_description: '',
     persona_description_position: persona_description_positions_enum.IN_PROMPT,
     persona_description_depth: 2,
@@ -126,6 +134,38 @@ export function syncPowerUserToExtensionSettings() {
     } catch (_e) { /* noop */ }
 }
 
+/**
+ * [v247] 把 `request_token_probabilities` 的**写入**同步到宿主。
+ *
+ * 为什么需要 Proxy：脚本通常是 `power_user.request_token_probabilities = true;`
+ * 这种直接赋值（ST 里也是这么用的），不会经过任何 setter 函数。
+ * 不用 Proxy 的话，宿主永远不知道用户开了这个开关，
+ * GenerationLoop 就不会加 `logprobs`，logprobs 面板永远是空的（假完成）。
+ */
+function __rikkaPushTokenProbabilities(value) {
+    try {
+        const b = (typeof window !== 'undefined') ? window.RikkaBridge : null;
+        if (b && typeof b.setRequestTokenProbabilities === 'function') {
+            b.setRequestTokenProbabilities(!!value);
+        }
+    } catch (_e) { /* noop */ }
+}
+
+const __powerUserRaw = __powerUserRawBase;
+
+export const power_user = new Proxy(__powerUserRaw, {
+    set(target, prop, value) {
+        const ok = Reflect.set(target, prop, value);
+        if (prop === 'request_token_probabilities') __rikkaPushTokenProbabilities(value);
+        return ok;
+    },
+});
+
+
+try {
+    window.__rikkaPushTokenProbabilities = __rikkaPushTokenProbabilities;
+} catch (_e) { /* noop */ }
+
 try {
     window.__rikkaSyncPowerUserFromExt = syncPowerUserFromExtensionSettings;
     window.__rikkaSyncPowerUserToExt = syncPowerUserToExtensionSettings;
@@ -212,3 +252,22 @@ export function resetMovableStyles(..._args) { return null; }
 export const send_on_enter_options = { DISABLED: -1, AUTO: 0, ENABLED: 1 };
 export function sortEntitiesList(..._args) { return null; }
 export const toastPositionClasses = ['toast-top-left', 'toast-top-center', 'toast-top-right', 'toast-bottom-left', 'toast-bottom-center', 'toast-bottom-right'];
+
+/**
+ * [v247] `power_user` 的可观测代理：拦截 `request_token_probabilities` 写入并同步宿主。
+ *
+ * 注意：这里用 `Object.defineProperty` 覆盖导出绑定是不可能的（ESM 导出是只读的），
+ * 所以采用「模块内所有引用改走 proxy + 导出 proxy」的方式：
+ * 下游 `import { power_user }` 拿到的是 proxy，读写语义与普通对象一致。
+ */
+
+export const __powerUserProxy = power_user;
+
+// 模块加载时把宿主当前值同步进来（宿主可能是上一次会话留下的 true）
+try {
+    const b = (typeof window !== 'undefined') ? window.RikkaBridge : null;
+    if (b && typeof b.getRequestTokenProbabilities === 'function') {
+        const v = b.getRequestTokenProbabilities();
+        if (typeof v === 'boolean') __powerUserRaw.request_token_probabilities = v;
+    }
+} catch (_e) { /* noop */ }

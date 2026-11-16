@@ -209,4 +209,64 @@ class TavernWiringAuditTest {
             missing.isEmpty(),
         )
     }
+
+    /**
+     * ★★ 全仓扫描：任何 JS 文件里通过 `window.RikkaBridge.x(...)` /
+     * `typeof b.x !== 'function'` 访问的桥方法，Kotlin 侧都必须真实存在。
+     *
+     * 为什么必须加这条：
+     * `everyJsCallBridgeHasKotlinMethod` 只扫 runtime.js 里的 `callBridge('x')`，
+     * 但 st-compat 里大量模块是**直接用 window.RikkaBridge** 的
+     * （典型：`extensions/gallery/index.js` 里的 `b.galleryListJson()`）。
+     * `galleryListJson` 曾经在 JS 里被调用、Kotlin 里根本不存在，
+     * 而 `if (!b || typeof b.x !== 'function') return []` 让它静默返回空数组 ——
+     * 上面那条检查完全看不见。这就是本条存在的理由。
+     */
+    @Test
+    fun everyRikkaBridgeCallAcrossAllJsHasKotlinMethod() {
+        val ktMethods = Regex("""@JavascriptInterface\s*\n\s*fun\s+(\w+)\s*\(""")
+            .findAll(manager)
+            .map { it.groupValues[1] }
+            .toSet()
+
+        val jsFiles = listOf(
+            File("src/main/assets/st-runtime"),
+            File("app/src/main/assets/st-runtime"),
+        ).first { it.exists() }
+            .walkTopDown()
+            .filter { it.isFile && it.name.endsWith(".js") }
+            .toList()
+        assertTrue("找不到 st-runtime 下的 JS 文件", jsFiles.isNotEmpty())
+
+        val orphans = sortedMapOf<String, MutableSet<String>>()
+        jsFiles.forEach { f ->
+            val src = f.readText()
+            // 该文件里所有指向 RikkaBridge 的别名
+            val aliases = mutableSetOf("RikkaBridge")
+            Regex("""(?:const|let|var)\s+(\w+)\s*=\s*[^;\n]*RikkaBridge""")
+                .findAll(src).forEach { aliases.add(it.groupValues[1]) }
+            aliases.forEach { a ->
+                Regex("""\b${Regex.escape(a)}\s*\.\s*(\w+)\s*\(""")
+                    .findAll(src).forEach { m ->
+                        val name = m.groupValues[1]
+                        if (name !in ktMethods) {
+                            orphans.getOrPut(name) { mutableSetOf() }.add(f.name)
+                        }
+                    }
+            }
+        }
+
+        // 已知的 JS 原生方法名（不是桥方法，属于误报）
+        val jsNative = setOf(
+            "apply", "call", "bind", "slice", "indexOf", "startsWith", "endsWith",
+            "forEach", "map", "filter", "find", "some", "every", "reduce", "join",
+            "toString", "toJSON", "hasOwnProperty", "constructor",
+        )
+        val real = orphans.filterKeys { it !in jsNative }
+        assertTrue(
+            "以下桥方法在 JS 里被调用、但 Kotlin 里不存在（会静默失效）：" +
+                real.map { "${it.key} ← ${it.value}" },
+            real.isEmpty(),
+        )
+    }
 }

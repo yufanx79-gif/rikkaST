@@ -1348,6 +1348,9 @@ class GenerationLoop(
                 me.rerere.ai.provider.ToolChoice.AUTO
             },
             reasoningLevel = assistant.reasoningLevel,
+            // [v247] ST `power_user.request_token_probabilities` → 索取 token 概率。
+            // ST openai.js:2858 固定用 5（OpenAI 上限）。默认 0 = 不下发，请求形状不变。
+            logprobs = if (me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.requestTokenProbabilities) 5 else 0,
             customHeaders = buildList {
                 addAll(assistant.customHeaders)
                 addAll(model.customHeaders)

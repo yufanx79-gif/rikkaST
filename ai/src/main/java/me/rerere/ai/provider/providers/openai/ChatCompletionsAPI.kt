@@ -125,7 +125,12 @@ class ChatCompletionsAPI(
         TextGenerationResult(
             id = id,
             model = model,
-            message = parseMessage(message),
+            message = parseMessage(
+                // logprobs 挂在 choice 上，而不是 message 上 —— 合进来交给 parseMessage 统一处理
+                if (choice.containsKey("logprobs")) {
+                    JsonObject(message.toMutableMap().apply { put("logprobs", choice["logprobs"]!!) })
+                } else message
+            ),
             finishReason = finishReason,
             usage = usage
         )
@@ -248,6 +253,12 @@ class ChatCompletionsAPI(
                 if (params.topP != null) put("top_p", params.topP)
             }
             if (params.maxTokens != null) put("max_tokens", params.maxTokens)
+
+            // [v247] ST logprobs 支持：仅在显式要求时下发，默认不改变请求形状。
+            if (params.logprobs > 0) {
+                put("logprobs", true)
+                put("top_logprobs", params.logprobs)
+            }
 
             put("stream", stream)
             if (stream) {
@@ -722,6 +733,19 @@ class ChatCompletionsAPI(
         }
     }
 
+    /**
+     * [v247] 把响应里的 `logprobs.content[]` 原样挂到 Text part 的 metadata 上。
+     *
+     * ST `logprobs.js` 读的是 `message.extra.logprobs`（形如
+     * `{ content: [{ token, logprob, top_logprobs: [...] }] }`）。
+     * 我们保留原始 JSON 结构，JS 侧无需二次转换。
+     */
+    private fun logprobsMetadata(jsonObject: JsonObject): JsonObject? {
+        val lp = jsonObject["logprobs"] as? JsonObject ?: return null
+        if (!lp.containsKey("content")) return null
+        return kotlinx.serialization.json.buildJsonObject { put("logprobs", lp) }
+    }
+
     private fun parseMessage(jsonObject: JsonObject): UIMessage {
         val role = MessageRole.valueOf(
             jsonObject["role"]?.jsonPrimitive?.contentOrNull?.uppercase() ?: "ASSISTANT"
@@ -774,7 +798,9 @@ class ChatCompletionsAPI(
                         )
                     )
                 }
-                if (content.isNotEmpty()) add(UIMessagePart.Text(content))
+                if (content.isNotEmpty()) {
+                    add(UIMessagePart.Text(content, metadata = logprobsMetadata(jsonObject)))
+                }
                 images.forEach { image ->
                     val imageObject = image.jsonObjectOrNull ?: return@forEach
                     val type = imageObject["type"]?.jsonPrimitive?.contentOrNull ?: return@forEach

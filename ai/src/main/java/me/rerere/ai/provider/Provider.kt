@@ -85,6 +85,17 @@ data class TextGenerationParams(
     val customHeaders: List<CustomHeader> = emptyList(),
     val customBody: List<CustomBody> = emptyList(),
     val sessionId: String? = Uuid.random().toString(),
+    /**
+     * [v247] 请求 top-N logprobs（ST `logprobs.js` 需要）。
+     *
+     * 0 = 不下发该字段（默认，与改动前完全一致）。
+     * >0 时在请求体里加 `logprobs: N` 与 `top_logprobs: N`，并把响应里的
+     * `choices[].logprobs.content[]` 挂到消息 metadata 上，供 JS 读取。
+     *
+     * 为什么要加：ST 的 logprobs 面板/导出脚本依赖逐 token 概率。
+     * 之前宿主请求从不带这个参数，JS 层永远拿不到数据（假完成）。
+     */
+    val logprobs: Int = 0,
 )
 
 @Serializable

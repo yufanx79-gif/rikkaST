@@ -706,6 +706,14 @@ object TavernRuntimeManager {
         appendLog("debug", "[buttons] broadcast to main + $n aux webview(s)")
         eval(script)
     }
+    /**
+     * [v247] 是否在生成请求里索取 token 概率（ST `power_user.request_token_probabilities`）。
+     *
+     * JS 侧 `setRequestTokenProbabilities(true)` 后置位，GenerationLoop 读取它决定
+     * `TextGenerationParams.logprobs`。默认 false —— 与改动前请求形状完全一致。
+     */
+    @Volatile var requestTokenProbabilities: Boolean = false
+
     @Volatile private var appContext: Context? = null
     @Volatile private var pageReady = false
 
@@ -3274,6 +3282,91 @@ object TavernRuntimeManager {
         fun getModelListJson(): String {
             val supplier = modelListSupplier ?: return "[]"
             return runCatching { supplier() }.getOrElse { "[]" }
+        }
+
+        /**
+         * [v247] ST `power_user.request_token_probabilities` 的宿主落点。
+         *
+         * ST openai.js:2856 用它在请求里加 `logprobs: 5`（仅支持的源）。
+         * 这里只记录开关，实际下发由 GenerationLoop 读 [requestTokenProbabilities] 完成。
+         */
+        @JavascriptInterface
+        fun setRequestTokenProbabilities(enabled: Boolean): Boolean {
+            TavernRuntimeManager.requestTokenProbabilities = enabled
+            return true
+        }
+
+        /** 读取当前开关（脚本侧自检用）。 */
+        @JavascriptInterface
+        fun getRequestTokenProbabilities(): Boolean = TavernRuntimeManager.requestTokenProbabilities
+
+        /**
+         * [v247] JSR 画廊桥（ST `extensions/gallery/index.js:getGalleryItems` 的落点）。
+         *
+         * ST 从 `user/images/<folder>/` 目录列文件（POST `/api/images/list`）。
+         * 我们对应的是沙箱 `st-user-files/images/<folder>/`，由 [TavernFileBridge.list] 提供。
+         *
+         * 为什么必须真做：`st-compat/extensions/gallery/index.js` 里
+         * `if (!b || typeof b.galleryListJson !== 'function') return []` ——
+         * 桥缺失时它**静默返回空数组**，调用方完全看不出问题（假完成）。
+         *
+         * @param folder 画廊子目录名（空 = 根目录）
+         * @return `[{"url":..,"src":..,"srct":..,"title":..,"name":..}]`，失败返回 `[]`
+         */
+        @JavascriptInterface
+        fun galleryListJson(folder: String): String {
+            return runCatching {
+                val raw = me.rerere.rikkahub.data.st.runtime.TavernFileBridge.list(
+                    if (folder.isBlank()) "images" else "images/$folder"
+                )
+                val obj = kotlinx.serialization.json.Json
+                    .parseToJsonElement(raw) as? kotlinx.serialization.json.JsonObject
+                    ?: return "[]"
+                val okFlag = (obj["ok"] as? kotlinx.serialization.json.JsonPrimitive)
+                    ?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                if (!okFlag) return "[]"
+                val files = obj["files"] as? kotlinx.serialization.json.JsonArray ?: return "[]"
+                val prefix = if (folder.isBlank()) "user/images" else "user/images/$folder"
+                kotlinx.serialization.json.JsonArray(
+                    files.mapNotNull { el ->
+                        val o = el as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+                        val name = (o["name"] as? kotlinx.serialization.json.JsonPrimitive)
+                            ?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        val isDir = (o["dir"] as? kotlinx.serialization.json.JsonPrimitive)
+                            ?.contentOrNull?.toBooleanStrictOrNull() ?: false
+                        if (isDir) return@mapNotNull null
+                        val url = "$prefix/$name"
+                        kotlinx.serialization.json.buildJsonObject {
+                            put("url", kotlinx.serialization.json.JsonPrimitive(url))
+                            put("src", kotlinx.serialization.json.JsonPrimitive(url))
+                            put("srct", kotlinx.serialization.json.JsonPrimitive(url))
+                            put("title", kotlinx.serialization.json.JsonPrimitive(""))
+                            put("name", kotlinx.serialization.json.JsonPrimitive(name))
+                        }
+                    }
+                ).toString()
+            }.getOrElse { "[]" }
+        }
+
+        /**
+         * [v247] 下载落点桥（ST `utils.js:download` 的落点）。
+         *
+         * 上游用 `a.download` + blob URL；WebView 里 blob 下载不可靠，
+         * 所以 `st-compat/utils.js` 优先调本方法。宿主把它写进应用外部下载目录，
+         * 失败时返回 false，JS 侧再回退到 blob（行为与上游一致）。
+         */
+        @JavascriptInterface
+        fun downloadFile(fileName: String, mimeType: String, content: String): Boolean {
+            val app = TavernRuntimeManager.appContext ?: return false
+            return runCatching {
+                val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
+                    .ifBlank { "download" }
+                val dir = app.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                    ?: app.filesDir
+                if (!dir.exists()) dir.mkdirs()
+                java.io.File(dir, safeName).writeText(content)
+                true
+            }.getOrDefault(false)
         }
 
         /**
