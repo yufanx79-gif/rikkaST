@@ -4000,7 +4000,31 @@ function mountScriptIframe(script) {
     const blobUrl = URL.createObjectURL(blob);
     const iframe = document.createElement('iframe');
     iframe.src = blobUrl;
-    iframe.id = `TH-script--${id}`;
+    // [v247 BUGFIX] iframe.id 必须与 window.name **完全同格式**：`TH-script--<name>--<id>`。
+    //
+    // 上游 Tavern Helper 的 `_getIframeName()`（rikkast-entry.js:10909-10921）优先读
+    // `this.frameElement?.id`，只有它为空时才退回 `this.__TH_IFRAME_ID || this.name`：
+    // ```
+    // function _getIframeName() {
+    //     const frameElement = this.frameElement;
+    //     const cachedId = this.__TH_IFRAME_ID || this.name;
+    //     if (frameElement?.id) { ...; return frameElement.id; }
+    //     if (cachedId) { ...; return cachedId; }
+    //     throw new TypeError('frameElement is null while resolving iframe id');
+    // }
+    // ```
+    // 而 `_getScriptId()` 用贪婪正则剥壳（同文件 :10936-10940）：
+    // ```
+    // return iframe_name.replace(/TH-script--.+--/, '');
+    // ```
+    // 此前我们写的是 `TH-script--${id}`（**没有中间的 --<name>-- 段**），
+    // 于是 `.+` 把整个 id 吃掉、`replace` 后返回空串（或错位），
+    // `getScriptId()` 返回错值 → `getButtonEvent()` 拼出的事件名与脚本注册时不一致
+    // → **按钮能显示、点了没反应**（KEMINI / TRANS-AM 控制台打不开的直接原因之一）。
+    // 修法：id 与 window.name 用同一个字符串（buildScriptIframeHtml 里的 iframeName）。
+    // 与 buildScriptIframeHtml 里的 iframeName 同源（那里是 `TH-script--${scriptName}--${scriptId}`）
+    const scriptName = String(script.name == null ? '' : script.name);
+    iframe.id = `TH-script--${scriptName}--${id}`;
     iframe.style.cssText = 'display:none;width:0;height:0;border:none;position:absolute;pointer-events:none;';
     document.body.appendChild(iframe);
     iframe.addEventListener('load', () => { try { URL.revokeObjectURL(blobUrl); } catch (_e) { /* noop */ } });
@@ -4053,6 +4077,18 @@ let scriptsLoadGen = 0;
  * 合并策略：声明式按钮与运行时按钮**并集**，按 scriptId+name 去重。
  * 声明式优先（预设作者显式写在 JSON 里的通常是主入口）。
  */
+/**
+ * [v247] 上游按钮事件名：`${script_id}_${getStringHash(button_name)}`。
+ * 依据 `rikkast-entry.js:11127-11129 getButtonId()`。与 shims/button-shims.js 的 _eventNameOf 同源，
+ * 两边必须一致，否则「宿主 emit 的事件名」和「脚本监听的事件名」对不上 → 点了没反应。
+ */
+function buttonEventName(scriptId, buttonName) {
+    try {
+        if (buttonHub && typeof buttonHub.event === 'function') return buttonHub.event(String(scriptId), String(buttonName));
+    } catch (_e) { /* noop */ }
+    return String(scriptId) + '_' + String(buttonName);
+}
+
 function syncDeclaredScriptButtons(scripts) {
     try {
         const out = [];
@@ -4075,7 +4111,10 @@ function syncDeclaredScriptButtons(scripts) {
                     scriptId: scriptId,
                     scriptName: String(sc.name == null ? '' : sc.name),
                     name: name,
-                    event: `script_button::${scriptId}::${name}`,
+                    // [v247 BUGFIX] 必须与上游 getButtonId() 的事件名逐字一致：
+                    // `${script_id}_${getStringHash(button_name)}`（rikkast-entry.js:11127-11129）。
+                    // 此前这里是自造的 `script_button::id::name`，宿主 fire 后脚本监听不到。
+                    event: buttonEventName(scriptId, name),
                 });
             }
         }

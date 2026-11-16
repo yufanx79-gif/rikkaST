@@ -21,19 +21,35 @@ function _ensure(scriptId, scriptName) {
     return entry;
 }
 
-function _simpleHash(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash |= 0;
-    }
-    return Math.abs(hash).toString(36);
-}
+import { getStringHash } from '../st-compat/utils.js';
 
+/**
+ * [v247 BUGFIX] 按钮事件名必须与 Tavern Helper 上游契约**逐字一致**。
+ *
+ * 上游真源（`src/function/script.ts` + `src/store/script_iframe_runtimes.ts`）：
+ * ```
+ * function getButtonId(script_id, button_name) {
+ *     return `${script_id}_${getStringHash(button_name)}`;   // rikkast-entry.js:11127-11129
+ * }
+ * function _getButtonEvent(button_name) {
+ *     return getButtonId(String(_getScriptId.call(this)), button_name);  // :18930-18932
+ * }
+ * function _eventOnButton(event_type, listener) {
+ *     _eventOn.call(this, _getButtonEvent.call(this, event_type), listener);  // :19029-19031
+ * }
+ * ```
+ * 即脚本调 `eventOnButton('打开面板', fn)` 时，它监听的事件名是
+ * `<scriptId>_<hash('打开面板')>`（`getStringHash` = ST `public/scripts/utils.js:522` 的 cyrb53 变体）。
+ *
+ * 我们此前用的是自造格式 `rikka_button_<base36>` —— 和上游**永远不匹配**，
+ * 于是「按钮能显示、点了没反应」：宿主 `fireButton()` emit 的事件名，
+ * 脚本根本没在监听。这就是 KEMINI / TRANS-AM 控制台点击无反应的根因。
+ *
+ * 修法：直接复用 st-compat 里那份与 ST 逐字对齐的 `getStringHash`，拼出上游同名事件。
+ */
 function _eventNameOf(scriptId, entry, name) {
     if (!entry.events.has(name)) {
-        entry.events.set(name, `rikka_button_${_simpleHash(String(scriptId) + '::' + name)}`);
+        entry.events.set(name, `${String(scriptId)}_${getStringHash(String(name))}`);
     }
     return entry.events.get(name);
 }
