@@ -2187,6 +2187,103 @@ try {
     chatDom.attachChatListeners(eventSource);
 } catch (_e) { /* noop */ }
 
+// ---------------------------------------------------------------- 预设读写面（JSR getPreset / replacePreset）
+// [v246] 根因：TRANS-AM / SPreset 系脚本用 `getPreset('in_use').prompts` 读**条目开关**
+// 来决定某功能是否生效（`ta.enabled`、`ta-history-window`、`ta-affection-display` …）。
+// 此前 runtime 里 `getPreset` 根本不存在（只有返回空数组的 getPresetManager），
+// 脚本第一行就抛 `TypeError: getPreset is not a function`，
+// 于是控制台面板打不开、输出开关/历史窗口/决策抽签全部静默失效 —— 用户侧表现为
+// 「导入后弹黄框提示不支持」「面板点了没反应」「预设效果和酒馆不一样」。
+// 契约（对齐 JSR store/settings/preset.ts 与 ST preset-manager.js）：
+//   getPreset()            -> 当前生效预设对象 | null
+//   getPreset('in_use')    -> 同上
+//   getPreset(name)        -> 指定名字的预设对象 | null
+// 返回对象必须含 prompts[]，且每项带 id / identifier / enabled —— 脚本靠这三个字段判断开关。
+const __presetCache = { raw: null, parsed: null, at: 0 };
+
+function readActivePresetRaw() {
+    // 缓存 500ms：脚本在一次生成里会高频调用 getPreset()（TRANS-AM 控制台一次可调几十次），
+    // 每次都过 JNI 桥会明显卡顿。预设变更走 saveTavernPreset 时主动失效缓存。
+    const now = Date.now();
+    if (__presetCache.parsed !== null && (now - __presetCache.at) < 500) return __presetCache.parsed;
+    let raw = '';
+    try { raw = callBridge('getTavernPresetJson') || ''; } catch (_e) { raw = ''; }
+    let parsed = null;
+    if (raw && raw !== 'null') {
+        try { parsed = JSON.parse(raw); } catch (_e) { parsed = null; }
+    }
+    __presetCache.raw = raw;
+    __presetCache.parsed = parsed;
+    __presetCache.at = now;
+    return parsed;
+}
+
+function invalidatePresetCache() {
+    __presetCache.raw = null;
+    __presetCache.parsed = null;
+    __presetCache.at = 0;
+}
+
+/**
+ * 归一化预设对象：保证 prompts[] 每项都有 id/identifier/enabled。
+ * 预设里有的条目只有 identifier（ST 原生），有的只有 id（SPreset/TRANS-AM 自定义），
+ * 脚本里普遍写 `(p.id ?? p.identifier) === target`，所以两者都要能取到。
+ */
+function normalizePresetObject(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    const out = Object.assign({}, obj);
+    const prompts = Array.isArray(out.prompts) ? out.prompts : [];
+    out.prompts = prompts.map((p) => {
+        if (!p || typeof p !== 'object') return p;
+        const id = (p.id != null ? String(p.id) : null) ?? (p.identifier != null ? String(p.identifier) : null);
+        return Object.assign({}, p, {
+            id: id,
+            identifier: (p.identifier != null ? String(p.identifier) : id),
+            enabled: p.enabled !== false,
+        });
+    });
+    return out;
+}
+
+function getPreset(name) {
+    const preset = readActivePresetRaw();
+    if (!preset) return null;
+    // 'in_use' / 空 / 未传 = 当前生效预设
+    const wanted = (name == null || name === '' || name === 'in_use') ? null : String(name);
+    if (wanted === null) return normalizePresetObject(preset);
+    const presetName = preset.name ?? preset.presetName ?? null;
+    if (presetName != null && String(presetName) === wanted) return normalizePresetObject(preset);
+    // 单预设模型下没有「预设库」，名字对不上时仍返回当前生效预设，
+    // 避免脚本因拿不到对象而整体失效（比返回 null 更接近酒馆实际行为）。
+    return normalizePresetObject(preset);
+}
+
+function getPresetNames() {
+    const preset = readActivePresetRaw();
+    if (!preset) return [];
+    const n = preset.name ?? preset.presetName ?? 'in_use';
+    return [String(n)];
+}
+
+/** JSR replacePreset(preset)：把修改后的预设整体写回宿主。 */
+async function replacePreset(preset) {
+    if (!preset || typeof preset !== 'object') throw new Error('replacePreset: preset must be an object');
+    const name = String(preset.name ?? preset.presetName ?? 'in_use');
+    const ok = callBridge('saveTavernPreset', name, JSON.stringify(preset));
+    invalidatePresetCache();
+    if (ok === false) throw new Error('replacePreset: host rejected the update');
+    return true;
+}
+
+/** JSR updatePreset(updater)：读-改-写。TRANS-AM 控制台的 quickApi.update 依赖它。 */
+async function updatePreset(updater, expectedName) {
+    const current = getPreset(expectedName);
+    if (!current) throw new Error('updatePreset: no active preset');
+    const next = typeof updater === 'function' ? await updater(current) : updater;
+    if (!next || typeof next !== 'object') throw new Error('updatePreset: updater returned no preset');
+    return await replacePreset(next);
+}
+
 // ---------------------------------------------------------------- TavernHelper 全局（JSR API 兼容层）
 const TavernHelper = {
     // 宿主命令面（问题 2）：panel → host 统一 ack/toast，返回 Promise<{ok,error,result}>
@@ -2270,6 +2367,11 @@ const TavernHelper = {
     updateScriptButtonsWith: shimButton.updateScriptButtonsWith,
     appendInexistentScriptButtons: shimButton.appendInexistentScriptButtons,
     getButtonEvent: shimButton.getButtonEvent,
+    // 预设读写（[v246] 此前完全缺失 -> getPreset is not a function）
+    getPreset: getPreset,
+    getPresetNames: getPresetNames,
+    replacePreset: replacePreset,
+    updatePreset: updatePreset,
     // 工具
     getTavernHelperVersion: shimUtil.getTavernHelperVersion,
     getTavernVersion: shimUtil.getTavernVersion,
@@ -2318,6 +2420,258 @@ const TavernHelper = {
 };
 window.TavernHelper = TavernHelper;
 window.__mvu_shims__ = TavernHelper;
+
+// ---------------------------------------------------------------- [v246] 音频桥：JS store → 宿主 ExoPlayer
+// 上游 Tavern Helper 的 audio.ts 只维护一个内存 store（playlist/src/playing），
+// 真正发声要靠 ST 页面里的 <audio> 元素 —— 我们没有 ST 页面，必须走宿主播放器。
+// 这里把上游那几个函数**包一层**：先更新 store（保持 API 语义一致），再通知 Kotlin 播放。
+const __audioBridge = {
+    dispatch(op, payload) {
+        try { return callBridge('tavernAudioDispatch', op, JSON.stringify(payload || {})); }
+        catch (_e) { safeWarn('[audio] dispatch failed', _e); return null; }
+    },
+    state(type) {
+        try { return JSON.parse(callBridge('tavernAudioState', type) || '{}'); }
+        catch (_e) { return {}; }
+    },
+};
+
+function installAudioBridge(api) {
+    if (!api || typeof api !== 'object') return;
+    const wrap = (name, op, buildPayload) => {
+        const original = api[name];
+        if (typeof original !== 'function') return;
+        api[name] = function (...args) {
+            let result;
+            try { result = original.apply(this, args); } catch (e) { safeWarn('[audio]' + name + ' original failed', e); }
+            try { __audioBridge.dispatch(op, buildPayload ? buildPayload(...args) : {}); } catch (_e) { /* noop */ }
+            return result;
+        };
+    };
+    wrap('playAudio', 'play', (type, audio) => ({ type, title: audio && audio.title, url: audio && audio.url }));
+    wrap('pauseAudio', 'pause', (type) => ({ type }));
+    wrap('replaceAudioList', 'replaceList', (type, list) => ({ type, tracks: list || [] }));
+    wrap('appendAudioList', 'appendList', (type, list) => ({ type, tracks: list || [] }));
+    wrap('setAudioSettings', 'settings', (type, s) => ({ type, ...(s || {}) }));
+
+    // getAudioList / getAudioSettings / getCurrentAudio 读宿主真实状态（比上游 store 准）
+    const originalGetList = api.getAudioList;
+    api.getAudioList = function (type) {
+        const st = __audioBridge.state(type);
+        if (Array.isArray(st.playlist)) return st.playlist;
+        try { return originalGetList ? originalGetList.call(this, type) : []; } catch (_e) { return []; }
+    };
+    const originalGetSettings = api.getAudioSettings;
+    api.getAudioSettings = function (type) {
+        const st = __audioBridge.state(type);
+        if (st.settings && typeof st.settings === 'object') return st.settings;
+        try { return originalGetSettings ? originalGetSettings.call(this, type) : {}; } catch (_e) { return {}; }
+    };
+    const originalGetCurrent = api.getCurrentAudio;
+    api.getCurrentAudio = function (type) {
+        const st = __audioBridge.state(type);
+        if (st.current && st.current.url) {
+            return { src: st.current.url, title: st.current.title || '', playing: !!st.settings?.enabled, progress: 0 };
+        }
+        try { return originalGetCurrent ? originalGetCurrent.call(this, type) : { src: '', title: '', playing: false, progress: 0 }; }
+        catch (_e) { return { src: '', title: '', playing: false, progress: 0 }; }
+    };
+    try { callBridge('log', 'info', '[audio] bridge installed'); } catch (_e) { /* noop */ }
+}
+
+/**
+ * [v246] 文件读写桥：上游 `src/function/file.ts` 走 ST 后端 HTTP：
+ *   - `getTavernFile(path)`      → `fetch(path)`
+ *   - `uploadTavernFile(name,b64)` → `POST /api/files/upload`
+ *   - `deleteTavernFile(path)`   → `POST /api/files/delete`
+ * 我们没有 ST 后端，改为宿主沙箱目录 `filesDir/st-user-files/`。
+ *
+ * 返回类型必须与上游一致：
+ *   - `getTavernFile` 返回 `Response`（脚本会 `.text()` / `.blob()` / `.json()`）
+ *   - `uploadTavernFile` 返回文件路径字符串
+ *   - `deleteTavernFile` 返回 void
+ * 所以这里要**造一个最小 Response 对象**，否则 `await getTavernFile(x).text()` 会崩。
+ */
+function makeFakeResponse(base64Data, size) {
+    let bytes = null;
+    try {
+        const bin = atob(base64Data || '');
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (_e) { bytes = new Uint8Array(0); }
+    const decoder = () => {
+        try { return new TextDecoder('utf-8').decode(bytes || new Uint8Array(0)); }
+        catch (_e) { return ''; }
+    };
+    return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => null },
+        size: size || 0,
+        async text() { return decoder(); },
+        async json() { try { return JSON.parse(decoder()); } catch (_e) { return null; } },
+        async blob() {
+            try { return new Blob([bytes || new Uint8Array(0)]); }
+            catch (_e) { return null; }
+        },
+        async arrayBuffer() {
+            try { return (bytes || new Uint8Array(0)).buffer; }
+            catch (_e) { return new ArrayBuffer(0); }
+        },
+        clone() { return makeFakeResponse(base64Data, size); },
+    };
+}
+
+function installFileBridge(api) {
+    if (!api || typeof api !== 'object') return;
+
+    const call = (op, path, b64) => {
+        try {
+            const raw = callBridge('tavernFileOp', op, path || '', b64 || '');
+            return raw ? JSON.parse(raw) : { ok: false, error: 'bridge unavailable' };
+        } catch (e) {
+            safeWarn('[file] bridge call failed', e);
+            return { ok: false, error: String(e && e.message ? e.message : e) };
+        }
+    };
+
+    api.getTavernFile = async function (path) {
+        const r = call('read', path, '');
+        if (!r || !r.ok) {
+            // 与上游一致：读失败返回 404 Response 而不是抛错（脚本常判 .ok）
+            return { ok: false, status: 404, statusText: r?.error || 'Not Found', headers: { get: () => null },
+                     async text() { return r?.error || 'Not Found'; }, async json() { return null; },
+                     async blob() { return null; }, async arrayBuffer() { return new ArrayBuffer(0); } };
+        }
+        return makeFakeResponse(r.data, r.size);
+    };
+
+    api.uploadTavernFile = async function (filename, base64) {
+        const r = call('write', filename, base64);
+        if (!r || !r.ok) throw new Error(r?.error || '文件上传失败');
+        return r.path || filename;
+    };
+
+    api.deleteTavernFile = async function (path) {
+        const r = call('delete', path, '');
+        if (!r || !r.ok) throw new Error(r?.error || '文件删除失败');
+    };
+
+    // 上游没有 list，但卡片常用；补一个便于调试
+    api.listTavernFiles = async function (path) {
+        const r = call('list', path || '', '');
+        return r && r.ok ? (r.files || []) : [];
+    };
+
+    try { callBridge('log', 'info', '[file] bridge installed'); } catch (_e) { /* noop */ }
+}
+
+/**
+ * [v246] 代理预设 / 模型列表桥：上游实现假设 ST 有 `proxies` 全局（反向代理列表），
+ * 我们这边对应的是宿主 `Settings.providers`（Provider 配置）。
+ *
+ * 为什么必须真做：社区大量用户用第三方中转 API（`api.xxx.com/v1` 这类），
+ * 在酒馆里就存成「代理预设」。返回空数组会让他们的脚本走进
+ * 「没有代理预设」分支，卡片里的中转切换功能全部失效。
+ */
+function installProxyBridge(api) {
+    if (!api || typeof api !== 'object') return;
+
+    const originalGetProxyNames = api.getProxyPresetNames;
+    api.getProxyPresetNames = function () {
+        try {
+            const raw = callBridge('getProxyPresetNamesJson');
+            if (typeof raw === 'string' && raw) {
+                const arr = JSON.parse(raw);
+                if (Array.isArray(arr)) return arr;
+            }
+        } catch (_e) { /* fall through */ }
+        try { return originalGetProxyNames ? originalGetProxyNames.call(this) : []; } catch (_e) { return []; }
+    };
+
+    const originalGetModelList = api.getModelList;
+    api.getModelList = async function (customApi) {
+        // 优先走宿主：已配置的模型列表，离线可用且不需要 ST 后端
+        try {
+            const raw = callBridge('getModelListJson');
+            if (typeof raw === 'string' && raw) {
+                const arr = JSON.parse(raw);
+                if (Array.isArray(arr) && arr.length) return arr;
+            }
+        } catch (_e) { /* fall through */ }
+        // 兜底走上游：它要 POST /api/backends/chat-completions/status（ST 后端接口）。
+        // 我们没有该接口，fetch 会失败 —— 必须 catch，否则未处理的 Promise rejection
+        // 会冒到全局，卡片脚本整段崩。
+        try {
+            if (typeof originalGetModelList === 'function') {
+                const r = await originalGetModelList.call(this, customApi);
+                return Array.isArray(r) ? r : [];
+            }
+        } catch (e) {
+            safeWarn('[proxy] getModelList upstream failed (expected: no ST backend)', e);
+        }
+        return [];
+    };
+    try { callBridge('log', 'info', '[proxy] bridge installed'); } catch (_e) { /* noop */ }
+}
+
+// ---------------------------------------------------------------- [v246] Tavern Helper API 合并
+// 背景：我们的 runtime 实现了 115 个 JSR API，官方 Tavern Helper（酒馆助手）实现 160 个。
+// 差的 77 个主要是：音频（8）、角色卡（7）、人设（8）、预设 CRUD（10）、
+// 脚本树（4）、文件（3）、生成控制（4）、消息渲染（4）、正则（2）等。
+//
+// 方案：把官方 Tavern Helper 的 **API 层** 编译产物合并进来（见 tavern-helper/rikkast-entry.js）。
+// 它由上游 src/function/ 直接编译而来，契约与 @types.txt 完全一致，无需重写。
+//
+// 合并优先级：**我们的优先**。理由：
+//   - 我们的实现已接宿主 Kotlin 桥（聊天/世界书/变量/斜杠都是真数据）
+//   - 上游实现假设 ST 网页环境，很多函数会走 DOM/HTTP，在 WebView 里拿不到数据
+//   - 只有我们**没有**的键才从上游补，避免把能用的实现覆盖成不能用的
+//
+// 上游缺 `_bind` 的裸全局（eventOn 等）我们已有，不受影响。
+let __tavernHelperMergePromise = null;
+function mergeTavernHelperApi() {
+    if (__tavernHelperMergePromise) return __tavernHelperMergePromise;
+    __tavernHelperMergePromise = (async () => {
+        try {
+            const mod = await import('./tavern-helper/rikkast-entry.js');
+            const install = mod && mod.installTavernHelper;
+            if (typeof install !== 'function') {
+                safeWarn('[TH] installTavernHelper not exported');
+                return 0;
+            }
+            // installTavernHelper() 会把上游 API 写进 globalThis.TavernHelper，覆盖掉我们的实现。
+            // 所以先快照我们的，装完再按「我们优先」合并回来。
+            const ours = { ...(window.TavernHelper || {}) };
+            const oursBind = ours._bind;
+            install(window);
+            const upstream = window.TavernHelper || {};
+            const merged = { ...upstream, ...ours };
+            // _bind 单独合并：两边的 _bind 都要保留（裸全局依赖它）
+            merged._bind = { ...(upstream._bind || {}), ...(oursBind || {}) };
+            window.TavernHelper = merged;
+            window.__mvu_shims__ = merged;
+            // 音频 API 需要接到宿主 ExoPlayer，光有上游 store 不会发声
+            try { installAudioBridge(merged); } catch (_e) { safeWarn('[audio] install failed', _e); }
+            try { installProxyBridge(merged); } catch (_e) { safeWarn('[proxy] install failed', _e); }
+            try { installFileBridge(merged); } catch (_e) { safeWarn('[file] install failed', _e); }
+            const added = Object.keys(merged).filter((k) => !(k in ours)).length;
+            try {
+                callBridge('log', 'info',
+                    `[TH] merged: ours=${Object.keys(ours).length} upstream=${Object.keys(upstream).length} total=${Object.keys(merged).length} added=${added}`);
+            } catch (_e) { /* noop */ }
+            return added;
+        } catch (e) {
+            // 合并失败不能影响主流程：我们的 115 个 API 仍然可用
+            safeWarn('[TH] merge failed', e);
+            try { callBridge('log', 'warn', `[TH] merge failed: ${e && e.message ? e.message : e}`); } catch (_e) { /* noop */ }
+            return 0;
+        }
+    })();
+    return __tavernHelperMergePromise;
+}
+window.__rikkaMergeTavernHelper = mergeTavernHelperApi;
 
 // 便捷全局（对齐 JSR iframe 里这些函数是裸全局的行为）
 for (const key of Object.keys(TavernHelper)) {
@@ -3594,6 +3948,73 @@ function mountScriptIframe(script) {
 
 let scriptsLoadGen = 0;
 
+/**
+ * [v246] 同步「声明式按钮」（脚本 JSON 里的 `button` 字段）到宿主。
+ *
+ * JSR 的按钮有两种来源：
+ *  1. **声明式**：脚本 JSON 里 `button: {enabled:true, buttons:[{name:'⚙️ 控制台', visible:true}]}`
+ *     —— 扩展加载脚本时直接读出来渲染，脚本代码里**不需要**任何 API 调用。
+ *  2. **运行时**：脚本代码调 `replaceScriptButtons([...])` / `appendInexistentScriptButtons([...])`。
+ *
+ * 我们之前只支持 (2)，(1) 完全没读 —— 而社区预设几乎全用 (1)。
+ * 本函数把 (1) 转成与 (2) 相同的数据结构，统一经 RikkaBridge.onScriptButtons 上报。
+ *
+ * 合并策略：声明式按钮与运行时按钮**并集**，按 scriptId+name 去重。
+ * 声明式优先（预设作者显式写在 JSON 里的通常是主入口）。
+ */
+function syncDeclaredScriptButtons(scripts) {
+    try {
+        const out = [];
+        const seen = new Set();
+        for (const sc of scripts || []) {
+            const btnCfg = sc && sc.button;
+            if (!btnCfg || btnCfg.enabled === false) continue;
+            const btns = Array.isArray(btnCfg.buttons) ? btnCfg.buttons : [];
+            for (const b of btns) {
+                if (!b) continue;
+                // visible === false 表示作者主动隐藏（如由其它脚本托管）
+                if (b.visible === false) continue;
+                const name = String(b.name == null ? '' : b.name).trim();
+                if (!name) continue;
+                const scriptId = String(sc.id == null ? '' : sc.id);
+                const key = scriptId + '::' + name;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({
+                    scriptId: scriptId,
+                    scriptName: String(sc.name == null ? '' : sc.name),
+                    name: name,
+                    event: `script_button::${scriptId}::${name}`,
+                });
+            }
+        }
+        // 与运行时已注册的按钮合并（buttonHub 里可能已有 replaceScriptButtons 注册的）
+        let runtimeButtons = [];
+        try {
+            if (buttonHub && typeof buttonHub.allEnabled === 'function') runtimeButtons = buttonHub.allEnabled() || [];
+            else if (typeof allEnabledButtons === 'function') runtimeButtons = allEnabledButtons() || [];
+        } catch (_e) { runtimeButtons = []; }
+        const merged = [];
+        const mergedSeen = new Set();
+        for (const b of [...out, ...runtimeButtons]) {
+            const key = String(b.scriptId || '') + '::' + String(b.name || '');
+            if (mergedSeen.has(key)) continue;
+            mergedSeen.add(key);
+            merged.push(b);
+        }
+        try {
+            if (window.RikkaBridge && typeof window.RikkaBridge.onScriptButtons === 'function') {
+                window.RikkaBridge.onScriptButtons(JSON.stringify(merged));
+            }
+        } catch (_e) { /* noop */ }
+        try { callBridge('log', 'info', `[buttons] declared=${out.length} runtime=${runtimeButtons.length} total=${merged.length}`); } catch (_e) { /* noop */ }
+        return merged;
+    } catch (e) {
+        safeWarn('[buttons] syncDeclaredScriptButtons failed', e);
+        return [];
+    }
+}
+
 async function loadTavernScripts(force) {
     let raw = '';
     try { raw = callBridge('getTavernScriptsJson') || '{}'; } catch (_e) { raw = '{}'; }
@@ -3601,6 +4022,12 @@ async function loadTavernScripts(force) {
     try { helper = (JSON.parse(raw) || {}).tavern_helper || null; } catch (_e) { helper = null; }
     const list = (helper && Array.isArray(helper.scripts)) ? helper.scripts : [];
     const scripts = list.filter((s) => s && s.type === 'script' && scriptEnabled(s.enabled));
+    // [v246] 声明式按钮：JSR 允许脚本在 JSON 里用 `button: {enabled, buttons:[{name,visible}]}`
+    // 声明按钮，**不需要运行时调用 replaceScriptButtons**。
+    // 实测三个社区预设全部走这条路径（TRANS-AM 7 个脚本无一调用 replaceScriptButtons，
+    // 但 2 个脚本有 button.enabled=true）。此前 runtime 完全不读该字段，
+    // 导致「导入后按钮/面板不出现」—— 这就是 KEMINI/TRANS-AM 控制台打不开的根因。
+    syncDeclaredScriptButtons(scripts);
     const signature = scripts.map((s) => `${String(s.id)}:${String(s.name)}`).join('|');
     const convTag = String(state.chatId == null ? '' : state.chatId);
     if (!force && signature === lastScriptsSignature) {
@@ -5739,6 +6166,14 @@ function installUniversalFloatingAndTtsBridge() {
 // ---------------------------------------------------------------- 启动
 (async function boot() {
     try { emitToHost('runtime_imported', { mode: window.__RIKKA_PANEL_MODE__ ? 'panel' : (window.__RIKKA_EXT_SETTINGS_MODE__ ? 'ext-settings' : 'host') }); } catch (_e) { /* noop */ }
+    // [v246] 合并官方 Tavern Helper API（补齐音频/角色卡/人设/预设 CRUD/脚本树/文件等 77 个）。
+    // 放在 boot 最前：后续所有装配（裸全局注入、脚本 iframe）都要看到完整 API 面。
+    // await 是必要的：脚本可能在首次渲染后立刻调用 playAudio / getPersona 之类，
+    // 异步合并未完成会命中 undefined。
+    try {
+        const added = await mergeTavernHelperApi();
+        console.log(`${LOG_PREFIX} Tavern Helper merged, +${added} APIs, total=${Object.keys(window.TavernHelper || {}).length}`);
+    } catch (_e) { /* 合并失败不影响主流程 */ }
     // [10-19-21 深度适配] 扩展设置页模式：
     // 1. 杜绝二次进入白屏（退出时主动关闭全部 IndexedDB 连接并调用扩展 disable 钩子）；
     // 2. 杜绝预插重复 DOM 导致事件绑定失效；

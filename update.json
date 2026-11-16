@@ -54,17 +54,6 @@
       "certificateSha256": "b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748"
     },
     {
-      "name": "rikkaST-2.5.7-universal-release.apk",
-      "version": "2.5.7",
-      "versionCode": 239,
-      "status": "historical-reference",
-      "url": "https://github.com/yufanx79-gif/rikkaST/releases/download/v2.5.7/rikkaST-2.5.7-universal-release.apk",
-      "size": "58.7 MB",
-      "abi": "arm64-v8a",
-      "sha256": "8620c3e2bf744732ed7fcdd6f9b9de8175814242315fe70a73124972a9f3441e",
-      "certificateSha256": "b01fb58500aa307fbba70a0c0f242d949b131435e81b16acbd3e5b365ee45748"
-    },
-    {
       "name": "rikkaST-2.5.6-public-20261020.apk",
       "version": "2.5.6",
       "versionCode": 238,

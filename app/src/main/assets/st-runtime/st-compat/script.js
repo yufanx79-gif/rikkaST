@@ -67,6 +67,14 @@ const ES = st().eventSource || host().eventSource;
 export const eventSource = ES || {
     on() {}, once() {}, off() {}, emit() {}, emitAndWait() {},
     addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {},
+    // [v246] ST 的 EventSource（eventemitter3 扩展）还提供这些方法。
+    // Tavern Helper 的 `src/store/iframe_runtimes/*` 与 `src/function/event.ts`
+    // 会调用 makeFirst/makeLast 调整监听器顺序、clearEvent/clearListener/clearAll 清理。
+    // 此前 fallback 缺这些方法 -> 加载即 `eventSource.makeFirst is not a function`。
+    makeFirst() {}, makeLast() {},
+    clearEvent() {}, clearListener() {}, clearAll() {},
+    waitForEvent() { return Promise.resolve(); },
+    emitAndWaitAsync() { return Promise.resolve(); },
 };
 export const event_types = st().eventTypes || st().event_types || {};
 

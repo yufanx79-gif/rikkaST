@@ -484,7 +484,25 @@ export function compareIgnoreCaseAndAccents(a, b) { return String(a ?? '').local
 export async function convertImageFile(..._args) { return null; }
 export function convertTextToBase64(..._args) { return null; }
 export function convertValueType(..._args) { return null; }
-export function countOccurrences(..._args) { return null; }
+/**
+ * 统计 `character` 在 `string` 里出现的次数。
+ *
+ * [v246] 旧实现是 `(..._args) => null` 空桩。Tavern Helper 的
+ * `src/function/chat_message.ts` 用它做消息去重/分页统计，
+ * 拿到 null 会直接 `null > 0` → false，静默走错分支。
+ *
+ * 对齐 ST 1.19.0 `public/scripts/utils.js:993`。
+ */
+export function countOccurrences(string, character) {
+    const str = String(string ?? '');
+    const ch = String(character ?? '');
+    if (!ch) return 0;
+    let count = 0;
+    for (let i = 0; i < str.length; i++) {
+        if (str.substring(i, i + ch.length) === ch) count++;
+    }
+    return count;
+}
 export function createThumbnail(..._args) { return null; }
 export function createTimeout(..._args) { return null; }
 export function debounceAsync(fn) { return typeof fn === 'function' ? fn : (async () => {}); }

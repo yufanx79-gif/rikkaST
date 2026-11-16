@@ -87,3 +87,11 @@ app/app.key
 
 .worktrees/
 .superpowers/
+
+# Gradle 缓存误建在项目根目录时不要提交（v246 清理）
+/caches/
+/daemon/
+/native/
+/kotlin-profile/
+/notifications/
+/android/FakeDependency.jar

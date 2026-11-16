@@ -64,6 +64,10 @@ import me.rerere.rikkahub.data.st.runtime.TavernVariableStore
 import me.rerere.rikkahub.data.st.runtime.buildCharacterJson
 import me.rerere.rikkahub.data.st.runtime.buildLorebookJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernChatJson
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import me.rerere.rikkahub.data.st.runtime.buildTavernPresetJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernScriptsJson
 import me.rerere.rikkahub.data.st.runtime.buildWorldNamesJson
 import me.rerere.rikkahub.data.st.script.StSlashExecutor
@@ -200,6 +204,44 @@ fun ChatPage(
                 tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId),
                 tavernLatestSettings.value,
             )
+        }
+        // [v246] JSR getPreset()/replacePreset() 接线：TRANS-AM/SPreset 系脚本靠它读条目开关。
+        TavernRuntimeManager.tavernPresetSupplier = {
+            buildTavernPresetJson(
+                tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId),
+                tavernLatestSettings.value,
+            )
+        }
+        // [v246] 代理预设名：ST 的 proxies 对应我们的 Provider 列表。
+        // 社区大量用户用第三方中转 API（api.xxx.com/v1），在酒馆里就叫「代理预设」，
+        // 返回空数组会让这些人的脚本走进「没有代理预设」分支，功能受限。
+        TavernRuntimeManager.proxyPresetNamesSupplier = {
+            runCatching {
+                val list = tavernLatestSettings.value.providers
+                    .filter { it.enabled }
+                    .map { it.name }
+                kotlinx.serialization.json.JsonArray(list.map { JsonPrimitive(it) }).toString()
+            }.getOrElse { "[]" }
+        }
+        // [v246] 可用模型 id 列表
+        TavernRuntimeManager.modelListSupplier = {
+            runCatching {
+                val list = tavernLatestSettings.value.providers
+                    .filter { it.enabled }
+                    .flatMap { p -> p.models.map { it.modelId } }
+                    .distinct()
+                kotlinx.serialization.json.JsonArray(list.map { JsonPrimitive(it) }).toString()
+            }.getOrElse { "[]" }
+        }
+        TavernRuntimeManager.tavernPresetUpdater = { name, rawJson ->
+            runCatching {
+                val cur = tavernLatestSettings.value
+                val obj = (Json.parseToJsonElement(cur.tavernPresets) as? JsonObject) ?: JsonObject(emptyMap())
+                vm.updateSettings(
+                    cur.copy(tavernPresets = JsonObject(obj + (name to JsonPrimitive(rawJson))).toString()),
+                )
+                true
+            }.getOrDefault(false)
         }
         TavernRuntimeManager.tavernLorebookSupplier = { name ->
             buildLorebookJson(

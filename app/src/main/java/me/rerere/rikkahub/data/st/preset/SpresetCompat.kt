@@ -34,7 +34,16 @@ object SpresetCompat {
 
     private val resolvedToolCache = ConcurrentHashMap<String, JsonObject>()
 
-    /** 已支持的全部 SPreset 扩展私有键（用于导入告警过滤）。 */
+    /**
+     * 已支持的全部 SPreset 扩展私有键（用于导入告警过滤）。
+     *
+     * [LogUpload] 语义：SPreset 扩展把调试会话日志上传到作者自建端点
+     * （实测 `{enabled:true, url:"https://catgod.soliumbra.com/upload_debug_session"}`）。
+     * 本应用**有意不实现**网络上传：这是预设作者的调试遥测，与生成效果无关，
+     * 且会把用户会话数据外发到第三方。该键被显式认领为「已知且按设计跳过」，
+     * 不再计入 unsupportedExtensions —— 否则每个带此键的预设导入时都会弹黄色告警，
+     * 而用户对此无能为力（该功能本来就不应启用）。
+     */
     fun supportedKeys(): Set<String> = setOf(
         "ChatSquash",
         "RegexBinding",
@@ -45,6 +54,7 @@ object SpresetCompat {
         "FixedPresetName",
         "ForcedPostProcessing",
         "FinalRequestProcessing",
+        "LogUpload",
         "version",
         "enabled",
     )

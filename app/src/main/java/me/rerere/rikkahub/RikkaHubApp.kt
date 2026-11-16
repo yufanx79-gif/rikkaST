@@ -85,6 +85,15 @@ class RikkaHubApp : Application() {
             modules(appModule, viewModelModule, dataSourceModule, repositoryModule)
         }
         this.createNotificationChannel()
+        // [v246] 酒馆音频桥：JS 侧 playAudio/pauseAudio 需要宿主 ExoPlayer 才能真发声。
+        // 必须在 Koin 启动后初始化（播放器要 Context，且按会话隔离实例）。
+        runCatching {
+            me.rerere.rikkahub.data.st.audio.TavernAudioBridge.init(this)
+        }.onFailure { Log.w(TAG, "TavernAudioBridge init failed", it) }
+        // [v246] 文件桥：JSR getTavernFile/uploadTavernFile 的沙箱根目录（filesDir/st-user-files/）
+        runCatching {
+            me.rerere.rikkahub.data.st.runtime.TavernFileBridge.init(filesDir)
+        }.onFailure { Log.w(TAG, "TavernFileBridge init failed", it) }
 
         // set cursor window size to 32MB
         DatabaseUtil.setCursorWindowSize(32 * 1024 * 1024)

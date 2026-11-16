@@ -88,13 +88,32 @@ export class MacrosParser {
     }
 }
 
-/** 最后一条消息的索引（宿主 chat 数组末位）。 */
-export function getLastMessageId() {
+/**
+ * 最后一条消息的索引。
+ *
+ * [v246] 补齐 `filter` 参数：ST 1.19 的 `getLastMessageId({filter})` 会从末尾往前找
+ * 第一个满足 filter 的消息（Tavern Helper 的 `formatAsDisplayedMessage` 用它定位
+ * `last_user` / `last_char` 楼层）。旧实现忽略参数直接返回末位索引，
+ * 导致「按角色/按用户定位楼层」永远命中同一条 —— 显示格式化结果错位。
+ *
+ * 同时补齐 `exclude_swipe_in_propress`（ST 原拼写，保留以对齐）：
+ * swipe 进行中的消息不算「最后一条」，否则格式化会读到半成品 swipe。
+ *
+ * @param {{exclude_swipe_in_propress?: boolean, filter?: ((m:any)=>boolean)|null}} [opts]
+ * @returns {number|null} 找不到时返回 null（与 ST 一致，不是 -1）
+ */
+export function getLastMessageId({ exclude_swipe_in_propress = true, filter = null } = {}) {
     try {
         const c = st().chat || [];
-        return c.length - 1;
+        if (!Array.isArray(c) || c.length === 0) return null;
+        for (let i = c.length - 1; i >= 0; i--) {
+            const m = c[i];
+            if (exclude_swipe_in_propress && m && m.swipes && m.swipe_id >= m.swipes.length) continue;
+            if (!filter || filter(m)) return i;
+        }
+        return null;
     } catch (_e) {
-        return -1;
+        return null;
     }
 }
 

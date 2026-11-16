@@ -80,6 +80,32 @@ fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
     }.toString()
 }
 
+/**
+ * [v246] 构建 `getPreset()` 的数据源：当前**生效**预设的原始 root JSON。
+ *
+ * 生效判定与 [buildTavernScriptsJson] 保持一致：只看助手已启用预设组。
+ * 多组同时启用时取第一个（ST 本身也是「同一时刻只有一个 chat completion 预设」的模型）。
+ *
+ * 返回空串表示无生效预设；runtime 侧据此返回 null，脚本 `getPreset()?.prompts` 安全短路。
+ */
+fun buildTavernPresetJson(assistant: Assistant?, settings: Settings?): String {
+    if (settings == null) return ""
+    val groups = enabledPresetGroups(assistant, settings)
+    if (groups.isEmpty()) return ""
+    val raw = runCatching {
+        (Json.parseToJsonElement(settings.tavernPresets) as? JsonObject)
+    }.getOrNull() ?: return ""
+    // 按 enabledPresetGroups 的顺序找第一个真正存了 raw 的组
+    val hit = groups.firstNotNullOfOrNull { g ->
+        (raw[g] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+    } ?: return ""
+    // 补一个 name 字段，供脚本 getPreset(name) 匹配
+    val obj = runCatching { Json.parseToJsonElement(hit) as? JsonObject }.getOrNull() ?: return hit
+    if (obj.containsKey("name") || obj.containsKey("presetName")) return hit
+    val groupName = groups.firstOrNull { g -> (raw[g] as? JsonPrimitive)?.contentOrNull == hit }
+    return JsonObject(obj + ("name" to JsonPrimitive(groupName ?: "in_use"))).toString()
+}
+
 /** 当前助手已启用的预设组集合（来自 modeInjectionIds → presetGroup 推导）。 */
 fun enabledPresetGroups(
     assistant: Assistant?,

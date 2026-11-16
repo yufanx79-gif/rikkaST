@@ -108,8 +108,33 @@ function createPromptManagerStub() {
 export const promptManager = createPromptManagerStub();
 export const openai_max_stop_strings = 4;
 
-export async function prepareOpenAIMessages(args) {
+/**
+ * 组装 chat completion 消息数组。
+ *
+ * [v246] 补齐 `dryRun` 参数。ST 1.19.0 `public/scripts/openai.js:1559` 的签名是
+ * `prepareOpenAIMessages({...}, dryRun)`，dryRun 影响三件事（见 1561/1608/1613）：
+ *   1. 无激活角色 + dryRun → 直接返回 `[null, false]`（无法准确算 token）
+ *   2. `squash_system_messages` 只在 `dryRun == false` 时执行
+ *   3. `promptManager.render(false)` 只在非 dryRun 时调用（避免预览触发 UI 重绘）
+ * 旧实现丢弃该参数，导致 Tavern Helper 的 token 预演（dry run）会误触发渲染与 squash。
+ *
+ * @param {object} args
+ * @param {boolean} [dryRun=false]
+ * @returns {Promise<[any[]|null, boolean]>}
+ */
+export async function prepareOpenAIMessages(args, dryRun = false) {
     try {
+        // (1) 与 ST 一致：无激活角色时 dry run 无法估算 token
+        if (dryRun) {
+            let hasActive = false;
+            try {
+                hasActive = !!(promptManager && promptManager.activeCharacter);
+            } catch (_e) { hasActive = false; }
+            if (!hasActive) {
+                try { console.debug('prepareOpenAIMessages: no active character, dry run aborted'); } catch (_e) { /* noop */ }
+                return [null, false];
+            }
+        }
         if (args && Array.isArray(args.messages)) {
             const chat = args.messages
                 .filter((m) => m && typeof m === 'object')
@@ -117,11 +142,30 @@ export async function prepareOpenAIMessages(args) {
                     role: m.role || 'system',
                     content: m.content == null ? '' : String(m.content),
                     ...(m.name ? { name: String(m.name) } : {}),
+                    ...(Array.isArray(m.tool_calls) && m.tool_calls.length ? { tool_calls: m.tool_calls } : {}),
                 }));
-            return [chat, false];
+            // (2)(3) dryRun 时跳过 squash 与 render（ST 语义）
+            if (!dryRun) {
+                try {
+                    if (oai_settings && oai_settings.squash_system_messages && typeof squashSystemMessages === 'function') {
+                        await squashSystemMessages(chat);
+                    }
+                } catch (_e) { /* noop */ }
+                try {
+                    if (promptManager && typeof promptManager.render === 'function') promptManager.render(false);
+                } catch (_e) { /* noop */ }
+            }
+            // 事件带 dryRun 标记（ST openai.js:1618 的 eventData）
+            try {
+                const es = (typeof window !== 'undefined' && window.eventSource) || null;
+                if (es && typeof es.emit === 'function') {
+                    es.emit('chat_completion_prompt_ready', { chat, dryRun });
+                }
+            } catch (_e) { /* noop */ }
+            return [chat, dryRun];
         }
     } catch (_e) { /* noop */ }
-    return [[], false];
+    return [dryRun ? null : [], false];
 }
 
 /**

@@ -106,13 +106,47 @@ export async function doExtrasFetch(url, options = {}) {
 }
 
 /** 写扩展字段的便捷函数（对齐 ST：extension_settings[name][field] = value）。 */
-export function writeExtensionField(extensionName, fieldName, value) {
+/**
+ * 写角色卡的扩展字段。
+ *
+ * [v246 修正] 旧实现语义完全错了：
+ *   旧：(extensionName, fieldName, value) → 写 `extension_settings[extensionName][fieldName]`
+ *   真：(characterId, key, value)          → 写 `characters[characterId].data.extensions[key]`
+ *
+ * 证据：ST 1.19.0 `public/scripts/extensions.js:2070`
+ *   `export async function writeExtensionField(characterId, key, value)`
+ *   `const character = context.characters[characterId];`
+ *   `const extensionPath = \`data.extensions.${key}\`;`
+ *
+ * 影响：Tavern Helper 的 `src/function/extension.ts` 与 `src/util/tavern.ts`
+ * 都用它给角色卡写扩展数据（如卡片的自定义状态）。旧实现把这些数据
+ * 写进了 `extension_settings`，角色卡永远读不到 —— 表现为「卡片存的状态下次没了」。
+ *
+ * @param {number|string} characterId 角色在 characters[] 里的下标
+ * @param {string} key 扩展字段名
+ * @param {any} value 值；传 `UNSET_VALUE` 表示删除
+ */
+export async function writeExtensionField(characterId, key, value) {
     try {
-        if (!extension_settings[extensionName]) extension_settings[extensionName] = {};
-        extension_settings[extensionName][fieldName] = value;
-        saveMetadataDebounced();
+        const c = st();
+        const chars = c.characters || [];
+        const character = chars[Number(characterId)];
+        if (!character) {
+            // 与 ST 一致：只 warn 不抛错
+            try { console.warn('writeExtensionField: character not found', characterId); } catch (_e) { /* noop */ }
+            return;
+        }
+        if (!character.data) character.data = {};
+        if (!character.data.extensions) character.data.extensions = {};
+        if (value === UNSET_VALUE) {
+            delete character.data.extensions[key];
+        } else {
+            character.data.extensions[key] = value;
+        }
+        try { saveMetadataDebounced(); } catch (_e) { /* noop */ }
     } catch (_e) { /* noop */ }
 }
+
 
 export function writeExtensionFieldBulk(extensionName, fields = {}) {
     try {

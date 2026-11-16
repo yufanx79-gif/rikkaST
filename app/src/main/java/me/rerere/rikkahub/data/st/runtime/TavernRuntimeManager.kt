@@ -755,6 +755,33 @@ object TavernRuntimeManager {
     /** [v208] 由 UI 层注入：可用世界书名列表 JSON（world_names / selected / charLore）。 */
     @Volatile var worldNamesSupplier: (() -> String)? = null
 
+    /**
+     * [v246] 由 UI 层注入：当前生效的酒馆预设原始 JSON（`Settings.tavernPresets` 里对应预设的 raw root）。
+     *
+     * 为什么需要：TRANS-AM / SPreset 系脚本用 `getPreset('in_use').prompts` 读**条目开关**来决定
+     * 功能是否生效（如 `ta.enabled`、`ta-history-window`）。此前 runtime 完全没有 `getPreset`，
+     * 脚本第一步 `getPreset('in_use').prompts` 就抛 TypeError，整块面板/输出处理全部失效。
+     * 返回空串表示当前没有生效预设，JS 侧据此返回 null 而不是抛错。
+     */
+    @Volatile var tavernPresetSupplier: (() -> String)? = null
+
+    /**
+     * [v246] 由 UI 层注入：把修改后的预设写回 `Settings.tavernPresets`。
+     * 入参 (presetName, rawJson)；返回是否写入成功。
+     * 对应 JSR `replacePreset()` / 预设面板的「保存」动作。
+     */
+    @Volatile var tavernPresetUpdater: ((String, String) -> Boolean)? = null
+
+    /**
+     * [v246] 由 UI 层注入：代理预设名列表 JSON（JSR `getProxyPresetNames` 语义）。
+     * 数据源是 `Settings.providers` 里的名字——社区大量用户用第三方中转 API，
+     * 这些中转配置在酒馆里就叫「代理预设」。
+     */
+    @Volatile var proxyPresetNamesSupplier: (() -> String)? = null
+
+    /** [v246] 由 UI 层注入：可用模型 id 列表 JSON（JSR `getModelList` 简化版）。 */
+    @Volatile var modelListSupplier: (() -> String)? = null
+
     /** 由 UI 层注入：已安装第三方扩展装载列表 JSON（文件夹/入口文件；供 runtime 注入）。 */
     @Volatile var thirdPartyExtensionsSupplier: (() -> String)? = null
 
@@ -3090,6 +3117,111 @@ object TavernRuntimeManager {
         /** 当前助手卡内 tavern_helper（scripts / variables），JSR 卡脚本语义。 */
         @JavascriptInterface
         fun getTavernScriptsJson(): String = tavernScriptsSupplier?.invoke() ?: "{}"
+
+        /**
+         * [v246] JSR `getPreset()` / `getPreset('in_use')` 的数据源。
+         * 返回当前生效预设的原始 root JSON；无生效预设时返回 `"null"`（不是 `"{}"`），
+         * 因为脚本用 `getPreset(...)?.prompts` 判空，`{}` 会让 `.prompts` 变 undefined 再 .find 抛错。
+         */
+        @JavascriptInterface
+        fun getTavernPresetJson(): String {
+            val raw = tavernPresetSupplier?.invoke().orEmpty()
+            return raw.ifBlank { "null" }
+        }
+
+        /**
+         * [v246] JSR 音频指令单一入口。
+         *
+         * op: play / pause / resume / list / replaceList / appendList / settings / seek
+         * 返回 JSON。任何异常都在 Kotlin 侧吞掉并转成 `{"ok":false}`，
+         * 绝不把异常抛回 JS（否则卡片脚本整段崩）。
+         */
+        @JavascriptInterface
+        fun tavernAudioDispatch(op: String, payloadJson: String): String {
+            val scope = activeConversationId ?: "global"
+            return me.rerere.rikkahub.data.st.audio.TavernAudioBridge.dispatch(scope, op, payloadJson)
+        }
+
+        /** [v246] 读音频状态（列表 / 设置 / 当前曲目）。 */
+        @JavascriptInterface
+        fun tavernAudioState(type: String): String {
+            val scope = activeConversationId ?: "global"
+            return me.rerere.rikkahub.data.st.audio.TavernAudioBridge.stateJson(scope, type)
+        }
+
+        /** [v246] 恢复持久化的音频状态（会话切换时调用）。 */
+        @JavascriptInterface
+        fun tavernAudioRestore(rawJson: String) {
+            val scope = activeConversationId ?: "global"
+            me.rerere.rikkahub.data.st.audio.TavernAudioBridge.restore(scope, rawJson)
+        }
+
+        /** [v246] 序列化当前音频状态供持久化。 */
+        @JavascriptInterface
+        fun tavernAudioSnapshot(): String {
+            val scope = activeConversationId ?: "global"
+            return me.rerere.rikkahub.data.st.audio.TavernAudioBridge.snapshot(scope)
+        }
+
+        /**
+         * [v246] JSR `getProxyPresetNames()` 的数据源。
+         *
+         * ST 语义：`proxies` 是 `[{name, url, password}]` 列表，用于**第三方中转 API**
+         * （社区大量用户走 `api.example.com/v1` 这类中转站，而不是官方 OpenAI）。
+         * 上游实现 `src/function/generate/index.ts:39` 就是 `proxies.map(p => p.name)`。
+         *
+         * 我们的对应物是 `ProviderSetting`：
+         *   ST `name`     → `provider.name`
+         *   ST `url`      → `provider.baseUrl`（OpenAI 兼容类才有）
+         *   ST `password` → `provider.apiKey`
+         *
+         * 返回 `string[]`（JSON 数组）。**没有对应概念时返回 `[]` 而不是 null**，
+         * 因为上游 `getProxyPresetNames()` 返回类型是 `string[]`，脚本会直接 `.map()`。
+         */
+        @JavascriptInterface
+        fun getProxyPresetNamesJson(): String {
+            val supplier = proxyPresetNamesSupplier ?: return "[]"
+            return runCatching { supplier() }.getOrElse { "[]" }
+        }
+
+        /**
+         * [v246] JSR `getModelList(custom_api)` 的简化版：返回当前可用模型 id 列表。
+         * 上游需要发 HTTP 探测，我们直接读已配置的模型列表（更快且离线可用）。
+         */
+        @JavascriptInterface
+        fun getModelListJson(): String {
+            val supplier = modelListSupplier ?: return "[]"
+            return runCatching { supplier() }.getOrElse { "[]" }
+        }
+
+        /**
+         * [v246] JSR 文件读写桥。
+         *
+         * op: read / write / delete / list
+         * 上游走 ST 后端 HTTP（`/api/files/upload` 等），我们改为直接读写沙箱目录
+         * `filesDir/st-user-files/`，带路径穿越防护与 32MB 上限。
+         */
+        @JavascriptInterface
+        fun tavernFileOp(op: String, path: String, base64: String): String {
+            return runCatching {
+                when (op.lowercase()) {
+                    "read" -> me.rerere.rikkahub.data.st.runtime.TavernFileBridge.read(path)
+                    "write" -> me.rerere.rikkahub.data.st.runtime.TavernFileBridge.write(path, base64)
+                    "delete" -> me.rerere.rikkahub.data.st.runtime.TavernFileBridge.delete(path)
+                    "list" -> me.rerere.rikkahub.data.st.runtime.TavernFileBridge.list(path)
+                    else -> """{"ok":false,"error":"unknown file op: $op"}"""
+                }
+            }.getOrElse { e ->
+                """{"ok":false,"error":"${e.message ?: "file op failed"}"}"""
+            }
+        }
+
+        /** [v246] JSR `replacePreset(name, preset)` 的落点。 */
+        @JavascriptInterface
+        fun saveTavernPreset(name: String, rawJson: String): Boolean {
+            val updater = tavernPresetUpdater ?: return false
+            return runCatching { updater(name, rawJson) }.getOrDefault(false)
+        }
 
         /** 卡内嵌世界书读取（JSR `loadWorldInfo` 语义）。 */
         @JavascriptInterface
