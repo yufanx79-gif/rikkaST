@@ -4,7 +4,24 @@
  * 模拟 SillyTavern `public/scripts/RossAscends-mods.js` 的常用导出（P0）。
  */
 
-export const favsToHotswap = [];
+/**
+ * [v247 BUGFIX] ST 真源是 `export async function favsToHotswap()`（RossAscends-mods.js:305），
+ * 作用是把收藏的角色卡渲染到右侧栏的快捷切换区。
+ *
+ * 我们此前导出成**数组 `[]`** —— 上游 `replaceCharacter()`（rikkast-entry.js:18543）
+ * 和 `BulkEditOverlay`（:785）/ `group-chats`（:850）都会**直接调用**它：
+ * ```
+ * favsToHotswap();
+ * ^ TypeError: favsToHotswap is not a function
+ * ```
+ * 后果：**任何角色卡修改都会崩**（updateCharacterWith / replaceCharacter 全部失效）。
+ *
+ * 宿主用 Compose 渲染角色列表，没有 ST 的 `#right-nav-panel .hotswap` DOM，
+ * 所以这里是 no-op —— 但必须是**函数**且返回 Promise（调用方会 await）。
+ */
+export async function favsToHotswap() {
+    // no-op by design（宿主用 Compose 渲染收藏列表）
+}
 
 export const isMobile = true;
 

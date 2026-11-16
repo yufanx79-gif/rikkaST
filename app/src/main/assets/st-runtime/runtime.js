@@ -2796,6 +2796,29 @@ function mergeTavernHelperApi() {
             try { installAudioBridge(merged); } catch (_e) { safeWarn('[audio] install failed', _e); }
             try { installProxyBridge(merged); } catch (_e) { safeWarn('[proxy] install failed', _e); }
             try { installFileBridge(merged); } catch (_e) { safeWarn('[file] install failed', _e); }
+            // [v247] 上游 @types.txt 声明了 `placeholder_prompt_default_order`（:1205），
+            // 但产物顶层只导出 `builtin_prompt_default_order`（index.ts:343 的别名写法）。
+            // 脚本按声明调用 `placeholder_prompt_default_order` 会 undefined。
+            // 这里按 @types 的声明补上别名（值来自 generate/types.ts:191-203）。
+            // [v247] `@types.txt` 声明了 `getExtensionInstallationInfo`（:getExtensionInstallationInfo），
+            // 上游实现要 POST /api/extensions/version（酒馆后端）。我们没有该后端 ——
+            // 按「返回类型正确的空值」原则返回 null（调用方按「查不到就不提示更新」处理），
+            // 不能让它 undefined 导致脚本 `await undefined()` 崩。
+            if (typeof merged.getExtensionInstallationInfo !== 'function') {
+                merged.getExtensionInstallationInfo = async function (extensionId) {
+                    try {
+                        if (typeof merged.getExtensionStatus === 'function') return await merged.getExtensionStatus(extensionId);
+                    } catch (_e) { /* noop */ }
+                    return null;
+                };
+            }
+            if (merged.placeholder_prompt_default_order === undefined) {
+                merged.placeholder_prompt_default_order = merged.builtin_prompt_default_order || [
+                    'world_info_before', 'persona_description', 'char_description',
+                    'char_personality', 'scenario', 'world_info_after',
+                    'dialogue_examples', 'chat_history', 'user_input',
+                ];
+            }
             const added = Object.keys(merged).filter((k) => !(k in ours)).length;
             try {
                 callBridge('log', 'info',
