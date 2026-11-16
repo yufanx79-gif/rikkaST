@@ -15,7 +15,12 @@
  * 第 2 块是 ST 消息 DOM 染色，我们用 Compose 渲染消息 → no-op（见 DIVERGENCE）。
  */
 
-import { chat } from './script.js';
+import * as ScriptNS from './script.js';
+// ⚠️ [v247 BUGFIX] 不能 `import { chat }` —— st-compat/script.js 的 `chat` 是
+// `export let`（live binding），在 ES module 里解构导入后拿到的是**快照**，
+// 后续 runtime 刷新 `chat = [...]` 时本模块仍指向旧数组（甚至初始空数组）。
+// 必须每次通过命名空间读 `ScriptNS.chat` 才能拿到最新值。
+const getChat = () => (Array.isArray(ScriptNS.chat) ? ScriptNS.chat : []);
 import { getStringHash } from './utils.js';
 
 /** ST logprobs.js:16 */
@@ -36,9 +41,10 @@ const state = {
  * 所有 swipe 的 id 改变，哈希就全失效了。只取 {name, mid, text}。
  */
 function getMessageHash(message) {
+    const c = getChat();
     const hashParams = {
         name: message && message.name,
-        mid: Array.isArray(chat) ? chat.indexOf(message) : -1,
+        mid: c.indexOf(message),
         text: message && message.mes,
     };
     return getStringHash(JSON.stringify(hashParams));
@@ -53,9 +59,10 @@ function getMessageHash(message) {
 export function saveLogprobsForActiveMessage(logprobs, continueFrom) {
     // 非流式 API 可能返回 null
     if (!logprobs) return;
-    if (!Array.isArray(chat) || chat.length === 0) return;
-    const msgId = chat.length - 1;
-    const message = chat[msgId];
+    const c = getChat();
+    if (c.length === 0) return;
+    const msgId = c.length - 1;
+    const message = c[msgId];
     if (!message) return;
 
     const data = {
@@ -83,9 +90,10 @@ export function saveLogprobsForActiveMessage(logprobs, continueFrom) {
  * @returns {object|null}
  */
 export function getMessageLogprobs(messageId) {
-    if (!Array.isArray(chat) || chat.length === 0) return null;
-    const idx = Number.isFinite(Number(messageId)) ? Number(messageId) : chat.length - 1;
-    const message = chat[idx];
+    const c = getChat();
+    if (c.length === 0) return null;
+    const idx = Number.isFinite(Number(messageId)) ? Number(messageId) : c.length - 1;
+    const message = c[idx];
     if (!message) return null;
     const hash = getMessageHash(message);
     return state.messageLogprobs.get(hash) ?? null;

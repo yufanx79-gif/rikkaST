@@ -64,9 +64,13 @@ class BulkEditOverlayBase {
     get selectedCharacters() { return this.#selectedCharacters; }
 
     constructor() {
-        // 单例语义（ST :468-475：重复 new 返回同一实例并 Object.freeze）
+        // ⚠️ [v247 BUGFIX] ST 真源确实 `Object.freeze(this)`（BulkEditOverlay.js:472），
+        // 但那是**类字段**实现：freeze 后私有字段 #selectedCharacters / lastSelected 仍可改
+        // （私有字段走内部槽，不受 freeze 影响）。我们这里是普通属性，freeze 后
+        // `lastSelected = {...}` 直接抛 "Cannot assign to read only property"。
+        // 所以这里**不 freeze**：单例语义靠下面的 if 保证，可变状态靠属性可写保证。
         if (bulkEditOverlayInstance instanceof BulkEditOverlayBase) return bulkEditOverlayInstance;
-        bulkEditOverlayInstance = Object.freeze(this);
+        bulkEditOverlayInstance = this;
     }
 
     /**
