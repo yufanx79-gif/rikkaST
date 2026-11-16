@@ -95,3 +95,9 @@ app/app.key
 /kotlin-profile/
 /notifications/
 /android/FakeDependency.jar
+
+# 开发期验证脚本（Node 跑真实预设脚本用；不进 APK，也不污染仓库）
+/dev-scripts/
+
+# 本机构建包装（固定 GRADLE_USER_HOME 到 D 盘，避免 C 盘爆满）
+/g.bat

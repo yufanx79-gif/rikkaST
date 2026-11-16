@@ -339,7 +339,7 @@ fun ChatPage(
         // [v247] 切换会话（ST openCharacterChat 语义）
         TavernRuntimeManager.conversationOpener = { conversationId ->
             runCatching {
-                val id = kotlinx.uuid.Uuid.parse(conversationId)
+                val id = Uuid.parse(conversationId)
                 scope.launch { navigateToChatPage(navController, chatId = id) }
                 true
             }.getOrDefault(false)
