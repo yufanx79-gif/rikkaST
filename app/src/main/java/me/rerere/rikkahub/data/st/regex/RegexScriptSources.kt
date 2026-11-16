@@ -142,6 +142,26 @@ fun parseCardRegexScripts(extensionsObj: JsonObject?): List<RegexScript> {
         .filter { it.findRegex.isNotBlank() }
 }
 
+/**
+ * [v247 G 组] 把 JSON 文本（ST `RegexScriptData[]` 形状）解析成 [RegexScript] 列表。
+ *
+ * 用途：`TavernRuntimeManager.TavernJsBridge.regexFormatText` 拿 JS 侧传来的正则表，
+ * 交给宿主同一份 [RegexScriptEngine] 处理 —— 保证脚本算出的文本与消息气泡里渲染的完全一致。
+ *
+ * 宽容解析：单条失败跳过，整体不是数组时返回空表（绝不抛）。
+ */
+fun parseRegexScriptArray(json: String): List<RegexScript> {
+    if (json.isBlank()) return emptyList()
+    val parsed = runCatching { Json.parseToJsonElement(json) }.getOrNull() ?: return emptyList()
+    val arr = when (parsed) {
+        is JsonArray -> parsed
+        is JsonObject -> (parsed["regex_scripts"] as? JsonArray) ?: return emptyList()
+        else -> return emptyList()
+    }
+    return arr.mapNotNull { parseRegexScript(it) }
+        .filter { it.findRegex.isNotBlank() }
+}
+
 /** 单条内嵌正则的宽容解析（规则见 [parseCardRegexScripts]）；解析失败返回 null。 */
 internal fun parseRegexScript(element: JsonElement): RegexScript? {
     val obj = element as? JsonObject ?: return null

@@ -118,6 +118,29 @@ export function getRegexedString(rawString, placement, { characterOverride, isMa
     let finalString = rawString;
     if (!rawString || placement === undefined) return finalString;
 
+    // [v247 G 组] 优先走宿主 Kotlin 的 RegexScriptEngine —— 与消息气泡里**同一份**实现。
+    //
+    // 为什么：StRegexedText.kt:575 渲染消息时调的是 Kotlin `RegexScriptEngine.getRegexedString`，
+    // 而这里是 JS 复刻版。两套实现只要有一处漂移，就会出现
+    // 「脚本 formatAsTavernRegexedString 算出 A、界面上显示 B」这类无法排查的诡异问题。
+    // 宿主桥可用时以宿主为准；不可用（Node 测试 / 面板模式）时退回本地实现。
+    // 注意：`isEdit` 语义宿主桥暂不承载（脚本极少用），带 isEdit 时仍走本地实现。
+    if (!isEdit) {
+        try {
+            const bridge = (typeof window !== 'undefined' && window.RikkaBridge) ? window.RikkaBridge : null;
+            if (bridge && typeof bridge.regexFormatText === 'function') {
+                const destination = isMarkdown ? 'display' : (isPrompt ? 'prompt' : 'none');
+                const out = bridge.regexFormatText(
+                    rawString,
+                    Number(placement),
+                    destination,
+                    (typeof depth === 'number' && Number.isFinite(depth)) ? Number(depth) : -1,
+                );
+                if (typeof out === 'string') return out;
+            }
+        } catch (_e) { /* 宿主桥不可用 → 落回本地实现 */ }
+    }
+
     const allRegex = getRegexScripts();
     for (const script of allRegex) {
         if (!script) continue;

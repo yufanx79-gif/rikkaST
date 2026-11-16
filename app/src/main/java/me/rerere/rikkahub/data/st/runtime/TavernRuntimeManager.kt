@@ -3314,6 +3314,47 @@ object TavernRuntimeManager {
             return runCatching { supplier() }.getOrElse { "[]" }
         }
 
+        /**
+         * [v247 G 组] 用**宿主同一份**正则引擎处理文本（JSR `formatAsTavernRegexedString` 的落点）。
+         *
+         * 为什么必须走宿主：JS 侧 `st-compat/regex-engine.js` 是我们自己写的复刻版，
+         * 而消息气泡里真正渲染用的是 Kotlin `RegexScriptEngine`（StRegexedText.kt:575）。
+         * 两边实现一旦漂移，脚本算出来的文本就和用户看到的不一样 ——
+         * 这正是「脚本判定 A、界面上显示 B」这类诡异 bug 的来源。
+         *
+         * 入参用 ST 的语义命名，内部转成 Kotlin 引擎的参数：
+         *  - `placement`：1=USER_INPUT / 2=AI_OUTPUT / 3=SLASH_COMMAND / 5=WORLD_INFO / 6=REASONING
+         *  - `destination`：'display' → isMarkdown=true（对齐 engine.js:350）；'prompt' → isPrompt=true
+         *  - `depth`：-1 表示不限（ST 用 undefined 表示，JSON 里传 -1）
+         *
+         * 任何异常都返回原文（脚本拿到原文好过拿到异常）。
+         */
+        @JavascriptInterface
+        fun regexFormatText(
+            rawText: String,
+            placement: Int,
+            destination: String,
+            depth: Int,
+        ): String {
+            val supplier = regexScriptsSupplier ?: return rawText
+            return runCatching {
+                val scripts = me.rerere.rikkahub.data.st.regex.parseRegexScriptArray(supplier())
+                val isDisplay = destination.equals("display", ignoreCase = true)
+                val isPrompt = destination.equals("prompt", ignoreCase = true)
+                me.rerere.rikkahub.data.st.regex.RegexScriptEngine.getRegexedString(
+                    rawString = rawText,
+                    scripts = scripts,
+                    placement = placement,
+                    isMarkdown = isDisplay,
+                    isPrompt = isPrompt,
+                    depth = depth.takeIf { it >= 0 },
+                )
+            }.getOrElse { e ->
+                appendLog("warn", "[regex] regexFormatText failed: ${e.message}")
+                rawText
+            }
+        }
+
         /** ST `chat_metadata`（含 variables）。 */
         @JavascriptInterface
         fun getChatMetadataJson(): String {
