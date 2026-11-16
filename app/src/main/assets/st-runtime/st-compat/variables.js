@@ -308,28 +308,94 @@ export function parseBooleanOperands(args = {}) {
     return { a, b, rule };
 }
 
-export function evalBoolean(expressionOrArgs, scope = null) {
-    if (expressionOrArgs && typeof expressionOrArgs === 'object') {
-        const { a, b, rule } = parseBooleanOperands(expressionOrArgs);
-        const na = Number(a);
-        const nb = Number(b);
-        const bothNum = !Number.isNaN(na) && !Number.isNaN(nb) && String(a).trim() !== '' && String(b).trim() !== '';
-        switch (rule) {
-            case 'eq': case '==': return bothNum ? na === nb : String(a) === String(b);
-            case 'neq': case '!=': return bothNum ? na !== nb : String(a) !== String(b);
-            case 'gt': case '>': return bothNum ? na > nb : String(a) > String(b);
-            case 'gte': case '>=': return bothNum ? na >= nb : String(a) >= String(b);
-            case 'lt': case '<': return bothNum ? na < nb : String(a) < String(b);
-            case 'lte': case '<=': return bothNum ? na <= nb : String(a) <= String(b);
-            case 'in': return String(a).toLowerCase().includes(String(b).toLowerCase());
-            case 'nin': return !String(a).toLowerCase().includes(String(b).toLowerCase());
-            case 'not': return !evalBoolean(a, scope);
-            default: return Boolean(a);
+/**
+ * 布尔比较（ST variables.js:494-560 语义）。
+ *
+ * ST 签名是 **位置参数** `evalBoolean(rule, a, b)`，我们之前写成
+ * `evalBoolean(expressionOrArgs, scope)`（对象形式）—— 两套调用约定不兼容：
+ * 脚本按 ST 写 `evalBoolean('gt', 5, 3)` 会拿到错误结果。
+ *
+ * 这里同时支持两种调用形态（ST 位置参数优先，对象形式保留向后兼容）：
+ *   evalBoolean('gt', 5, 3)              → true
+ *   evalBoolean(undefined, 'yes')        → true（真值判定）
+ *   evalBoolean('not', 'no')             → true
+ *   evalBoolean({ rule: 'gt', a: 5, b: 3 }) → true（旧对象形式）
+ *
+ * @param {string|object|undefined} rule 比较规则，或旧形式的对象
+ * @param {*} a 左操作数
+ * @param {*} b 右操作数
+ * @returns {boolean}
+ */
+export function evalBoolean(rule, a, b) {
+    // 旧对象形式：evalBoolean({rule, a, b})
+    if (rule && typeof rule === 'object' && !Array.isArray(rule)) {
+        const o = rule;
+        return evalBoolean(o.rule, o.a, o.b);
+    }
+    // 旧双参形式：evalBoolean(expressionString, scope) —— 把表达式交给斜杠求值器
+    if (typeof rule === 'string' && a !== undefined && b === undefined && /[<>=!]/.test(rule)) {
+        try {
+            const m = rule.match(/^\s*(.+?)\s*(>=|<=|!=|==|>|<)\s*(.+?)\s*$/);
+            if (m) return evalBoolean(
+                { '>': 'gt', '<': 'lt', '>=': 'gte', '<=': 'lte', '!=': 'neq', '==': 'eq' }[m[2]],
+                m[1], m[3],
+            );
+        } catch (_e) { /* fallthrough */ }
+    }
+
+    const isTrue = (v) => {
+        const t = String(v ?? '').trim().toLowerCase();
+        return t === 'true' || t === 'yes' || t === '1' || t === 'on';
+    };
+    const isFalse = (v) => {
+        const t = String(v ?? '').trim().toLowerCase();
+        return t === 'false' || t === 'no' || t === '0' || t === 'off' || t === '';
+    };
+
+    // ST :495-512 —— 只给一个操作数时做真值判定
+    if (a === undefined) {
+        throw new Error('Left operand is not provided');
+    }
+    if (b === undefined) {
+        if (rule === undefined || rule === null || rule === '' || rule === 'not') {
+            const wantTruthy = rule !== 'not';
+            if (isTrue(a)) return wantTruthy;
+            if (isFalse(a)) return !wantTruthy;
+            return wantTruthy ? !!a : !a;
+        }
+        throw new Error(`Unknown boolean comparison rule for truthy check. If right operand is not provided, the rule must not provided or be 'not'. Provided: ${rule}`);
+    }
+
+    // ST :515 —— 没给规则时默认 eq
+    const r = (rule === undefined || rule === null || rule === '') ? 'eq' : String(rule);
+    const na = Number(a), nb = Number(b);
+    const bothNum = typeof a === 'number' && typeof b === 'number';
+
+    if (bothNum) {
+        switch (r) {
+            case 'gt': return na > nb;
+            case 'gte': return na >= nb;
+            case 'lt': return na < nb;
+            case 'lte': return na <= nb;
+            case 'eq': case '==': return na === nb;
+            case 'neq': case '!=': return na !== nb;
+            default: break;
         }
     }
-    const resolved = resolveVariable(expressionOrArgs, scope);
-    const s = String(resolved ?? '').trim().toLowerCase();
-    return s.length > 0 && s !== '0' && s !== 'false' && s !== 'off' && s !== 'no' && s !== 'null' && s !== 'undefined';
+    const sa = String(a), sb = String(b);
+    switch (r) {
+        case 'eq': case '==': return sa === sb;
+        case 'neq': case '!=': return sa !== sb;
+        case 'gt': return sa > sb;
+        case 'gte': return sa >= sb;
+        case 'lt': return sa < sb;
+        case 'lte': return sa <= sb;
+        case 'in': return sb.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean).includes(sa);
+        case 'nin': return !sb.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean).includes(sa);
+        case 'not': return !isTrue(a);
+        default:
+            throw new Error(`Unknown boolean comparison rule: ${rule}`);
+    }
 }
 
 export function listVariables({ scope = 'local' } = {}) {

@@ -502,7 +502,35 @@ export async function checkOverwriteExistingData(..._args) { return null; }
 export function clamp(val, min, max) { return Math.min(Math.max(Number(val) || 0, Number(min) || 0), Number(max) || 0); }
 export function clearInfoBlock(..._args) { return null; }
 export function collapseSpaces(s) { return String(s ?? '').replace(/\s+/g, ' ').trim(); }
-export function compareIgnoreCaseAndAccents(a, b) { return String(a ?? '').localeCompare(String(b ?? ''), undefined, { sensitivity: 'base' }); }
+/**
+ * 忽略大小写与变音符号的比较（ST utils.js:2243-2251 逐行移植）。
+ *
+ * ST 语义：
+ * ```
+ * export function compareIgnoreCaseAndAccents(a, b, comparisonFunction) {
+ *     if (!a || !b) return comparisonFunction(a, b);
+ *     const normalizedA = a.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+ *     ...
+ *     return comparisonFunction(normalizedA, normalizedB);
+ * }
+ * ```
+ * ⚠️ 第三个参数 `comparisonFunction` 是**必需**的 —— 它决定返回什么
+ * （`sortIgnoreCaseAndAccents` 传的是 `(x,y) => x.localeCompare(y)`）。
+ * 我们之前省略它，直接返回 localeCompare 结果 —— 对「排序」够用，
+ * 但调用方若传自定义比较函数（如相等判定）就会拿错结果。
+ *
+ * @param {string} a
+ * @param {string} b
+ * @param {(x: string, y: string) => any} comparisonFunction
+ */
+export function compareIgnoreCaseAndAccents(a, b, comparisonFunction) {
+    const cmp = typeof comparisonFunction === 'function'
+        ? comparisonFunction
+        : ((x, y) => String(x ?? '').localeCompare(String(y ?? ''), undefined, { sensitivity: 'base' }));
+    if (!a || !b) return cmp(a, b);
+    const norm = (v) => String(v).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    return cmp(norm(a), norm(b));
+}
 export async function convertImageFile(..._args) { return null; }
 export function convertTextToBase64(..._args) { return null; }
 export function convertValueType(..._args) { return null; }
