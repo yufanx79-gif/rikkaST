@@ -4209,16 +4209,28 @@ object TavernRuntimeManager {
         }
         return runCatching {
             me.rerere.rikkahub.data.st.macro.MacroDefinitions.registerAll()
-            val ctxObj = runCatching { JSONObject(contextJson.ifBlank { "{}" }) }.getOrNull()
+            // [v247] 用 kotlinx.serialization 而不是 org.json.JSONObject：
+            // org.json 在 JVM 单元测试里是 Android stub（optString 恒返回 null），
+            // 会导致 {{user}}/{{char}} 在测试里永远是 User/Assistant —— 这是测试环境假阳性，
+            // 但换成 kotlinx 后 JVM 与 Android 行为一致，测试才真正有效。
+            val ctxObj: kotlinx.serialization.json.JsonObject? = runCatching {
+                kotlinx.serialization.json.Json.parseToJsonElement(contextJson.ifBlank { "{}" })
+                    as? kotlinx.serialization.json.JsonObject
+            }.getOrNull()
+            fun ctxStr(key: String): String? =
+                (ctxObj?.get(key) as? kotlinx.serialization.json.JsonPrimitive)
+                    ?.takeIf { it !is kotlinx.serialization.json.JsonNull }
+                    ?.contentOrNull
+                    ?.takeIf { it.isNotEmpty() }
             val ast = activeAssistant
             val tav = ast?.tavernData
-            val userName = ctxObj?.optString("name1", "")?.takeIf { it.isNotEmpty() } ?: "User"
-            val charName = ctxObj?.optString("name2", "")?.takeIf { it.isNotEmpty() }
+            val userName = ctxStr("name1") ?: "User"
+            val charName = ctxStr("name2")
                 ?: tav?.nickname?.takeIf { it.isNotBlank() }
                 ?: ast?.name?.takeIf { it.isNotBlank() }
                 ?: "Assistant"
-            val groupName = ctxObj?.optString("group", "")?.takeIf { it.isNotEmpty() } ?: ""
-            val originalText = ctxObj?.optString("original", "")
+            val groupName = ctxStr("group") ?: ""
+            val originalText = ctxStr("original") ?: ""
             val convId = activeConversationId
             val localStore = object : me.rerere.rikkahub.data.st.macro.MacroVariableStore {
                 private val key = convId ?: "__st_js_local__"
