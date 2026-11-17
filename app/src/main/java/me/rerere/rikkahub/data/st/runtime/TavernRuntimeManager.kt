@@ -25,6 +25,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -3326,6 +3327,48 @@ object TavernRuntimeManager {
          * @param folder 画廊子目录名（空 = 根目录）
          * @return `[{"url":..,"src":..,"srct":..,"title":..,"name":..}]`，失败返回 `[]`
          */
+        /**
+         * [v248] 向量库桥（ST `extensions/vectors/index.js` 的 `/api/vector/` 系列 落点）。
+         *
+         * ST 原版把这 5 个操作 POST 到酒馆后端，由后端调 embedding 服务。我们没有
+         * 那个后端（用户明确不做 provider 请求 API），但宿主**有** embedding 能力：
+         * `ProviderManager.generateEmbedding` + `Settings.embeddingModelId`。
+         *
+         * 集合数据存进沙箱 `st-user-files/vectors/<collectionId>.json`，
+         * 结构与 ST 的 `{hash, text, index}` 一致，所以 ST 导出的索引可以直接用。
+         *
+         * op:
+         *  - `list`        → number[]（集合里所有 hash）
+         *  - `insert`      → 写入 {hash,text,index}，顺带算 embedding
+         *  - `delete`      → 按 hash 删除
+         *  - `query`       → {hashes, metadata}
+         *  - `query-multi` → {[collectionId]: {hashes, metadata}}
+         *  - `purge`       → 清空集合
+         *
+         * ⚠️ 运行在 JavaBridge 线程：禁止 runBlocking，网络调用放 IO 协程 + 超时。
+         *
+         * @return `{"ok":true,"data":...}` 或 `{"ok":false,"error":"..."}`
+         */
+        @JavascriptInterface
+        fun vectorOp(op: String, payloadJson: String): String {
+            val result = java.util.concurrent.CompletableFuture<String>()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            scope.launch {
+                runCatching { TavernVectorStore.execute(op, payloadJson) }
+                    .onSuccess { result.complete(it) }
+                    .onFailure { e ->
+                        appendLog("warn", "[vector] ${op} failed: ${e.message}")
+                        result.complete("""{"ok":false,"error":"${e.message ?: "vector op failed"}"}""")
+                    }
+            }
+            return runCatching { result.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+                .getOrElse {
+                    scope.cancel()
+                    appendLog("warn", "[vector] ${op} timeout")
+                    """{"ok":false,"error":"vector op timeout"}"""
+                }
+        }
+
         @JavascriptInterface
         fun galleryListJson(folder: String): String {
             return runCatching {

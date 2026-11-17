@@ -9,6 +9,9 @@ import me.rerere.rikkahub.data.model.AuthorNotePosition
 import me.rerere.rikkahub.data.model.InjectionPosition
 import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.Lorebook
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.findModelById
+import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.model.extractContextForMatching
 import me.rerere.rikkahub.data.model.parseWorldInfoDecorators
 import me.rerere.rikkahub.data.model.applyWorldInfoDecoratorOverrides
@@ -149,6 +152,117 @@ object PromptInjectionTransformer : InputMessageTransformer {
         return if (denom <= 1e-12) 0.0 else (dot / denom).coerceIn(0.0, 1.0)
     }
 
+    /**
+     * [v248] 真实语义向量：embedding 结果缓存（文本 → 单位向量）。
+     *
+     * 世界书条目内容是静态的，同一批条目每轮都会被重新比较，缓存能省掉绝大部分
+     * embedding 调用。用 LRU 限制在 512 条，避免长会话把内存吃光。
+     */
+    private val embeddingCache = object : LinkedHashMap<String, List<Float>>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<Float>>) =
+            size > 512
+    }
+
+    /** 缓存是否命中过（用于统计/日志，不参与逻辑）。 */
+    @Volatile
+    var lastEmbeddingCacheHit: Boolean = false
+        private set
+
+    /**
+     * [v248] 批量取 embedding（有缓存）。失败返回空 Map，调用方回退到词袋余弦。
+     *
+     * 为什么必须带超时：embedding 是网络请求，世界书注入在生成主链路上，
+     * 一旦卡住就是「点发送没反应」。3 秒拿不到就放弃，用词袋兜底。
+     */
+    private suspend fun fetchEmbeddings(
+        texts: List<String>,
+        settings: Settings,
+    ): Map<String, List<Float>> {
+        if (texts.isEmpty()) return emptyMap()
+        val result = HashMap<String, List<Float>>()
+        val missing = mutableListOf<String>()
+        for (t in texts) {
+            val cached = synchronized(embeddingCache) { embeddingCache[t] }
+            if (cached != null) result[t] = cached else missing += t
+        }
+        lastEmbeddingCacheHit = missing.isEmpty() && result.isNotEmpty()
+        if (missing.isEmpty()) return result
+
+        return try {
+            kotlinx.coroutines.withTimeoutOrNull(3_000L) {
+                val providerManager = org.koin.java.KoinJavaComponent.get<
+                    me.rerere.ai.provider.ProviderManager>(
+                    me.rerere.ai.provider.ProviderManager::class.java
+                )
+                val model = settings.findModelById(settings.embeddingModelId)
+                    ?: settings.findModelById(settings.chatModelId)
+                    ?: return@withTimeoutOrNull emptyMap<String, List<Float>>()
+                val provider = model.findProvider(settings.providers)
+                    ?: return@withTimeoutOrNull emptyMap<String, List<Float>>()
+                val impl = providerManager.getProviderByType(provider)
+                // 单批上限 32 条：部分后端对 batch size 有限制，超了会整批失败
+                for (chunk in missing.chunked(32)) {
+                    val resp = impl.generateEmbedding(
+                        provider,
+                        me.rerere.ai.provider.EmbeddingGenerationParams(
+                            model = model,
+                            input = chunk,
+                        ),
+                    )
+                    resp.embeddings.forEachIndexed { i, vec ->
+                        if (i < chunk.size) {
+                            result[chunk[i]] = vec
+                            synchronized(embeddingCache) { embeddingCache[chunk[i]] = vec }
+                        }
+                    }
+                }
+                result
+            } ?: emptyMap()
+        } catch (_e: Exception) {
+            // 没配 embedding 模型 / 网络失败 / 模型不支持 —— 一律回退词袋，不打断生成
+            emptyMap()
+        }
+    }
+
+    /** 余弦相似度（Float 版，与词袋版数值语义一致）。 */
+    private fun cosine(a: List<Float>, b: List<Float>): Double {
+        if (a.size != b.size || a.isEmpty()) return 0.0
+        var dot = 0.0
+        var na = 0.0
+        var nb = 0.0
+        for (i in a.indices) {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        val denom = kotlin.math.sqrt(na) * kotlin.math.sqrt(nb)
+        return if (denom <= 1e-12) 0.0 else (dot / denom).coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * [v248] 语义相似度提供者：优先真 embedding，缺模型时回退词袋余弦。
+     *
+     * 为什么不是纯 embedding：ST 的 vectors 扩展要求用户配好 embedding 源
+     * （OpenAI / Ollama / WebLLM 等），没配就整个扩展不工作。我们的产品决策是
+     * 「没配也不能让世界书功能退化」，所以保留词袋作为兜底 —— 精度低但永远可用。
+     */
+    internal fun makeSemanticScorer(
+        settings: Settings,
+        embeddings: Map<String, List<Float>>,
+    ): (String, String) -> Double {
+        return { query, doc ->
+            val qv = embeddings[query]
+            val dv = embeddings[doc]
+            if (qv != null && dv != null) {
+                val sim = cosine(qv, dv)
+                // embedding 失败/维度不一致时 cosine 返回 0，此时退回词袋更可靠
+                if (sim > 0.0) sim else computeVectorSimilarity(query, doc)
+            } else {
+                computeVectorSimilarity(query, doc)
+            }
+        }
+    }
+
     override suspend fun transform(
         ctx: TransformerContext,
         messages: List<UIMessage>,
@@ -208,6 +322,41 @@ object PromptInjectionTransformer : InputMessageTransformer {
             ctx.conversationLorebookIds
         }
 
+        // [v248] 世界书向量激活：预先算好 query + 所有 vectorized 条目的 embedding。
+        //
+        // 为什么在 transform（suspend）里算、而不是在 transformMessages（纯函数）里算：
+        //  - transformMessages 是同步纯函数，被 10+ 个单测直接调用，改成 suspend 会波及全部；
+        //  - embedding 要走网络，必须在挂起上下文里做，且要有超时。
+        // 做法：这里一次性算完，把「怎么算相似度」作为函数注入进去。
+        val semanticScorer: ((String, String) -> Double)? = run {
+            if (!vectorWorldInfoEnabled) return@run null
+            val vectorizedEntries = ctx.settings.lorebooks
+                .flatMap { it.entries }
+                .filter { it.vectorized }
+            if (vectorizedEntries.isEmpty()) return@run null
+
+            // query 用与激活逻辑一致的上下文拼法：最近若干条消息
+            val queryText = messages.asReversed()
+                .take(4)
+                .joinToString("\n") { m ->
+                    m.parts.filterIsInstance<UIMessagePart.Text>().joinToString(" ") { it.text }
+                }
+            if (queryText.isBlank()) return@run null
+
+            val docTexts = vectorizedEntries.map { entry ->
+                (entry.keywords + entry.secondaryKeys + listOf(entry.name, entry.content))
+                    .joinToString(" ")
+            }.filter { it.isNotBlank() }
+
+            val embeddings = fetchEmbeddings(listOf(queryText) + docTexts, ctx.settings)
+            if (embeddings.isEmpty()) {
+                // 没有可用 embedding 模型：返回 null → transformMessages 自动回退词袋余弦
+                null
+            } else {
+                makeSemanticScorer(ctx.settings, embeddings)
+            }
+        }
+
         val result = transformMessages(
             messages = messages,
             assistant = runtimeAssistant,
@@ -248,6 +397,7 @@ object PromptInjectionTransformer : InputMessageTransformer {
             personaDescription = ctx.settings.personas
                 .firstOrNull { p -> p.id == ctx.settings.activePersonaId && p.enabled }
                 ?.description ?: "",
+            semanticScorer = semanticScorer,
             // 官方 outlet（position=7）汇聚结果发布给宏引擎（{{outlet::name}} 读取）
             outletSink = { outlets ->
                 WorldInfoOutlets.publish(ctx.conversationId?.toString(), outlets)
@@ -294,6 +444,13 @@ internal fun transformMessages(
     worldInfoUseGroupScoring: Boolean = false,
     generationType: me.rerere.rikkahub.data.model.GenerationType = me.rerere.rikkahub.data.model.GenerationType.NORMAL,
     personaDescription: String = "",
+    /**
+     * [v248] 语义相似度函数（query, doc → [0,1]）。
+     *
+     * 默认 null = 用词袋余弦（`computeVectorSimilarity`），保证纯函数测试与
+     * 未配置 embedding 的场景行为完全不变。非 null 时由调用方注入真 embedding 版本。
+     */
+    semanticScorer: ((String, String) -> Double)? = null,
     onOverflow: () -> Unit = {},
     regexScripts: List<RegexScript> = emptyList(),
     /**
@@ -337,6 +494,7 @@ internal fun transformMessages(
         activeStickyEntries = activeStickyEntries,
         cooldownEntries = cooldownEntries,
         delayOverrideEntries = delayOverrideEntries,
+        semanticScorer = semanticScorer,
         worldInfoBudget = worldInfoBudget,
         worldInfoBudgetCap = worldInfoBudgetCap,
         worldInfoMinActivations = worldInfoMinActivations,
@@ -430,6 +588,10 @@ internal fun collectInjections(
     worldInfoUseGroupScoring: Boolean = false,
     generationType: me.rerere.rikkahub.data.model.GenerationType = me.rerere.rikkahub.data.model.GenerationType.NORMAL,
     personaDescription: String = "",
+    /**
+     * [v248] 语义相似度函数（query, doc → [0,1]）。null = 词袋余弦（旧行为）。
+     */
+    semanticScorer: ((String, String) -> Double)? = null,
     onOverflow: () -> Unit = {},
     regexScripts: List<RegexScript> = emptyList(),
     /**
@@ -779,7 +941,10 @@ internal fun collectInjections(
                     triggeredScores[entry.id] = entry.matchedKeyScore(context)
                 } else if (entry.vectorized && PromptInjectionTransformer.vectorWorldInfoEnabled) {
                     val docText = (entry.keywords + entry.secondaryKeys + listOf(entry.name, entry.content)).joinToString(" ")
-                    val sim = PromptInjectionTransformer.computeVectorSimilarity(context, docText)
+                    // [v248] 有 embedding 用真语义相似度，没有则回退词袋余弦（行为与旧版一致）
+                    val sim = (semanticScorer ?: { q: String, d: String ->
+                        PromptInjectionTransformer.computeVectorSimilarity(q, d)
+                    })(context, docText)
                     if (sim >= PromptInjectionTransformer.vectorThreshold) {
                         newlyTriggered.add(entry)
                         triggeredScores[entry.id] = (sim * 100.0).roundToInt().coerceAtLeast(1)
