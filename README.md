@@ -231,7 +231,7 @@ rikkaST 的目标是尽可能兼容 SillyTavern 的使用方式，但目前仍�
 
 前往 [GitHub Releases](https://github.com/yufanx79-gif/rikkaST/releases) 下载最新发布版本。
 
-当前发布版本：**v2.5.10-public-20261026**
+当前发布版本：**v2.5.16-1115.apk**
 
 - 安装包：`rikkaST-2.5.10-public-20261026.apk`
 - SHA-256：`01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
