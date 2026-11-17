@@ -6,6 +6,8 @@
 
 const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
+import { FilterHelper } from './filters.js';
+
 export let user_avatar = 'user-default.png';
 
 /**
@@ -123,7 +125,7 @@ export function isPersonaConnectionLocked(..._args) { return null; }
 export function isPersonaLocked(..._args) { return null; }
 export function isPersonaPanelOpen(..._args) { return null; }
 export const persona_description_positions = { IN_PROMPT: 0, AFTER_CHAR: 1, TOP_AN: 2, BOTTOM_AN: 3, AT_DEPTH: 4, NONE: 9 };
-export const personasFilter = {};
+export const personasFilter = new FilterHelper(() => { /* 人设列表变化由宿主刷新 */ });
 export async function retriggerFirstMessageOnEmptyChat(..._args) { return null; }
 export function setPersonaDescription(..._args) { return null; }
 export async function setPersonaLockState(..._args) { return null; }

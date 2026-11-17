@@ -910,6 +910,15 @@ object TavernRuntimeManager {
     @Volatile var imageCaptioner: ((String, String) -> String)? = null
 
     /**
+     * [v248] ActionLoader 活跃状态（ST `action-loader.js` 的 `loader` 对象语义）。
+     *
+     * 扩展会 `loader.show({ blocking: true })` 然后读 `loader.isBlocking()`
+     * 决定是否拦截用户输入。宿主侧必须真的记住这个状态，不能永远是 false。
+     */
+    @Volatile var actionLoaderCount: Int = 0
+    @Volatile var actionLoaderBlocking: Boolean = false
+
+    /**
      * [v248] 文本翻译（ST `extensions/translate/index.js:translate()` 语义）。
      *
      * 入参 (text, targetLang)，返回译文；未接线/失败返回空串（调用方自行回退原文）。
@@ -3349,6 +3358,29 @@ object TavernRuntimeManager {
          *
          * @return `{"ok":true,"data":...}` 或 `{"ok":false,"error":"..."}`
          */
+        /**
+         * [v248] ActionLoader 状态同步（ST `action-loader.js` 的 `loader.show/hide`）。
+         *
+         * ST 用 jQuery 往 DOM 里插遮罩 + toast；宿主是 Compose，没有那些节点。
+         * 但**状态必须是真的**：扩展写 `const h = loader.show({blocking:true})` 之后
+         * 会读 `loader.isBlocking()` 判断要不要拦截输入。空实现会让这个判断永远错。
+         *
+         * 这里只记录状态，展示交给 Compose（后续可在 ChatPage 读这个值显示遮罩）。
+         *
+         * @param count 当前活跃 handle 数
+         * @param blocking 是否存在阻塞式 handle
+         */
+        @JavascriptInterface
+        fun setActionLoaderState(count: Int, blocking: Boolean): Boolean {
+            actionLoaderCount = count
+            actionLoaderBlocking = blocking
+            return true
+        }
+
+        @JavascriptInterface
+        fun getActionLoaderStateJson(): String =
+            """{"count":$actionLoaderCount,"blocking":$actionLoaderBlocking}"""
+
         @JavascriptInterface
         fun vectorOp(op: String, payloadJson: String): String {
             val result = java.util.concurrent.CompletableFuture<String>()

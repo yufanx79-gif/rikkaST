@@ -6,6 +6,8 @@
 
 const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.SillyTavern.getContext() : {});
 
+import { FilterHelper } from './filters.js';
+
 export let selected_group = null;
 export let groups = [];
 export let is_group_generating = false;
@@ -90,8 +92,8 @@ export async function getGroupChat(..._args) { return null; }
 export function getGroupChatNames(..._args) { return null; }
 export function getGroupDepthPrompts(..._args) { return null; }
 export async function getGroupPastChats(..._args) { return null; }
-export const groupCandidatesFilter = {};
-export const groupMembersFilter = {};
+export const groupCandidatesFilter = new FilterHelper(() => { /* 列表变化由宿主刷新 */ });
+export const groupMembersFilter = new FilterHelper(() => { /* 列表变化由宿主刷新 */ });
 export const group_activation_strategy = { NATURAL: 0, LIST: 1, MANUAL: 2, POOLED: 3 };
 export let group_generation_id = null;
 export const group_generation_mode = { SWAP: 0, APPEND: 1, APPEND_DISABLED: 2 };
