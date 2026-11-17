@@ -40,6 +40,17 @@ object TavernFileBridge {
     }
 
     /**
+     * [v248] 沙箱根目录（画廊页面用）。
+     *
+     * 之前只有 [list] 这种返回 JSON 的方法，Compose 侧拿不到真实 File，
+     * 结果是「桥通了但 UI 无法展示」。这里补一个只读访问器，
+     * 不改变任何既有路径校验逻辑（写操作仍只走 [resolveSafe]）。
+     *
+     * @return `filesDir/st-user-files`；未初始化返回 null
+     */
+    fun rootDirectory(): File? = rootDir
+
+    /**
      * 把用户传入的路径规范化到沙箱内。
      *
      * @return 规范化后的 File；越界/非法/扩展名不允许时返回 null

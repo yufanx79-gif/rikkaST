@@ -172,6 +172,9 @@ fun ChatPage(
         }
     )
     val filesManager: FilesManager = koinInject()
+    // [v248] ST 翻译扩展的落点（TavernRuntimeManager.textTranslator）需要它。
+    // 单例，与 ChatService 内部用的是同一个实例，不产生第二份状态。
+    val translationHandler: me.rerere.rikkahub.data.ai.TranslationHandler = koinInject()
     val navController = LocalNavController.current
     val scope = rememberCoroutineScope()
 
@@ -343,6 +346,39 @@ fun ChatPage(
                     .onFailure { result.complete("") }
             }
             runCatching { result.get(60, java.util.concurrent.TimeUnit.SECONDS) }.getOrDefault("")
+        }
+        // [v248] 文本翻译（ST extensions/translate 的落点）：走宿主 TranslationHandler，
+        // 与「翻译消息」按钮、TranslatorPage 用同一个模型、同一份用量记账。
+        // 同样在 JavaBridge 线程：禁止 runBlocking，走 IO 协程 + 超时。
+        TavernRuntimeManager.textTranslator = { text, targetLang ->
+            val settings = tavernLatestSettings.value
+            val locale = runCatching {
+                if (targetLang.isBlank()) java.util.Locale.getDefault()
+                else java.util.Locale.forLanguageTag(targetLang)
+            }.getOrDefault(java.util.Locale.getDefault())
+            val result = java.util.concurrent.CompletableFuture<String>()
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    // translateText 是 Flow<String>，流式过程中持续 emit 全量译文，
+                    // 取最后一次非空值即为最终结果。
+                    var latest = ""
+                    translationHandler.translateText(
+                        settings = settings,
+                        sourceText = text,
+                        targetLanguage = locale,
+                    ).collect { chunk -> if (chunk.isNotBlank()) latest = chunk }
+                    latest
+                }.onSuccess { result.complete(it) }
+                    .onFailure { e ->
+                        TavernRuntimeManager.appendLog("warn", "[translate] failed: ${e.message}")
+                        result.complete("")
+                    }
+            }
+            runCatching { result.get(90, java.util.concurrent.TimeUnit.SECONDS) }
+                .getOrElse {
+                    TavernRuntimeManager.appendLog("warn", "[translate] timeout after 90s")
+                    ""
+                }
         }
         // [v247] 切换会话（ST openCharacterChat 语义）
         TavernRuntimeManager.conversationOpener = { conversationId ->

@@ -117,6 +117,7 @@ import me.rerere.rikkahub.ui.pages.extensions.skills.SkillsPage
 import me.rerere.rikkahub.ui.pages.memory.MemoryFilePage
 import me.rerere.rikkahub.ui.pages.mediacreation.MediaCreationPage
 import me.rerere.rikkahub.ui.pages.mediacreation.MediaCreationSessionsPage
+import me.rerere.rikkahub.ui.pages.gallery.GalleryPage
 import me.rerere.rikkahub.ui.pages.setting.SettingMcpDetailPage
 import me.rerere.rikkahub.ui.pages.setting.SettingMediaPage
 import me.rerere.workspace.WorkspaceStorageArea
@@ -499,6 +500,10 @@ class RouteActivity : ComponentActivity() {
 
                             entry<Screen.MediaCreationSessions> {
                                 MediaCreationSessionsPage()
+                            }
+
+                            entry<Screen.Gallery> {
+                                GalleryPage()
                             }
 
                             entry<Screen.MediaCreation> { key ->
@@ -942,6 +947,10 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object GroupChatList : Screen
+
+    /** [v248] 画廊：对齐 ST `extensions/gallery` 的 `#gallery` 面板。 */
+    @Serializable
+    data object Gallery : Screen
 
     @Serializable
     data object KnowledgeBase : Screen

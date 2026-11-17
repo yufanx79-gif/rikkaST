@@ -2530,4 +2530,12 @@
   <string name="error_send_prerequest_timeout">The request stalled before it was ever sent: waited %2$d s locally and never left “%1$s”, so nothing reached the provider. This is a local issue, not a network or provider problem. Try again, and if it keeps happening please share tavern-runtime.log with the developer.</string>
   <string name="error_send_watchdog_unknown_stage">preparing the request</string>
   <string name="chat_generation_waiting_first_token">Waiting for the model to start replying…</string>
+  <string name="gallery_page_title">Gallery</string>
+  <string name="gallery_page_all">All</string>
+  <string name="gallery_page_loading">Loading…</string>
+  <string name="gallery_page_empty">No images yet</string>
+  <string name="gallery_page_delete_title">Delete image</string>
+  <string name="gallery_page_delete_confirm">Delete</string>
+  <string name="gallery_page_cancel">Cancel</string>
+  <string name="gallery_page_close">Close</string>
 </resources>

@@ -767,6 +767,14 @@ private fun DrawerActions(navController: Navigator) {
             text = stringResource(R.string.chat_page_menu_ai_translator),
             onClick = { navController.navigate(Screen.Translator) },
         )
+
+        // [v248] 画廊入口：对齐 ST `extensions/gallery` 的 `#gallery` 面板。
+        // 数据源是沙箱 `st-user-files/images/`，与文件桥、图片上传共用同一个目录。
+        DrawerEntry(
+            icon = HugeIcons.Image02,
+            text = stringResource(R.string.gallery_page_title),
+            onClick = { navController.navigate(Screen.Gallery) },
+        )
     }
 }
 

@@ -909,6 +909,19 @@ object TavernRuntimeManager {
     @Volatile var imageCaptioner: ((String, String) -> String)? = null
 
     /**
+     * [v248] 文本翻译（ST `extensions/translate/index.js:translate()` 语义）。
+     *
+     * 入参 (text, targetLang)，返回译文；未接线/失败返回空串（调用方自行回退原文）。
+     * 宿主侧走已有 `TranslationHandler`（`Settings.translateModeId/translatePrompt`），
+     * 与「翻译消息」按钮、TranslatorPage 用同一个模型、同一份用量记账。
+     *
+     * 为什么不能返回 null：`st-compat/extensions/translate/index.js` 的 `translate()`
+     * 是 ST 的公开导出，第三方扩展会 `import { translate }`。返回 null 时调用方
+     * 拿到的是 null 而不是字符串，`.trim()` / 模板拼接都会炸或写出 "null"。
+     */
+    @Volatile var textTranslator: ((String, String) -> String)? = null
+
+    /**
      * [v247] Instruct 序列模板（ST `power_user.instruct` 语义）。
      *
      * 数据源：当前助手的 `Assistant.instructTemplate`（`InstructTemplate.kt:24-49`，
@@ -3437,6 +3450,33 @@ object TavernRuntimeManager {
             }
         }
 
+        /**
+         * [v248] 文本翻译桥（ST `extensions/translate/index.js:translate()` 的落点）。
+         *
+         * ST 原版按 provider 分支：libre / google / lingva / deepl / deeplx /
+         * oneringtranslator / bing / yandex —— 全部 POST 到酒馆后端的
+         * `/api/translate/` 系列。我们没有那个后端（用户明确不做 provider 请求 API），
+         * 但宿主**有**翻译能力：`TranslationHandler` + `Settings.translateModeId`。
+         *
+         * 语义对齐点：
+         *  - ST 的 `lang` 是目标语言码（'zh-CN' / 'en' 等），这里原样透传；
+         *  - ST 失败时 `console.log` + `toastr.error` 并返回 undefined，
+         *    我们返回空串，让 JS 侧统一走 `|| text` 回退，避免 undefined 传染。
+         *
+         * @param text 待翻译文本
+         * @param targetLang 目标语言（空 = 用宿主默认）
+         * @return 译文；未接线/失败返回空串
+         */
+        @JavascriptInterface
+        fun translateText(text: String, targetLang: String): String {
+            if (text.isEmpty()) return ""
+            val translator = textTranslator ?: return ""
+            return runCatching { translator(text, targetLang) }.getOrElse { e ->
+                appendLog("warn", "[translate] failed: ${e.message}")
+                ""
+            }
+        }
+
         /** [v247] 切换会话（ST `openCharacterChat` 语义）。 */
         @JavascriptInterface
         fun openConversation(conversationId: String): Boolean {
@@ -4444,6 +4484,16 @@ object TavernRuntimeManager {
     /**
      * 供 JS `getWorldInfoPrompt` / `checkWorldInfo` 调用的只读世界书扫描桥。
      */
+    /**
+     * [v248] 世界书求值的空结果常量。
+     *
+     * 必须是编译期字符串字面量，不能在失败路径里临时 `JSONObject().toString()`：
+     * JVM 单测下 `org.json` 是桩，`toString()` 返回 null，会让「兜底」本身再抛 NPE，
+     * 把真正的异常原因吞掉（这个坑实际踩过一次）。
+     */
+    private const val EMPTY_WORLD_INFO_RESULT =
+        """{"found":false,"worldInfoString":"","worldInfoBefore":"","worldInfoAfter":"","worldInfoExamples":[],"worldInfoDepth":[],"anBefore":"","anAfter":"","outletEntries":[],"allActivatedEntries":[],"budget":0,"budgetRemaining":0}"""
+
     internal fun evaluateWorldInfoFromJs(
         chatJson: String,
         maxContext: Int,
@@ -4637,21 +4687,22 @@ object TavernRuntimeManager {
                 put("budget", budget)
                 put("budgetRemaining", (budget - combined.length / 4).coerceAtLeast(0))
             }.toString()
-        }.getOrElse {
-            JSONObject().apply {
-                put("found", false)
-                put("worldInfoString", "")
-                put("worldInfoBefore", "")
-                put("worldInfoAfter", "")
-                put("worldInfoExamples", org.json.JSONArray())
-                put("worldInfoDepth", org.json.JSONArray())
-                put("anBefore", "")
-                put("anAfter", "")
-                put("outletEntries", org.json.JSONArray())
-                put("allActivatedEntries", org.json.JSONArray())
-                put("budget", 0)
-                put("budgetRemaining", 0)
-            }.toString()
+        }.getOrElse { e ->
+            // ⚠️ 这里**不能**再构造 JSONObject().toString()。
+            //
+            // 原来的写法是 `JSONObject().apply { ... }.toString()`，看起来是在给失败兜底，
+            // 实际有两个问题：
+            //  1) 一旦主路径抛异常，兜底分支自己也可能返回 null（JVM 单测里
+            //     org.json 是桩，toString() 返回 null），于是 `getOrElse` 直接
+            //     抛 `NullPointerException: getOrElse(...) must not be null`，
+            //     **把真正的异常原因彻底吞掉**，日志里只剩一个莫名其妙的 NPE。
+            //  2) 返回 null 违反函数签名 `: String`，Kotlin 的 null 检查会炸在调用点，
+            //     堆栈指向调用方，排查方向完全跑偏。
+            //
+            // 改成硬编码的字符串常量：不依赖任何可能被桩掉的 API，
+            // 且把原始异常记进日志，下次再挂能直接看到根因。
+            appendLog("warn", "[worldinfo] evaluateWorldInfoFromJs failed: ${e.message}")
+            EMPTY_WORLD_INFO_RESULT
         }
     }
 

@@ -387,6 +387,14 @@ dependencies {
 
     // tests
     testImplementation(libs.junit)
+    /*
+     * org.json 是 Android 平台自带的类，JVM 单测里拿到的是**桩实现**：
+     * `JSONObject.toString()` 直接返回 null，不抛异常也不报错。
+     * 结果 `TavernRuntimeManager.evaluateWorldInfoFromJs()` 这类「构造 JSON 再序列化」
+     * 的函数在单测里永远返回 null，测试看起来像功能坏了，实际只是没实现。
+     * 补一个真实的 org.json 实现，只作用于测试 classpath，不影响 APK。
+     */
+    testImplementation(libs.org.json)
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
