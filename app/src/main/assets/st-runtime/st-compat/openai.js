@@ -105,7 +105,7 @@ function createPromptManagerStub() {
     };
 }
 
-export const promptManager = createPromptManagerStub();
+export let promptManager = createPromptManagerStub();
 export const openai_max_stop_strings = 4;
 
 /**
@@ -379,7 +379,14 @@ export const isImageInliningSupported = () => false;
  * 不经过 `getProxyPresetNames()`。导出空数组会让「按代理预设名匹配自定义 API」永远返回 undefined，
  * 用户配置的中转站全部失效。这里在模块加载 + 每次 `rikka-st-refresh` 时原位同步（引用恒定）。
  */
-export const proxies = [];
+/**
+ * [v248 BUGFIX] ST `openai.js:522` 是 `export let proxies = [...]`。
+ *
+ * 用 `const` 的后果：ST 内部（以及任何扩展）执行 `proxies = [...]` 会抛
+ * `TypeError: Assignment to constant variable` —— 而且是在 try/catch 里静默吞掉，
+ * 表现是「代理预设列表永远是空」。这里改成 `let`，与上游一致。
+ */
+export let proxies = [];
 
 function __rikkaSyncProxies() {
     try {
@@ -540,7 +547,11 @@ export function isReasoningSignatureSupported(..._args) { return null; }
 export function isVideoInliningSupported(..._args) { return null; }
 export function loadOpenAISettings(..._args) { return null; }
 export function loadProxyPresets(..._args) { return null; }
-export const model_list = [];
+/**
+ * [v248 BUGFIX] ST `openai.js:175` 是 `export let model_list = []`。
+ * 同 proxies：`const` 会让运行时的 `model_list = ...` 抛 TypeError。
+ */
+export let model_list = [];
 export const openai_messages_count = 0;
 export const reasoning_effort_types = { auto: 'auto', low: 'low', medium: 'medium', high: 'high', min: 'min', max: 'max' };
 export let selected_proxy = '';

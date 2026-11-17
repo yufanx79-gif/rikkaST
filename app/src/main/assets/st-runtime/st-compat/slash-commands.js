@@ -145,7 +145,7 @@ export const COMMENT_NAME_DEFAULT = 'Note';
 export const CONNECT_API_MAP = {};
 export const UNIQUE_APIS = [];
 export function activateScriptButtons(..._args) { return null; }
-export const commandsFromChatInputAbortController = {};
+export let commandsFromChatInputAbortController = {};
 export function deactivateScriptButtons(..._args) { return null; }
 export async function generateSystemMessage(..._args) { return null; }
 export function getNameAndAvatarForMessage(..._args) { return null; }

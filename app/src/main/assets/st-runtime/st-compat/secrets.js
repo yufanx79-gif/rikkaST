@@ -21,7 +21,7 @@ export const SECRET_KEYS = {
     COMETAPI: 'api_key_cometapi',
     NOVEL: 'api_key_novel',
 };
-export const secret_state = {};
+export let secret_state = {};
 export function canViewSecrets() { return false; }
 export async function checkOpenRouterAuth() {}
 export async function deleteSecret() {}

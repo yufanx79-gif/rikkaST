@@ -70,7 +70,7 @@ function normalizeFolderAlias(raw) {
  * [v243 BUGFIX C2] 扩展类型表。
  * 同时提供保留常量键与 `third-party/<folder>` 映射（含去版本后缀别名）。
  */
-export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global' };
+export let extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global' };
 
 function __rikkaRefreshExtensionTypes() {
     try {

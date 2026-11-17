@@ -66,11 +66,11 @@ export const DEFAULT_WEIGHT = 100;
 export const METADATA_KEY = 'world_info';
 
 // ---------------------------------------------------------------- 设置（静态近似）
-export const world_info_include_names = true;
-export const world_info_max_recursion_steps = 0;
-export const world_info_case_sensitive = false;
-export const world_info_match_whole_words = false;
-export const world_info_use_group_scoring = false;
+export let world_info_include_names = true;
+export let world_info_max_recursion_steps = 0;
+export let world_info_case_sensitive = false;
+export let world_info_match_whole_words = false;
+export let world_info_use_group_scoring = false;
 
 export function getWorldInfoSettings() {
     try { __refreshWorldInfoData(); } catch (_e) { /* noop */ }

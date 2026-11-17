@@ -84,7 +84,7 @@ export class PromptCollection {
     }
 }
 
-export const promptManager = new PromptCollection();
+export let promptManager = new PromptCollection();
 
 // ---- [ST 1.19.0 Full Export Parity] ----
 export class PromptManager {

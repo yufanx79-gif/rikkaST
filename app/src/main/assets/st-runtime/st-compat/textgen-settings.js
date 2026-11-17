@@ -16,9 +16,9 @@ export const textgen_types = {
     GENERIC: 'generic',
 };
 export const textgenerationwebui_settings = { type: 'ooba', temp: 1.0, max_new_tokens: 512 };
-export const textgenerationwebui_presets = [];
-export const textgenerationwebui_preset_names = {};
-export const textgenerationwebui_banned_in_macros = [];
+export let textgenerationwebui_presets = [];
+export let textgenerationwebui_preset_names = {};
+export let textgenerationwebui_banned_in_macros = [];
 export const setting_names = [
     'temp',
     'temperature_last',
@@ -122,12 +122,12 @@ export const APHRODITE_DEFAULT_ORDER = [
     'quadratic',
     'xtc',
 ];
-export const DREAMGEN_SERVER = '';
-export const FEATHERLESS_SERVER = '';
-export const INFERMATICAI_SERVER = '';
-export const MANCER_SERVER = '';
-export const OPENROUTER_SERVER = '';
-export const TOGETHERAI_SERVER = '';
+export let DREAMGEN_SERVER = '';
+export let FEATHERLESS_SERVER = '';
+export let INFERMATICAI_SERVER = '';
+export let MANCER_SERVER = '';
+export let OPENROUTER_SERVER = '';
+export let TOGETHERAI_SERVER = '';
 
 export function createTextGenGenerationData(prompt) { return { prompt }; }
 export function formatTextGenURL(url) { return String(url ?? ''); }

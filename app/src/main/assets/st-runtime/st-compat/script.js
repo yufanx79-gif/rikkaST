@@ -659,7 +659,7 @@ export async function itemizedParams(itemizedPrompts = [], thisPromptSet = 0, in
     params.selectedTokenizer = p.tokenizer || '';
     return params;
 }
-export const itemizedPrompts = [];
+export let itemizedPrompts = [];
 export let koboldai_setting_names = [];
 export let koboldai_settings = [];
 export const lastSwipeInfo = { now: (typeof performance !== 'undefined' ? performance.now() : Date.now()), direction: 'right' };
