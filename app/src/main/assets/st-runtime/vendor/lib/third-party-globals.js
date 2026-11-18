@@ -8,12 +8,14 @@
  * v212（§5.F 真库替换）：
  *  - highlight.js 已升级为真库（vendor/lib/hljs.min.js，BSD-3-Clause，v11.9.0，
  *    在宿主页于本文件之前加载）；本文件的 hljs 段只剩「真库缺失环境」的占位兜底。
- *  - showdown 本地无真库副本（ST 走 npm 依赖，参考库内无 bundled 产物），
- *    从「原样返回 String(text)」升级为轻量 Markdown 渲染：
+ *  - showdown 已升级为真库（vendor/lib/showdown.min.js，MIT，v2.1.0，
+ *    取自上游 ST 1.19.0 的 npm 依赖；宿主页于本文件之前加载）。
+ *    下面这段只在「真库缺失」的环境里兜底，从「原样返回 String(text)」起
+ *    升级为轻量 Markdown 渲染：
  *    围栏代码 / atx 标题 / 粗体 / 斜体 / 删除线 / 行内代码 / 链接 / 图片 /
  *    无序有序列表 / 引用 / 水平线 / 段落；HTML 直通（与 showdown 默认一致）。
  *    行内代码先提取后回填，避免内部符号被二次格式化。
- *    取得真 showdown.min.js 后可无缝替换（同名 API：Converter#makeHtml）。
+ *    真库同名 API（Converter#makeHtml），二者可直接互换。
  *  - Popper 保持占位（API 兼容、无真实定位；JSR 仅 tavern_helper_types_popup 一处使用）。
  */
 (function () {

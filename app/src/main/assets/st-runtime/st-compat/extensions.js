@@ -15,6 +15,28 @@ export const UNSET_VALUE = undefined;
 export const EMPTY_AUTHOR = '<No author>';
 export { SimpleMutex, SimpleMutex as ModuleWorkerWrapper };
 
+/**
+ * 兼容冗余（超出 ST 1.19.0 的导出面）。
+ *
+ * ST 1.19.0 的 public/scripts/extensions.js 只导出
+ *   { getContext, getApiUrl, SimpleMutex as ModuleWorkerWrapper }
+ * —— 它内部 import 了 saveSettingsDebounced 但**没有再导出**。
+ *
+ * 但真实生态里有插件写：
+ *   import * as ext from '.../scripts/extensions.js';
+ *   const { saveSettingsDebounced } = ext;   // ← 上游为 undefined
+ * 然后无保护地调用它，在 ST 里同样会崩（ZerxzLib 就是这样）。
+ *
+ * 我们多导出一个指向 script.js 同名函数的转发，插件能跑起来，
+ * 且对按上游正确写法调用的插件没有任何影响。
+ */
+export function saveSettingsDebounced(...args) {
+    const fn = rootWin()?.__rikkaStSaveSettingsDebounced;
+    if (typeof fn === 'function') return fn(...args);
+    const ctx = st();
+    if (typeof ctx.saveSettingsDebounced === 'function') return ctx.saveSettingsDebounced(...args);
+}
+
 /** 全扩展共享的设置对象（live：runtime refreshAll 后自动同步）。 */
 export let extension_settings = st().extensionSettings || {};
 export let extensionNames = [];

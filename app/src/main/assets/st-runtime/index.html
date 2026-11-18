@@ -45,7 +45,22 @@
         <div id="chat" style="display:none !important;"></div>
     </div>
     <!-- [v212 · §5.F] highlight.js 11.9.0（BSD-3，真库，来自 Rikkahub-Revised assets）必须在 third-party-globals.js 之前加载 -->
+    <!-- ST 宿主模板：第三方扩展会 getElementById('generic_draggable_template') 后 clone。
+         TopInfoBar 等扩展缺它会报 "Cannot read properties of undefined (reading 'cloneNode')"。
+         定义原样取自 ST 1.19.0 public/index.html:6434。 -->
+    <template id="generic_draggable_template">
+        <div class="draggable">
+            <div class="dragTitle"></div>
+            <div class="panelControlBar flex-container">
+                <div class="fa-fw fa-solid fa-grip drag-grabber"></div>
+                <div class="fa-fw fa-solid fa-circle-xmark dragClose"></div>
+            </div>
+        </div>
+    </template>
+    <template id="NULL_SELECTOR" class="displayNone"></template>
     <script src="./vendor/lib/hljs.min.js"></script>
+    <!-- showdown 2.1.0（MIT，真库，取自上游 ST 1.19.0 依赖）-->
+    <script src="./vendor/lib/showdown.min.js"></script>
     <link rel="stylesheet" href="./vendor/lib/hljs-theme.css">
     <script src="./vendor/lib/third-party-globals.js"></script>
     <!-- [v209] select2 4.1.0（MIT/GPL，ST 自带同款） -->
