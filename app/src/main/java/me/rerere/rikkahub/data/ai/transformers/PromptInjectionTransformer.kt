@@ -21,6 +21,7 @@ import me.rerere.rikkahub.data.model.WORLD_INFO_DECORATOR_ACTIVATE
 import me.rerere.rikkahub.data.model.WORLD_INFO_DECORATOR_DONT_ACTIVATE
 import me.rerere.rikkahub.data.st.regex.RegexPlacement
 import me.rerere.rikkahub.data.st.runtime.TavernWorldInfoEvents
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.tokenizer.TokenizerMode
 import me.rerere.rikkahub.data.st.tokenizer.countTokens
 import me.rerere.rikkahub.data.st.tokenizer.estimateTokensHeuristic
@@ -1061,6 +1062,23 @@ internal fun collectInjections(
             scanState = nextScanState
         }
 
+        // [取证] 世界书激活结果落日志。
+        //
+        // 用户反馈「不知道世界书有没有真的生效」时，这条日志能直接回答：
+        //   - 最终激活几条、每条的名字/位置/字符数
+        //   - 是否发生预算溢出、概率检查失败多少条
+        // 没有这条，`internalMessages=8` 这种计数无法区分
+        // 「世界书没命中」和「命中了但被预设覆盖」。
+        runCatching {
+            val summary = activatedEntries.joinToString(", ") { entry ->
+                "${entry.name}[${entry.position.name.lowercase()}/${entry.content.length}ch]"
+            }
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[worldinfo] activated=${activatedEntries.size} budget=$budget " +
+                    "entries=[${summary.take(600)}]",
+            )
+        }
         val autoIds = activatedEntries.mapNotNull { it.automationId.trim().takeIf { id -> id.isNotEmpty() } }.distinct()
         PromptInjectionTransformer.recordActivatedAutomationIds("${assistant.id}:default", autoIds)
 

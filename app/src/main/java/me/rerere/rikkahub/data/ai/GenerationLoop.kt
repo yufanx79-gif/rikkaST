@@ -1386,7 +1386,39 @@ class GenerationLoop(
         TavernRuntimeManager.recordSendDiagnostic(
             stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_6_MODEL_REQUEST_SENT,
             conversationId = conversationId?.toString().orEmpty(),
-            detail = "model=${model.modelId} internalMessages=${internalMessages.size} stream=$stream",
+            detail = buildString {
+                append("model=${model.modelId}")
+                append(" internalMessages=${internalMessages.size}")
+                append(" stream=$stream")
+                // [取证] 世界书 / 预设是否真的进了请求体。
+                // 只看 internalMessages=8 无法判断内容对不对，这里把「可验证的指纹」打出来：
+                //   - 每条消息的 role / 字符数 / 首行摘要
+                //   - 命中的世界书条目名（来自 WorldInfoOutlets 的注入标记）
+                // 这样用户报「世界书没生效」时，日志里能直接看出是没注入还是注入了但被覆盖。
+                append(" tools=${params.tools.size}")
+                append(" msgFingerprint=[")
+                append(
+                    internalMessages.mapIndexed { index, message ->
+                        val text = message.parts.filterIsInstance<me.rerere.ai.ui.UIMessagePart.Text>()
+                            .joinToString("") { it.text }
+                        val firstLine = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim()
+                            ?.take(48)?.replace('\n', ' ') ?: ""
+                        "#$index:${message.role.name.lowercase()}:${text.length}:$firstLine"
+                    }.joinToString(" | ")
+                )
+                append("]")
+                if (settings.developerMode) {
+                    // 开发者模式下额外记录完整请求体，便于逐字核对世界书/预设组装。
+                    append(" [requestDump]")
+                    append(
+                        internalMessages.mapIndexed { index, message ->
+                            val text = message.parts.filterIsInstance<me.rerere.ai.ui.UIMessagePart.Text>()
+                                .joinToString("") { it.text }
+                            "\n===== #$index ${message.role.name} (${text.length} chars) =====\n$text"
+                        }.joinToString("")
+                    )
+                }
+            },
         )
         // [P0] 请求已发出但还没有第一个 token 的这段窗口，UI 上必须能看到「在等模型」，
         // 否则用户只能看到一个没有文案的转圈，无法区分「正在请求上游」和「卡在本地」。
