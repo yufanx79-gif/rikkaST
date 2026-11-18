@@ -2420,12 +2420,17 @@ class ChatService(
                 )
             }
         }.onFailure {
+            // [P3] 标题生成是**后台辅助功能**，失败不该在聊天界面弹红框。
+            //
+            // 用户反馈：「把消息生成标题失败的红框提示去掉」。
+            // 这个红框除了制造焦虑没有可执行动作 —— 标题只影响会话列表的显示名，
+            // 用户完全可以手动改名；而且失败多半是快模型没配好，与当前对话无关。
+            //
+            // 改为只落诊断日志：需要排查的人仍能在日志里看到完整堆栈。
             it.printStackTrace()
-            addError(
-                error = it,
-                conversationId = conversationId,
-                title = context.getString(R.string.error_title_generate_title),
-                solution = ChatErrorSolution.CheckFastModelSettings,
+            me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager.appendLog(
+                "warn",
+                "[title] generation failed conv=${conversationId ?: "-"} : ${it.javaClass.simpleName}: ${it.message}",
             )
         }
     }
