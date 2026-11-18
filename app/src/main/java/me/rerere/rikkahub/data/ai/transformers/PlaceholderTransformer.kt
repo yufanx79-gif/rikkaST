@@ -360,6 +360,10 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
     ): List<UIMessage> {
         val settingsStore = get<SettingsStore>()
         val vars = SettingsMacroVars(settingsStore, ctx.settings)
+        // [P3 性能] 与消息内容无关的前置计算只做一次。
+        // 旧实现把这段放进 replacePlaceholders()，导致每条消息都重新解析
+        // 整个预设 JSON（Meowssiah = 543 KB）；8 条消息 ≈ 748ms。
+        val pass = buildMacroPassContext(ctx, settingsStore, messages)
         // 宏替换由高保真 ST 宏引擎执行（StMacroSupport → data.st.macro），旧引擎不再参与管线
         val result = messages.map {
             it.copy(
@@ -369,10 +373,9 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
                             text = stripInjectedMarker(
                                 replacePlaceholders(
                                     text = part.text,
-                                    ctx = ctx,
                                     vars = vars,
-                                    settingsStore = settingsStore,
-                                    messages = messages,
+                                    pass = pass,
+                                    defaultProvider = defaultProvider,
                                 )
                             )
                         )
@@ -386,15 +389,12 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
         return result
     }
 
-    private fun replacePlaceholders(
-        text: String,
+    /** 构造一次 transform() 内可复用的宏上下文（预设解析 + PlaceholderCtx）。 */
+    private fun buildMacroPassContext(
         ctx: TransformerContext,
-        vars: MacroVars,
         settingsStore: SettingsStore,
         messages: List<UIMessage>,
-    ): String {
-        var result = text
-
+    ): MacroPassContext {
         val placeholderCtx = PlaceholderCtx(
             context = ctx.context,
             settingsStore = settingsStore,
@@ -414,8 +414,22 @@ object PlaceholderTransformer : InputMessageTransformer, KoinComponent {
                 ctx.conversationModeInjectionIds,
             ),
         )
-        val nestPasses = activePresetCfg.spresetMacroNestDepth.coerceIn(1, 5)
-        for (pass in 0 until nestPasses) {
+        return MacroPassContext(
+            placeholderCtx = placeholderCtx,
+            nestPasses = activePresetCfg.spresetMacroNestDepth.coerceIn(1, 5),
+        )
+    }
+
+    private fun replacePlaceholders(
+        text: String,
+        vars: MacroVars,
+        pass: MacroPassContext,
+        defaultProvider: PlaceholderProvider,
+    ): String {
+        var result = text
+        val placeholderCtx = pass.placeholderCtx
+        val nestPasses = pass.nestPasses
+        for (macroPass in 0 until nestPasses) {
             val next = StMacroSupport.substitute(result, placeholderCtx, vars, defaultProvider)
             result = next
             if (!result.contains("{{")) break
