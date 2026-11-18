@@ -1047,6 +1047,50 @@ fun parseActiveStPresetConfig(
     enabledGroups: Set<String>,
 ): StActivePresetConfig {
     if (tavernPresetsJson.isNullOrBlank() || enabledGroups.isEmpty()) return StActivePresetConfig()
+
+    // [P3 性能] 按 (预设JSON, 启用分组) 做进程级缓存。
+    //
+    // 真机日志 `[transformer] slow #3 PromptInjectionTransformer 449ms`：
+    // 一次生成里 parseActiveStPresetConfig 会被调用 8+ 次（transformer、
+    // GenerationLoop 的预设后处理、ChatService 的续写分支…），每次都
+    // `parseToJsonElement` 整份预设 JSON —— Meowssiah 2.0.11 = 543 KB。
+    //
+    // 预设内容在一次生成期间不会变，因此按内容哈希缓存是安全的；
+    // 用户改预设 → JSON 变化 → 哈希变化 → 自动失效，不会读到脏数据。
+    val cacheKey = tavernPresetsJson.hashCode().toLong() * 31 + enabledGroups.hashCode()
+    StPresetConfigCache.get(cacheKey)?.let { return it }
+    val parsed = parseActiveStPresetConfigUncached(tavernPresetsJson, enabledGroups)
+    StPresetConfigCache.put(cacheKey, parsed)
+    return parsed
+}
+
+/** 预设配置解析缓存（LRU，容量固定，避免内存无界增长）。 */
+private object StPresetConfigCache {
+    private const val MAX_ENTRIES = 8
+    private val map = object : LinkedHashMap<Long, StActivePresetConfig>(MAX_ENTRIES, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, StActivePresetConfig>?): Boolean =
+            size > MAX_ENTRIES
+    }
+
+    @Synchronized
+    fun get(key: Long): StActivePresetConfig? = map[key]
+
+    @Synchronized
+    fun put(key: Long, value: StActivePresetConfig) {
+        map[key] = value
+    }
+
+    /** 仅供测试：清空缓存以验证解析路径本身。 */
+    @Synchronized
+    fun clearForTest() = map.clear()
+}
+
+private fun parseActiveStPresetConfigUncached(
+    tavernPresetsJson: String?,
+    enabledGroups: Set<String>,
+): StActivePresetConfig {
+    // 调用方已保证非空；这里再兜一次是为了让函数自身也安全
+    if (tavernPresetsJson.isNullOrBlank() || enabledGroups.isEmpty()) return StActivePresetConfig()
     return runCatching {
         val mapObj = ExportSerializer.DefaultJson.parseToJsonElement(tavernPresetsJson) as? JsonObject
             ?: return@runCatching StActivePresetConfig()
