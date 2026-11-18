@@ -5,6 +5,7 @@ import me.rerere.hugeicons.stroke.Folder01
 import me.rerere.hugeicons.stroke.Forward02
 import me.rerere.hugeicons.stroke.Pin
 import me.rerere.hugeicons.stroke.PinOff
+import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.hugeicons.stroke.Refresh01
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.Edit01
@@ -262,6 +263,9 @@ private fun ConversationItem(
     } else {
         Color.Transparent
     }
+    // 「自定义标题」输入对话框
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var renameText by remember { mutableStateOf("") }
     var showDropdownMenu by remember {
         mutableStateOf(false)
     }
@@ -348,6 +352,20 @@ private fun ConversationItem(
                     }
                 )
 
+                // [P3] 自定义标题：手动指定会话名。
+                // 与上面的「重新生成标题」并列 —— 一个是让模型总结，一个是自己写。
+                DropdownMenuItem(
+                    text = { Text("自定义标题") },
+                    onClick = {
+                        renameText = conversation.title
+                        showDropdownMenu = false
+                        showRenameDialog = true
+                    },
+                    leadingIcon = {
+                        Icon(HugeIcons.PencilEdit01, null)
+                    }
+                )
+
                 DropdownMenuItem(
                     text = {
                         Text(stringResource(R.string.chat_page_move_to_assistant))
@@ -385,6 +403,41 @@ private fun ConversationItem(
                     leadingIcon = {
                         Icon(HugeIcons.Delete01, null)
                     }
+                )
+            }
+
+            // [P3] 自定义标题输入框（与长按菜单的「自定义标题」配套）
+            if (showRenameDialog) {
+                AlertDialog(
+                    onDismissRequest = { showRenameDialog = false },
+                    title = { Text("自定义标题") },
+                    text = {
+                        OutlinedTextField(
+                            value = renameText,
+                            onValueChange = { renameText = it },
+                            singleLine = true,
+                            label = { Text("会话标题") },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                val trimmed = renameText.trim()
+                                if (trimmed.isNotEmpty()) {
+                                    onRenameTitle(conversation, trimmed)
+                                }
+                                showRenameDialog = false
+                            },
+                            // 空白标题不允许提交，避免把会话名清空
+                            enabled = renameText.isNotBlank(),
+                        ) { Text(stringResource(R.string.confirm)) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showRenameDialog = false }) {
+                            Text(stringResource(R.string.cancel))
+                        }
+                    },
                 )
             }
         }

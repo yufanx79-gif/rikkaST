@@ -330,6 +330,12 @@ fun ChatDrawerContent(
                 onRegenerateTitle = {
                     vm.generateTitle(it, true)
                 },
+                // [P3] 自定义标题：长按会话 → 自定义标题。
+                // renameConversation 早就有了，之前只是没接到菜单上。
+                onRenameTitle = { conversation, title ->
+                    vm.renameConversation(conversation, title)
+                    conversations.refresh()
+                },
                 onDelete = {
                     scope.launch {
                         vm.deleteConversation(it).join()
