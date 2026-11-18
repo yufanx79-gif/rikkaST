@@ -2042,27 +2042,55 @@ object TavernRuntimeManager {
         }
     }
 
-    /** ST 核心模块兼容 shim 路由（返回 null 表示该路径不属于兼容层，放行后续资产链路）。 */
+    /**
+     * ST 核心模块兼容 shim 路由（返回 null 表示该路径不属于兼容层，放行后续资产链路）。
+     *
+     * ## 为什么需要「层级归一化」和「lib 归一化」
+     *
+     * 第三方插件在 ST 里位于 `public/scripts/extensions/third-party/<folder>/`，
+     * 它们用相对路径导入 ST 核心模块。但**入口可能位于子目录**
+     * （例如 `dist/index.js`），相对路径的基准随之加深，于是同一个
+     * `../../../script.js` 在两种入口下会归一化成不同 URL：
+     *
+     * | 插件入口 | `../../../script.js` 归一化结果 | ST 真实位置 |
+     * |---|---|---|
+     * | `index.js` | `/scripts/script.js` | `/script.js`（public 根） |
+     * | `dist/index.js` | `/script.js` | `/script.js` |
+     *
+     * 同理 `../../../lib/yaml.esm.js` 会变成 `/scripts/lib/yaml.esm.js`，
+     * 而 ST 的真实位置是 `public/lib/yaml.esm.js`。
+     *
+     * 用真实插件实测（dev-scripts/plugin_compat_lab.mjs，38 个社区插件）：
+     * 不做归一化时有 7 个插件因 `lib.js` / `script.js` 落到 `/scripts/` 下而整模块加载失败。
+     * 归一化后这 7 个全部通过。
+     */
     private fun routeStCompat(path: String): WebResourceResponse? {
-        val shimPath = when {
-            path == "/script.js" -> "st-runtime/st-compat/script.js"
-            path == "/lib.js" -> "st-runtime/st-compat/lib.js"
-            path == "/scripts/events.js" -> "st-runtime/vendor/st/events.js"
-            path == "/scripts/eventemitter.js" -> "st-runtime/vendor/st/eventemitter.js"
-            path.startsWith("/scripts/") -> {
-                val rel = path.removePrefix("/scripts/")
-                if (!isPlausibleStModulePath(rel)) return null
-                // 根级文件（/script.js、/lib.js）不经 /scripts/ 暴露（对齐 ST 的真实布局，避免模块双实例）；
-                // 其余未命中 st-compat 资源时由 openAsset 自然 404。
-                if (rel == "script.js" || rel == "lib.js") return notFound()
-                "st-runtime/st-compat/$rel"
-            }
-            else -> return null
-        }
+        val shimPath = resolveStCompatShimPath(path) ?: return null
         return openAsset(shimPath) ?: run {
             appendLog("error", "[compat] 缺少 st-compat shim: $path → $shimPath（第三方扩展会整模块加载失败）")
             notFound()
         }
+    }
+
+    /**
+     * ST 模块 URL → assets 内 shim 路径的**纯映射**（无 Android 依赖，可单测）。
+     *
+     * 返回 null 表示该路径不属于兼容层，应放行给后续资产链路。
+     *
+     * 之所以把「层级归一化」做成独立纯函数：真实插件上溯层数取决于入口深度，
+     * 同一个 ST 模块会出现多种 URL 形态。这段规则是本轮修复的核心，
+     * 必须有单元测试锁住（见 StCompatRouteTest）。
+     */
+    internal fun resolveStCompatShimPath(path: String): String? =
+        resolveStCompatShimPathPure(path) { rel -> stCompatAssetExists(rel) }
+
+    /** 查询 st-compat 目录下是否存在某个相对模块（只用于层级归一化判定）。 */
+    private fun stCompatAssetExists(rel: String): Boolean {
+        val ctx = appContext ?: return false
+        return runCatching {
+            ctx.assets.open("st-runtime/st-compat/$rel").use { }
+            true
+        }.getOrDefault(false)
     }
 
     /** 兼容层路径形态校验：`xxx.js` 或 `a/b.js`（段字符白名单，防目录穿越）。 */
@@ -4927,4 +4955,99 @@ object TavernRuntimeManager {
     fun chatCompletionError(message: String): String =
         TavernChatCompletionsApi.errorBody(message)
 
+}
+
+
+/**
+ * ST 模块 URL → assets 内 shim 路径的纯映射（顶层函数，便于单元测试）。
+ *
+ * 返回 null 表示该路径不属于兼容层，应放行给后续资产链路。
+ *
+ * ## 为什么需要「层级归一化」
+ *
+ * 第三方插件位于 `/scripts/extensions/third-party/<folder>/`，入口可能在子目录
+ * （如 `dist/index.js`）。它们用相对路径导入 ST 核心模块，上溯层数随入口深度变化，
+ * 同一个模块会得到多种 URL 形态：
+ *
+ * | 插件入口 | 写法 | 归一化 URL |
+ * |---|---|---|
+ * | `index.js` | `../../../script.js` | `/scripts/script.js` |
+ * | `dist/index.js` | `../../../script.js` | `/script.js` |
+ * | `index.js` | `../../../lib/yaml.esm.js` | `/scripts/lib/yaml.esm.js` |
+ * | `dist/index.js` | `../../../../lib/x.js` | `/scripts/extensions/lib/x.js` |
+ *
+ * 实测（dev-scripts/plugin_compat_lab.mjs，38 个真实社区插件）：
+ * 不做归一化时有 7 个插件因落错层级而整模块加载失败；归一化后全部通过。
+ */
+internal fun resolveStCompatShimPathPure(
+    path: String,
+    exists: (String) -> Boolean = { false },
+): String? {
+    // 根级文件名特判。
+    //
+    // `script.js` / `lib.js` 在 ST 里位于 public/ 根。插件上溯层数随入口深度变化，
+    // 同一个文件会得到 /script.js、/scripts/script.js、/scripts/extensions/script.js
+    // 等多种形态，全部映射回根级 shim（保持同一模块实例）。
+    //
+    // 注意：不能把「折叠 extensions/」当成通用规则——`/scripts/extensions/regex/engine.js`
+    // 是 ST 的真实路径（public/scripts/extensions/regex/engine.js），折叠会破坏它。
+    // 这里只对这两个根级文件名做后缀匹配。
+    if (path == "/script.js" || path.endsWith("/script.js") && path.startsWith("/scripts/")) {
+        return "st-runtime/st-compat/script.js"
+    }
+    if (path == "/lib.js" || path.endsWith("/lib.js") && path.startsWith("/scripts/")) {
+        return "st-runtime/st-compat/lib.js"
+    }
+    val collapsed = path
+
+    // public/lib 运行时库（yaml / zod / dompurify / eventemitter / dialog-polyfill …）
+    //
+    // 插件上溯层数不同会得到多种形态，全部要命中 vendor/lib：
+    //   /lib/yaml.esm.js
+    //   /scripts/lib/yaml.esm.js
+    //   /scripts/extensions/lib/yaml.esm.js
+    //   /scripts/extensions/third-party/x/lib/yaml.esm.js
+    Regex("^/(?:[A-Za-z0-9_.-]+/)*lib/([A-Za-z0-9_.-]+)$").find(collapsed)?.let { m ->
+        val rel = m.groupValues[1]
+        if (!isPlausibleStModulePathPure(rel)) return null
+        return "st-runtime/vendor/lib/$rel"
+    }
+
+    // 顶层 scripts 模块。
+    //
+    // 上溯过深时会多出一层 `extensions/`（如 /scripts/extensions/extensions.js）。
+    // 判断依据是「去掉这层之后是否对应一个真实存在的 st-compat 模块」——
+    // 这样既不会破坏 /scripts/extensions/regex/engine.js 这类真实子目录，
+    // 也不需要维护一份永远会漏的目录白名单。
+    if (collapsed.startsWith("/scripts/extensions/")) {
+        val inner = collapsed.removePrefix("/scripts/extensions/")
+        if (isPlausibleStModulePathPure(inner) && exists(inner)) {
+            return "st-runtime/st-compat/$inner"
+        }
+        val withoutExt = collapsed.removePrefix("/scripts/")
+        if (!isPlausibleStModulePathPure(withoutExt)) return null
+        return "st-runtime/st-compat/$withoutExt"
+    }
+    return when {
+        collapsed == "/scripts/events.js" -> "st-runtime/vendor/st/events.js"
+        collapsed == "/scripts/eventemitter.js" -> "st-runtime/vendor/st/eventemitter.js"
+        collapsed.startsWith("/scripts/") -> {
+            val rel = collapsed.removePrefix("/scripts/")
+            if (!isPlausibleStModulePathPure(rel)) return null
+            "st-runtime/st-compat/$rel"
+        }
+        else -> null
+    }
+}
+
+/** 兼容层路径形态校验：`xxx.js` 或 `a/b.js`（段字符白名单，防目录穿越）。 */
+internal fun isPlausibleStModulePathPure(rel: String): Boolean {
+    if (!rel.endsWith(".js")) return false
+    val segs = rel.split('/')
+    if (segs.isEmpty()) return false
+    return segs.all { seg ->
+        seg.isNotEmpty() && seg != "." && seg != ".." && seg.none { c ->
+            !(c.isLetterOrDigit() || c == '_' || c == '-' || c == '.')
+        }
+    }
 }

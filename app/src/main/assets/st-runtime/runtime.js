@@ -27,6 +27,7 @@ import * as mathRender from './shims/math-render.js';
 import { deepClone } from './shims/clone-util.js';
 // [v243 BUGFIX C3] SillyTavern public/script.js 的原生导出面（裸全局挂载用）
 import * as stCompatScript from './st-compat/script.js';
+import * as stCompatLib from './st-compat/lib.js';
 import { normalizeStCharacter } from './character-shape.js';
 // [v214] ST ctx.powerUserSettings（recon §2.9：ST-PT persona 域）——零依赖模块，直接复用 st-compat 导出。
 import { power_user as stCompatPowerUser } from './st-compat/power-user.js';
@@ -1494,6 +1495,78 @@ async function callGenericPopupStub(content, type, defaultResult /*, options */)
     return defaultResult;
 }
 
+/**
+ * ST 1.19.0 `scripts/popup.js:97-147` 的 `Popup.show` 便捷命名空间。
+ *
+ * 真实插件大量依赖它（实测 30 个社区插件里 `Popup.show.confirm` 出现 33 次、
+ * `.input` 13 次、`.text` 2 次）。缺了这个命名空间，插件会在初始化阶段直接
+ * `TypeError: ... .show.confirm(...).then is not a function`。
+ *
+ * 语义对齐 ST（popup.js:104-147）：
+ * - `confirm(header, text, opts)` → Promise<POPUP_RESULT?>，默认 AFFIRMATIVE
+ * - `input(header, text, defaultValue, opts)` → Promise<string?>；空串是「成功输入空」，
+ *   其余 falsy 视为取消返回 null
+ * - `text(header, text, opts)` → Promise<POPUP_RESULT?>，默认 AFFIRMATIVE
+ */
+const stPopupShowHelper = {
+    confirm: async (header, text, popupOptions = {}) => {
+        try {
+            callBridge('log', 'info', `[popup] confirm header=${String(header).slice(0, 120)} text=${String(text).slice(0, 200)}`);
+        } catch (_e) { /* noop */ }
+        const onOpen = popupOptions && popupOptions.onOpen;
+        if (typeof onOpen === 'function') { try { await onOpen(stPopupShowHelper); } catch (_e) { /* noop */ } }
+        return POPUP_RESULT.AFFIRMATIVE;
+    },
+    input: async (header, text, defaultValue = '', popupOptions = {}) => {
+        try {
+            callBridge('log', 'info', `[popup] input header=${String(header).slice(0, 120)} default=${String(defaultValue).slice(0, 120)}`);
+        } catch (_e) { /* noop */ }
+        const onOpen = popupOptions && popupOptions.onOpen;
+        if (typeof onOpen === 'function') { try { await onOpen(stPopupShowHelper); } catch (_e) { /* noop */ } }
+        // 无界面时回填默认值；空串是合法「成功」结果（对齐 popup.js:113-115）
+        return defaultValue == null ? '' : String(defaultValue);
+    },
+    text: async (header, text, popupOptions = {}) => {
+        try {
+            callBridge('log', 'info', `[popup] text header=${String(header).slice(0, 120)} text=${String(text).slice(0, 200)}`);
+        } catch (_e) { /* noop */ }
+        const onOpen = popupOptions && popupOptions.onOpen;
+        if (typeof onOpen === 'function') { try { await onOpen(stPopupShowHelper); } catch (_e) { /* noop */ } }
+        return POPUP_RESULT.AFFIRMATIVE;
+    },
+};
+
+/** ST 1.19.0 `Popup` 类的最小可用替身（部分插件 `new Popup(...)` 后 `.show()`）。 */
+class PopupStub {
+    constructor(content, type, defaultValue, popupOptions = {}) {
+        this.content = content;
+        this.type = type;
+        this.defaultValue = defaultValue;
+        this.options = popupOptions || {};
+        this.result = null;
+        this.dlg = null;
+    }
+    async show() {
+        try {
+            callBridge('log', 'info', `[popup] Popup.show type=${this.type} content=${String(this.content).slice(0, 200)}`);
+        } catch (_e) { /* noop */ }
+        if (this.type === POPUP_TYPE.INPUT) {
+            this.result = this.defaultValue == null ? '' : String(this.defaultValue);
+        } else {
+            this.result = POPUP_RESULT.AFFIRMATIVE;
+        }
+        const onOpen = this.options && this.options.onOpen;
+        if (typeof onOpen === 'function') { try { await onOpen(this); } catch (_e) { /* noop */ } }
+        return this.result;
+    }
+    async complete(result) { this.result = result; return result; }
+    async completeAffirmative() { return this.complete(POPUP_RESULT.AFFIRMATIVE); }
+    async completeNegative() { return this.complete(POPUP_RESULT.NEGATIVE); }
+    async completeCancelled() { return this.complete(POPUP_RESULT.CANCELLED); }
+    static show = stPopupShowHelper;
+}
+const Popup = PopupStub;
+
 // ---------------------------------------------------------------- [v214] ST 兼容成员面的实现体
 // st-memory-enhancement 走 `ctx.macros.registry.registerMacro`（新版）与 `ctx.registerMacro`（旧版）双路径；
 // 这里给一个真实注册表（可查询、可展开），避免 TypeError。
@@ -1877,6 +1950,9 @@ const stCtx = {
     getChatCompletionModel: () => state.modelName || 'unknown',
     getCharacterCardFields: () => ({ name: state.name2 || '', description: '', personality: '', scenario: '', first_mes: '', mes_example: '' }),
     callGenericPopup: callGenericPopupStub,
+    Popup,
+    POPUP_TYPE,
+    POPUP_RESULT,
     registerFunctionTool: registerStFunctionTool,
     unregisterFunctionTool: unregisterStFunctionTool,
     registerMacro: stMacrosFacade.registerMacro,
@@ -2229,7 +2305,16 @@ const stCtx = {
 const SillyTavern = {
     name: 'SillyTavern',
     version: '1.19.0',
-    libs: {},
+    // ST 1.19.0 script.js:293-296 契约：
+    //   globalThis.SillyTavern = { libs, getContext };
+    // libs 来自 lib.js 的 default export（showdown / moment / DOMPurify / hljs /
+    // Handlebars / SVGInject / Popper / lodash / yaml / Fuse / localforage …）。
+    // 真实插件（如 EchoChamber）会做 `const { DOMPurify } = SillyTavern.libs`，
+    // 留空对象会让它们在整个初始化阶段抛 TypeError。
+    libs: (stCompatLib && stCompatLib.default) ? stCompatLib.default : stCompatLib,
+    Popup,
+    POPUP_TYPE,
+    POPUP_RESULT,
     getContext: () => stCtx,
     callGenericPopup: callGenericPopupStub,
     saveChat,
