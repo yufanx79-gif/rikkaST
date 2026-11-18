@@ -1868,6 +1868,115 @@ function stMessageFormatting(text, ch_name, isSystem, isUser, messageId, sanitiz
 // Kotlin 侧同一个值定义在 TavernRuntimeManager.TAVERN_ST_COMPAT_VERSION（回归测试会比对两处一致）。
 const TAVERN_ST_COMPAT_VERSION = '1.19.0';
 
+// ---------------------------------------------------------------- SlashCommandParser（ST 命令表）
+// 契约来源：ST 1.19.0 scripts/slash-commands/SlashCommandParser.js
+//   :44   static commands = {};
+//   :95   this.commands[command.name] = command;
+//   :99   for (const alias of command.aliases) this.commands[alias] = command;
+//   :105  get commands() { return SlashCommandParser.commands; }
+//
+// 为什么必须是真的：
+//   插件读 `getContext().SlashCommandParser.commands['echo'].callback(...)` 是常见写法
+//   （SillyTavern-Roadway 每次提示都这么调）。空对象 → `.callback` of undefined
+//   → 插件初始化直接中断。
+//
+// 两条来源合并进同一张表：
+//   1) 宿主内置命令（/echo /send /sys /pass …）—— 由 Kotlin StSlashExecutor 真正执行
+//   2) 扩展通过 addCommandObject 注册的命令 —— 存在共享 registry
+const slashCommandParser = (() => {
+    const commands = {};
+
+    // 宿主确有执行分支的内置命令（StSlashExecutor.runCommand 的 when 分支）。
+    // 只声明真能跑的，避免插件调到「有名字但不干活」的假命令。
+    const HOST_BUILTINS = [
+        'echo', 'toast', 'send', 'sys', 'nar', 'comment', 'pass', 'return',
+        'addswipe', 'delswipe', 'setvar', 'getvar', 'addvar', 'incvar', 'decvar', 'delvar',
+        'setglobalvar', 'getglobalvar', 'addglobalvar', 'incglobalvar', 'decglobalvar', 'delglobalvar',
+        'if', 'else', 'while', 'times', 'run', 'abort', 'break', 'delay',
+        'trigger', 'generate', 'continue', 'inject', 'flushinject', 'listinjects',
+        'getchat', 'getcharcard', 'getchar', 'getpreset', 'setpreset', 'getprompt',
+        'len', 'substr', 'replace', 'trim', 'upper', 'lower', 'test', 'match',
+        'add', 'sub', 'mul', 'div', 'mod', 'pow', 'min', 'max', 'abs', 'round', 'floor', 'ceil',
+        'and', 'or', 'not', 'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
+        'random', 'pick', 'shuffle', 'sort', 'reverse', 'merge',
+        'newchat', 'delchat', 'renamechat', 'closechat', 'chat-jump',
+        'member', 'members', 'char-find', 'char-get', 'char-create', 'char-update', 'char-delete',
+        'world', 'wi-get', 'wi-set', 'wi-list',
+        'regex', 'show', 'hide', 'buttons', 'custom', 'input', 'help', 'commands',
+    ];
+
+    function execViaHost(name, unnamedArgs, pipe) {
+        // 走宿主 StSlashExecutor：拼成 `/name args` 交给 triggerSlashAsync。
+        const args = String(unnamedArgs == null ? '' : unnamedArgs);
+        const script = '/' + name + (args ? ' ' + args : '');
+        try {
+            const run = (typeof stCtx !== 'undefined' && stCtx && typeof stCtx.triggerSlashAsync === 'function')
+                ? stCtx.triggerSlashAsync
+                : null;
+            if (!run) return Promise.resolve('');
+            return Promise.resolve(run(script, { pipe: pipe == null ? '' : String(pipe) }))
+                .then((r) => (r == null ? '' : r))
+                .catch(() => '');
+        } catch (_e) {
+            return Promise.resolve('');
+        }
+    }
+
+    function makeCommand(name, source) {
+        return {
+            name,
+            aliases: [],
+            callback: (namedArgs, unnamedArgs) => execViaHost(
+                name,
+                unnamedArgs,
+                (namedArgs && namedArgs._pipe) != null ? namedArgs._pipe : '',
+            ),
+            helpString: '',
+            returns: '',
+            source,
+        };
+    }
+
+    for (const n of HOST_BUILTINS) commands[n] = makeCommand(n, 'host');
+
+    // 扩展注册的命令：共享 registry（st-compat/slash-commands/SlashCommand.js 写入）
+    function syncFromRegistry() {
+        try {
+            const reg = (typeof window !== 'undefined') ? window.__rikkaStSlashRegistry : null;
+            if (!reg || typeof reg.forEach !== 'function') return;
+            reg.forEach((cmd, key) => {
+                if (!cmd) return;
+                commands[String(key)] = cmd;
+                if (Array.isArray(cmd.aliases)) {
+                    for (const a of cmd.aliases) commands[String(a)] = cmd;
+                }
+            });
+        } catch (_e) { /* noop */ }
+    }
+
+    return {
+        commands,
+        getHelpString: () => Object.keys(commands).map((k) => '/' + k).join('\n'),
+        addCommandObject: (cmd) => {
+            if (!cmd || !cmd.name) return cmd;
+            commands[cmd.name] = cmd;
+            if (Array.isArray(cmd.aliases)) for (const a of cmd.aliases) commands[String(a)] = cmd;
+            syncFromRegistry();
+            return cmd;
+        },
+        addCommand: (name, callback, aliases) => {
+            const cmd = makeCommand(String(name), 'extension');
+            if (typeof callback === 'function') cmd.callback = callback;
+            if (Array.isArray(aliases)) cmd.aliases = aliases;
+            commands[cmd.name] = cmd;
+            for (const a of cmd.aliases) commands[String(a)] = cmd;
+            return cmd;
+        },
+        /** 供宿主/兼容层在扩展加载后同步 registry */
+        __syncFromRegistry: syncFromRegistry,
+    };
+})();
+
 const stCtx = {
     getThumbnailUrl(type = 'avatar', file = '') {
         const f = String(file || '').trim();
@@ -2216,7 +2325,15 @@ const stCtx = {
     SlashCommandArgument: class SlashCommandArgument { static fromProps(props = {}) { return Object.assign(new SlashCommandArgument(), props); } },
     SlashCommandEnumValue: class SlashCommandEnumValue { constructor(value = '', description = '') { this.value = value; this.description = description; } },
     SlashCommandNamedArgument: class SlashCommandNamedArgument { static fromProps(props = {}) { return Object.assign(new SlashCommandNamedArgument(), props); } },
-    SlashCommandParser: { commands: {}, addCommandObject: (cmd) => cmd, addCommand: () => {}, getHelpString: () => '' },
+    // ST 1.19.0 scripts/slash-commands/SlashCommandParser.js:44 是
+    //   static commands = {};
+    // 并且 :105 `get commands()` 直接返回它；:95/:99 把命令名**和每个别名**都写进去。
+    // 第三方插件会直接读 `getContext().SlashCommandParser.commands['echo'].callback(...)`
+    // （Roadway 就是这样打印提示的），空的 commands 会让它们第一个提示就 TypeError。
+    //
+    // 这里不再放空对象，而是接上真实可执行表：内置命令的 callback 走
+    // 宿主 StSlashExecutor（`/echo ...` 语法），扩展注册的命令走共享 registry。
+    SlashCommandParser: slashCommandParser,
     TextCompletionService: { create: () => ({}), sendRequest: async () => ({}) },
     convertCharacterBook: (book) => (book && typeof book === 'object' ? book : { entries: {} }),
     getPresetManager: () => ({ getPresetList: () => ({ presets: [], preset_names: {} }), getCompletionPresetByName: () => ({}), updateList: () => {} }),
