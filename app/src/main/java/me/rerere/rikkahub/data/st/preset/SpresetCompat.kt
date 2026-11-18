@@ -81,7 +81,7 @@ object SpresetCompat {
         val script = buildToolActionScript(binding, safeArgsJson)
         withSpresetQuickJs {
             installSpresetConsole()
-            evaluate<String?>(script)
+            evaluateSpresetScriptValue(script)
         }
     }
 
@@ -98,14 +98,15 @@ object SpresetCompat {
             resolvedToolCache[cacheKey]?.let { return@presetRunCatching it }
 
             val codeLiteral = JsonPrimitive(binding.code).toString()
+            // 工具的 code 可能是 async 工厂函数（返回 Promise），必须走会 await 的入口。
             val resolvedRaw = withSpresetQuickJs {
                 installSpresetConsole()
-                evaluate<String?>(
+                evaluateSpresetScriptValue(
                     """
                     (() => {
                       const tool = new Function($codeLiteral)();
-                      if (!tool || typeof tool !== 'object') {
-                        throw new Error('SPreset tool code did not return an object');
+                      if (!tool || typeof tool !== "object") {
+                        throw new Error("SPreset tool code did not return an object");
                       }
                       return JSON.stringify({
                         name: tool.name ?? null,

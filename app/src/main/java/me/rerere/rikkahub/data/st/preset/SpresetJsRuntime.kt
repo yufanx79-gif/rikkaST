@@ -62,24 +62,36 @@ internal suspend fun QuickJs.installSpresetFunction(name: String, script: String
 }
 
 /**
+ * 把脚本返回值统一转成 `String?` 的 JS 片段。
+ *
+ * 契约与旧实现一致：字符串原样、对象/数组/数字 `JSON.stringify`、null/undefined → null。
+ * 调用方需保证 `value` 已经在作用域里。
+ */
+private const val RESULT_TO_STRING_BODY = """
+    if (value === undefined || value === null) return null;
+    if (typeof value === 'string') return value;
+    return JSON.stringify(value);
+"""
+
+/**
  * 调用已安装函数，参数必须是 JSON 字符串，内部 JSON.parse 后传入。
  * 返回值：字符串原样返回；对象/数组/数字 JSON.stringify；null/undefined 返回 null。
+ *
+ * **会等待 async 脚本返回的 Promise 结算。**
  */
 internal suspend fun QuickJs.callSpresetFunction(name: String, argsJson: String): String? {
     val nameLiteral = JsonPrimitive(name).toString()
     val argsLiteral = JsonPrimitive(argsJson).toString()
     return evaluate<String?>(
         """
-        (async () => {
+        await (async () => {
           const args = JSON.parse($argsLiteral);
           const fn = globalThis[$nameLiteral];
           if (typeof fn !== 'function') {
             throw new Error('SPreset function is not installed');
           }
           const value = await fn(args);
-          if (value === undefined || value === null) return null;
-          if (typeof value === 'string') return value;
-          return JSON.stringify(value);
+          $RESULT_TO_STRING_BODY
         })()
         """.trimIndent()
     )
@@ -88,6 +100,8 @@ internal suspend fun QuickJs.callSpresetFunction(name: String, argsJson: String)
 /**
  * 调用已安装函数并把单个字符串作为参数传入。
  * ChatSquash 的 squashed_post_script 形态是 `content => {...}`，必须传字符串而不是对象。
+ *
+ * **会等待 async 脚本返回的 Promise 结算。**
  */
 internal suspend fun QuickJs.callSpresetFunctionWithStringArg(
     name: String,
@@ -97,15 +111,61 @@ internal suspend fun QuickJs.callSpresetFunctionWithStringArg(
     val argumentLiteral = JsonPrimitive(argument).toString()
     return evaluate<String?>(
         """
-        (async () => {
+        await (async () => {
           const fn = globalThis[$nameLiteral];
           if (typeof fn !== 'function') {
             throw new Error('SPreset function is not installed');
           }
           const value = await fn($argumentLiteral);
-          if (value === undefined || value === null) return null;
-          if (typeof value === 'string') return value;
-          return JSON.stringify(value);
+          $RESULT_TO_STRING_BODY
+        })()
+        """.trimIndent()
+    )
+}
+
+/**
+ * 执行一段 JS **表达式**，等待其顶层 Promise 结算后按统一契约转成 `String?`。
+ *
+ * 用于工具 action / 动态工具定义这类需要 `await` 用户脚本的场合。
+ *
+ * ## 为什么必须显式 `await`
+ *
+ * quickjs-kt 1.0.15 的 `evaluate` **不会自动等待脚本最后返回的 Promise**。
+ * 实测（见 `SpresetOutputPromiseTest`）：
+ *
+ * | JS 表达式 | 裸 `evaluate<String?>` |
+ * |---|---|
+ * | `'hello'` | `hello` |
+ * | `Promise.resolve('x')` | `Promise { <state>: "fulfilled" }` |
+ * | `(async () => 'x')()` | `Promise { <state>: "fulfilled" }` |
+ *
+ * 只要 Promise 在 JNI 取结果前已经 settle，桥层就把 **Promise 对象本身**
+ * 交给 `TypeConverter`，转 String 时调用 `toString()` 得到
+ * `Promise { <state>: "fulfilled" }`。
+ *
+ * 线上故障现场（2026-11-18 18:30，Meowssiah 2.0.11）：
+ * ```
+ * [event] stream_token_received "Promise { <state>: \"fulfilled\" }"
+ * ```
+ * 模型思考正常、正文只有一个假 token —— 就是 `OutputPreprocessing` 的
+ * `callSpresetFunction` 把 Promise 字符串化后当成唯一一段正文发了出去。
+ *
+ * ## 可行性与代价
+ *
+ * `evaluate` 以 **module 语义** 编译脚本，因此支持顶层 `await`
+ * （`search/CustomJsSearchService` 一直依赖 `JSON.stringify(await ...)` 且测试通过）。
+ * 我们只需把调用包进 `async` IIFE 并 `await` 一次，无需在 Kotlin 侧泵微任务。
+ *
+ * 注意：若脚本返回一个永不 settle 的 Promise，这里会一直挂到
+ * [withSpresetQuickJs] 的外层超时；这是期望行为（与浏览器一致）。
+ */
+internal suspend fun QuickJs.evaluateSpresetScriptValue(script: String): String? {
+    val scriptLiteral = JsonPrimitive(script).toString()
+    return evaluate<String?>(
+        """
+        await (async () => {
+          const value = await (0, eval)($scriptLiteral);
+          $RESULT_TO_STRING_BODY
         })()
         """.trimIndent()
     )
