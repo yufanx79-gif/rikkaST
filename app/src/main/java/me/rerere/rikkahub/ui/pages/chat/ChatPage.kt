@@ -427,7 +427,8 @@ fun ChatPage(
                 conversationId = tavernLatestConversation.value.id.toString(),
                 detail = "source=panel_sendUserMessage textLen=${text.length}",
             )
-            val shouldScroll = !chatListState.canScrollForward
+            // 面板内发送同样总是滚到底部（见 onSendClick 处的说明）
+            val shouldScroll = true
             val sent = vm.handleMessageSend(
                 content = listOf(UIMessagePart.Text(text)),
                 answer = answer,
@@ -440,7 +441,7 @@ fun ChatPage(
                             conversationId = tavernLatestConversation.value.id.toString(),
                             detail = "source=panel_sendUserMessage targetIdx=$targetIdx firstVisible=${chatListState.firstVisibleItemIndex}",
                         )
-                        scope.launch { chatListState.requestScrollToItem(targetIdx) }
+                        scope.launch { chatListState.scrollToBottomAligned(targetIdx) }
                     }
                 },
             )
@@ -629,7 +630,9 @@ fun ChatPage(
                     chatListState.scrollToItem(index)
                 }
             } else {
-                chatListState.requestScrollToItem(conversation.messageNodes.lastIndex.coerceAtLeast(0))
+                // 直接进入已有会话：定位到底部（旧实现用 requestScrollToItem，
+                // 会把最后一条对齐到视口顶部 = 用户看到「一进来就跳到最上面」）。
+                chatListState.scrollToBottomAligned(conversation.messageNodes.lastIndex.coerceAtLeast(0))
             }
             vm.chatListInitialized = true
         }
@@ -1199,7 +1202,12 @@ private fun ChatPageContent(
                                 return@ChatInput
                             }
                             val draftSnapshot = contents
-                            val shouldAutoScroll = !chatListState.canScrollForward
+                            // [P0 修复] 发送后必须滚到底部 —— 用户明确要求：
+                            // 「一共 5 层楼，我在第 3 层楼看了消息，发送之后应当
+                            //   正常发送，然后就直接自动滑到最下面」。
+                            // 旧逻辑是 `!canScrollForward`（仅当已在底部才滚），
+                            // 结果在第 3 楼发消息时列表纹丝不动，反而看不到自己刚发的消息。
+                            val shouldAutoScroll = true
                             sendPending = true
                             val sent = vm.handleMessageSend(contents, onPersisted = { persisted ->
                                 sendPending = false
@@ -1216,7 +1224,7 @@ private fun ChatPageContent(
                                             conversationId = conversation.id.toString(),
                                             detail = "source=ChatPage_onSendClick targetIdx=$target firstVisible=${chatListState.firstVisibleItemIndex}",
                                         )
-                                        scope.launch { chatListState.requestScrollToItem(target) }
+                                        scope.launch { chatListState.scrollToBottomAligned(target) }
                                     }
                                 } else {
                                     // 失败时恢复草稿（仅当用户没有继续输入新内容）。
@@ -1467,13 +1475,14 @@ private fun ChatPageContent(
                             if (currentChatModel == null) {
                                 toaster.show(context.getString(R.string.slash_toast_no_model), type = ToastType.Error)
                             } else {
-                                val shouldScroll = !chatListState.canScrollForward
+                                // slash 命令发送同样总是滚到底部
+                                val shouldScroll = true
                                 vm.handleMessageSend(
                                     listOf(UIMessagePart.Text(content)),
                                     onPersisted = { persisted ->
                                         if (persisted && shouldScroll) {
                                             scope.launch {
-                                                chatListState.requestScrollToItem(
+                                                chatListState.scrollToBottomAligned(
                                                     vm.conversation.value.messageNodes.lastIndex.coerceAtLeast(0)
                                                 )
                                             }

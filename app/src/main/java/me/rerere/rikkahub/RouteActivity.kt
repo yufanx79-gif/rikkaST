@@ -359,6 +359,15 @@ class RouteActivity : ComponentActivity() {
                     // 但导航转场的 expressive 观感是主人 2026-10-03 已验收的，这里显式固定 expressive，
                     // 与本改动解耦（两处 spec 调用点不变）。
                     val motionScheme = MotionScheme.expressive()
+                    // [P3 流畅度] 页面转场按用户设置决定是否叠加 scale。
+                    //
+                    // scale(0.7f) 会让整页在动画期间失去硬件层缓存，必须逐帧重新
+                    // 光栅化 —— 中低端机上就是「切页卡一下」。slide / fade 都能走
+                    // 硬件层，观感同样有层次。
+                    // 默认 FLUID（纯 slide+fade）；需要弹性的用户可在设置里切回 EXPRESSIVE。
+                    val expressiveTransit =
+                        settings.displaySetting.transitMotion ==
+                            me.rerere.rikkahub.data.datastore.TransitMotion.EXPRESSIVE
                     NavDisplay(
                         backStack = backStack,
                         entryDecorators = listOf(
@@ -379,9 +388,14 @@ class RouteActivity : ComponentActivity() {
                                     fadeOut(motionScheme.defaultEffectsSpec())
                             } else {
                                 slideInHorizontally(motionScheme.defaultSpatialSpec()) { it } togetherWith
-                                    slideOutHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
-                                    scaleOut(motionScheme.defaultSpatialSpec(), targetScale = 0.7f) +
-                                    fadeOut(motionScheme.defaultEffectsSpec())
+                                    (if (expressiveTransit) {
+                                        slideOutHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                            scaleOut(motionScheme.defaultSpatialSpec(), targetScale = 0.7f) +
+                                            fadeOut(motionScheme.defaultEffectsSpec())
+                                    } else {
+                                        slideOutHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                            fadeOut(motionScheme.defaultEffectsSpec())
+                                    })
                             }
                         },
                         popTransitionSpec = {
@@ -389,10 +403,15 @@ class RouteActivity : ComponentActivity() {
                                 fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
                                     fadeOut(motionScheme.defaultEffectsSpec())
                             } else {
-                                slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
-                                    scaleIn(motionScheme.defaultSpatialSpec(), initialScale = 0.7f) +
-                                    fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                                    slideOutHorizontally(motionScheme.defaultSpatialSpec()) { it }
+                                (if (expressiveTransit) {
+                                    slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                        scaleIn(motionScheme.defaultSpatialSpec(), initialScale = 0.7f) +
+                                        fadeIn(motionScheme.defaultEffectsSpec())
+                                } else {
+                                    slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                        fadeIn(motionScheme.defaultEffectsSpec())
+                                }) togetherWith
+                                slideOutHorizontally(motionScheme.defaultSpatialSpec()) { it }
                             }
                         },
                         predictivePopTransitionSpec = {
@@ -400,10 +419,15 @@ class RouteActivity : ComponentActivity() {
                                 fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
                                     fadeOut(motionScheme.defaultEffectsSpec())
                             } else {
-                                slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
-                                    scaleIn(motionScheme.defaultSpatialSpec(), initialScale = 0.7f) +
-                                    fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                                    slideOutHorizontally(motionScheme.defaultSpatialSpec()) { it }
+                                (if (expressiveTransit) {
+                                    slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                        scaleIn(motionScheme.defaultSpatialSpec(), initialScale = 0.7f) +
+                                        fadeIn(motionScheme.defaultEffectsSpec())
+                                } else {
+                                    slideInHorizontally(motionScheme.defaultSpatialSpec()) { -it / 2 } +
+                                        fadeIn(motionScheme.defaultEffectsSpec())
+                                }) togetherWith
+                                slideOutHorizontally(motionScheme.defaultSpatialSpec()) { it }
                             }
                         },
                         entryProvider = entryProvider {

@@ -283,6 +283,39 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                             },
                         )
                     }
+                    // [P3 流畅度] 页面转场动效档位。
+                    // 主人反馈「上滑下滑、返回下一级菜单那种流畅度」不足，
+                    // 而 scale 是转场里唯一的整页重绘来源。默认走 FLUID。
+                    item(
+                        headlineContent = { Text("页面转场动效") },
+                        supportingContent = {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    if (displaySetting.transitMotion ==
+                                        me.rerere.rikkahub.data.datastore.TransitMotion.FLUID
+                                    ) {
+                                        "流畅优先：只做横向滑入 + 淡入，切换最跟手"
+                                    } else {
+                                        "弹性优先：额外叠加缩放，观感更活泼，但低端机可能掉帧"
+                                    }
+                                )
+                                Select(
+                                    options = me.rerere.rikkahub.data.datastore.TransitMotion.entries,
+                                    selectedOption = displaySetting.transitMotion,
+                                    onOptionSelected = {
+                                        updateDisplaySetting(displaySetting.copy(transitMotion = it))
+                                    },
+                                    modifier = Modifier.padding(top = 4.dp).fillMaxWidth(),
+                                    optionToString = {
+                                        when (it) {
+                                            me.rerere.rikkahub.data.datastore.TransitMotion.FLUID -> "流畅优先"
+                                            me.rerere.rikkahub.data.datastore.TransitMotion.EXPRESSIVE -> "弹性优先"
+                                        }
+                                    },
+                                )
+                            }
+                        },
+                    )
                     if (displaySetting.enableBlurEffect) {
                         item(
                             headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_type)) },

@@ -1239,6 +1239,16 @@ enum class ResourceFetchMode {
     VPN,
 }
 
+/** 页面转场动效档位；见 [DisplaySetting.transitMotion]。 */
+@Serializable
+enum class TransitMotion {
+    /** 只要 slide + fade：渲染最稳，切页最跟手。 */
+    FLUID,
+
+    /** slide + fade + scale(0.7f)：更有弹性，但整页逐帧重绘，低端机可能掉帧。 */
+    EXPRESSIVE,
+}
+
 @Serializable
 data class DisplaySetting(
     val userAvatar: Avatar = Avatar.Dummy,
@@ -1273,6 +1283,18 @@ data class DisplaySetting(
     val enableAutoScroll: Boolean = true,
     val enableLatexRendering: Boolean = false,
     val enableBlurEffect: Boolean = true,
+
+    /**
+     * 页面转场动效档位。
+     *
+     * [TransitMotion.FLUID]（默认）只做「横向滑入 + 淡入」；
+     * [TransitMotion.EXPRESSIVE] 额外叠加 scale(0.7f) 缩放，观感更「有弹性」，
+     * 但整页在动画期间会逐帧重新光栅化，低端机上表现为页面切换「卡一下」。
+     *
+     * 之所以默认改成 FLUID：主人反馈「上滑下滑、返回下一级菜单那种流畅度」不足，
+     * 而 scale 是转场里唯一的整页重绘来源（slide / fade 都能走硬件层缓存）。
+     */
+    val transitMotion: TransitMotion = TransitMotion.FLUID,
     val backgroundEffectType: BackgroundEffectType = BackgroundEffectType.BLUR,
     val chatFontFamily: ChatFontFamily = ChatFontFamily.DEFAULT,
     val chatCustomFontPath: String = "",

@@ -272,14 +272,41 @@ private fun ChatListNormal(
         }
     }
 
+    /**
+     * 判断列表当前是否「已经贴到底部」。
+     *
+     * [P0 修复] 旧实现只判断 `lastPos <= inputPos - 8`，在**内容不足一屏**时
+     * （例如只有开场白、或只有一两条消息）恒为 true。于是每次
+     * `visibleItemsInfo` 变化都会触发 `requestScrollToItem(lastIndex)`，
+     * 而该 API 会把目标 item 对齐到视口**顶部** —— 用户看到的就是
+     * 「输入消息点发送，列表跳到最上面」。
+     *
+     * 正确语义（对齐聊天类 App 的通行做法）：
+     *  - 内容不足一屏：整个列表本来就全部可见，**不需要任何滚动**；
+     *  - 内容超过一屏：只有当最后一项的底边已经进入视口底部附近时，
+     *    才认为「用户正停在底部」，此时新消息才应自动跟随。
+     */
     fun List<LazyListItemInfo>.isAtBottom(): Boolean {
         val lastItem = lastOrNull() ?: return false
+        val layout = state.layoutInfo
+        // 没有任何可滚动空间 = 内容不足一屏，全部可见，不需要滚动
+        if (!state.canScrollForward && !state.canScrollBackward) return true
         val inputBarHeight = with(density) { innerPadding.calculateBottomPadding().toPx() }
         val lastPos = lastItem.offset + lastItem.size
-        val inputPos = (state.layoutInfo.viewportEndOffset - inputBarHeight.roundToInt())
-        // println("lastPos = $lastPos, inputPos = $inputPos  | ${lastPos <= inputPos - 8}")
+        val inputPos = (layout.viewportEndOffset - inputBarHeight.roundToInt())
         return lastPos <= inputPos - 8
     }
+
+    /**
+     * 内容不足一屏时无需滚动；否则把最后一项滚到「底部对齐」。
+     *
+     * 直接用 `requestScrollToItem` 有一个陷阱：它把目标对齐到**顶部**。
+     * 对聊天列表来说这会让最后一条消息跳到屏幕最上方，观感就是「跳顶」。
+     * 这里用 `scrollToItem(index, scrollOffset)` 让目标贴底：
+     * offset = 视口高度（正向偏移 = 目标顶部在视口底部之外，即贴底）。
+     */
+    suspend fun LazyListState.scrollToBottomSafely(lastIndex: Int) =
+        scrollToBottomAligned(lastIndex)
 
     // 聊天选择
     val selectedItems = remember { mutableStateListOf<Uuid>() }
@@ -317,7 +344,7 @@ private fun ChatListNormal(
                     // println("is bottom = ${visibleItemsInfo.isAtBottom()}, scroll = ${state.isScrollInProgress}, can_scroll = ${state.canScrollForward}, loading = $loading")
                     if (!state.isScrollInProgress && loadingState) {
                         if (visibleItemsInfo.isAtBottom()) {
-                            state.requestScrollToItem(conversationUpdated.messageNodes.lastIndex.coerceAtLeast(0))
+                            state.scrollToBottomSafely(conversationUpdated.messageNodes.lastIndex.coerceAtLeast(0))
                             // Log.i(TAG, "ChatList: scroll to ${conversationUpdated.messageNodes.lastIndex}")
                         }
                     }
@@ -895,5 +922,38 @@ private fun BoxScope.MessageJumper(
                 )
             }
         }
+    }
+}
+
+/**
+ * 把列表滚到「最后一项贴底」的位置。
+ *
+ * ## 为什么不用 `requestScrollToItem(lastIndex)`
+ *
+ * `LazyListState.requestScrollToItem(index)` 的语义是把目标 item 对齐到视口**顶部**。
+ * 对聊天列表来说，这会让最后一条消息跳到屏幕最上方 —— 用户观感就是
+ * 「发送后列表跳到顶」。
+ *
+ * 正确做法：`scrollToItem(index, scrollOffset)`，`scrollOffset` 为正表示
+ * 目标 item 的顶部位于视口起点**之下**这么多像素；给一个视口高度即可让
+ * 目标贴底。
+ *
+ * ## 内容不足一屏时不滚动
+ *
+ * 此时 `canScrollForward` 与 `canScrollBackward` 都为 false，本来就没有
+ * 可滚动空间。强行 scrollToItem 会把内容顶到屏幕上方，形成「只有开场白时
+ * 跳到最上面」的现象。
+ */
+suspend fun LazyListState.scrollToBottomAligned(lastIndex: Int) {
+    if (lastIndex < 0) return
+    val layout = layoutInfo
+    val viewport = layout.viewportEndOffset - layout.viewportStartOffset
+    if (viewport <= 0) return
+    // 内容不足一屏（没有任何可滚动空间）→ 保持不动
+    if (!canScrollForward && !canScrollBackward) return
+    runCatching {
+        scrollToItem(lastIndex, viewport)
+    }.onFailure {
+        runCatching { scrollToItem(lastIndex) }
     }
 }
