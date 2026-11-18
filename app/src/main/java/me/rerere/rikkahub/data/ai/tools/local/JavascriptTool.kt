@@ -84,7 +84,7 @@ internal suspend fun evaluateJavascript(
                 // and returning arbitrary objects would also bypass the output limit.
                 val result = evaluate<String?>(
                     """
-                    (() => {
+                    await (async () => {
                         const log = globalThis.__rikkahubLog;
                         delete globalThis.__rikkahubLog;
                         const stringify = JSON.stringify;
@@ -109,7 +109,11 @@ internal suspend fun evaluateJavascript(
                                 log(line);
                             };
                         }
-                        const result = (0, eval)(${JsonPrimitive(code)});
+                        // 用户代码可能返回 Promise（async IIFE / 顶层 await）。
+                        // 必须 await 后再序列化，否则 JSON.stringify(Promise) 得到 "{}"。
+                        const raw = (0, eval)(${JsonPrimitive(code)});
+                        const result = (raw !== null && (typeof raw === 'object' || typeof raw === 'function')
+                            && typeof raw.then === 'function') ? await raw : raw;
                         if (result == null) return null;
                         const type = typeof result;
                         const text = type === 'object' || type === 'function'

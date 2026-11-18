@@ -29,6 +29,28 @@ class JavascriptToolTest {
         assertEquals("😀", output["result"]?.jsonPrimitive?.content)
     }
 
+    /**
+     * 回归：用户代码返回 Promise 时必须 await 后再序列化。
+     *
+     * 修复前 `JSON.stringify(Promise)` 会得到 `"{}"`，用户看到的是一对空花括号，
+     * 与 SPreset 那个 `Promise { <state>: "fulfilled" }` 是同一类 bug。
+     */
+    @Test(timeout = 20_000)
+    fun `awaits async results before serializing`() = runBlocking {
+        assertEquals(
+            "{\"value\":42}",
+            evaluate("(async () => ({value: 42}))()")["result"]?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "async-text",
+            evaluate("(async () => { await null; return 'async-text'; })()")["result"]?.jsonPrimitive?.content,
+        )
+        // 日志在 await 前后都要保留
+        val out = evaluate("console.log('before'); (async () => { await null; console.log('after'); return 'done'; })()")
+        assertEquals("done", out["result"]?.jsonPrimitive?.content)
+        assertEquals("[LOG] before\n[LOG] after", out["logs"]?.jsonPrimitive?.content)
+    }
+
     @Test(timeout = 20_000)
     fun `interrupts infinite loops including during serialization`() = runBlocking {
         for (code in listOf(
