@@ -62,21 +62,27 @@ try {
     window.addEventListener('rikka-st-refresh', () => { try { __refresh(); } catch (_e) { /* noop */ } });
 } catch (_e) { /* noop */ }
 
-// ---------------------------------------------------------------- 事件总线（与 runtime 同实例）
-const ES = st().eventSource || host().eventSource;
-export const eventSource = ES || {
-    on() {}, once() {}, off() {}, emit() {}, emitAndWait() {},
-    addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {},
-    // [v246] ST 的 EventSource（eventemitter3 扩展）还提供这些方法。
-    // Tavern Helper 的 `src/store/iframe_runtimes/*` 与 `src/function/event.ts`
-    // 会调用 makeFirst/makeLast 调整监听器顺序、clearEvent/clearListener/clearAll 清理。
-    // 此前 fallback 缺这些方法 -> 加载即 `eventSource.makeFirst is not a function`。
-    makeFirst() {}, makeLast() {},
-    clearEvent() {}, clearListener() {}, clearAll() {},
-    waitForEvent() { return Promise.resolve(); },
-    emitAndWaitAsync() { return Promise.resolve(); },
-};
-export const event_types = st().eventTypes || st().event_types || {};
+// ---------------------------------------------------------------- 事件总线
+// [BUGFIX] 必须**直接 import 真单例**，不能用 st()/host() 取值。
+//
+// 原写法：`const ES = st().eventSource || host().eventSource;`
+// 根因：runtime.js 第 29 行 `import * as stCompatScript from './st-compat/script.js'`，
+// 而 runtime.js 第 2472 行才 `window.SillyTavern = SillyTavern`。
+// ES 模块求值顺序：被 import 的模块先跑完模块体 → script.js 求值时
+// window.SillyTavern 还是 undefined，st() 返回 {}，ES 为 undefined，
+// 于是**手写 fallback 被永久固化成导出值**：emit/on 全是空函数。
+// event_types 同理被固化成 {} —— 实测 0 个键。
+//
+// 后果（实测）：43 个插件文件从 script.js 导入 eventSource/event_types，
+// 他们的事件订阅全部静默失效；Roadway 的 `makeFirst(CHARACTER_MESSAGE_RENDERED)`
+// 装到死总线上，自动触发永远不会响。
+//
+// 上游做法（SillyTavern public/script.js:278）就是直接
+// `import { event_types, eventSource } from './scripts/events.js';`。
+// 我们的 vendor/st/events.js 通过 globalThis.__rikkaSharedEventSource 保证
+// 不同模块路径（vendor/st/events.js 与 st-compat/events.js）共享同一实例，
+// 因此这里直接转发即与 getContext().eventSource 同一对象。
+export { eventSource, event_types } from '../vendor/st/events.js';
 
 // ---------------------------------------------------------------- 常量（对齐 ST1.18 popup/script）
 export const extension_prompt_types = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
