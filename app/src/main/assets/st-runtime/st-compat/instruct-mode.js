@@ -242,3 +242,143 @@ export function selectContextPreset() { /* no-op by design */ }
 export function selectInstructPreset() { /* no-op by design */ }
 /** 自动匹配预设由 Compose 承担。 */
 export function autoSelectInstructPreset() { /* no-op by design */ }
+
+
+// ============================================================================
+// [今晚 P4] 补齐 ST 1.19.0 `public/scripts/instruct-mode.js` 的 4 个缺失导出。
+//
+// `_st_export_inventory.mjs` 报的「ST 导出 1331，缺 4」就是这 4 个：
+//   force_output_sequence      ← ST :369
+//   formatInstructModeChat     ← ST :387
+//   instruct_presets           ← ST :15
+//   updateBindModelTemplatesState ← ST :162
+//
+// 实测 38 个真实插件里**无人 import 这 4 个符号**
+// （`grep -rl "formatInstructModeChat|updateBindModelTemplatesState|force_output_sequence|instruct_presets"`
+//   扫整个插件语料 → 0 命中），它们只被 ST 自己的 script.js / custom-request.js / power-user.js 用。
+// 所以优先级低，但属于供给面缺口 —— 补上让 `import` 不报错，形状与上游一致。
+// ============================================================================
+
+/** ST instruct-mode.js:369 —— 强制使用首/尾输出序列。 */
+export const force_output_sequence = {
+    FIRST: 1,
+    LAST: 2,
+};
+
+/**
+ * ST instruct-mode.js:15 —— instruct 预设列表。
+ *
+ * 上游是 `export let instruct_presets = []`，由 `loadInstructMode()` 从
+ * `instruct-presets.json` 填充（:113 `instruct_presets = data.instruct`）。
+ *
+ * 我们是宿主承担预设管理（见文件头 DIVERGENCE），所以这里是**只读空数组**。
+ * 用 `let` 而非 `const` 保持与上游一致的活绑定语义（将来若要填充无需改导出）。
+ */
+export let instruct_presets = [];
+
+/** 供宿主/兼容层在加载预设后回填（对齐上游 :113 的赋值点）。 */
+export function __setInstructPresets(list) {
+    instruct_presets = Array.isArray(list) ? list : [];
+}
+
+/**
+ * ST instruct-mode.js:387 —— 把一条消息按 Instruct 模板包装。
+ *
+ * 与 [formatInstructModePrompt] 的区别：那个包装「待生成的提示」，
+ * 这个包装「已有的历史消息」（用于 text-completion 的对话拼接）。
+ *
+ * 语义逐条对齐上游 :
+ *   - getPrefix：按 isUser / isNarrator / forceOutputSequence 选序列
+ *   - getSuffix：同理选后缀
+ *   - includeNames：names_behavior === ALWAYS，或 FORCE 且（群聊/forceAvatar）且不是自己
+ *
+ * @param {string} name 消息作者名
+ * @param {string} mes 消息正文
+ * @param {boolean} isUser 是否用户消息
+ * @param {boolean} isNarrator 是否旁白
+ * @param {string} forceAvatar 强制头像（非自己时用于 FORCE 判定）
+ * @param {string} name1 用户名
+ * @param {string} name2 角色名
+ * @param {boolean|number} forceOutputSequence 强制首/尾序列
+ * @param {object|null} customInstruct 自定义 instruct 设置
+ * @returns {string}
+ */
+export function formatInstructModeChat(name, mes, isUser, isNarrator, forceAvatar, name1, name2, forceOutputSequence, customInstruct = null) {
+    const instruct = Object.assign({}, getInstruct(), customInstruct || {});
+    const nb = Number(instruct.names_behavior);
+
+    let includeNames = isNarrator ? false : nb === names_behavior_types.ALWAYS;
+    if (!isNarrator && nb === names_behavior_types.FORCE) {
+        let groupId = null;
+        try { groupId = st().groupId || null; } catch (_e) { groupId = null; }
+        if ((groupId && name !== name1) || (forceAvatar && name !== name1)) includeNames = true;
+    }
+
+    function getPrefix() {
+        if (isNarrator) {
+            return instruct.system_same_as_user ? instruct.input_sequence : instruct.system_sequence;
+        }
+        if (isUser) {
+            if (forceOutputSequence === force_output_sequence.FIRST) {
+                return instruct.first_input_sequence || instruct.input_sequence;
+            }
+            if (forceOutputSequence === force_output_sequence.LAST) {
+                return instruct.last_input_sequence || instruct.input_sequence;
+            }
+            return instruct.input_sequence;
+        }
+        if (forceOutputSequence === force_output_sequence.FIRST) {
+            return instruct.first_output_sequence || instruct.output_sequence;
+        }
+        if (forceOutputSequence === force_output_sequence.LAST) {
+            return instruct.last_output_sequence || instruct.output_sequence;
+        }
+        return instruct.output_sequence;
+    }
+
+    function getSuffix() {
+        if (isNarrator) {
+            return instruct.system_same_as_user ? instruct.input_suffix : instruct.system_suffix;
+        }
+        return isUser ? instruct.input_suffix : instruct.output_suffix;
+    }
+
+    const prefix = String(getPrefix() || '');
+    const suffix = String(getSuffix() || '');
+    const body = String(mes == null ? '' : mes);
+
+    if (isNarrator) return prefix + body + suffix;
+    if (includeNames) {
+        const displayName = isUser ? (name1 || name) : (name2 || name);
+        return prefix + displayName + ': ' + body + suffix;
+    }
+    return prefix + body + suffix;
+}
+
+/**
+ * ST instruct-mode.js:162 —— 根据当前模型/模板回填「绑定模型模板」勾选状态。
+ *
+ * 上游读 `power_user.model_templates_mappings[online_status]` 与
+ * `power_user.context.preset` / `power_user.instruct.preset` 比对，然后改
+ * `#bind_model_templates` 的 checked。
+ *
+ * 我们是宿主设置页承担（Compose），没有这个 checkbox，所以做成**安全的 no-op**：
+ * 不 throw、不改 DOM、返回当前比对结果。这样 `power-user.js` 那类调用方
+ * import 得到函数、调用不崩，且拿到一个布尔结果。
+ *
+ * @returns {boolean} 当前是否匹配
+ */
+export function updateBindModelTemplatesState() {
+    try {
+        const pu = (typeof globalThis !== 'undefined' ? globalThis.power_user : null) || null;
+        if (!pu) return false;
+        const mappings = pu.model_templates_mappings || {};
+        const bind = mappings[pu.online_status] ?? mappings[pu.chat_template_hash];
+        if (!bind) return false;
+        const contextMatch = pu.context && pu.context.preset === bind.context;
+        const instructMatch = !pu.instruct || !pu.instruct.enabled || pu.instruct.preset === bind.instruct;
+        return Boolean(contextMatch && instructMatch);
+    } catch (_e) {
+        return false;
+    }
+}

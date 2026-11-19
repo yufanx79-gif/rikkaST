@@ -792,6 +792,20 @@ object TavernRuntimeManager {
     @Volatile var modelListSupplier: (() -> String)? = null
 
     /**
+     * [今晚 P0] 由 UI 层注入：ST `ConnectionProfile[]` JSON（对齐 ST 1.19.0
+     * `extensions/connection-manager/index.js` 的 ConnectionProfile 形状）。
+     *
+     * 为什么需要：9 个真实第三方插件调 `ConnectionManagerRequestService`
+     * （22 处 sendRequest / 9 处 getProfile / 2 处 getSupportedProfiles …），
+     * 其 `getSupportedProfiles()` 第一行就读
+     * `getContext().extensionSettings.connectionManager.profiles`。
+     * 此前该键根本不存在 → TypeError。
+     *
+     * 安全：**绝不包含 API Key**。secret-id 恒为空串，密钥只在 Kotlin 侧取用。
+     */
+    @Volatile var connectionProfilesSupplier: (() -> String)? = null
+
+    /**
      * [v247 B 组] 由 UI 层注入：全部角色卡 → ST `characters[]` 数组 JSON。
      *
      * 为什么需要：JSR `getCharacterNames()` / `getCharacterIds()` 直接 `characters.map(...)`
@@ -3332,6 +3346,19 @@ object TavernRuntimeManager {
         @JavascriptInterface
         fun getModelListJson(): String {
             val supplier = modelListSupplier ?: return "[]"
+            return runCatching { supplier() }.getOrElse { "[]" }
+        }
+
+        /**
+         * [今晚 P0] ST `ConnectionProfile[]`（`ConnectionManagerRequestService` 数据源）。
+         *
+         * 返回 `[{id,name,api,model,"api-url","secret-id",instruct}, ...]`。
+         * `getSupportedProfiles()` / `getProfile()` / `validateProfile()` 全靠它。
+         * 无注入或未配置供应商时返回 `[]`（合法空态，不是错误）。
+         */
+        @JavascriptInterface
+        fun getConnectionProfilesJson(): String {
+            val supplier = connectionProfilesSupplier ?: return "[]"
             return runCatching { supplier() }.getOrElse { "[]" }
         }
 

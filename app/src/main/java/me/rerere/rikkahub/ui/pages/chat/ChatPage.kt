@@ -72,6 +72,7 @@ import me.rerere.rikkahub.data.st.runtime.buildTavernChatJson
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import me.rerere.rikkahub.data.st.runtime.buildTavernPresetJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernScriptsJson
 import me.rerere.rikkahub.data.st.runtime.buildWorldNamesJson
@@ -239,6 +240,37 @@ fun ChatPage(
                     .flatMap { p -> p.models.map { it.modelId } }
                     .distinct()
                 kotlinx.serialization.json.JsonArray(list.map { JsonPrimitive(it) }).toString()
+            }.getOrElse { "[]" }
+        }
+        // [今晚 P0] ST `ConnectionProfile[]` —— ConnectionManagerRequestService 的数据源。
+        //
+        // 上游形状（extensions/connection-manager/index.js 的 ConnectionProfile）：
+        //   { id, name, api, model, 'api-url', 'secret-id', instruct, ... }
+        // 我们把宿主每个 enabled provider 映射成一个 profile：
+        //   api 恒为 'openai'（宿主走 OpenAI 兼容协议）
+        //   model 取该 provider 的第一个 modelId
+        //   'api-url' 取 ApiKey 子类的 baseUrl
+        //
+        // ⚠️ 安全红线：**绝不下发 API Key**。secret-id 恒为空串，
+        // sendRequest 走 Kotlin 时由宿主自己取密钥。
+        TavernRuntimeManager.connectionProfilesSupplier = {
+            runCatching {
+                val arr = kotlinx.serialization.json.JsonArray(
+                    tavernLatestSettings.value.providers
+                        .filter { it.enabled }
+                        .map { p ->
+                            buildJsonObject {
+                                put("id", JsonPrimitive(p.id.toString()))
+                                put("name", JsonPrimitive(p.name))
+                                put("api", JsonPrimitive("openai"))
+                                put("model", JsonPrimitive(p.models.firstOrNull()?.modelId ?: ""))
+                                put("api-url", JsonPrimitive((p as? me.rerere.ai.provider.ProviderSetting.ApiKey)?.baseUrl ?: ""))
+                                put("secret-id", JsonPrimitive(""))
+                                put("instruct", JsonPrimitive(""))
+                            }
+                        },
+                )
+                arr.toString()
             }.getOrElse { "[]" }
         }
         TavernRuntimeManager.tavernPresetUpdater = { name, rawJson ->

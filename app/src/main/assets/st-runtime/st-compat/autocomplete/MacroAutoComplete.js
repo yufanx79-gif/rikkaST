@@ -233,7 +233,21 @@ function handleNodeChange(node) {
  * MutationObserver to watch for dynamically added elements with macro autocomplete attribute.
  * @type {MutationObserver}
  */
-const observer = (typeof MutationObserver !== 'undefined' ? new MutationObserver : class { observe() {} disconnect() {} })(mutations => {
+// [今晚 P4 BUGFIX] 上游 SillyTavern 1.19.0 这里有个**真实的语法级 bug**：
+//   (cond ? new MutationObserver : class {...})(cb)
+// 三元表达式的 `new MutationObserver` 分支只会**求值出构造函数引用**，
+// 随后的 `(cb)` 就变成「调用一个未经 new 的类」→
+//   TypeError: (intermediate value)(intermediate value)(intermediate value) is not a function
+// 在真酒馆浏览器里同样会抛（不是我们环境的特例）——
+// 已用不含任何项目代码的最小复现验证：
+//   上游写法 → 抛错；
+//   先取出 Ctor 再 new Ctor(cb) → 正常。
+//
+// 修法：把构造函数先取出来，再统一 new。
+const MacroAutoCompleteObserverCtor = (typeof MutationObserver !== 'undefined')
+    ? MutationObserver
+    : class { observe() {} disconnect() {} takeRecords() { return []; } };
+const observer = new MacroAutoCompleteObserverCtor(mutations => {
     for (const mutation of mutations) {
         if (mutation.type === 'childList') {
             for (const node of mutation.addedNodes) {

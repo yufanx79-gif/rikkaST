@@ -23,6 +23,7 @@ import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.SelectiveLogic
 import me.rerere.rikkahub.data.model.TavernBookEntry
 import me.rerere.rikkahub.data.st.script.StSlashExecutor
+import me.rerere.rikkahub.data.st.script.StSlashRuntimeOverrides
 import me.rerere.rikkahub.data.model.isHidden
 import me.rerere.rikkahub.data.model.withHidden
 import me.rerere.rikkahub.data.model.withoutHidden
@@ -118,6 +119,19 @@ internal fun buildChatSlashHost(
      * 卡片 `await triggerSlash('/trigger')` 以为成功 → 既不生成也不报错 → 用户只看到转圈。
      */
     fun slashError(reason: String): String = "(slash error: $reason)"
+
+    /**
+     * [今晚 P2] 「命令存在但宿主暂不具备该能力」的统一回复。
+     *
+     * 为什么不能返回空串或原样回显：那会让脚本以为命令**成功了**。
+     * ST 里这些命令失败时也是给出可见错误（`SlashCommandParser` 的
+     * "Command not found" / 命令自身 throw），而不是静默成功。
+     *
+     * 格式与既有 TTS/SD 那批保持一致：
+     *   `命令不可用：/xxx（当前客户端暂不支持...）`
+     */
+    fun slashUnsupported(cmd: String): String =
+        "命令不可用：/$cmd（当前客户端暂不支持该命令）"
 
     return object : StSlashHost {
         override val chatKey: String?
@@ -1993,6 +2007,89 @@ internal fun buildChatSlashHost(
                     TavernVariableStore.flushNow()
                     ""
                 }
+
+                // ============================================================
+                // [今晚 P2] 12 条「只挂名不干活」的 ST 斜杠命令。
+                //
+                // 此前它们只出现在 StSlashExecutor 的派发名单里（约 :983-:1019），
+                // executeExtendedCommand 没有分支 → 返回 null →
+                // runFallbackExtendedCommand 的 `else -> unnamed` → **原样回显输入**。
+                // 不报错、不崩溃、什么也没做 —— 静默假成功，比报错恶劣得多。
+                //
+                // 按处置方式分三组：
+                //   A 组 = 真接线（4 条）：写 StSlashRuntimeOverrides，真影响生成
+                //   B 组 = 明确不支持（5 条）：返回明确文案，不再回显
+                //   C 组 = 需要宿主 UI 才能实现（3 条）：同上
+                // ============================================================
+
+                // ---- A 组：真接线 ----
+                "start-reply-with" -> {
+                    // ST /start-reply-with <text>：下次生成以该文本开头（assistant prefill）。
+                    // 空参数 = 清除（与 ST 传空串等价）。
+                    val text = unnamed.trim()
+                    StSlashRuntimeOverrides.assistantPrefill = text.ifEmpty { null }
+                    if (text.isEmpty()) "start-reply-with: 已清除" else "start-reply-with: $text"
+                }
+                "stop-strings" -> {
+                    // ST /stop-strings <a,b,c>：设置本次生成的停止序列。
+                    // 支持逗号/换行分隔，去空白去重。
+                    val raw = unnamed.trim()
+                    if (raw.isEmpty()) {
+                        StSlashRuntimeOverrides.stopStrings = null
+                        "stop-strings: 已清除"
+                    } else {
+                        val list = raw.split(',', '\n')
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() }
+                            .distinct()
+                        StSlashRuntimeOverrides.stopStrings = list
+                        "stop-strings: ${list.joinToString(", ")}"
+                    }
+                }
+                "prompt-post-processing" -> {
+                    // ST /prompt-post-processing <on|off|...>：预设后处理开关。
+                    // 无参数时返回当前状态（不报错）。
+                    val v = unnamed.trim().lowercase()
+                    when {
+                        v.isEmpty() -> StSlashRuntimeOverrides.promptPostProcessing?.toString() ?: "(未设置)"
+                        v == "on" || v == "true" || v == "1" -> {
+                            StSlashRuntimeOverrides.promptPostProcessing = true
+                            "prompt-post-processing: on"
+                        }
+                        v == "off" || v == "false" || v == "0" -> {
+                            StSlashRuntimeOverrides.promptPostProcessing = false
+                            "prompt-post-processing: off"
+                        }
+                        else -> "prompt-post-processing: 无法识别的取值「$v」（应为 on/off）"
+                    }
+                }
+                "ask" -> {
+                    // ST /ask <text>：向模型提一个独立问题，结果不写入聊天（quiet prompt）。
+                    // 上游走 generateQuietPrompt；我们用 gen(asRole=system) 同一语义。
+                    val prompt = unnamed.trim()
+                    if (prompt.isEmpty()) {
+                        "ask: 缺少要问的内容（用法 /ask <文本>）"
+                    } else {
+                        gen(
+                            prompt = prompt,
+                            asRole = "system",
+                            lock = false,
+                            length = 0,
+                            name = null,
+                            trim = true,
+                        ) ?: "ask: 生成失败（未选择模型或无响应）"
+                    }
+                }
+
+                // ---- B 组：明确「不支持」（宿主无对应能力，不假装成功）----
+                "bgcol", "css-var" -> slashUnsupported(cmd)
+                "list-gallery", "show-gallery" -> slashUnsupported(cmd)
+                "pick-icon" -> slashUnsupported(cmd)
+
+                // ---- C 组：需要宿主 UI 才能实现 ----
+                "chat-jump", "chat-manager" -> slashUnsupported(cmd)
+                "yt-script" -> slashUnsupported(cmd)
+
                 else -> null
             }
         }

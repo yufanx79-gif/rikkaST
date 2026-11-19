@@ -15,12 +15,19 @@ const st = () => (window.SillyTavern && window.SillyTavern.getContext ? window.S
 //   JSR lorebook.ts:88 读 world_info_settings.world_info.globalSelect 直接 TypeError。
 export let world_info = { globalSelect: [], charLore: [] };
 export let world_names = [];
+// [今晚 P1] 单例身份（L4）：`selected_world_info` 必须与 `getContext().selected_world_info`
+// 是**同一个数组引用**，否则插件 `.push()` 进去的书名消失、宿主也读不到。
+// 上游 world-info.js:66 `export let selected_world_info = []` 与 st-context.js 返回的是同一活绑定。
+// 之前这里是模块私有数组，只靠 rikka-st-refresh 单向拷贝 → 三份数据。
+// 现在改为：有 ctx 值时直接**持有 ctx 的引用**，不再拷贝。
 export let selected_world_info = [];
 
 function __refreshWorldInfoData() {
     const c = st();
     // selected_world_info：优先取 ctx 的 selected_world_info，其次 world_info.globalSelect
-    if (Array.isArray(c.selected_world_info) && c.selected_world_info.length) {
+    // [今晚 P1] 直接持有 ctx 的数组引用（含空数组的情况），不做长度判断、
+    // 不拷贝 —— 否则 ctx 侧 push 之后这边看不到，身份也再次分裂。
+    if (Array.isArray(c.selected_world_info)) {
         selected_world_info = c.selected_world_info;
     } else if (c.world_info && Array.isArray(c.world_info.globalSelect)) {
         selected_world_info = c.world_info.globalSelect;

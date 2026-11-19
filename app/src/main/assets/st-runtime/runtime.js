@@ -912,6 +912,18 @@ const state = {
     modelName: '',
     // [v247 B 组] ST `user_avatar`（当前人设的头像 id）。personas.js 的 getUserAvatar() 读 ctx.userAvatar。
     userAvatar: '',
+    // ---- [今晚 P1] 单例身份（L4）：必须是**稳定引用**，不能每次访问返回新字面量 ----
+    // 依据：ST 的 st-context.js 这些是 import 进来的活绑定，连读两次是同一引用：
+    //   groups   ← st-context.js:120（group-chats.js:114 `let groups = []`）
+    //   tags     ← st-context.js:218（tags.js:345 `let tags = []`）
+    //   streamingProcessor ← st-context.js:42/137（script.js:456 `export let streamingProcessor`）
+    //   loader   ← st-context.js:247（action-loader.js:328 `export const loader = {...}`）
+    // 之前 getter 返回 `[]` / `{}` 新建字面量 → 插件 `.push()` 进去的值立刻消失、
+    // `streamingProcessor.isFinished` 恒 undefined。与昨天 eventSource 同一类问题。
+    groups: [],
+    tags: [],
+    selectedGroup: null,
+    streamingProcessor: null,
 };
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
@@ -1018,6 +1030,17 @@ function ensureStStateShapes() {
         if (!state.chatMetadata.variables || typeof state.chatMetadata.variables !== 'object' || Array.isArray(state.chatMetadata.variables)) {
             state.chatMetadata.variables = {};
         }
+        // [今晚 P0] ST `extension_settings.connectionManager` 形状保证。
+        // 依据：上游 extensions.js:172
+        //   connectionManager: { selectedProfile: '', profiles: [] }
+        // 为什么必须有：ConnectionManagerRequestService.getSupportedProfiles()（shared.js:530）
+        // 第一行就读 `context.extensionSettings.connectionManager.profiles`，
+        // 缺这个键直接 TypeError —— 9 个真实插件在用 ConnectionManagerRequestService。
+        if (!es.connectionManager || typeof es.connectionManager !== 'object' || Array.isArray(es.connectionManager)) {
+            es.connectionManager = { selectedProfile: '', profiles: [] };
+        }
+        if (typeof es.connectionManager.selectedProfile !== 'string') es.connectionManager.selectedProfile = '';
+        if (!Array.isArray(es.connectionManager.profiles)) es.connectionManager.profiles = [];
     } catch (_e) { /* noop */ }
 }
 
@@ -1977,6 +2000,432 @@ const slashCommandParser = (() => {
     };
 })();
 
+// ============================================================================
+// [今晚 P0] ST `ConnectionManagerRequestService`
+//
+// 对齐上游 SillyTavern 1.19.0 `public/scripts/extensions/shared.js:392-700`
+// （`export class ConnectionManagerRequestService`），全部 static 方法。
+//
+// ## 为什么必须真实实现
+// 9 个真实第三方插件在用它，调用分布（全语料 grep）：
+//   22x sendRequest / 9x getProfile / 2x handleDropdown
+//    2x getSupportedProfiles / 1x validateProfile / 1x constructPrompt
+// 涉及：Pathweaver / MessageSummarize / EchoChamber / character-memory /
+//       MemoryBooks / DeepLore / WorldInfo-Recommender / Roadway / Character-Creator
+//
+// 此前是 `{ handleDropdown: () => {}, sendRequest: async () => ({}) }` 空壳：
+//   - sendRequest 返回 `{}` → 插件当模型回复用，不崩但结果为空
+//   - getSupportedProfiles 第一行读 `extensionSettings.connectionManager.profiles`
+//     而该键根本不存在 → TypeError（已在 ensureStStateShapes 补形状）
+//
+// ## sendRequest 怎么真正发请求
+// 复用已存在的 A1 通道：`window.fetch('/api/backends/chat-completions/generate')`
+// 由 runtime.js 顶部的 installChatCompletionsFetchPatch 拦截 →
+// callBridge('chatCompletionStart') → Kotlin startChatCompletionStream → 逐块回推。
+// 所以这里**不新造协议**，直接走 fetch，与 JSR 的 generate() 同一条路。
+//
+// ## 与上游的 DIVERGENCE（都记明白，不留静默假成功）
+// 1. 只支持非流式。`custom.stream === true` → 明确 throw，不假装返回。
+//    上游流式返回「一个产生 AsyncGenerator 的函数」，我们没有可消费的 SSE 消费者，
+//    返回一个假生成器比抛错更难查。
+// 2. `getProfileIcon()` 恒返回 null —— 我们没有 model icon 资源。
+//    上游在 profile 不存在/无 api 时同样返回 null，形状一致。
+// 3. `handleDropdown` 不创建 optgroup（我们无「Text Completion」类 profile），
+//    平铺 profile 列表；选择/新建/删除回调照上游签名调用。
+// 4. `instructSettings` 透传给 TextCompletionService；我们 openai 路径直接返回 prompt。
+// ============================================================================
+
+/**
+ * ST `CONNECT_API_MAP`（上游 slash-commands.js:142 `export const CONNECT_API_MAP = {}`，
+ * 运行时由 setupConnectAPIMap() 填入）。
+ *
+ * 我们只需要 validateProfile()/isProfileSupported() 依赖的 `selected` / `source` / `type` 三字段。
+ * 必须是**模块级常量**（同一个引用），不能每次访问新建 —— 否则
+ * `ctx.CONNECT_API_MAP === ctx.CONNECT_API_MAP` 为 false，插件缓存下来的引用会失效。
+ */
+const ST_CONNECT_API_MAP = {
+    openai: { selected: 'openai', source: 'openai', button: '#api_button' },
+    claude: { selected: 'openai', source: 'claude', button: '#api_button' },
+    makersuite: { selected: 'openai', source: 'makersuite', button: '#api_button' },
+    vertexai: { selected: 'openai', source: 'vertexai', button: '#api_button' },
+    deepseek: { selected: 'openai', source: 'deepseek', button: '#api_button' },
+    openrouter: { selected: 'openai', source: 'openrouter', button: '#api_button' },
+    mistralai: { selected: 'openai', source: 'mistralai', button: '#api_button' },
+    xai: { selected: 'openai', source: 'xai', button: '#api_button' },
+    groq: { selected: 'openai', source: 'groq', button: '#api_button' },
+    perplexity: { selected: 'openai', source: 'perplexity', button: '#api_button' },
+    cohere: { selected: 'openai', source: 'cohere', button: '#api_button' },
+    ai21: { selected: 'openai', source: 'ai21', button: '#api_button' },
+    pollinations: { selected: 'openai', source: 'pollinations', button: '#api_button' },
+    textgenerationwebui: { selected: 'textgenerationwebui', type: 'ooba', button: '#api_button' },
+    kobold: { selected: 'kobold', button: '#api_button' },
+};
+
+/**
+ * ST `loader`（上游 action-loader.js:328 `export const loader = {...}`）。
+ *
+ * 上游是**常量对象**，字段：
+ *   show / hide / active / get / isBlocking / ToastMode / Handle / createOverlay
+ * 我们无 action-loader UI（那是 ST 顶部的转圈遮罩），但**形状必须齐**：
+ * 插件调 `loader.show()` 不应该 ReferenceError / undefined is not a function。
+ *
+ * DIVERGENCE：`show()` 返回一个 handle 对象（含 id / hide()），而不是真实 DOM 遮罩。
+ * 因为宿主侧没有对应 UI；这样插件的 `const h = loader.show(); h.hide();` 不会崩。
+ */
+const stActionLoader = (function () {
+    let seq = 0;
+    const active = new Map();
+
+    class ActionLoaderHandle {
+        constructor(id) { this.id = id; }
+        hide() { try { active.delete(this.id); } catch (_e) { /* noop */ } }
+    }
+
+    return {
+        // 上游 ActionLoaderToastMode
+        ToastMode: { NONE: 'none', INFO: 'info', SUCCESS: 'success', WARNING: 'warning', ERROR: 'error' },
+        Handle: ActionLoaderHandle,
+
+        /** 上游 showActionLoader —— 返回 handle。 */
+        show(_text, _options) {
+            const id = 'rikka-loader-' + (++seq);
+            const h = new ActionLoaderHandle(id);
+            try { active.set(id, h); } catch (_e) { /* noop */ }
+            return h;
+        },
+
+        /** 上游 hideActionLoader —— 传 handle 摘指定，不传全清。 */
+        hide(handle) {
+            try {
+                if (handle && typeof handle === 'object' && handle.id) active.delete(handle.id);
+                else active.clear();
+            } catch (_e) { /* noop */ }
+            return true;
+        },
+
+        /** 上游 getActiveLoaderHandles */
+        active() { return Array.from(active.values()); },
+
+        /** 上游 getLoaderHandleById */
+        get(id) { return active.get(id) || null; },
+
+        /** 上游 isOverlayDisplayed —— 我们无真实遮罩，恒 false。 */
+        isBlocking() { return false; },
+
+        /** 上游 createDefaultLoaderOverlay —— 无 DOM 时返回 null（与「找不到容器」一致）。 */
+        createOverlay() { return null; },
+    };
+})();
+
+const CMRS_ALLOWED_TYPES = {
+    openai: 'Chat Completion',
+    textgenerationwebui: 'Text Completion',
+};
+
+const CMRS_DEFAULT_PARAMS = {
+    stream: false,
+    signal: null,
+    extractData: true,
+    includePreset: true,
+    includeInstruct: true,
+    instructSettings: {},
+};
+
+/** 读 `getContext().extensionSettings.connectionManager`（保证形状，绝不返回 undefined）。 */
+function cmrsConnManager() {
+    let es = null;
+    try {
+        es = stCtx && stCtx.extensionSettings;
+    } catch (_e) { es = null; }
+    if (!es || typeof es !== 'object') {
+        try { es = window.extension_settings; } catch (_e) { es = null; }
+    }
+    if (!es || typeof es !== 'object') es = {};
+    if (!es.connectionManager || typeof es.connectionManager !== 'object' || Array.isArray(es.connectionManager)) {
+        es.connectionManager = { selectedProfile: '', profiles: [] };
+    }
+    if (!Array.isArray(es.connectionManager.profiles)) es.connectionManager.profiles = [];
+    return es.connectionManager;
+}
+
+/**
+ * 从宿主拉取 ConnectionProfile[]。
+ *
+ * 每次调用都重新拉（宿主侧 provider 配置随时可能变），但用
+ * `globalThis.__rikkaConnProfilesCache` 做 1 秒节流 —— 插件常在一个循环里
+ * 连续调 getSupportedProfiles()，不节流会把 bridge 打爆。
+ */
+function cmrsPullProfiles() {
+    const now = Date.now();
+    const cache = globalThis.__rikkaConnProfilesCache;
+    if (cache && cache.at && (now - cache.at) < 1000 && Array.isArray(cache.list)) {
+        return cache.list;
+    }
+    let list = [];
+    try {
+        const raw = callBridge('getConnectionProfilesJson');
+        if (typeof raw === 'string' && raw.length) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) list = parsed;
+        }
+    } catch (_e) { list = []; }
+    // 宿主没注入（Node 测试台 / 未进对话页）时，退回已有的 profiles，不要清空插件自己塞的数据
+    if (list.length === 0) {
+        try {
+            const mgr = cmrsConnManager();
+            if (Array.isArray(mgr.profiles) && mgr.profiles.length) list = mgr.profiles;
+        } catch (_e) { /* noop */ }
+    }
+    try {
+        globalThis.__rikkaConnProfilesCache = { at: now, list: list };
+    } catch (_e) { /* noop */ }
+    // 同步回 extensionSettings，插件直接读 .profiles 也能看到
+    try {
+        cmrsConnManager().profiles = list;
+    } catch (_e) { /* noop */ }
+    return list;
+}
+
+class ConnectionManagerRequestService {
+    static get defaultSendRequestParams() { return CMRS_DEFAULT_PARAMS; }
+
+    /** 上游 shared.js:402 */
+    static getAllowedTypes() { return CMRS_ALLOWED_TYPES; }
+
+    /** 上游 shared.js:530 */
+    static getSupportedProfiles() {
+        cmrsPullProfiles();
+        const mgr = cmrsConnManager();
+        return (mgr.profiles || []).filter((p) => this.isProfileSupported(p));
+    }
+
+    /** 上游 shared.js:546 —— 找不到必须 throw，与上游一致（不静默返回 undefined）。 */
+    static getProfile(profileId) {
+        cmrsPullProfiles();
+        const mgr = cmrsConnManager();
+        const profile = (mgr.profiles || []).find((p) => p && p.id === profileId);
+        if (!profile) throw new Error(`Profile not found (ID: ${String(profileId)})`);
+        return profile;
+    }
+
+    /** 上游 shared.js:558 —— 无 icon 资源，恒 null（与上游「找不到时返回 null」形状一致）。 */
+    static getProfileIcon(_profileId) { return null; }
+
+    /** 上游 shared.js:579 */
+    static isProfileSupported(profile) {
+        if (!profile || !profile.api) return false;
+        const apiMap = ST_CONNECT_API_MAP[profile.api];
+        if (!apiMap) return false;
+        if (!Object.prototype.hasOwnProperty.call(CMRS_ALLOWED_TYPES, apiMap.selected)) return false;
+        switch (apiMap.selected) {
+            case 'openai': return !!apiMap.source;
+            case 'textgenerationwebui': return !!apiMap.type;
+            default: return false;
+        }
+    }
+
+    /** 上游 shared.js:605 */
+    static validateProfile(profile) {
+        if (!profile) throw new Error('Could not find profile.');
+        if (!profile.api) throw new Error('Select a connection profile that has an API');
+        const selectedApiMap = ST_CONNECT_API_MAP[profile.api];
+        if (!selectedApiMap) throw new Error(`Unknown API type ${profile.api}`);
+        if (!Object.prototype.hasOwnProperty.call(CMRS_ALLOWED_TYPES, selectedApiMap.selected)) {
+            throw new Error(
+                `API type ${selectedApiMap.selected} is not supported. ` +
+                `Supported types: ${Object.values(CMRS_ALLOWED_TYPES).join(', ')}`
+            );
+        }
+        return selectedApiMap;
+    }
+
+    /** 上游 shared.js:501 */
+    static constructPrompt(prompt, profileId, instructSettings = null) {
+        const profile = this.getProfile(profileId);
+        const selectedApiMap = this.validateProfile(profile);
+        const instructName = profile.instruct;
+        switch (selectedApiMap.selected) {
+            case 'openai': {
+                if (!selectedApiMap.source) {
+                    throw new Error(`API type ${selectedApiMap.selected} does not support chat completions`);
+                }
+                return prompt;
+            }
+            case 'textgenerationwebui': {
+                if (!selectedApiMap.type) {
+                    throw new Error(`API type ${selectedApiMap.selected} does not support text completions`);
+                }
+                const svc = stCtx && stCtx.TextCompletionService;
+                if (svc && typeof svc.constructPrompt === 'function') {
+                    return svc.constructPrompt(prompt, instructName, instructSettings);
+                }
+                // 无 TextCompletionService 时退化为拼接，不抛错（ST 里 textgen 是少见路径）
+                return Array.isArray(prompt)
+                    ? prompt.map((m) => (m && typeof m === 'object' ? String(m.content || '') : String(m || ''))).join('\n')
+                    : String(prompt || '');
+            }
+            default:
+                throw new Error(`Unknown API type ${selectedApiMap.selected}`);
+        }
+    }
+
+    /**
+     * 上游 shared.js:423
+     *
+     * 非流式：走 A1 fetch 通道（同 JSR generate()），返回上游 ExtractedData 形状。
+     * 流式：明确 throw（DIVERGENCE，见文件头注释）。
+     */
+    static async sendRequest(profileId, prompt, maxTokens, custom = CMRS_DEFAULT_PARAMS, overridePayload = {}) {
+        const opts = Object.assign({}, CMRS_DEFAULT_PARAMS, custom || {});
+
+        // DIVERGENCE 1：只支持非流式
+        if (opts.stream === true) {
+            throw new Error(
+                '[rikkaST] ConnectionManagerRequestService.sendRequest: ' +
+                'stream:true 暂不支持（只支持非流式）。' +
+                '如需流式请改用 JSR generate()。'
+            );
+        }
+
+        const profile = this.getProfile(profileId);
+        const selectedApiMap = this.validateProfile(profile);
+
+        // 上游 shared.js:443 —— prompt 可以是字符串或消息数组
+        let messages = Array.isArray(prompt)
+            ? prompt.slice()
+            : [{ role: 'user', content: String(prompt == null ? '' : prompt) }];
+
+        // includeInstruct / includePreset 我们不做预处理（宿主生成管线自己会加预设），
+        // 但保留这两个开关的语义：显式传 false 时不额外包装。
+        if (opts.includeInstruct === false || opts.includePreset === false) {
+            // no-op：宿主侧无「按 profile 复现预设」能力，这里不假装做过
+        }
+
+        const body = Object.assign({
+            chat_completion_source: selectedApiMap.source || 'openai',
+            model: String(profile.model || ''),
+            messages: messages,
+            max_tokens: typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : undefined,
+            stream: false,
+        }, overridePayload && typeof overridePayload === 'object' ? overridePayload : {});
+
+        // 去掉 undefined，避免宿主侧 JSON 里出现字面量 undefined
+        Object.keys(body).forEach((k) => { if (body[k] === undefined) delete body[k]; });
+
+        let resp = null;
+        if (typeof window.fetch === 'function') {
+            resp = await window.fetch('/api/backends/chat-completions/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: opts.signal || undefined,
+            });
+        } else {
+            throw new Error('[rikkaST] sendRequest: window.fetch 不可用，无法发起生成请求');
+        }
+
+        if (!resp || resp.ok === false) {
+            let detail = '';
+            try { detail = String(await resp.text()).slice(0, 400); } catch (_e) { detail = ''; }
+            throw new Error(
+                `[rikkaST] sendRequest 失败：HTTP ${resp ? resp.status : '?'}${detail ? ' — ' + detail : ''}`
+            );
+        }
+
+        let payload = null;
+        try { payload = await resp.json(); } catch (_e) { payload = null; }
+
+        const content = (function extract(p) {
+            if (!p || typeof p !== 'object') return '';
+            // OpenAI chat.completion
+            if (Array.isArray(p.choices) && p.choices.length) {
+                const c = p.choices[0];
+                if (c && c.message && typeof c.message.content === 'string') return c.message.content;
+                if (c && typeof c.text === 'string') return c.text;
+            }
+            if (typeof p.content === 'string') return p.content;
+            if (typeof p.result === 'string') return p.result;
+            if (typeof p.text === 'string') return p.text;
+            return '';
+        })(payload);
+
+        // 上游 extractData:false 时返回原始响应；true 时返回提取后的对象
+        if (opts.extractData === false) return payload;
+        return Object.assign({}, payload && typeof payload === 'object' ? payload : {}, {
+            content: content,
+        });
+    }
+
+    /**
+     * 上游 shared.js:634
+     *
+     * 填 profile 下拉框 + 绑回调。签名与上游一致。
+     * DIVERGENCE 3：不建 optgroup（我们只有 openai 类 profile），平铺。
+     */
+    static handleDropdown(selector, initialSelectedProfileId, onChange = () => {}, onCreate = () => {}, unUpdate = () => {}, onDelete = () => {}) {
+        const $ = (typeof window !== 'undefined' && window.jQuery) ? window.jQuery : null;
+        const doc = (typeof document !== 'undefined') ? document : null;
+        if (!doc || typeof doc.querySelector !== 'function') return null;
+
+        const dropdown = doc.querySelector(selector);
+        if (!dropdown) throw new Error(`Could not find dropdown with selector ${selector}`);
+
+        // 清空（jQuery 可用时用 jQuery，保持与上游一致的 DOM 行为）
+        try {
+            if ($) $(dropdown).empty();
+            else while (dropdown.firstChild) dropdown.removeChild(dropdown.firstChild);
+        } catch (_e) { /* noop */ }
+
+        const makeOption = (value, text) => {
+            const opt = doc.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            return opt;
+        };
+
+        const append = (node) => {
+            try {
+                if ($) $(dropdown).append(node);
+                else dropdown.appendChild(node);
+            } catch (_e) { /* noop */ }
+        };
+
+        append(makeOption('', 'Select a Connection Profile'));
+
+        const profiles = this.getSupportedProfiles().slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        for (const profile of profiles) {
+            const opt = makeOption(profile.id, String(profile.name || profile.id));
+            try { opt.dataset.profileId = profile.id; } catch (_e) { /* noop */ }
+            append(opt);
+        }
+
+        try {
+            if (initialSelectedProfileId) dropdown.value = initialSelectedProfileId;
+            else dropdown.value = '';
+        } catch (_e) { /* noop */ }
+
+        // 绑定回调（change → onChange(profile)）
+        const bind = (evt, fn) => {
+            try {
+                if ($) $(dropdown).on(evt, fn);
+                else dropdown.addEventListener(evt, fn);
+            } catch (_e) { /* noop */ }
+        };
+        bind('change', function () {
+            let profile;
+            try {
+                const id = this && this.value !== undefined ? this.value : dropdown.value;
+                profile = id ? this.getProfile(id) : undefined;
+            } catch (_e) { profile = undefined; }
+            try { onChange(profile); } catch (_e) { /* noop */ }
+        });
+
+        // 暴露回调供扩展自行触发（上游通过 UI 按钮调用，我们让插件直接调）
+        ConnectionManagerRequestService.__dropdownCallbacks = { onChange, onCreate, unUpdate, onDelete };
+        return dropdown;
+    }
+}
+
 const stCtx = {
     getThumbnailUrl(type = 'avatar', file = '') {
         const f = String(file || '').trim();
@@ -2168,19 +2617,31 @@ const stCtx = {
     clearChat: () => {},
     printMessages: () => {},
     // ---- [v214] ST getContext() 成员面补齐（st-context.js:129-311；按真实消费方优先级）----
-    get groups() { return []; },
-    get groupId() { return null; },
+    // [今晚 P1] 稳定引用：ST group-chats.js:114 `let groups = []`（活绑定）。
+    // 之前 return [] 每次都新建 → 插件 .push 丢失、.length 恒 0。
+    get groups() { return state.groups; },
+    // [今晚 P1] 上游 st-context.js:124 `groupId: selected_group` —— 两者是同一个值。
+    // 之前恒 null，且没有 selected_group 键 → 插件读 ctx.selected_group 得到 undefined。
+    get groupId() { return state.selectedGroup; },
+    get selected_group() { return state.selectedGroup; },
     get onlineStatus() { return ''; },
     get maxContext() { return 32768; },
     get mainApi() { return 'openai'; },
     get textCompletionSettings() { return {}; },
-    get tags() { return []; },
+    // [今晚 P1] 稳定引用：ST tags.js:345 `let tags = []`（活绑定）。
+    get tags() { return state.tags; },
     get tagMap() { return {}; },
     get menuType() { return 0; },
     get accountStorage() { return accountStorage; },
     get ChatCompletionService() { return ChatCompletionService; },
-    get streamingProcessor() { return {}; },
-    get loader() { return {}; },
+    // [今晚 P1] ST script.js:456 `export let streamingProcessor = null`，
+    // 生成期间被赋成 `new StreamingProcessor(...)`（script.js:3540），字段含
+    // result / messageId / isStopped / isFinished / generator / abortController / toolCalls。
+    // 之前 return {} 每次都新建 → 插件读 isFinished 恒 undefined（不是 false）。
+    get streamingProcessor() { return state.streamingProcessor; },
+    // [今晚 P1] ST action-loader.js:328 `export const loader = {...}` 是**常量对象**。
+    // 之前 return {} 每次都新建 → 插件调 loader.show()/hide() 全是 undefined。
+    get loader() { return stActionLoader; },
     get createCharacterData() { return {}; },
     get symbols() { return { ignore: ST_SYMBOL_IGNORE, unset: ST_SYMBOL_UNSET }; },
     get constants() { return { unset: ST_SYMBOL_UNSET }; },
@@ -2188,7 +2649,11 @@ const stCtx = {
     get messageFormatter() { return stMessageFormatterFacade; },
     get swipe() { return stSwipeFacade; },
     get variables() { return stVariablesFacade; },
-    get CONNECT_API_MAP() { return {}; },
+    // [今晚 P1] 必须是**模块级常量**返回同一引用。
+    // 上游 slash-commands.js:142 `export const CONNECT_API_MAP = {}`，
+    // 运行时由 setupConnectAPIMap() 填充后**引用不变**。
+    // 之前每次访问 new {} → 插件缓存引用失效、validateProfile 拿到空表抛 Unknown API type。
+    get CONNECT_API_MAP() { return ST_CONNECT_API_MAP; },
     // ST st-context.js:229 powerUserSettings（ST-PT persona 域：persona_description / persona_description_position）
     get powerUserSettings() { return stCompatPowerUser; },
     // ST st-context.js:214-217 i18n 面
@@ -2319,7 +2784,7 @@ const stCtx = {
     },
     get AccountStorage() { return accountStorage; },
     ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', LIST: 'list', OBJECT: 'object', CLOSURE: 'closure', SUBCOMMAND: 'subcommand' },
-    ConnectionManagerRequestService: { handleDropdown: () => {}, sendRequest: async () => ({}) },
+    ConnectionManagerRequestService: ConnectionManagerRequestService,
     ModuleWorkerWrapper: class ModuleWorkerWrapper { constructor(fn) { this.fn = fn; } async update(...args) { return typeof this.fn === 'function' ? await this.fn(...args) : undefined; } },
     SlashCommand: class SlashCommand { static fromProps(props = {}) { return Object.assign(new SlashCommand(), props); } },
     SlashCommandArgument: class SlashCommandArgument { static fromProps(props = {}) { return Object.assign(new SlashCommandArgument(), props); } },
@@ -3734,6 +4199,42 @@ window.__rikkaRunGenerationHooks = async function __rikkaRunGenerationHooks(seq,
 window.__rikkaEmit = function __rikkaEmit(name, payload) {
     window.__rikkaIncomingHostEvent = true;
     setTimeout(() => { window.__rikkaIncomingHostEvent = false; }, 0);
+    // [今晚 P1] ST `streamingProcessor` 生命周期。
+    // 上游 script.js:456 `export let streamingProcessor = null`，生成时赋实例、生成结束置 null；
+    // 插件（如扩展里读 isFinished 的那些）依赖它判断当前是否在生成。
+    // 之前 getter 恒返回新建 {} → isFinished 恒 undefined。
+    try {
+        if (name === 'generation_started') {
+            const prev = state.streamingProcessor;
+            if (!prev || typeof prev !== 'object') {
+                // 与上游 StreamingProcessor（script.js:3540）字段对齐的最小形状。
+                // 只提供插件会读的字段；宿主真实流式数据由 updateMessageBlock 那套走，
+                // 这里不复制整份流内容，避免双份状态。
+                state.streamingProcessor = {
+                    result: '',
+                    messageId: -1,
+                    isStopped: false,
+                    isFinished: false,
+                    type: '',
+                    timeStarted: new Date(),
+                    createdAt: new Date(),
+                    toolCalls: [],
+                };
+            } else {
+                prev.isStopped = false;
+                prev.isFinished = false;
+            }
+        } else if (name === 'generation_ended') {
+            if (state.streamingProcessor && typeof state.streamingProcessor === 'object') {
+                state.streamingProcessor.isFinished = true;
+            }
+        } else if (name === 'generation_stopped') {
+            if (state.streamingProcessor && typeof state.streamingProcessor === 'object') {
+                state.streamingProcessor.isStopped = true;
+                state.streamingProcessor.isFinished = true;
+            }
+        }
+    } catch (_eSp) { /* noop */ }
     try {
         if (['message_received', 'message_sent', 'message_updated', 'user_message_rendered',
              'character_message_rendered', 'message_swiped', 'active_conversation_changed'].includes(name)) {

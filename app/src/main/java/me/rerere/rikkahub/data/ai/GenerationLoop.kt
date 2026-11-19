@@ -1249,10 +1249,19 @@ class GenerationLoop(
                 internalMessages = internalMessages.toMutableList().apply { set(lastIdx, uMsg.copy(parts = updatedParts)) }
             }
         }
-        val combinedPrefill = listOfNotNull(
-            postPresetCfg.startReplyWith.takeIf { it.isNotBlank() },
-            postPresetCfg.assistantPrefill?.takeIf { it.isNotBlank() },
-        ).distinct().joinToString("")
+        // [今晚 P2] `/start-reply-with` 运行时覆写。
+        // StSlashRuntimeOverrides.assistantPrefill 非 null 时**完全替代**预设里的 prefill
+        // （与 ST 一致：命令是运行时改当前生成行为，不是叠加）。
+        // 为 null 时保持原行为（预设 startReplyWith + assistantPrefill）。
+        val overriddenPrefill = me.rerere.rikkahub.data.st.script.StSlashRuntimeOverrides.assistantPrefill
+        val combinedPrefill = if (overriddenPrefill != null) {
+            overriddenPrefill.trim()
+        } else {
+            listOfNotNull(
+                postPresetCfg.startReplyWith.takeIf { it.isNotBlank() },
+                postPresetCfg.assistantPrefill?.takeIf { it.isNotBlank() },
+            ).distinct().joinToString("")
+        }
         if (combinedPrefill.isNotBlank() &&
             generationType != me.rerere.rikkahub.data.model.GenerationType.IMPERSONATE
         ) {
@@ -1883,11 +1892,15 @@ internal fun buildPresetMergedCustomBodies(
             presetBodies += me.rerere.ai.provider.CustomBody(key = key, value = value)
         }
     }
-    if (preset.customStoppingStrings.isNotEmpty()) {
+    // [今晚 P2] `/stop-strings` 运行时覆写优先于预设。
+    // StSlashRuntimeOverrides.stopStrings 为 null 时退回预设值（原行为不变）。
+    val effectiveStopStrings = me.rerere.rikkahub.data.st.script.StSlashRuntimeOverrides.stopStrings
+        ?: preset.customStoppingStrings
+    if (effectiveStopStrings.isNotEmpty()) {
         putIfAbsent(
             "stop",
             kotlinx.serialization.json.JsonArray(
-                preset.customStoppingStrings.map { kotlinx.serialization.json.JsonPrimitive(it) }
+                effectiveStopStrings.map { kotlinx.serialization.json.JsonPrimitive(it) }
             ),
         )
     }

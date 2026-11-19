@@ -55,6 +55,10 @@ function __refresh() {
         if (c.chatMetadata && typeof c.chatMetadata === 'object') chat_metadata = c.chatMetadata;
         if (c.extensionSettings && typeof c.extensionSettings === 'object') extension_settings = c.extensionSettings;
         if (c.streamingProcessor !== undefined) streamingProcessor = c.streamingProcessor;
+        // [今晚 P1] groups 必须同步，否则 script.js 导出的 groups 与 getContext().groups 分裂
+        // （L4 身份问题：插件 import { groups } 拿到的是一份、ctx.groups 是另一份）。
+        // 上游 group-chats.js:114 是同一份 `let groups`。
+        if (Array.isArray(c.groups)) groups = c.groups;
     } catch (_e) { /* noop */ }
 }
 __refresh();

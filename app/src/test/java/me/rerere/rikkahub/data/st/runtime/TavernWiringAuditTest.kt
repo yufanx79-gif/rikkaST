@@ -70,6 +70,9 @@ class TavernWiringAuditTest {
         Wiring("chatJsonSupplier", "getChatJson", jsCalls = true),
         Wiring("thirdPartyExtensionsSupplier", "getThirdPartyExtensionsJson", jsCalls = true),
         Wiring("thirdPartySettingsSupplier", "getThirdPartySettingsJson", jsCalls = true),
+        // [今晚 P0] ST `ConnectionProfile[]` → ConnectionManagerRequestService 的数据源。
+        // JS 侧 runtime.js 的 cmrsPullProfiles() → callBridge('getConnectionProfilesJson')。
+        Wiring("connectionProfilesSupplier", "getConnectionProfilesJson", jsCalls = true),
         // 这些 supplier 由非 ChatPage 的地方接线（ChatService / 设置页），只校验声明与桥
         Wiring("generationModelIdsSupplier", "getModelListJson", jsCalls = true, requireChatPageWiring = false),
         Wiring("currentModelIdSupplier", null, jsCalls = false, requireChatPageWiring = false),
