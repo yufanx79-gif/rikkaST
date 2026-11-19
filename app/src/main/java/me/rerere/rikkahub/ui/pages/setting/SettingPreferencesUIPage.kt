@@ -81,7 +81,7 @@ import kotlin.math.roundToInt
 @Composable
 fun SettingPreferencesUIPage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
-    var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
+    var displaySetting by remember(settings.displaySetting) { mutableStateOf(settings.displaySetting) } // [P5] key 收窄：原为整个 settings，任何设置变更都重置草稿 → 输入框闪回/卡顿
     val context = LocalContext.current
     val toaster = LocalToaster.current
     val scope = rememberCoroutineScope()

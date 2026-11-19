@@ -45,7 +45,7 @@ private const val MILLIS_PER_DAY = 24 * 60 * 60 * 1_000L
 @Composable
 fun SettingPreferencesNotificationPage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
-    var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
+    var displaySetting by remember(settings.displaySetting) { mutableStateOf(settings.displaySetting) } // [P5] key 收窄：原为整个 settings，任何设置变更都重置草稿 → 输入框闪回/卡顿
     var showUpdatePauseDialog by remember { mutableStateOf(false) }
     var selectedUpdatePauseDays by remember { mutableStateOf(UPDATE_PAUSE_DAY_OPTIONS.first()) }
 

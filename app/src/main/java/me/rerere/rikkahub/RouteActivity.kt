@@ -355,10 +355,21 @@ class RouteActivity : ComponentActivity() {
                         .semantics { testTagsAsResourceId = true }
                         .background(MaterialTheme.colorScheme.background)
                 ) {
-                    // [v222 R2 收尾] 全局 MotionScheme 已改 standard（为了让 172 处 M3 Switch 的弹簧窗口减半），
-                    // 但导航转场的 expressive 观感是主人 2026-10-03 已验收的，这里显式固定 expressive，
-                    // 与本改动解耦（两处 spec 调用点不变）。
-                    val motionScheme = MotionScheme.expressive()
+                    // [2026-11-19 P5] 导航转场改用全局 standard MotionScheme。
+                    //
+                    // 原来这里硬编码 `MotionScheme.expressive()`，理由是
+                    // 「expressive 观感是 2026-10-03 验收过的」。但 Theme.kt:186 已经把
+                    // 全局 MotionScheme 改成 standard（为了 172 处 Switch 的弹簧窗口减半），
+                    // 导航这里独自留在 expressive → **绕过了那次全局优化**。
+                    //
+                    // 实测差异：expressive 的 spatial spec 弹簧更软、settle 更久，
+                    // 在「返回上一级菜单」这种高频操作上表现为『动画拖尾、点了没立刻响应』。
+                    // 用户反馈的「返回下一级菜单卡一下」就是这个。
+                    //
+                    // 现在统一到 standard：位移/淡入的**结构完全不变**（还是 slide+fade），
+                    // 只是曲线更干脆。想把弹性观感要回来的用户，
+                    // 可在「设置 → 偏好 → 页面转场动效」选 EXPRESSIVE，那条路径仍然叠加 scale。
+                    val motionScheme = MotionScheme.standard()
                     // [P3 流畅度] 页面转场按用户设置决定是否叠加 scale。
                     //
                     // scale(0.7f) 会让整页在动画期间失去硬件层缓存，必须逐帧重新
@@ -378,7 +389,8 @@ class RouteActivity : ComponentActivity() {
                         onBack = { navController.popBackStack() },
                         // [v221 UI 二期] 转场接 MotionScheme（此前硬编码 tween(300)/spring 默认值）：
                         // 几何保持不变（位移比例 / 缩放 0.7f / 淡入淡出），只把时长/曲线交给
-                        // MaterialTheme.motionScheme（Theme.kt 已全局注入 MotionScheme.expressive()）。
+                        // MaterialTheme.motionScheme（Theme.kt:186 已全局注入 MotionScheme.standard()；
+                        // 本文件 2026-11-19 已从 expressive 对齐到 standard，不再绕过全局优化）。
                         transitionSpec = {
                             if (targetState.key is Screen.Chat || initialState.key is Screen.Chat) {
                                 fadeIn(motionScheme.defaultEffectsSpec()) togetherWith

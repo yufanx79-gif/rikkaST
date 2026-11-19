@@ -141,22 +141,104 @@ class ChatScrollBehaviorGuardTest {
     @Test
     fun `bottom aligned helper does not scroll when content fits`() {
         val src = chatListSource()
-        val start = src.indexOf("suspend fun LazyListState.scrollToBottomAligned")
-        assertTrue("找不到 scrollToBottomAligned", start > 0)
-        val body = src.substring(start, (start + 900).coerceAtMost(src.length))
+        val body = bodyOfScrollToBottomAligned(src)
 
         assertTrue(
             "scrollToBottomAligned 在内容不足一屏时必须直接返回",
             body.contains("!canScrollForward && !canScrollBackward"),
         )
         assertTrue(
-            "scrollToBottomAligned 必须用 scrollToItem(index, viewport) 贴底，" +
-                "而不是默认的顶对齐",
+            "负数索引必须被忽略",
+            body.contains("if (lastIndex < 0) return"),
+        )
+    }
+
+    private fun bodyOfScrollToBottomAligned(src: String): String {
+        val start = src.indexOf("suspend fun LazyListState.scrollToBottomAligned")
+        assertTrue("找不到 scrollToBottomAligned", start > 0)
+        return src.substring(start, (start + 2600).coerceAtMost(src.length))
+    }
+
+    // ---------------------------------------------------------------- 4
+
+    /**
+     * [2026-11-19] 用户第二轮反馈：
+     *
+     * > 假如我的助手有一个很长的开场白，我在开场白的中间发送了一条消息，
+     * > 此时我希望它能滑动到最下方，固定定位到我的消息。
+     * > 或者假如有 10 层楼，我在第 5 层楼发送了消息，我也希望它能直接滑动到第 5 层楼。
+     * > 目前是它好像会自动到处跳转，比如我在第二层楼发送消息，就可能跳转到第一层、
+     * > 跳转到开场白上。
+     *
+     * 三个根因（全部已修）：
+     *
+     * 1. `isAtBottom()` 用了 `visibleItemsInfo.lastOrNull()` ——
+     *    那是**视口内最后可见项**，不是列表最后一项。
+     *    在 10 层楼停在第 5 层时，视口内最后一项是第 6 层，
+     *    它的底边当然在视口内 → isAtBottom 恒为 true → 每帧把用户拽到底。
+     *
+     * 2. `snapshotFlow { visibleItemsInfo }.collect` 在滚动期间**每帧发射**，
+     *    而滚到底又会改变 visibleItemsInfo → 再次发射 → 回弹抖动。
+     *
+     * 3. `scrollToItem(lastIndex, viewport)` 的 offset 是「第一项顶部滚出视口多少像素」，
+     *    传一个视口高度 = 要求最后一项滚出视口一整屏 → clamp 后视口顶部出现大量历史
+     *    消息，观感就是「跳到上面去了」。
+     */
+    @Test
+    fun `isAtBottom uses true last item not last visible item`() {
+        val src = chatListSource()
+        val start = src.indexOf("fun List<LazyListItemInfo>.isAtBottom()")
+        assertTrue("找不到 isAtBottom", start > 0)
+        val body = src.substring(start, (start + 1800).coerceAtMost(src.length))
+
+        // 必须按「列表真正的最后一项」判断，而不是视口内最后可见项
+        assertTrue(
+            "isAtBottom 必须用 totalItemsCount - 1 找出真正的最后一项",
+            body.contains("total - 1") || body.contains("totalItemsCount - 1"),
+        )
+        assertFalse(
+            "isAtBottom 不能用 `lastOrNull()` —— 那是视口内最后可见项，" +
+                "会让「10 层楼停在第 5 层」被判成已在底部",
+            Regex("""val\s+lastItem\s*=\s*lastOrNull\(\)""").containsMatchIn(body),
+        )
+    }
+
+    @Test
+    fun `auto scroll is driven by message count not scroll frames`() {
+        val src = chatListSource()
+
+        assertFalse(
+            "自动跟随不能再由 snapshotFlow { visibleItemsInfo } 驱动 ——" +
+                "滚动期间每帧发射，且滚动本身又改变它，形成回弹抖动",
+            src.contains("snapshotFlow { state.layoutInfo.visibleItemsInfo }"),
+        )
+        assertTrue(
+            "自动跟随必须改为「消息条数变化」驱动",
+            src.contains("LaunchedEffect(conversationUpdated.messageNodes.size)"),
+        )
+        assertTrue(
+            "用户手动上滑过（不在底部附近）时不应打扰",
+            src.contains("isCloseToBottom()"),
+        )
+    }
+
+    @Test
+    fun `bottom aligned helper never passes viewport as scroll offset`() {
+        val src = chatListSource()
+        val body = bodyOfScrollToBottomAligned(src)
+
+        assertFalse(
+            "不能再写 scrollToItem(lastIndex, viewport) —— " +
+                "offset 语义是「滚出视口多少像素」，传视口高度会让最后一项滚出一整屏",
             body.contains("scrollToItem(lastIndex, viewport)"),
         )
         assertTrue(
-            "负数索引必须被忽略",
-            body.contains("if (lastIndex < 0) return"),
+            "必须以 scrollToItem(lastIndex) 起步（无 offset 时才 clamp 到最底部）",
+            body.contains("scrollToItem(lastIndex)"),
+        )
+        assertTrue(
+            "最后一项比视口高时必须继续 scrollBy 补齐余量，否则长开场白/长回复只看到开头",
+            body.contains("scrollBy("),
         )
     }
 }

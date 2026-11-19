@@ -181,6 +181,13 @@ composeCompiler {
     stabilityConfigurationFiles.add(
         project.layout.projectDirectory.file("compose_compiler_config.conf")
     )
+    // [今晚 P5] 打开稳定性报告，拿到「哪些类被判定为 unstable、哪些 Composable 因此无法跳过重组」
+    // 的精确清单，而不是靠猜。产物：build/compose-reports/compose-metrics.txt 等。
+    // 只在需要排查时开（会增加编译时间），默认关闭。
+    if (project.findProperty("composeReport") == "true") {
+        reportsDestination.set(layout.buildDirectory.dir("compose-reports"))
+        metricsDestination.set(layout.buildDirectory.dir("compose-reports"))
+    }
 }
 
 tasks.register("printVersionName") {
