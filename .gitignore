@@ -101,3 +101,9 @@ app/app.key
 
 # 本机构建包装（固定 GRADLE_USER_HOME 到 D 盘，避免 C 盘爆满）
 /g.bat
+
+# 本地调试脚手架（不入库）
+_testshots/
+_tools/
+_backup_bridge.txt
+_backup_stage1_mine/

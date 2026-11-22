@@ -5973,6 +5973,10 @@ function installPanelMode() {
         try {
             const h = measure() | 0;
             if (h === lastReportedHeight) return;
+            // 抖动抑制：真机上同一面板在 90/92/95dp 之间反复跳变，
+            // 每次跳变都会让 Compose 重组 -> stage 重算 -> UI 反复闪「加载中」并使间距跳动。
+            // 只有变化超过 4px 才上报，小抖动直接吸收。
+            if (lastReportedHeight >= 0 && Math.abs(h - lastReportedHeight) <= 4) return;
             lastReportedHeight = h;
             if (window.RikkaPanel && typeof RikkaPanel.panelResize === 'function') RikkaPanel.panelResize(h);
             if (window.RikkaPanel && typeof RikkaPanel.log === 'function') RikkaPanel.log('debug', '[panel] height=' + h);
@@ -6055,6 +6059,251 @@ function installPanelMode() {
         }
     };
     window.__rikkaPanelAwaitSettled = () => { waitPanelResourcesSettled(); };
+    // 阶段 2：截图与点击补发前的就绪探针（等待所有图片 onload/onerror + document.fonts.ready + rAF + 50ms）
+    let renderReadyToken = 0;
+    const waitPanelRenderReady = (panelId) => {
+        const token = ++renderReadyToken;
+        const pid = String(panelId || window.__rikkaPanelMessageKey || '');
+        try {
+            const imgPromises = Array.from(document.images || [])
+                .filter((i) => { try { return i && !i.complete && i.loading !== 'lazy'; } catch (_e) { return false; } })
+                .map((i) => new Promise((r) => {
+                    const done = () => r();
+                    i.addEventListener('load', done, { once: true });
+                    i.addEventListener('error', done, { once: true });
+                    setTimeout(done, 3000);
+                }));
+            const fontsPromise = (document.fonts && document.fonts.ready)
+                ? Promise.race([document.fonts.ready.catch(() => {}), new Promise((r) => setTimeout(r, 1500))])
+                : Promise.resolve();
+            Promise.all([...imgPromises, fontsPromise]).then(() => {
+                if (token !== renderReadyToken) return;
+                const fire = () => {
+                    if (token !== renderReadyToken) return;
+                    setTimeout(() => {
+                        if (token !== renderReadyToken) return;
+                        try {
+                            const h = Math.max(
+                                document.documentElement ? document.documentElement.scrollHeight : 0,
+                                measure() | 0
+                            );
+                            if (window.RikkaPanel && typeof RikkaPanel.onRenderReady === 'function') {
+                                RikkaPanel.onRenderReady(pid, h | 0);
+                            }
+                        } catch (_e) { /* noop */ }
+                    }, 50);
+                };
+                try { requestAnimationFrame(fire); } catch (_e) { setTimeout(fire, 16); }
+            });
+        } catch (_e) {
+            try {
+                if (window.RikkaPanel && typeof RikkaPanel.onRenderReady === 'function') {
+                    RikkaPanel.onRenderReady(pid, measure() | 0);
+                }
+            } catch (_e2) { /* noop */ }
+        }
+    };
+    window.__rikkaWaitRenderReady = waitPanelRenderReady;
+    // 阶段 3：运行时内容分类探测（hook addEventListener + getAnimations + 定时器/rAF + 内部滚动容器）
+    let panelUserListenerCount = 0;
+    let panelSendBridgeCalled = false;
+    let panelRafCount = 0;
+    try {
+        const origEtAdd = EventTarget.prototype.addEventListener;
+        if (origEtAdd && !EventTarget.prototype.__rikkaPanelProbeHooked) {
+            EventTarget.prototype.__rikkaPanelProbeHooked = true;
+            EventTarget.prototype.addEventListener = function (type, listener, opts) {
+                if (type && type !== 'DOMContentLoaded' && type !== 'load' && type !== 'error' && type !== 'unhandledrejection') {
+                    if (this instanceof Element && root && root.contains(this)) {
+                        panelUserListenerCount++;
+                    }
+                }
+                return origEtAdd.call(this, type, listener, opts);
+            };
+        }
+    } catch (_e) { /* noop */ }
+    const probePanelRuntimeClass = (contentHash) => {
+        try {
+            const animations = (typeof document.getAnimations === 'function') ? document.getAnimations().length : 0;
+            let hasScrollContainer = false;
+            const els = root ? root.querySelectorAll('*') : [];
+            const maxCheck = Math.min(els.length, 200);
+            for (let i = 0; i < maxCheck; i++) {
+                const el = els[i];
+                if ((el.scrollHeight > el.clientHeight + 4) || (el.scrollWidth > el.clientWidth + 4)) {
+                    const cs = window.getComputedStyle(el);
+                    if (cs && (cs.overflowY === 'auto' || cs.overflowY === 'scroll' || cs.overflowX === 'auto' || cs.overflowX === 'scroll')) {
+                        hasScrollContainer = true;
+                        break;
+                    }
+                }
+            }
+            const hasInteractiveDom = !!(root && root.querySelector('details, button, input, select, textarea, form, a[href]'));
+            let detected = 'STATIC';
+            if (panelSendBridgeCalled) {
+                detected = 'SEND';
+            } else if (hasScrollContainer) {
+                detected = 'BIG';
+            } else if (hasInteractiveDom || panelUserListenerCount > 0) {
+                detected = 'LIGHT';
+            } else if (animations > 0 || panelRafCount > 0 || panelIntervals.size > 0) {
+                detected = 'ANIMATED';
+            }
+            if (window.RikkaPanel && typeof RikkaPanel.onPanelClassProbed === 'function') {
+                RikkaPanel.onPanelClassProbed(contentHash | 0, detected);
+            }
+        } catch (_e) { /* noop */ }
+    };
+    window.__rikkaProbePanelClass = probePanelRuntimeClass;
+    // 阶段 4：冻结脱水（表单值 / details[open] / 滚动位置 / active 标记）与唤醒复水 + 点击补发
+    // 阶段 4 修复：给同类元素打稳定 id，替代裸 index（脚本异步执行导致 DOM 顺序变化时 index 会错位）。
+    const DEHYDRATE_ID_ATTR = 'data-rikka-dehydrate-id';
+    const stampDehydrateIds = (scope) => {
+        try {
+            const groups = ['details', 'input', 'textarea', 'select'];
+            groups.forEach((sel) => {
+                const els = scope.querySelectorAll(sel);
+                for (let i = 0; i < els.length; i++) {
+                    const el = els[i];
+                    if (!el.getAttribute(DEHYDRATE_ID_ATTR)) {
+                        el.setAttribute(DEHYDRATE_ID_ATTR, sel + ':' + i);
+                    }
+                }
+            });
+            // 滚动容器与 active 元素用结构路径指纹
+            const allEls = scope.querySelectorAll('*');
+            const limit = Math.min(allEls.length, 300);
+            for (let i = 0; i < limit; i++) {
+                const el = allEls[i];
+                if (!el.getAttribute(DEHYDRATE_ID_ATTR)) {
+                    const tag = (el.tagName || '').toLowerCase();
+                    const cls = (el.className && typeof el.className === 'string') ? el.className.split(/\\s+/)[0] : '';
+                    el.setAttribute(DEHYDRATE_ID_ATTR, 'n:' + tag + (cls ? '.' + cls : '') + ':' + i);
+                }
+            }
+        } catch (_e) { /* noop */ }
+    };
+    window.__rikkaDehydratePanel = () => {
+        try {
+            const scope = root || document.body;
+            stampDehydrateIds(scope);
+            const did = (el) => el.getAttribute(DEHYDRATE_ID_ATTR) || '';
+            const details = Array.from(scope.querySelectorAll('details')).map((d, idx) => ({ idx, id: did(d), open: !!d.open }));
+            const inputs = Array.from(scope.querySelectorAll('input, textarea, select')).map((el, idx) => {
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'select') return { idx, id: did(el), tag, selectedIndex: el.selectedIndex, value: el.value };
+                if (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) {
+                    return { idx, id: did(el), tag, type: el.type, checked: !!el.checked };
+                }
+                return { idx, id: did(el), tag, value: el.value || '' };
+            });
+            const scrolls = [];
+            const allEls = scope.querySelectorAll('*');
+            const limit = Math.min(allEls.length, 300);
+            for (let i = 0; i < limit; i++) {
+                const el = allEls[i];
+                if (el.scrollTop > 0 || el.scrollLeft > 0) {
+                    scrolls.push({ idx: i, id: did(el), top: el.scrollTop | 0, left: el.scrollLeft | 0 });
+                }
+            }
+            const actives = [];
+            for (let i = 0; i < limit; i++) {
+                const el = allEls[i];
+                if ((el.classList && el.classList.contains('active')) ||
+                    el.getAttribute('aria-selected') === 'true' ||
+                    el.getAttribute('data-active') === 'true') {
+                    actives.push({ idx: i, id: did(el) });
+                }
+            }
+            const state = { details, inputs, scrolls, actives };
+            const exportedHtml = scope ? scope.innerHTML : (document.documentElement ? document.documentElement.outerHTML : '');
+            return JSON.stringify({ state, html: exportedHtml });
+        } catch (_e) {
+            return '';
+        }
+    };
+    window.__rikkaHydrateState = (stateJson) => {
+        try {
+            if (!stateJson) return false;
+            const state = (typeof stateJson === 'string') ? JSON.parse(stateJson) : stateJson;
+            if (!state || typeof state !== 'object') return false;
+            const scope = root || document.body;
+            // 优先按稳定 id 解析，失败再回退到 index（兼容旧版已保存的状态）。
+            const byId = (sel, id, fallbackIdx, list) => {
+                try {
+                    if (id) {
+                        const esc = (window.CSS && CSS.escape) ? CSS.escape(id) : String(id).replace(/"/g, '\\"');
+                        const hit = scope.querySelector('[' + DEHYDRATE_ID_ATTR + '="' + esc + '"]');
+                        if (hit) return hit;
+                    }
+                } catch (_e) { /* noop */ }
+                return (list && typeof fallbackIdx === 'number') ? list[fallbackIdx] : null;
+            };
+            if (Array.isArray(state.details)) {
+                const dEls = scope.querySelectorAll('details');
+                state.details.forEach((item, i) => {
+                    const open = (typeof item === 'object' && item !== null) ? !!item.open : !!item;
+                    const id = (typeof item === 'object' && item !== null) ? item.id : '';
+                    const idx = (typeof item === 'object' && item !== null) ? item.idx : i;
+                    const el = byId('details', id, idx, dEls);
+                    if (el) el.open = open;
+                });
+            }
+            if (Array.isArray(state.inputs)) {
+                const fEls = scope.querySelectorAll('input, textarea, select');
+                state.inputs.forEach((item) => {
+                    const el = byId('field', item.id, item.idx, fEls);
+                    if (!el) return;
+                    if (item.tag === 'select') {
+                        if (typeof item.selectedIndex === 'number') el.selectedIndex = item.selectedIndex;
+                        if (typeof item.value === 'string') el.value = item.value;
+                    } else if (item.type === 'checkbox' || item.type === 'radio') {
+                        el.checked = !!item.checked;
+                    } else if (typeof item.value === 'string') {
+                        el.value = item.value;
+                    }
+                });
+            }
+            const allEls = scope.querySelectorAll('*');
+            if (Array.isArray(state.actives)) {
+                state.actives.forEach((item, i) => {
+                    const idx = (typeof item === 'object' && item !== null) ? item.idx : item;
+                    const id = (typeof item === 'object' && item !== null) ? item.id : '';
+                    const el = byId('active', id, (typeof idx === 'number' ? idx : i), allEls);
+                    if (!el) return;
+                    if (el.classList) el.classList.add('active');
+                    if (el.hasAttribute('aria-selected')) el.setAttribute('aria-selected', 'true');
+                });
+            }
+            if (Array.isArray(state.scrolls)) {
+                state.scrolls.forEach((s) => {
+                    const el = byId('scroll', s.id, s.idx, allEls);
+                    if (!el) return;
+                    el.scrollTop = s.top || 0;
+                    el.scrollLeft = s.left || 0;
+                });
+            }
+            report();
+            return true;
+        } catch (_e) {
+            return false;
+        }
+    };
+    window.__rikkaReplayClick = (xCss, yCss) => {
+        try {
+            const el = document.elementFromPoint(Number(xCss) || 0, Number(yCss) || 0);
+            if (!el) return false;
+            if (typeof el.click === 'function') {
+                el.click();
+            } else {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: Number(xCss) || 0, clientY: Number(yCss) || 0 }));
+            }
+            scheduleDynamicReport();
+            return true;
+        } catch (_e) {
+            return false;
+        }
+    };
     const runScripts = async (container) => {
         // 消息挂载时页面早已 loaded：r0 类「DOMContentLoaded 后初始化」的脚本原生监听
         // 不会再触发，导致表单点不动。这里做补偿式补丁：已加载状态下注册的
@@ -6311,6 +6560,240 @@ function installPanelMode() {
             } catch (_e) { /* noop */ }
         }
 
+    // 纵向内部滚动手势增强（边界处交还外层）
+    (function(){ try {
+        (function(){
+          'use strict';
+          if (window.__rikkaVScrollInstalled) return;
+          window.__rikkaVScrollInstalled = true;
+
+          function findVScrollable(el) {
+            var node = el;
+            while (node && node !== document.body && node !== document.documentElement) {
+              try {
+                var cs = getComputedStyle(node);
+                var oy = cs.overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight + 2) return node;
+              } catch (e) {}
+              node = node.parentElement;
+            }
+            return null;
+          }
+
+          function canScrollFurther(el, deltaY) {
+            if (!el) return false;
+            if (deltaY > 0) return el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+            return el.scrollTop > 1;
+          }
+
+          function attach(el) {
+            if (!el || el.__rikkaVDragBound) return;
+            el.__rikkaVDragBound = true;
+
+            var startX = 0, startY = 0, lastY = 0, lastT = 0;
+            var velocity = 0, decided = false, dragging = false, rafId = 0, startScrollTop = 0;
+
+            function stopInertia() {
+              if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }
+            }
+
+            el.addEventListener('touchstart', function(ev) {
+              if (!ev.touches || ev.touches.length !== 1) return;
+              stopInertia();
+              startX = ev.touches[0].clientX;
+              startY = ev.touches[0].clientY;
+              lastY = startY; lastT = Date.now();
+              startScrollTop = el.scrollTop;
+              decided = false; dragging = false; velocity = 0;
+            }, { passive: true });
+
+            el.addEventListener('touchmove', function(ev) {
+              if (!ev.touches || ev.touches.length !== 1) return;
+              var x = ev.touches[0].clientX, y = ev.touches[0].clientY;
+              var dx = x - startX, dy = y - startY;
+
+              if (!decided) {
+                if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+                if (Math.abs(dy) > Math.abs(dx)) {
+                  decided = true;
+                  dragging = true;
+                } else {
+                  dragging = false;
+                  return;
+                }
+              }
+              if (!dragging) return;
+
+              // 到边界时：不 preventDefault（让外层接走），但保持 dragging，
+              // 否则一碰到边界就再也拖不动、松手也不会有惯性。
+              if (!canScrollFurther(el, -dy)) {
+                return;
+              }
+
+              try { ev.preventDefault(); } catch (e) {}
+              el.scrollTop = startScrollTop - dy;
+
+              var now = Date.now(), dt = now - lastT;
+              if (dt > 0) {
+                velocity = ((y - lastY)) / Math.max(dt, 8) * 16;
+                lastY = y; lastT = now;
+              }
+            }, { passive: false });
+
+            el.addEventListener('touchend', function() {
+              if (!dragging) return;
+              dragging = false;
+              if (Math.abs(velocity) <= 0.01) return;
+              (function tick() {
+                rafId = 0;
+                if (Math.abs(velocity) < 0.01) return;
+                var before = el.scrollTop;
+                el.scrollTop = before - velocity;
+                velocity *= 0.965;
+                if (el.scrollTop === before) { velocity = 0; return; }
+                rafId = requestAnimationFrame(tick);
+              })();
+            }, { passive: true });
+
+            el.addEventListener('touchcancel', function() {
+              stopInertia(); dragging = false; decided = false; velocity = 0;
+            }, { passive: true });
+          }
+
+          function bindAll() {
+            try {
+              var nodes = document.querySelectorAll('*');
+              for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                try {
+                  var cs = getComputedStyle(n);
+                  if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                      && n.scrollHeight > n.clientHeight + 2) {
+                    attach(n);
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          }
+          window.__rikkaBindVScroll = bindAll;
+          bindAll();
+          [120, 400, 900, 1600, 2600].forEach(function(ms) { setTimeout(bindAll, ms); });
+        })();
+    } catch (e) { /* noop */ } })();
+    // 横向滚动手势增强（虚拟长度 + 惯性，逐元素绑定）
+    (function(){ try {
+        (function(){
+          'use strict';
+          if (window.__rikkaHScrollInstalled) return;
+          window.__rikkaHScrollInstalled = true;
+
+          var VIRTUAL_MULTIPLIER = 2.2;
+          var FRICTION = 0.965;
+          var MIN_VELOCITY = 0.01;
+
+          function findHScrollable(el) {
+            var node = el;
+            while (node && node !== document.body && node !== document.documentElement) {
+              try {
+                var cs = getComputedStyle(node);
+                var ox = cs.overflowX;
+                if ((ox === 'auto' || ox === 'scroll') && node.scrollWidth > node.clientWidth + 2) return node;
+              } catch (e) {}
+              node = node.parentElement;
+            }
+            return null;
+          }
+
+          function attach(el) {
+            if (!el || el.__rikkaHDragBound) return;
+            el.__rikkaHDragBound = true;
+
+            var startX = 0, startY = 0, lastX = 0, lastT = 0;
+            var velocity = 0, decided = false, rafId = 0, startScrollLeft = 0, dragging = false;
+
+            function stopInertia() {
+              if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }
+            }
+
+            el.addEventListener('touchstart', function(ev) {
+              if (!ev.touches || ev.touches.length !== 1) return;
+              stopInertia();
+              startX = ev.touches[0].clientX;
+              startY = ev.touches[0].clientY;
+              lastX = startX; lastT = Date.now();
+              startScrollLeft = el.scrollLeft;
+              decided = false; dragging = false; velocity = 0;
+            }, { passive: true });
+
+            el.addEventListener('touchmove', function(ev) {
+              if (!ev.touches || ev.touches.length !== 1) return;
+              var x = ev.touches[0].clientX, y = ev.touches[0].clientY;
+              var dx = x - startX, dy = y - startY;
+
+              if (!decided) {
+                if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+                if (Math.abs(dx) >= Math.abs(dy) * 0.8) {
+                  decided = true; dragging = true;
+                } else {
+                  dragging = false;
+                  return;
+                }
+              }
+              if (!dragging) return;
+
+              try { ev.preventDefault(); } catch (e) {}
+              el.scrollLeft = startScrollLeft - dx * VIRTUAL_MULTIPLIER;
+
+              var now = Date.now(), dt = now - lastT;
+              if (dt > 0) {
+                velocity = ((x - lastX) * VIRTUAL_MULTIPLIER) / Math.max(dt, 8) * 16;
+                lastX = x; lastT = now;
+              }
+            }, { passive: false });
+
+            el.addEventListener('touchend', function() {
+              if (!dragging) return;
+              dragging = false;
+              if (Math.abs(velocity) <= MIN_VELOCITY) return;
+              (function tick() {
+                rafId = 0;
+                if (Math.abs(velocity) < MIN_VELOCITY) return;
+                var before = el.scrollLeft;
+                el.scrollLeft = before - velocity;
+                velocity *= FRICTION;
+                if (el.scrollLeft === before) { velocity = 0; return; }
+                rafId = requestAnimationFrame(tick);
+              })();
+            }, { passive: true });
+
+            el.addEventListener('touchcancel', function() {
+              stopInertia(); dragging = false; decided = false; velocity = 0;
+            }, { passive: true });
+          }
+
+          // 面板内容每次挂载后都要重新绑定（innerHTML 替换会丢掉旧监听）
+          function bindAll() {
+            try {
+              var nodes = document.querySelectorAll('*');
+              for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                try {
+                  var cs = getComputedStyle(n);
+                  if ((cs.overflowX === 'auto' || cs.overflowX === 'scroll')
+                      && n.scrollWidth > n.clientWidth + 2) {
+                    attach(n);
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          }
+          window.__rikkaBindHScroll = bindAll;
+
+          // 首帧 + 若干次延迟扫描（面板可能异步渲染）
+          bindAll();
+          [120, 400, 900, 1600, 2600].forEach(function(ms) { setTimeout(bindAll, ms); });
+        })();
+    } catch (e) { /* noop */ } })();
     window.__rikkaPanelMount = (html, tag) => {
         const t = tag || 'mount';
         if (t === 'mount' && window.__rikkaPanelMountedHtml === html) {
@@ -6337,6 +6820,14 @@ function installPanelMode() {
                     setTimeout(report, 120);
                     setTimeout(report, 600);
                     setTimeout(() => { waitPanelResourcesSettled(); }, 120);
+                    waitPanelRenderReady(window.__rikkaPanelMessageKey || '');
+                    setTimeout(() => {
+                        let h = 0;
+                        const s = String(html || '');
+                        for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+                        probePanelRuntimeClass(h);
+                    }, 350);
+                    try { if (window.__rikkaBindHScroll) window.__rikkaBindHScroll(); } catch (_e) {}
                     probe(t);
                     setTimeout(() => probe(t + '+1500'), 1500);
                     // [v218.1] recon-ext-compat §2.3：RENDERED 类事件由面板渲染完成后自发。
@@ -6423,6 +6914,59 @@ function installPanelMode() {
     window.clearInterval = function (id) {
         panelIntervals.delete(id);
         return origClearInterval(id);
+    };
+    // 阶段 6.1：离屏暂停 CSS 动画与 requestAnimationFrame（不触碰全局 pauseTimers）
+    let offscreenPaused = false;
+    const pausedRafQueue = [];
+    const origRaf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
+    if (origRaf && !window.__rikkaRafWrapped) {
+        window.__rikkaRafWrapped = true;
+        window.requestAnimationFrame = function (cb) {
+            panelRafCount++;
+            if (offscreenPaused) {
+                pausedRafQueue.push(cb);
+                return -pausedRafQueue.length;
+            }
+            return origRaf(cb);
+        };
+    }
+    window.__rikkaPauseOffscreen = () => {
+        try {
+            offscreenPaused = true;
+            if (!document.getElementById('rikka-offscreen-pause')) {
+                const st = document.createElement('style');
+                st.id = 'rikka-offscreen-pause';
+                st.textContent = '*,*::before,*::after{animation-play-state:paused !important;transition:none !important;}';
+                (document.head || document.documentElement).appendChild(st);
+            }
+        } catch (_e) { /* noop */ }
+    };
+    window.__rikkaResumeOffscreen = () => {
+        try {
+            offscreenPaused = false;
+            const st = document.getElementById('rikka-offscreen-pause');
+            if (st && st.parentNode) st.parentNode.removeChild(st);
+            if (origRaf && pausedRafQueue.length > 0) {
+                const pending = pausedRafQueue.splice(0, pausedRafQueue.length);
+                pending.forEach((cb) => { try { origRaf(cb); } catch (_e2) {} });
+            }
+        } catch (_e) { /* noop */ }
+    };
+    // 阶段 6.3：GPU 减负（可选开关，关闭 backdrop-filter / box-shadow / text-shadow / filter）
+    window.__rikkaSetGpuReduction = (enabled) => {
+        try {
+            const existing = document.getElementById('rikka-gpu-reduction');
+            if (enabled) {
+                if (!existing) {
+                    const st = document.createElement('style');
+                    st.id = 'rikka-gpu-reduction';
+                    st.textContent = '*,*::before,*::after{backdrop-filter:none !important;-webkit-backdrop-filter:none !important;box-shadow:none !important;text-shadow:none !important;filter:none !important;}';
+                    (document.head || document.documentElement).appendChild(st);
+                }
+            } else if (existing && existing.parentNode) {
+                existing.parentNode.removeChild(existing);
+            }
+        } catch (_e) { /* noop */ }
     };
     window.__rikkaQuiescePanel = () => {
         try {

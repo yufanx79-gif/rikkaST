@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.data.st.runtime
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -21,6 +23,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -81,6 +85,12 @@ object TavernResourceRoute {
 
     @Volatile
     var mode: ResourceNetworkMode = ResourceNetworkMode.AUTO
+
+    /** 阶段 6.4：可选大图降采样（默认关闭；仅对缓存命中的超大静态位图限制宽度，避免影响 GIF/SVG）。 */
+    @Volatile
+    var downsampleLargeImages: Boolean = false
+
+    private const val MAX_DOWNSAMPLE_WIDTH_PX = 1280
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val downloadSemaphore = Semaphore(2)
@@ -457,6 +467,43 @@ object TavernResourceRoute {
     }
 
     private fun responseFor(resource: CachedResource): WebResourceResponse? = runCatching {
+        if (downsampleLargeImages &&
+            (resource.mime == "image/png" || resource.mime == "image/jpeg" || resource.mime == "image/webp")
+        ) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(resource.file.absolutePath, bounds)
+            if (bounds.outWidth > MAX_DOWNSAMPLE_WIDTH_PX) {
+                var sample = 1
+                while (bounds.outWidth / (sample * 2) >= MAX_DOWNSAMPLE_WIDTH_PX) {
+                    sample *= 2
+                }
+                val bmp = BitmapFactory.decodeFile(
+                    resource.file.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sample },
+                )
+                if (bmp != null) {
+                    val out = ByteArrayOutputStream()
+                    val usePng = resource.mime == "image/png"
+                    val fmt = if (usePng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                    bmp.compress(fmt, 88, out)
+                    bmp.recycle()
+                    val bytes = out.toByteArray()
+                    val outMime = if (usePng) "image/png" else "image/jpeg"
+                    return@runCatching WebResourceResponse(
+                        outMime,
+                        null,
+                        200,
+                        "OK",
+                        linkedMapOf(
+                            "Access-Control-Allow-Origin" to "*",
+                            "Cache-Control" to "public, max-age=86400",
+                            "Content-Length" to bytes.size.toString(),
+                        ),
+                        ByteArrayInputStream(bytes),
+                    )
+                }
+            }
+        }
         WebResourceResponse(
             resource.mime,
             null,

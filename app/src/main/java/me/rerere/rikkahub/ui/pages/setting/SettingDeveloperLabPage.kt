@@ -65,6 +65,7 @@ import me.rerere.rikkahub.ui.components.message.PanelSnapshotStore
 import me.rerere.rikkahub.ui.components.message.extractQuickPlainPreview
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.PageScaffold
+import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.utils.plus
 import org.json.JSONObject
@@ -201,6 +202,7 @@ fun SettingDeveloperLabPage(vm: SettingVM = koinViewModel()) {
     }
     val context = LocalContext.current
     val toaster = LocalToaster.current
+    val navController = LocalNavController.current
     val chatService = koinInject<ChatService>()
     val conversationRepo = koinInject<ConversationRepository>()
     val scope = rememberCoroutineScope()
@@ -308,6 +310,11 @@ fun SettingDeveloperLabPage(vm: SettingVM = koinViewModel()) {
                                     TextButton(onClick = { runAllP0() }, enabled = !batchRunning) {
                                         Text(if (batchRunning) "运行中…" else "运行全部 P0")
                                     }
+                                    TextButton(
+                                        onClick = {
+                                            runCatching { navController.navigate(me.rerere.rikkahub.Screen.DebugPanelLab) }
+                                        },
+                                    ) { Text("面板实验室") }
                                     TextButton(
                                         onClick = {
                                             val file = runner.exportReport(reportText)
@@ -850,7 +857,8 @@ private class DevLabRunner(
         val pass = totalMb <= 512 && snapshots <= 12
         val report = buildString {
             appendLine("host=${if (TavernRuntimeManager.isStarted) 1 else 0} aux=${TavernRuntimeManager.auxWebViewCount()}")
-            appendLine("activePanelPool=$active detachedPanelCache=$detached")
+            val poolStats = ActivePanelWebViewPool.stats()
+            appendLine("activePanelPool=$active/${poolStats.lastLimit} peak=${poolStats.peakActiveCount} evictions=${poolStats.evictionCount} renderProcessGone=${poolStats.renderProcessGoneCount} detachedPanelCache=$detached")
             appendLine("snapshots=$snapshots bytes=${formatBytes(snapshotBytes)}")
             appendLine("imageCache=$cacheCount bytes=${formatBytes(cacheBytes)}")
             appendLine("estimatedTotal≈${totalMb}MB budget=512MB")

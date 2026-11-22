@@ -1310,6 +1310,16 @@ data class DisplaySetting(
     val voiceModeListenWhileReplying: Boolean = false,
     val enableWebViewPerfReduction: Boolean = false,
     val webViewPerfMode: WebViewPerfMode = WebViewPerfMode.HIBERNATE_POOL,
+    /** 0 = 自动按设备内存分级（<=6GB:4, 8GB:8, >=12GB:16）；1..16 = 手动覆盖活跃 WebView 上限。 */
+    val webViewMaxActiveOverride: Int = 0,
+    /** 阶段 6.1：离屏时暂停该面板的 CSS 动画与 requestAnimationFrame（不调用全局 pauseTimers）。 */
+    val enableWebViewOffscreenPause: Boolean = true,
+    /** 阶段 6.2：聊天列表快速滑动期间延后挂载新 WebView，停止 150ms 后恢复。 */
+    val enableWebViewScrollDefer: Boolean = true,
+    /** 阶段 6.3：GPU 减负（禁用 backdrop-filter / box-shadow / text-shadow / filter，默认关闭）。 */
+    val enableWebViewGpuReduction: Boolean = false,
+    /** 阶段 6.4：大图降采样（限制超大静态立绘解码宽度，默认关闭）。 */
+    val enableWebViewImageDownsample: Boolean = false,
     val resourceNetworkMode: ResourceFetchMode = ResourceFetchMode.AUTO,
 )
 

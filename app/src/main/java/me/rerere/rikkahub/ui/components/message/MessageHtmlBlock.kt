@@ -3,6 +3,7 @@ package me.rerere.rikkahub.ui.components.message
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -15,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
@@ -36,6 +38,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
@@ -56,16 +59,23 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -76,6 +86,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -94,6 +106,8 @@ import org.json.JSONObject
 
 private const val MAX_PANEL_CRASH_REBUILDS = 5
 private const val GPU_SOFTWARE_LAYER_THRESHOLD_PX = 14_000
+// 分块截图允许的物理高度上限（超过则放弃快照并保持保活）。
+private const val MAX_TILE_CAPTURE_HEIGHT_PX = 32_768
 
 /**
  * 混排消息分片：将小说 Markdown 正文与内嵌 HTML 交互面板解耦，
@@ -426,12 +440,41 @@ sealed interface PanelLoadStage {
  */
 internal object TavernPanelLoadScheduler {
     const val HOST_READY_WAIT_MAX_MS = 800L
-    const val SINGLE_PANEL_TIMEOUT_MS = 2500L
+    /**
+     * 单面板占用渲染槽位的超时。
+     *
+     * 语义：等待该面板「首次上报高度」(markDone)，之后立刻轮转给队列下一项。
+     * 原值 2500ms 对重型角色卡够用，但一个卡死面板会把后续全部堵满 2.5 秒，
+     * 连续滑过多个楼层时表现为"一直转圈"。
+     *
+     * 因此拆成两档：普通内容 1200ms 让位更积极；BIG（角色卡大面板）保留 2500ms 的容错。
+     */
+    const val SINGLE_PANEL_TIMEOUT_MS = 1200L
+    const val SINGLE_PANEL_TIMEOUT_HEAVY_MS = 2500L
     const val INTER_PANEL_COOLDOWN_MS = 60L
+
+    /**
+     * 待加载队列上限。
+     *
+     * 背景：加载是严格串行的（同一时刻只允许 1 个面板），每面板最长占 2.5s 超时窗口。
+     * 快速滑过 10 个楼层时若全部入队，最坏要排队 25 秒 —— 用户看到的就是「一直加载」。
+     * 但排太久的楼层在真正轮到它时用户早已滑走，加载它纯属浪费。
+     * 因此限制队列长度，超出的请求直接放行（不加载），由快照/占位卡片兜底。
+     */
+    // 队列上限：真机实测 3 太小 —— 正常滚动时可见楼层就可能同时 4~5 个，
+    // 被丢弃的请求会一直停在"正在排队加载"的占位卡片上，观感比慢更差。
+    // 放宽到 6，仍能在快速滑动时抑制无限排队。
+    const val MAX_PENDING_QUEUE = 6
+    const val SCROLL_SETTLE_DELAY_MS = 150L
 
     data class QueueRequest(
         val key: String,
         val title: String,
+        /** 重型面板（如角色卡大面板）给更宽松的槽位超时。 */
+        val heavy: Boolean = false,
+        /** 是否因队列超长被丢弃（丢弃后应短暂等待再重排，而不是假装已获槽位）。 */
+        @Volatile
+        var dropped: Boolean = false,
         val gate: CompletableDeferred<Unit> = CompletableDeferred(),
         val done: CompletableDeferred<Unit> = CompletableDeferred(),
     )
@@ -451,7 +494,28 @@ internal object TavernPanelLoadScheduler {
     @Volatile
     var cooldownMsOverride: Long? = null
 
-    fun enqueue(key: String, title: String, prioritize: Boolean = false): QueueRequest {
+    @Volatile
+    var scrollDeferEnabled: Boolean = true
+
+    @Volatile
+    private var lastScrollStoppedAtMs: Long = 0L
+
+    private val _isListScrollingFlow = MutableStateFlow(false)
+    val isListScrollingFlow: StateFlow<Boolean> = _isListScrollingFlow.asStateFlow()
+
+    fun setListScrolling(scrolling: Boolean) {
+        if (!scrolling && _isListScrollingFlow.value) {
+            lastScrollStoppedAtMs = runCatching { android.os.SystemClock.uptimeMillis() }.getOrDefault(0L)
+        }
+        _isListScrollingFlow.value = scrolling
+    }
+
+    fun enqueue(
+        key: String,
+        title: String,
+        prioritize: Boolean = false,
+        heavy: Boolean = false,
+    ): QueueRequest {
         val req: QueueRequest
         synchronized(lock) {
             val active = activeRequest
@@ -470,11 +534,27 @@ internal object TavernPanelLoadScheduler {
                 EnsurePumpLocked()
                 return existing
             }
-            req = QueueRequest(key = key, title = title)
+            req = QueueRequest(key = key, title = title, heavy = heavy)
             if (prioritize) {
                 pendingQueue.addFirst(req)
             } else {
                 pendingQueue.addLast(req)
+            }
+            // 队列超长时丢弃队尾（最老、最可能已被用户滑过）的请求。
+            // 被丢弃者直接放行 gate/done，让调用方走占位或快照路径，不再干等。
+            while (pendingQueue.size > MAX_PENDING_QUEUE) {
+                val dropped = pendingQueue.removeAt(pendingQueue.size - 1)
+                if (dropped.key != key) {
+                    dropped.dropped = true
+                    dropped.gate.complete(Unit)
+                    dropped.done.complete(Unit)
+                    runCatching {
+                        TavernRuntimeManager.appendLog(
+                            "debug",
+                            "[panel-queue] dropped tail key=${dropped.key} (queue=${pendingQueue.size}/$MAX_PENDING_QUEUE)",
+                        )
+                    }
+                }
             }
             publishSnapshotLocked()
             EnsurePumpLocked()
@@ -515,6 +595,8 @@ internal object TavernPanelLoadScheduler {
     }
 
     internal fun resetForTest() {
+        _isListScrollingFlow.value = false
+        lastScrollStoppedAtMs = 0L
         synchronized(lock) {
             pumpJob?.cancel()
             pumpJob = null
@@ -548,6 +630,20 @@ internal object TavernPanelLoadScheduler {
         }
 
         while (true) {
+            // 阶段 6.2：列表快速滑动期间延后挂载新 WebView，停止滚动 150ms 后再放行
+            if (scrollDeferEnabled) {
+                while (_isListScrollingFlow.value) {
+                    delay(50L)
+                }
+                val stoppedAt = lastScrollStoppedAtMs
+                if (stoppedAt > 0L) {
+                    val now = runCatching { android.os.SystemClock.uptimeMillis() }.getOrDefault(0L)
+                    val remaining = SCROLL_SETTLE_DELAY_MS - (now - stoppedAt)
+                    if (remaining > 0L && remaining <= SCROLL_SETTLE_DELAY_MS) {
+                        delay(remaining)
+                    }
+                }
+            }
             var sendGuardWaited = 0L
             while (TavernRuntimeManager.isSendOrHookInFlight && sendGuardWaited < 3500L) {
                 delay(60L)
@@ -568,7 +664,8 @@ internal object TavernPanelLoadScheduler {
 
             next.gate.complete(Unit)
 
-            withTimeoutOrNull(SINGLE_PANEL_TIMEOUT_MS) {
+            val slotTimeout = if (next.heavy) SINGLE_PANEL_TIMEOUT_HEAVY_MS else SINGLE_PANEL_TIMEOUT_MS
+            withTimeoutOrNull(slotTimeout) {
                 next.done.await()
             }
 
@@ -594,8 +691,24 @@ internal object TavernPanelLoadScheduler {
  * - 本池将同时存活的面板 WebView 严格限制在 [MAX_ACTIVE_PANEL_WEBVIEWS]（默认 3 个）以内；
  * - 当第 4 个新面板挂载时，自动淘汰最早挂载的历史面板 WebView。
  */
+/**
+ * 面板活跃池淘汰优先级（数值越大越不容易被淘汰）：
+ * 1. [INTERACTING] 正在被触摸/操作：不淘汰
+ * 2. [LATEST_FLOOR] 最新一楼：不淘汰
+ * 3. [VISIBLE] 屏幕内可见：不淘汰
+ * 4. [ADJACENT_OFFSCREEN] 屏幕外相邻
+ * 5. [BACKGROUND] 其余历史楼层
+ */
+internal enum class PanelPoolPriority(val rank: Int) {
+    BACKGROUND(0),
+    ADJACENT_OFFSCREEN(1),
+    VISIBLE(2),
+    LATEST_FLOOR(3),
+    INTERACTING(4),
+}
+
 internal object ActivePanelWebViewPool {
-    // 保留原有公开预算常量（既有回归测试依赖它们）；实际运行使用下方更保守的 runtime 预算。
+    // 保留原有公开预算常量（既有回归测试依赖它们）；实际运行使用内存分级或手动覆盖预算。
     const val MAX_ACTIVE_PANEL_WEBVIEWS = 3
     const val LIVE_QUIESCENT_MAX_ACTIVE_WEBVIEWS = 4
     const val DEFAULT_SAFE_MAX_ACTIVE_WEBVIEWS = 6
@@ -603,31 +716,175 @@ internal object ActivePanelWebViewPool {
     const val RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS = 3
     const val RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS = 2
     const val RUNTIME_LIVE_MAX_ACTIVE_WEBVIEWS = 3
+
+    // 阶段 1 新增常量：硬上限 16，按设备总内存分级（初值，待真机实测微调）
+    const val HARD_MAX_ACTIVE_WEBVIEWS = 16
+    const val DEFAULT_TARGET_ACTIVE_WEBVIEWS = 8
+    const val MEM_TIER_HIGH_LIMIT = 16
+    const val MEM_TIER_MID_LIMIT = 8
+    const val MEM_TIER_LOW_LIMIT = 4
+    const val MEM_TIER_HIGH_THRESHOLD_BYTES = 10_500_000_000L
+    const val MEM_TIER_MID_THRESHOLD_BYTES = 6_800_000_000L
+
+    @Volatile
+    private var cachedTotalMemBytes: Long = -1L
+
+    fun detectDeviceTotalMemBytes(context: Context): Long {
+        val cached = cachedTotalMemBytes
+        if (cached > 0L) return cached
+        val detected = runCatching {
+            val am = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val info = ActivityManager.MemoryInfo()
+            am?.getMemoryInfo(info)
+            info.totalMem
+        }.getOrDefault(0L)
+        if (detected > 0L) {
+            cachedTotalMemBytes = detected
+        }
+        return detected
+    }
+
+    fun resolveMemoryTierMaxActive(totalMemBytes: Long, userOverride: Int = 0): Int {
+        if (userOverride > 0) {
+            return userOverride.coerceIn(1, HARD_MAX_ACTIVE_WEBVIEWS)
+        }
+        return when {
+            totalMemBytes >= MEM_TIER_HIGH_THRESHOLD_BYTES -> MEM_TIER_HIGH_LIMIT
+            totalMemBytes >= MEM_TIER_MID_THRESHOLD_BYTES -> MEM_TIER_MID_LIMIT
+            else -> MEM_TIER_LOW_LIMIT
+        }
+    }
+
+    fun resolveEffectiveMaxActive(
+        totalMemBytes: Long,
+        perfEnabled: Boolean,
+        perfMode: WebViewPerfMode,
+        userOverride: Int = 0,
+    ): Int {
+        if (userOverride > 0) {
+            return userOverride.coerceIn(1, HARD_MAX_ACTIVE_WEBVIEWS)
+        }
+        val tierLimit = resolveMemoryTierMaxActive(totalMemBytes, 0)
+        // 方案一（HIBERNATE_POOL，默认模式）此前被 RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS(=2) 硬压，
+        // 导致内存分级对它完全无效 —— 12GB 机器也只有 2 个活跃面板，达不到计划第 4 节「默认 6~8 个」。
+        // 现改为：方案一同样接受内存分级上限；仅在低内存档（4 个）时再收紧到 2，保住小内存机的安全边际。
+        return when {
+            perfEnabled && perfMode == WebViewPerfMode.HIBERNATE_POOL ->
+                if (tierLimit <= MEM_TIER_LOW_LIMIT) {
+                    minOf(tierLimit, RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS)
+                } else {
+                    tierLimit
+                }
+            else -> tierLimit
+        }
+    }
+    data class PoolStats(
+        val activeCount: Int,
+        val peakActiveCount: Int,
+        val evictionCount: Long,
+        val renderProcessGoneCount: Long,
+        val lastLimit: Int,
+    )
+
     private val lock = Any()
     private val lruKeys = java.util.LinkedHashSet<String>()
+    private val priorities = HashMap<String, PanelPoolPriority>()
     private val _activeKeysFlow = MutableStateFlow<Set<String>>(emptySet())
     val activeKeysFlow: StateFlow<Set<String>> = _activeKeysFlow.asStateFlow()
+    private var peakActiveCount: Int = 0
+    private var evictionCount: Long = 0L
+    private var renderProcessGoneCount: Long = 0L
+    private var lastLimit: Int = RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS
 
-    fun acquire(key: String, maxActive: Int = MAX_ACTIVE_PANEL_WEBVIEWS) {
-        val limit = maxActive.coerceAtLeast(1)
+    fun stats(): PoolStats = synchronized(lock) {
+        PoolStats(
+            activeCount = lruKeys.size,
+            peakActiveCount = peakActiveCount,
+            evictionCount = evictionCount,
+            renderProcessGoneCount = renderProcessGoneCount,
+            lastLimit = lastLimit,
+        )
+    }
+
+    fun recordRenderProcessGone(key: String?, didCrash: Boolean, priority: Int) {
+        val snapshot = synchronized(lock) {
+            renderProcessGoneCount++
+            PoolStats(lruKeys.size, peakActiveCount, evictionCount, renderProcessGoneCount, lastLimit)
+        }
+        runCatching {
+            TavernRuntimeManager.appendLog(
+                "error",
+                "[panel-pool] renderProcessGone key=$key didCrash=$didCrash priority=$priority " +
+                    "active=${snapshot.activeCount}/${snapshot.lastLimit} peak=${snapshot.peakActiveCount} " +
+                    "evictions=${snapshot.evictionCount} goneCount=${snapshot.renderProcessGoneCount}",
+            )
+        }
+    }
+
+    fun acquire(
+        key: String,
+        maxActive: Int = MAX_ACTIVE_PANEL_WEBVIEWS,
+        priority: PanelPoolPriority = PanelPoolPriority.BACKGROUND,
+    ) {
+        val limit = maxActive.coerceIn(1, HARD_MAX_ACTIVE_WEBVIEWS)
         synchronized(lock) {
+            lastLimit = limit
             lruKeys.remove(key)
             lruKeys.add(key)
+            priorities[key] = priority
             while (lruKeys.size > limit) {
-                val oldest = lruKeys.iterator()
-                if (!oldest.hasNext()) break
-                val evicted = oldest.next()
-                oldest.remove()
-                DetachedPanelWebViewCache.evictAndDestroy(evicted)
+                val hardExceeded = lruKeys.size > HARD_MAX_ACTIVE_WEBVIEWS
+                var victim: String? = null
+                var victimRank = Int.MAX_VALUE
+                for (candidate in lruKeys) {
+                    if (candidate == key) continue
+                    val p = priorities[candidate] ?: PanelPoolPriority.BACKGROUND
+                    // 正常超限时跳过正在交互/最新楼/屏幕内可见的受保护面板；仅在突破硬上限 16 时强制回收最低优先级非交互面板
+                    if (!hardExceeded && p.rank >= PanelPoolPriority.VISIBLE.rank) continue
+                    if (hardExceeded && p == PanelPoolPriority.INTERACTING) continue
+                    if (p.rank < victimRank) {
+                        victimRank = p.rank
+                        victim = candidate
+                        if (victimRank == PanelPoolPriority.BACKGROUND.rank) break
+                    }
+                }
+                if (victim == null) break
+                lruKeys.remove(victim)
+                val evictedPriority = priorities.remove(victim) ?: PanelPoolPriority.BACKGROUND
+                evictionCount++
+                DetachedPanelWebViewCache.evictAndDestroy(victim)
                 runCatching {
                     TavernRuntimeManager.appendLog(
                         "info",
-                        "[panel-pool] evicted oldest panel WebView key=$evicted (active=${lruKeys.size}/$limit)",
+                        "[panel-pool] evicted panel WebView key=$victim priority=$evictedPriority " +
+                            "(active=${lruKeys.size}/$limit peak=$peakActiveCount evictions=$evictionCount gone=$renderProcessGoneCount)",
                     )
                 }
             }
+            if (lruKeys.size > peakActiveCount) {
+                peakActiveCount = lruKeys.size
+            }
             _activeKeysFlow.value = lruKeys.toSet()
+            runCatching {
+                TavernRuntimeManager.appendLog(
+                    "debug",
+                    "[panel-pool] acquire key=$key priority=$priority active=${lruKeys.size}/$limit " +
+                        "peak=$peakActiveCount evictions=$evictionCount gone=$renderProcessGoneCount",
+                )
+            }
         }
+    }
+
+    fun updatePriority(key: String, priority: PanelPoolPriority) {
+        synchronized(lock) {
+            if (key in lruKeys) {
+                priorities[key] = priority
+            }
+        }
+    }
+
+    fun priorityOf(key: String): PanelPoolPriority = synchronized(lock) {
+        priorities[key] ?: PanelPoolPriority.BACKGROUND
     }
 
     fun touch(key: String) {
@@ -642,6 +899,7 @@ internal object ActivePanelWebViewPool {
 
     fun release(key: String) {
         synchronized(lock) {
+            priorities.remove(key)
             if (lruKeys.remove(key)) {
                 _activeKeysFlow.value = lruKeys.toSet()
             }
@@ -653,12 +911,19 @@ internal object ActivePanelWebViewPool {
     fun clearAll() {
         synchronized(lock) {
             lruKeys.clear()
+            priorities.clear()
             _activeKeysFlow.value = emptySet()
         }
         DetachedPanelWebViewCache.clearAll()
     }
 
     internal fun resetForTest() {
+        synchronized(lock) {
+            peakActiveCount = 0
+            evictionCount = 0L
+            renderProcessGoneCount = 0L
+            lastLimit = RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS
+        }
         clearAll()
     }
 }
@@ -671,7 +936,20 @@ internal object ActivePanelWebViewPool {
  *   0ms 原地恢复显示，彻底杜绝无谓的二次重渲染！
  */
 internal object DetachedPanelWebViewCache {
+    // 离屏保活上限。原值 2 太小：滚动时滑出屏幕的面板会立刻被挤出，
+    // 回到屏幕就退化成"已自动休眠"卡片（真机已复现）。
+    // 现按内存分级动态设定（见 detachedCapFor）。
     private const val MAX_DETACHED_WEBVIEWS = 2
+
+    /** 动态上限：高内存设备可保活更多离屏面板。 */
+    @Volatile
+    var dynamicMaxDetached: Int = 2
+
+    private fun effectiveMaxDetached(): Int =
+        dynamicMaxDetached.coerceIn(1, 8)
+
+    @Volatile
+    var offscreenPauseEnabled: Boolean = true
 
     internal class CachedPanelEntry(
         val key: String,
@@ -706,11 +984,11 @@ internal object DetachedPanelWebViewCache {
         runCatching {
             (entry.container.parent as? ViewGroup)?.removeView(entry.container)
         }
-        // 与 parkContainer 的 onPause() 配对恢复该面板自身的渲染。
+        // 与 parkContainer 的 onPause() 配对恢复该面板自身的渲染与动画/rAF。
         runCatching { entry.mountState.webView?.onResume() }
         runCatching {
             entry.mountState.webView?.evaluateJavascript(
-                "try{if(window.__rikkaPanelAwaitSettled)window.__rikkaPanelAwaitSettled();}catch(e){}",
+                "try{if(window.__rikkaResumeOffscreen)window.__rikkaResumeOffscreen();if(window.__rikkaPanelAwaitSettled)window.__rikkaPanelAwaitSettled();}catch(e){}",
                 null,
             )
         }
@@ -733,8 +1011,16 @@ internal object DetachedPanelWebViewCache {
             // 本工程从未调用 pauseTimers()/resumeTimers()，因此这里**不会**影响同进程其他
             // WebView（包括主运行时）的 setTimeout/Promise。
             // 曾被怀疑为「上游收不到请求」的根因，但该因果链与官方文档冲突，已排除。
+            if (offscreenPauseEnabled) {
+                runCatching {
+                    mountState.webView?.evaluateJavascript(
+                        "try{if(window.__rikkaPauseOffscreen)window.__rikkaPauseOffscreen();}catch(e){}",
+                        null,
+                    )
+                }
+            }
             runCatching { mountState.webView?.onPause() }
-            while (map.size > MAX_DETACHED_WEBVIEWS) {
+            while (map.size > effectiveMaxDetached()) {
                 val it = map.entries.iterator()
                 if (!it.hasNext()) break
                 val oldest = it.next().value
@@ -1030,6 +1316,112 @@ fun looksLikeHtmlFragment(text: String): Boolean {
 fun shouldRenderAsHtmlPanel(text: String): Boolean =
     looksLikeInteractiveHtml(text) || looksLikeHtmlFragment(text)
 
+/**
+ * 阶段 3：HTML 面板五类内容分级。
+ * - [STATIC] 静态美化：渲染一次 -> 快照 -> 永久释放 WebView
+ * - [ANIMATED] 动态展示：有动画/粒子但无交互；仅最新楼或可见焦点挂 WebView，历史楼显示快照
+ * - [LIGHT] 轻交互：展开收起、details、纯显示切换；旧楼冻结，点击唤醒
+ * - [SEND] 发送类：调用宿主桥发消息；仅最新楼存活，旧楼冻结
+ * - [BIG] 角色卡大面板：内部滚动容器/手势/复杂内部状态；仅最新楼存活，旧楼冻结，点击唤醒
+ */
+enum class PanelClass {
+    STATIC,
+    ANIMATED,
+    LIGHT,
+    SEND,
+    BIG,
+}
+
+private val PANEL_SEND_RE = Regex(
+    """(?:triggerSlash|RikkaBridge\s*\.\s*(?:send|trigger|emit)|sendMessage|sendTextMessage|createChatMessages|TavernHelper\s*\.\s*trigger|data-st-send|/send\s)""",
+    RegexOption.IGNORE_CASE,
+)
+private val PANEL_BIG_SCROLL_RE = Regex(
+    """(?:overflow(?:-[xy])?\s*:\s*(?:auto|scroll)|touchstart|touchmove|pointermove|scrollLeft|scrollTop|scrollIntoView|swiper|carousel)""",
+    RegexOption.IGNORE_CASE,
+)
+private val PANEL_LIGHT_INTERACT_RE = Regex(
+    """(?:<(?:details|button|input|select|textarea|form)\b|\son[a-z]{3,}\s*=|addEventListener\s*\(|:target\b|:checked\b|<a\s+[^>]*href\s*=)""",
+    RegexOption.IGNORE_CASE,
+)
+private val PANEL_ANIMATED_RE = Regex(
+    """(?:@keyframes\b|animation(?:-name)?\s*:|requestAnimationFrame\s*\(|setInterval\s*\(|<(?:canvas|video)\b|\.gif\b|particles|lottie)""",
+    RegexOption.IGNORE_CASE,
+)
+private val PANEL_BUTTON_TAG_RE = Regex("""<button\b""", RegexOption.IGNORE_CASE)
+private val PANEL_SCRIPT_TAG_RE = Regex("""<script[\s>]""", RegexOption.IGNORE_CASE)
+private val PANEL_STYLE_BLOCK_RE = Regex("""<style\b[^>]*>[\s\S]*?</style>""", RegexOption.IGNORE_CASE)
+private val PANEL_SCRIPT_BLOCK_RE = Regex("""<script\b[^>]*>[\s\S]*?</script>""", RegexOption.IGNORE_CASE)
+private val PANEL_HTML_TAG_RE = Regex("""<[^>]+>""")
+
+fun classifyPanelStatic(html: String): PanelClass {
+    val cleaned = if (html.contains("```")) NON_HTML_CODE_FENCE_RE.replace(html, "") else html
+    if (PANEL_SEND_RE.containsMatchIn(cleaned)) return PanelClass.SEND
+    val hasScript = PANEL_SCRIPT_TAG_RE.containsMatchIn(cleaned)
+    val buttonCount = PANEL_BUTTON_TAG_RE.findAll(cleaned).count()
+    if (PANEL_BIG_SCROLL_RE.containsMatchIn(cleaned) || (hasScript && buttonCount >= 5)) {
+        return PanelClass.BIG
+    }
+    if (PANEL_LIGHT_INTERACT_RE.containsMatchIn(cleaned)) return PanelClass.LIGHT
+    if (PANEL_ANIMATED_RE.containsMatchIn(cleaned) || hasScript) return PanelClass.ANIMATED
+    return PanelClass.STATIC
+}
+
+fun extractStaticPanelPlainText(html: String): String {
+    val withoutBlocks = PANEL_SCRIPT_BLOCK_RE.replace(PANEL_STYLE_BLOCK_RE.replace(html, " "), " ")
+    val stripped = PANEL_HTML_TAG_RE.replace(withoutBlocks, " ")
+    return stripped
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+}
+
+internal object PanelClassificationCache {
+    private const val MAX_ENTRIES = 256
+    private val map = java.util.LinkedHashMap<Int, PanelClass>(64, 0.75f, true)
+
+    fun getOrClassify(html: String): PanelClass {
+        val hash = html.hashCode()
+        synchronized(map) {
+            map[hash]?.let { return it }
+        }
+        val classified = classifyPanelStatic(html)
+        synchronized(map) {
+            map[hash] = classified
+            while (map.size > MAX_ENTRIES) {
+                val it = map.keys.iterator()
+                if (!it.hasNext()) break
+                it.next()
+                it.remove()
+            }
+        }
+        return classified
+    }
+
+    fun recordRuntimeClass(contentHash: Int, probed: PanelClass) {
+        synchronized(map) {
+            val existing = map[contentHash]
+            // 运行时探测只向更重类别升级，或修正静态漏判（例如动态脚本绑定了点击/滚动/发送）
+            val merged = when {
+                existing == null -> probed
+                probed.ordinal > existing.ordinal -> probed
+                else -> existing
+            }
+            map[contentHash] = merged
+        }
+    }
+
+    fun getCached(contentHash: Int): PanelClass? = synchronized(map) { map[contentHash] }
+
+    internal fun resetForTest() {
+        synchronized(map) { map.clear() }
+    }
+}
+
 
 /**
  * 计算 HTML 面板在 GPU 硬件加速纹理限制下的安全显示高度（dp）与是否启用内部滚动。
@@ -1062,15 +1454,39 @@ fun MessageHtmlBlock(
     val displaySetting = LocalSettings.current.displaySetting
     val perfEnabled = displaySetting.enableWebViewPerfReduction
     val perfMode = displaySetting.webViewPerfMode
+    val isListScrolling by TavernPanelLoadScheduler.isListScrollingFlow.collectAsState()
+    LaunchedEffect(
+        displaySetting.enableWebViewOffscreenPause,
+        displaySetting.enableWebViewScrollDefer,
+        displaySetting.enableWebViewImageDownsample,
+    ) {
+        DetachedPanelWebViewCache.offscreenPauseEnabled = displaySetting.enableWebViewOffscreenPause
+        TavernPanelLoadScheduler.scrollDeferEnabled = displaySetting.enableWebViewScrollDefer
+        TavernResourceRoute.downsampleLargeImages = displaySetting.enableWebViewImageDownsample
+    }
     val useBoundedWebViewPool = true
     val useHibernatePool = perfEnabled && perfMode == WebViewPerfMode.HIBERNATE_POOL
     val useLiveQuiescent = !perfEnabled || perfMode == WebViewPerfMode.LIVE_QUIESCENT
     val useHistoricalSnapshot = perfEnabled && perfMode == WebViewPerfMode.HISTORICAL_SNAPSHOT_IMAGE
-    val maxActivePoolSize = when {
-        !perfEnabled -> ActivePanelWebViewPool.RUNTIME_SAFE_MAX_ACTIVE_WEBVIEWS
-        useHibernatePool -> ActivePanelWebViewPool.RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS
-        useLiveQuiescent -> ActivePanelWebViewPool.RUNTIME_LIVE_MAX_ACTIVE_WEBVIEWS
-        else -> ActivePanelWebViewPool.RUNTIME_HIBERNATE_MAX_ACTIVE_WEBVIEWS
+    val totalMemBytes = remember(context) { ActivePanelWebViewPool.detectDeviceTotalMemBytes(context) }
+    val maxActivePoolSize = remember(totalMemBytes, perfEnabled, perfMode, displaySetting.webViewMaxActiveOverride) {
+        ActivePanelWebViewPool.resolveEffectiveMaxActive(
+            totalMemBytes = totalMemBytes,
+            perfEnabled = perfEnabled,
+            perfMode = perfMode,
+            userOverride = displaySetting.webViewMaxActiveOverride,
+        )
+    }
+    // 离屏保活上限跟随内存分级：至少 3，最多 6，且不超过活跃池本身。
+    // 否则滑出屏幕的面板会被立刻挤出，滚回来只能看到"已自动休眠"。
+    LaunchedEffect(maxActivePoolSize) {
+        DetachedPanelWebViewCache.dynamicMaxDetached =
+            (maxActivePoolSize / 2).coerceIn(3, 6).coerceAtMost(maxActivePoolSize)
+    }
+    val basePoolPriority = if (!isHistoricalFloor) {
+        PanelPoolPriority.LATEST_FLOOR
+    } else {
+        PanelPoolPriority.VISIBLE
     }
     val screenHeightDp = configuration.screenHeightDp.coerceAtLeast(480)
     val minHeightDp = 48
@@ -1084,6 +1500,10 @@ fun MessageHtmlBlock(
     val rendererGen by TavernRuntimeManager.rendererGeneration.collectAsState()
     var localCrashCount by remember(messageKey) { mutableIntStateOf(0) }
     val contentHash = remember(html) { html.hashCode() }
+    val panelClass = remember(contentHash) { PanelClassificationCache.getOrClassify(html) }
+    val staticPlainText = remember(contentHash, panelClass) {
+        if (panelClass == PanelClass.STATIC) extractStaticPanelPlainText(html) else ""
+    }
     val effectiveQueueKey = remember(messageKey, contentHash, localCrashCount) {
         "${messageKey ?: "anon"}#$contentHash#$localCrashCount"
     }
@@ -1092,6 +1512,16 @@ fun MessageHtmlBlock(
         val cached = PanelHeightCache.get(messageKey, contentHash)
         mutableIntStateOf(cached)
     }
+    val isPanelTouchingRef = remember(effectiveQueueKey) { AtomicBoolean(false) }
+    val deferredTouchHeightRef = remember(effectiveQueueKey) { java.util.concurrent.atomic.AtomicInteger(-1) }
+    // B 方案（最后手段）：BIG 类面板（角色卡大面板等）强制使用「固定视口高度」，
+    // 让 WebView 内部滚动成为一个独立滚动区，彻底绕开与外层 LazyColumn 的嵌套冲突。
+    // 依据：真机反复验证 requestDisallowIntercept / nestedScroll / pointerInteropFilter
+    // 都挡不住 LazyColumn 抢事件（gesture-probe 显示大量 ACTION_CANCEL）。
+    // 固定高度后，面板高度不再随内容/滚动变化，外层列表也不需要跟随，
+    // 用户手感上就是「面板内部独立滚动」。
+    val forceFixedViewport = panelClass == PanelClass.BIG
+
     val (computedHeightDp, computedScrollable) = computePanelHeightConstraint(
         rawContentHeightDp = heightDp,
         density = density.density,
@@ -1135,15 +1565,106 @@ fun MessageHtmlBlock(
         }
     }
 
-    val snapshotCompositeKey = remember(messageKey, contentHash) {
-        PanelSnapshotStore.compositeKey(messageKey, contentHash)
+    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    val containerWidthPx = (configuration.screenWidthDp * density.density).toInt().coerceAtLeast(1)
+    val effectiveFontScale = (density.fontScale * displaySetting.fontSizeRatio).coerceIn(0.5f, 3.0f)
+    val snapshotCompositeKey = remember(messageKey, contentHash, isDarkTheme, containerWidthPx, effectiveFontScale) {
+        PanelSnapshotStore.compositeKey(
+            messageKey = messageKey,
+            contentHash = contentHash,
+            isDarkTheme = isDarkTheme,
+            widthPx = containerWidthPx,
+            fontScale = effectiveFontScale,
+        )
     }
     var snapshotEntry by remember(snapshotCompositeKey) {
         mutableStateOf(PanelSnapshotStore.getMemory(snapshotCompositeKey))
     }
 
-    LaunchedEffect(snapshotCompositeKey, useHistoricalSnapshot) {
-        if (useHistoricalSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
+    // ---- 内容级快照缓存（跨楼层共享） ----
+    // 同一段 HTML 在多楼出现时（典型：发送按钮面板、状态栏），外观完全一致，
+    // 只需渲染一次。这里按「内容 + 主题 + 宽度 + 字号」寻址，key 里不含 messageKey。
+    val contentSnapshotKey = remember(contentHash, isDarkTheme, containerWidthPx, effectiveFontScale) {
+        PanelSnapshotStore.contentKey(
+            contentHash = contentHash,
+            isDarkTheme = isDarkTheme,
+            widthPx = containerWidthPx,
+            fontScale = effectiveFontScale,
+        )
+    }
+    var contentSnapshot by remember(contentSnapshotKey) {
+        mutableStateOf(PanelSnapshotStore.getMemory(contentSnapshotKey))
+    }
+    LaunchedEffect(contentSnapshotKey) {
+        if (contentSnapshot == null) {
+            contentSnapshot = PanelSnapshotStore.loadFromDiskIfNeeded(
+                context = context,
+                compositeKey = contentSnapshotKey,
+                fallbackHeightDp = 0,
+                density = density.density,
+            )
+        }
+    }
+
+    var userWokenUp by remember(effectiveQueueKey) { mutableStateOf(false) }
+    var pendingWakeClickCss by remember(effectiveQueueKey) { mutableStateOf<Pair<Float, Float>?>(null) }
+    var wakeStartedAtMs by remember(effectiveQueueKey) { mutableLongStateOf(0L) }
+    // 阶段 4 修复：唤醒时优先挂载「脚本执行后的真实 DOM 快照」(state_<key>.html)。
+    // 原先只把 exportedHtml 存盘从不回灌，导致脚本驱动面板（角色卡大面板 / MVU 状态栏）
+    // 重新渲染后回到初始态，再用裸 index 补水必然错位 -> 冻结状态等于白存。
+    var frozenExportHtml by remember(effectiveQueueKey) { mutableStateOf<String?>(null) }
+    LaunchedEffect(userWokenUp, snapshotCompositeKey) {
+        if (!userWokenUp || snapshotCompositeKey == null || frozenExportHtml != null) return@LaunchedEffect
+        val frozen = PanelFrozenStateStore.loadIfNeeded(context, snapshotCompositeKey)
+        if (frozen != null && frozen.exportedHtml.isNotBlank()) {
+            frozenExportHtml = frozen.exportedHtml
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[panel-wake] loaded frozen dom key=$effectiveQueueKey htmlLen=${frozen.exportedHtml.length}",
+            )
+        } else {
+            TavernRuntimeManager.appendLog(
+                "info",
+                "[panel-wake] no frozen dom, fallback to re-render key=$effectiveQueueKey",
+            )
+        }
+    }
+    val isInteractiveClass = panelClass == PanelClass.LIGHT || panelClass == PanelClass.SEND || panelClass == PanelClass.BIG
+    val canFreezeInteractiveHistorical = isInteractiveClass && isHistoricalFloor && !userWokenUp && !useHistoricalSnapshot
+
+    // 内容快照命中：同一段 HTML 之前渲染过（任意楼层），外观可直接复用。
+    // 但用户主动点开过（userWokenUp）或当前楼层需要现场动画时不走快照。
+    // 额外安全条件：快照必须是「有像素 + 比例合法」的图，否则宁可现场渲染，
+    // 避免出现「命中一张坏图 -> 整块面板空白」的回归。
+    // 暂时关闭「内容快照直接顶替渲染」的快速路径。
+    // 原因：真机验证发现内容级快照有可能捕获到未完成渲染的空图，
+    // 直接顶替会出现整块面板空白（比慢加载更糟）。
+    // 现只保留「捕获 + 落盘」能力（用于后续做正确的就绪判定后再启用）。
+    val contentSnapshotUsable = false && contentSnapshot != null && !userWokenUp
+
+    // 关键：任何「用快照顶替渲染」的路径都必须要求快照 ready=true。
+    // ready 只在 renderReady 之后捕获才为真；磁盘读回的旧图一律视为未就绪，
+    // 因此「每个面板必须先真实渲染一次，才有资格被快照复用」。
+    // 快照可用性 = 快照标记 ready（捕获时已渲染完成）
+    //               且 该内容已被登记为「至少真实渲染成功过一次」。
+    // 后者是用户提出的兜底规则：避免任何异常路径下用空白图顶替渲染。
+    val contentRenderedOnce = remember(contentSnapshotKey) {
+        PanelSnapshotStore.isRenderedOnce(contentSnapshotKey, context)
+    }
+    val hasUsableSnapshot = contentRenderedOnce &&
+        (snapshotEntry?.ready == true || contentSnapshot?.ready == true)
+
+    val shouldPreferSnapshot = hasUsableSnapshot && (
+        contentSnapshotUsable ||
+            (panelClass == PanelClass.STATIC) ||
+            (panelClass == PanelClass.ANIMATED && isHistoricalFloor && !userWokenUp) ||
+            (useHistoricalSnapshot && isHistoricalFloor) ||
+            canFreezeInteractiveHistorical ||
+            (displaySetting.enableWebViewScrollDefer && isListScrolling && !mountState.mounted)
+        )
+
+    LaunchedEffect(snapshotCompositeKey, shouldPreferSnapshot) {
+        if (shouldPreferSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
             val loaded = PanelSnapshotStore.loadFromDiskIfNeeded(
                 context = context,
                 compositeKey = snapshotCompositeKey,
@@ -1159,20 +1680,42 @@ fun MessageHtmlBlock(
         }
     }
 
-    // 方案三（历史楼层固化为图片）：
-    // 使用等比例缩放快照与 `.fillMaxWidth().aspectRatio(snap.aspectRatio)` 渲染，
-    // 100% 保持原面板真实宽高比，彻底杜绝长图被上下挤压导致人物脸部变形！
-    if (useHistoricalSnapshot && isHistoricalFloor && snapshotEntry != null) {
-        val snap = snapshotEntry!!
+    // 静态面板（STATIC）、历史动态展示（ANIMATED）、已冻结的历史交互面板或方案三历史楼层：
+    // 命中快照直接显示同宽高图片（高度不跳），交互类面板支持点击坐标唤醒并补发点击。
+    val preferEntry = (contentSnapshot?.takeIf { it.ready }) ?: snapshotEntry?.takeIf { it.ready }
+    if (shouldPreferSnapshot && preferEntry != null) {
+        val snap = preferEntry
         val safeAspectRatio = snap.aspectRatio.coerceIn(0.05f, 20f)
+        val allowTapWake = canFreezeInteractiveHistorical || (panelClass == PanelClass.ANIMATED && isHistoricalFloor)
         Image(
             bitmap = snap.imageBitmap,
-            contentDescription = panelTitle,
+            contentDescription = if (staticPlainText.isNotEmpty()) staticPlainText else panelTitle,
             contentScale = ContentScale.FillWidth,
             modifier = modifier
                 .fillMaxWidth()
                 .aspectRatio(safeAspectRatio)
-                .clip(RoundedCornerShape(8.dp)),
+                .clip(RoundedCornerShape(8.dp))
+                .then(
+                    if (allowTapWake) {
+                        Modifier.pointerInput(snapshotCompositeKey, effectiveQueueKey) {
+                            detectTapGestures { offset ->
+                                val xCss = offset.x / density.density.coerceAtLeast(1f)
+                                val yCss = offset.y / density.density.coerceAtLeast(1f)
+                                wakeStartedAtMs = android.os.SystemClock.uptimeMillis()
+                                pendingWakeClickCss = xCss to yCss
+                                userWokenUp = true
+                                ActivePanelWebViewPool.acquire(
+                                    key = effectiveQueueKey,
+                                    maxActive = maxActivePoolSize,
+                                    priority = PanelPoolPriority.INTERACTING,
+                                )
+                                TavernPanelLoadScheduler.enqueue(effectiveQueueKey, panelTitle, prioritize = true)
+                            }
+                        }
+                    } else {
+                        Modifier
+                    }
+                ),
         )
         return
     }
@@ -1181,20 +1724,45 @@ fun MessageHtmlBlock(
 
     LaunchedEffect(effectiveQueueKey, useBoundedWebViewPool, maxActivePoolSize) {
         if (!slotGranted) {
-            val req = TavernPanelLoadScheduler.enqueue(effectiveQueueKey, panelTitle, prioritize = false)
+            val req = TavernPanelLoadScheduler.enqueue(
+                effectiveQueueKey,
+                panelTitle,
+                prioritize = false,
+                // 角色卡大面板更容易在首帧耗时较长，给它更宽松的槽位超时。
+                heavy = panelClass == PanelClass.BIG,
+            )
             req.gate.await()
+            // 被队列挤掉的请求：给一小段退避后重排，而不是立刻假装"已拿到槽位"，
+            // 否则会停在"正在排队加载"的死状态（真机已复现）。
+            while (req.dropped && !mountState.isDisposed) {
+                req.dropped = false
+                delay(180L)
+                val retry = TavernPanelLoadScheduler.enqueue(
+                    effectiveQueueKey,
+                    panelTitle,
+                    prioritize = false,
+                    heavy = panelClass == PanelClass.BIG,
+                )
+                retry.gate.await()
+                if (!retry.dropped) break
+                req.dropped = retry.dropped
+            }
         }
         kotlinx.coroutines.currentCoroutineContext().let { ctx ->
             if (!ctx[Job]?.isActive.let { it ?: true } || mountState.isDisposed) return@LaunchedEffect
         }
         if (useBoundedWebViewPool) {
-            ActivePanelWebViewPool.acquire(effectiveQueueKey, maxActive = maxActivePoolSize)
+            ActivePanelWebViewPool.acquire(
+                key = effectiveQueueKey,
+                maxActive = maxActivePoolSize,
+                priority = basePoolPriority,
+            )
         }
         slotGranted = true
         if (!mountState.mounted) {
             stage = PanelLoadStage.LoadingWebView(panelTitle)
         } else {
-            stage = if (mountState.resourcesSettled) {
+            stage = if (mountState.resourcesSettled || mountState.renderReady) {
                 PanelLoadStage.Ready
             } else {
                 PanelLoadStage.ResourcesLoading(panelTitle)
@@ -1223,6 +1791,18 @@ fun MessageHtmlBlock(
         }
     }
 
+    LaunchedEffect(displaySetting.enableWebViewGpuReduction, mountState.mounted) {
+        if (mountState.mounted && !mountState.isDisposed) {
+            val enabled = displaySetting.enableWebViewGpuReduction
+            runCatching {
+                mountState.webView?.evaluateJavascript(
+                    "try{if(window.__rikkaSetGpuReduction)window.__rikkaSetGpuReduction($enabled);}catch(e){}",
+                    null,
+                )
+            }
+        }
+    }
+
     // 仅对真正拿到渲染槽位的面板预取外链图片，离屏/排队面板不抢网络。
     LaunchedEffect(slotGranted, contentHash) {
         if (slotGranted) {
@@ -1230,9 +1810,20 @@ fun MessageHtmlBlock(
         }
     }
 
+    // renderReady 一旦为真，立刻把 stage 推到 Ready —— 这是最可靠的"渲染完成"信号。
+    // 之前依赖 resources_settled 回调，回调丢失时 UI 会永远停在"正在加载"。
+    LaunchedEffect(mountState.renderReady) {
+        if (mountState.renderReady && stage !is PanelLoadStage.Ready) {
+            stage = PanelLoadStage.Ready
+        }
+    }
+
+    // 高度抖动抑制：真机观察到同一面板在 90/92dp 之间反复跳变，
+    // 每次跳变都会触发重组 -> stage 重算 -> UI 闪烁（"一直转"的直接成因）。
+    // 这里把 2dp 以内的抖动吸收掉，只有真实变化才更新。
     LaunchedEffect(mountState.mounted, mountState.resourcesSettled, mountState.resourcesTimedOut, heightDp) {
         if (mountState.mounted && heightDp > 0) {
-            stage = if (mountState.resourcesSettled) {
+            stage = if (mountState.resourcesSettled || mountState.renderReady) {
                 PanelLoadStage.Ready
             } else {
                 PanelLoadStage.ResourcesLoading(panelTitle)
@@ -1292,22 +1883,95 @@ fun MessageHtmlBlock(
     // 1. 始终在后台预捕获一张等比例高清快照存入 PanelSnapshotStore（无论当前处于方案一、二还是三），
     //    这样用户在偏好设置里切换到方案三时直接秒切静态图，完全无需重新渲染 WebView！
     // 2. 若开启方案二（全视觉保活+静默降频），自动静默后台轮询定时器。
-    LaunchedEffect(isPanelVisiblyReady, heightDp, mountState.resourcesSettled, useLiveQuiescent, useHistoricalSnapshot, isHistoricalFloor) {
+    // 阶段 4：唤醒就绪后先复水保存的 DOM 状态（防止脚本重跑重置状态），再补发点击坐标并记录唤醒耗时
+    LaunchedEffect(mountState.renderReady, userWokenUp, snapshotCompositeKey) {
+        if (!mountState.renderReady || mountState.isDisposed) return@LaunchedEffect
+        val wv = mountState.webView ?: return@LaunchedEffect
+        val frozen = PanelFrozenStateStore.loadIfNeeded(context, snapshotCompositeKey)
+        if (frozen != null && frozen.stateJson.isNotEmpty()) {
+            val quoted = JSONObject.quote(frozen.stateJson)
+            runCatching {
+                wv.evaluateJavascript(
+                    "try{if(window.__rikkaHydrateState)window.__rikkaHydrateState($quoted);}catch(e){}",
+                    null,
+                )
+            }
+        }
+        val tapCoords = pendingWakeClickCss
+        if (tapCoords != null) {
+            pendingWakeClickCss = null
+            val (xCss, yCss) = tapCoords
+            val elapsedMs = if (wakeStartedAtMs > 0L) {
+                (android.os.SystemClock.uptimeMillis() - wakeStartedAtMs).coerceAtLeast(0L)
+            } else 0L
+            // renderReady 后脚本可能仍在跑（尤其先 hydrate 再重排的面板），单次点击可能落空。
+            // 最多重试 3 次（间隔 120ms），命中即停；全部落空明确记 warn，不静默吞掉。
+            var clickHit = false
+            for (attempt in 0 until 3) {
+                if (attempt > 0) delay(120L)
+                if (mountState.isDisposed) break
+                val hit = suspendCoroutine<Boolean> { cont ->
+                    val resumed = java.util.concurrent.atomic.AtomicBoolean(false)
+                    runCatching {
+                        wv.evaluateJavascript(
+                            "try{String(!!(window.__rikkaReplayClick&&window.__rikkaReplayClick($xCss,$yCss)))}catch(e){\"false\"}",
+                        ) { result ->
+                            if (resumed.compareAndSet(false, true)) {
+                                cont.resume(result?.contains("true") == true)
+                            }
+                        }
+                    }.onFailure {
+                        if (resumed.compareAndSet(false, true)) {
+                            cont.resume(false)
+                        }
+                    }
+                }
+                if (hit) {
+                    clickHit = true
+                    break
+                }
+            }
+            TavernRuntimeManager.appendLog(
+                if (clickHit) "info" else "warn",
+                "[panel-wake] key=$effectiveQueueKey class=$panelClass elapsedMs=$elapsedMs " +
+                    "x=${xCss.toInt()} y=${yCss.toInt()} clickHit=$clickHit frozenDom=${frozenExportHtml != null}",
+            )
+        }
+    }
+
+    LaunchedEffect(isPanelVisiblyReady, heightDp, mountState.resourcesSettled, mountState.renderReady, useLiveQuiescent, useHistoricalSnapshot, isHistoricalFloor) {
         if (!isPanelVisiblyReady || heightDp <= 0) return@LaunchedEffect
         delay(420L)
         if (!mountState.isDisposed && mountState.mounted) {
-            if (useHistoricalSnapshot && mountState.resourcesSettled && snapshotEntry == null && snapshotCompositeKey != null) {
+            // 只认 renderReady（JS 明确报告「布局与资源都稳定了」）。
+            // 旧逻辑在 resourcesTimedOut 时也放行捕获 —— 真机上那正是空白帧的时段，
+            // 结果把空白图缓存下来并在下次顶替渲染，造成整块面板空白。
+            val readyForSnapshot = mountState.renderReady
+            // 捕获「内容级快照」（跨楼层共享）。注意：必须等 readyForSnapshot，
+            // 否则会抓到未完成渲染的空图 —— 真机上已因此出现过整块面板空白。
+            val shouldCaptureSnapshot = readyForSnapshot && snapshotEntry == null && snapshotCompositeKey != null
+            if (shouldCaptureSnapshot) {
                 val captured = PanelSnapshotStore.captureFromWebView(
                     context = context,
                     compositeKey = snapshotCompositeKey,
                     webView = mountState.webView,
                     heightDp = boundedHeightDp,
+                    // 只有 renderReady 之后捕获的帧才可信；否则标记未就绪，
+                    // 该快照不会被用来顶替渲染（避免把空白图固化下来）。
+                    renderReadyAtCapture = mountState.renderReady,
                 )
                 if (captured != null) {
                     snapshotEntry = captured
-                    if (isHistoricalFloor) {
-                        ActivePanelWebViewPool.release(effectiveQueueKey)
-                    }
+                    // 同时写入**内容级** key：同内容的其它楼层可立即复用，
+                    // 不必各自再排队渲染一遍。
+                    contentSnapshot = captured
+                    PanelSnapshotStore.putContentEntry(contentSnapshotKey, captured, context)
+                    // 登记「已成功真实渲染一次」，之后该内容的快照才允许复用。
+                    PanelSnapshotStore.markRenderedOnce(contentSnapshotKey, context)
+                    // 捕获后**不主动释放** WebView。
+                    // 真机反复验证：一旦释放，滚回来时该面板已不在活跃池，会退化成
+                    //「面板过多已自动休眠/唤醒面板」占位卡（用户明确反馈这是最糟的观感）。
+                    // 让淘汰完全交给池子的优先级 + LRU 自然处理即可。
                 }
             }
             if (useLiveQuiescent && (perfEnabled || isHistoricalFloor)) {
@@ -1324,14 +1988,44 @@ fun MessageHtmlBlock(
 
     Column(modifier = modifier.fillMaxWidth()) {
         if (isHibernated) {
-            PanelHibernatedPlaceholderCard(
-                panelTitle = panelTitle,
-                onWakeUp = {
-                    stage = PanelLoadStage.LoadingWebView(panelTitle)
-                    ActivePanelWebViewPool.acquire(effectiveQueueKey, maxActive = maxActivePoolSize)
-                },
-            )
-        } else if (!isPanelVisiblyReady) {
+            // 休眠时优先显示已缓存的外观图（有就显示，没有才用占位卡片），
+            // 这样用户在长列表里滚动时看到的仍然是真实面板外观，而不是一堆提示卡。
+            val hibernatedSnapshot = (contentSnapshot?.takeIf { it.ready }) ?: snapshotEntry?.takeIf { it.ready }
+            if (hibernatedSnapshot != null) {
+                val safeAspect = hibernatedSnapshot.aspectRatio.coerceIn(0.05f, 20f)
+                Image(
+                    bitmap = hibernatedSnapshot.imageBitmap,
+                    contentDescription = panelTitle,
+                    contentScale = ContentScale.FillWidth,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(safeAspect)
+                        .clip(RoundedCornerShape(8.dp))
+                        .pointerInput(effectiveQueueKey) {
+                            detectTapGestures {
+                                stage = PanelLoadStage.LoadingWebView(panelTitle)
+                                ActivePanelWebViewPool.acquire(
+                                    key = effectiveQueueKey,
+                                    maxActive = maxActivePoolSize,
+                                    priority = PanelPoolPriority.INTERACTING,
+                                )
+                            }
+                        },
+                )
+            } else {
+                PanelHibernatedPlaceholderCard(
+                    panelTitle = panelTitle,
+                    onWakeUp = {
+                        stage = PanelLoadStage.LoadingWebView(panelTitle)
+                        ActivePanelWebViewPool.acquire(
+                            key = effectiveQueueKey,
+                            maxActive = maxActivePoolSize,
+                            priority = PanelPoolPriority.INTERACTING,
+                        )
+                    },
+                )
+            }
+        } else if (!isPanelVisiblyReady && !mountState.renderReady && (!slotGranted || !mountState.mounted)) {
             PanelLoadingPlaceholderCard(
                 stage = stage,
                 panelTitle = panelTitle,
@@ -1352,14 +2046,19 @@ fun MessageHtmlBlock(
                 AndroidView(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(if (isPanelVisiblyReady) boundedHeightDp.dp else 1.dp),
+                        .height(if (isPanelVisiblyReady) boundedHeightDp.dp else 0.dp),
                     factory = { ctx ->
                         TavernRuntimeManager.ensureContext(ctx)
                         TavernRuntimeManager.ensureStarted(ctx)
                         // 优先从离屏保活池取回已渲染好的容器，杜绝切换页面或切换方案时重新创建 WebView
                         val cachedEntry = DetachedPanelWebViewCache.takeContainer(effectiveQueueKey)
                         if (cachedEntry != null) {
-                            cachedEntry.mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                            val frozenForCached = frozenExportHtml
+                            if (frozenForCached != null) {
+                                cachedEntry.mountState.submitFrozen(frozenForCached, foregroundHex, messageKey, screenHeightDp)
+                            } else {
+                                cachedEntry.mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                            }
                             val cachedHeight = PanelHeightCache.get(messageKey, contentHash)
                             if (cachedHeight > 0) {
                                 heightDp = cachedHeight
@@ -1385,14 +2084,20 @@ fun MessageHtmlBlock(
                             settings.mediaPlaybackRequiresUserGesture = false
                             settings.blockNetworkImage = false
                             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                            isNestedScrollingEnabled = false
+                            overScrollMode = View.OVER_SCROLL_NEVER
                             isVerticalScrollBarEnabled = false
                             isFocusable = false
                             isFocusableInTouchMode = false
                             var firstInteractionLogged = false
                             setOnTouchListener { v, event ->
                                 if (event.action == MotionEvent.ACTION_DOWN) {
+                                    ActivePanelWebViewPool.updatePriority(effectiveQueueKey, PanelPoolPriority.INTERACTING)
                                     ActivePanelWebViewPool.touch(effectiveQueueKey)
+                                } else if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+                                    ActivePanelWebViewPool.updatePriority(effectiveQueueKey, basePoolPriority)
+                                }
+                                if (event.action == MotionEvent.ACTION_DOWN) {
                                     if (!firstInteractionLogged) {
                                         firstInteractionLogged = true
                                         TavernRuntimeManager.recordWebViewBootStage(
@@ -1526,6 +2231,7 @@ fun MessageHtmlBlock(
                                     val priority = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                         detail?.rendererPriorityAtExit() ?: -1
                                     } else -1
+                                    ActivePanelWebViewPool.recordRenderProcessGone(messageKey, didCrash, priority)
                                     DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
                                     mountState.onRendererGone()
                                     TavernPanelLoadScheduler.markDone(effectiveQueueKey)
@@ -1566,7 +2272,11 @@ fun MessageHtmlBlock(
                                                     "screenHeightDp=$screenHeightDp safetyMaxHeightDp=$safetyMaxHeightDp physicalPx=${physicalPx}px",
                                             )
                                         }
-                                        heightDp = h
+                                        if (isPanelTouchingRef.get()) {
+                                            deferredTouchHeightRef.set(h)
+                                        } else {
+                                            heightDp = h
+                                        }
                                         if (h > 0) {
                                             // 高度 > 0 只代表骨架已经排版，绝不再冒充“加载完成”。
                                             if (!mountState.resourcesSettled) {
@@ -1580,7 +2290,12 @@ fun MessageHtmlBlock(
                             )
                             addJavascriptInterface(TavernRuntimeManager.TavernJsBridge(), "RikkaBridge")
                             mountState.attach(this)
-                            mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                            val frozenForFresh = frozenExportHtml
+                            if (frozenForFresh != null) {
+                                mountState.submitFrozen(frozenForFresh, foregroundHex, messageKey, screenHeightDp)
+                            } else {
+                                mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                            }
                             TavernRuntimeManager.registerAuxWebView(this, "panel")
                             TavernRuntimeManager.recordWebViewBootStage(
                                 hostType = "panel",
@@ -1600,6 +2315,22 @@ fun MessageHtmlBlock(
                             verticalScrollProbe = {
                                 webView.canScrollVertically(-1) || webView.canScrollVertically(1)
                             }
+                            // 注：横向手势已由 JS 侧逐元素接管（hscroll 增强），
+                            // 这里只需保证事件能进 WebView，不必单独探测横向可滚性。
+                            // 纵向边界：dir=1 手指下滑（看是否已在顶部），dir=-1 手指上滑（看是否到底部）。
+                            // 到边界就让外层列表接管，保证竖滑自然衔接。
+                            verticalEdgeProbe = { dir ->
+                                if (dir > 0) !webView.canScrollVertically(-1) else !webView.canScrollVertically(1)
+                            }
+                            onTouchActiveChanged = { touching ->
+                                isPanelTouchingRef.set(touching)
+                                if (!touching) {
+                                    val deferredH = deferredTouchHeightRef.getAndSet(-1)
+                                    if (deferredH > 0) {
+                                        heightDp = deferredH
+                                    }
+                                }
+                            }
                             addView(
                                 webView,
                                 ViewGroup.LayoutParams(
@@ -1610,10 +2341,34 @@ fun MessageHtmlBlock(
                         }
                     },
                     update = {
-                        mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                        // 已用冻结 DOM 挂载时，不要再被原始 html 覆盖（否则唤醒立即失效）。
+                        if (frozenExportHtml == null) {
+                            mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
+                        }
                     },
                     onRelease = { container ->
                         TavernPanelLoadScheduler.markDone(effectiveQueueKey)
+                        if (isInteractiveClass && mountState.mounted && !mountState.isDisposed && snapshotCompositeKey != null) {
+                            val wvForFreeze = mountState.webView
+                            val keyForFreeze = snapshotCompositeKey
+                            runCatching {
+                                wvForFreeze?.evaluateJavascript(
+                                    "window.__rikkaDehydratePanel?window.__rikkaDehydratePanel():''"
+                                ) { raw ->
+                                    PanelFrozenStateStore.parseDehydratePayload(raw)?.let { (stateJson, exportedHtml) ->
+                                        PanelFrozenStateStore.save(context, keyForFreeze, stateJson, exportedHtml)
+                                    }
+                                }
+                            }
+                            if (snapshotEntry == null && mountState.renderReady) {
+                                PanelSnapshotStore.captureFromWebView(
+                                    context = context,
+                                    compositeKey = keyForFreeze,
+                                    webView = wvForFreeze,
+                                    heightDp = boundedHeightDp,
+                                )
+                            }
+                        }
                         if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys) {
                             DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
                             mountState.release()
@@ -1624,7 +2379,16 @@ fun MessageHtmlBlock(
                         }
                     },
                 )
-                if (isPanelVisiblyReady) {
+                // 只有真正需要时才显示底部状态行：加载中 / 超时 / 出错。
+                // 面板健康（renderReady 且无错误）时不显示任何按钮，避免"明明已渲染完却挂着重载"的误判。
+                // 只有「确实还在加载」或「确实超时」才显示状态行。
+                // 不再因为 console 里的一条 js 警告(lastError) 就报"面板资源或脚本异常"，
+                // 那会让正常渲完的动画面板被误标成故障（真机已复现）。
+                val showPanelStatusRow = isPanelVisiblyReady && (
+                    (!mountState.resourcesSettled && !mountState.renderReady) ||
+                        mountState.resourcesTimedOut
+                    )
+                if (showPanelStatusRow) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1633,7 +2397,8 @@ fun MessageHtmlBlock(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         when {
-                            !mountState.resourcesSettled -> {
+                            // renderReady 已经代表「图片/字体/布局都稳定了」，此时不该再提示加载中。
+                            !mountState.resourcesSettled && !mountState.renderReady -> {
                                 Text(
                                     text = "正在加载图片/字体/脚本…",
                                     style = MaterialTheme.typography.labelSmall,
@@ -1825,6 +2590,15 @@ internal object PanelSnapshotStore {
         val imageBitmap: ImageBitmap,
         val heightDp: Int,
         val aspectRatio: Float = (imageBitmap.width.toFloat() / imageBitmap.height.coerceAtLeast(1).toFloat()).coerceIn(0.05f, 20f),
+        /**
+         * 该快照是否在「渲染确认完成」(renderReady) 之后捕获。
+         *
+         * 只有 ready=true 的快照才允许顶替实时渲染。
+         * 早期实现不看这个标记，结果把「面板还没画完时截到的空白图」缓存下来，
+         * 下次直接顶替渲染 -> 整块面板空白（真机已复现）。
+         * 从磁盘读回的旧快照默认按未就绪对待，必须重新渲染一次确认。
+         */
+        val ready: Boolean = false,
     )
 
     private const val MAX_MEMORY_ENTRIES = 12
@@ -1846,15 +2620,125 @@ internal object PanelSnapshotStore {
         return "$messageKey#$contentHash"
     }
 
+    fun compositeKey(
+        messageKey: String?,
+        contentHash: Int,
+        isDarkTheme: Boolean,
+        widthPx: Int,
+        fontScale: Float,
+    ): String? {
+        if (messageKey.isNullOrEmpty()) return null
+        val themeTag = if (isDarkTheme) "dark" else "light"
+        val fontBucket = (fontScale * 100f).toInt().coerceIn(50, 300)
+        return "$messageKey#$contentHash#$themeTag#w${widthPx.coerceAtLeast(1)}#fs$fontBucket"
+    }
+
+    /**
+     * **内容级**快照 key（不含 messageKey）。
+     *
+     * 用途：同一段 HTML 在多处出现时（例如第 3 楼和第 8 楼都是同一个「发送按钮」面板），
+     * 只需渲染一次并共享同一张快照。
+     *
+     * 为什么安全：快照只承载**外观**，不承载状态。交互仍然通过点击快照唤醒真实 WebView
+     * 来完成（见 MessageHtmlBlock 的冻结唤醒链路），因此复用外观不会串状态。
+     */
+    fun contentKey(
+        contentHash: Int,
+        isDarkTheme: Boolean,
+        widthPx: Int,
+        fontScale: Float,
+    ): String {
+        val themeTag = if (isDarkTheme) "dark" else "light"
+        val fontBucket = (fontScale * 100f).toInt().coerceIn(50, 300)
+        return "c$contentHash#$themeTag#w${widthPx.coerceAtLeast(1)}#fs$fontBucket"
+    }
+
     private fun safeFileName(compositeKey: String): String {
         val sanitized = compositeKey.replace(Regex("[^a-zA-Z0-9._-]"), "_").take(80)
         val hashHex = Integer.toHexString(compositeKey.hashCode())
         return "snap_${sanitized}_$hashHex.png"
     }
 
+    private fun ImageBitmap.asAndroidBitmapCompat(): Bitmap? = runCatching {
+        val w = this.width
+        val h = this.height
+        if (w <= 0 || h <= 0) return@runCatching null
+        val pixels = IntArray(w * h)
+        this.readPixels(pixels, 0, w, 0, 0, w, h)
+        Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+    }.getOrNull()
+
     fun getMemory(compositeKey: String?): SnapshotEntry? {
         if (compositeKey.isNullOrEmpty()) return null
         return synchronized(memoryMap) { memoryMap[compositeKey] }
+    }
+
+    /**
+     * 「已确认渲染完成」的内容登记表。
+     *
+     * 规则（用户提出的方案）：
+     * **任何内容都必须先真实渲染过一次，之后它的快照才有资格被复用。**
+     * 这样即使某次捕获到的是空白帧，只要该内容尚未登记为"已成功渲染"，
+     * 就不会用快照顶替渲染，用户至少能看到一次真实面板，而不是空白。
+     *
+     * 只记录 key（很小），不记图；图仍由 panel_snapshots 管理。
+     */
+    private val renderedOnceKeys = java.util.Collections.synchronizedSet(HashSet<String>())
+    private var renderedOnceLoaded = false
+
+    /** 标记该内容已真实渲染完成一次（renderReady 之后调用）。 */
+    fun markRenderedOnce(contentKey: String, context: Context?) {
+        if (contentKey.isEmpty()) return
+        renderedOnceKeys.add(contentKey)
+        val ctx = context?.applicationContext ?: return
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                val dir = File(ctx.filesDir, "panel_snapshots").apply { mkdirs() }
+                File(dir, "rendered_once.txt").appendText(contentKey + "\n")
+            }
+        }
+    }
+
+    /** 该内容是否已经真实渲染完成过一次。 */
+    fun isRenderedOnce(contentKey: String, context: Context?): Boolean {
+        if (contentKey.isEmpty()) return false
+        if (!renderedOnceLoaded) {
+            renderedOnceLoaded = true
+            runCatching {
+                val ctx = context?.applicationContext ?: return false
+                val f = File(ctx.filesDir, "panel_snapshots/rendered_once.txt")
+                if (f.isFile) {
+                    f.readLines(Charsets.UTF_8).forEach { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty()) renderedOnceKeys.add(trimmed)
+                    }
+                }
+            }
+        }
+        return renderedOnceKeys.contains(contentKey)
+    }
+
+    /**
+     * 写入内容级快照（同一段 HTML 跨楼层共享），并落盘以便下次冷启动复用。
+     */
+    fun putContentEntry(contentKey: String, entry: SnapshotEntry, context: Context?) {
+        if (contentKey.isEmpty()) return
+        putMemory(contentKey, entry)
+        val ctx = context?.applicationContext ?: return
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                val dir = File(ctx.filesDir, "panel_snapshots").apply { mkdirs() }
+                val outFile = File(dir, safeFileName(contentKey))
+                if (!outFile.isFile) {
+                    val bmp = entry.imageBitmap.asAndroidBitmapCompat()
+                    if (bmp != null) {
+                        FileOutputStream(outFile).use { fos ->
+                            bmp.compress(Bitmap.CompressFormat.PNG, 92, fos)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun putMemory(compositeKey: String, entry: SnapshotEntry) {
@@ -1908,6 +2792,9 @@ internal object PanelSnapshotStore {
                     imageBitmap = bmp.asImageBitmap(),
                     heightDp = resolvedHeightDp,
                     aspectRatio = ratio,
+                    // 从磁盘读回的旧快照无法确认当时是否画完 —— 按未就绪处理，
+                    // 必须让该面板重新渲染一次并重新捕获。
+                    ready = false,
                 )
                 putMemory(compositeKey, entry)
                 entry
@@ -1915,16 +2802,53 @@ internal object PanelSnapshotStore {
         }
     }
 
+    /**
+     * 判断位图是否「几乎空白」：抽样统计不同颜色数量，过少则认为是未渲染完成的帧。
+     */
+    private fun isLikelyBlankBitmap(bmp: Bitmap): Boolean = runCatching {
+        val w = bmp.width
+        val h = bmp.height
+        if (w < 8 || h < 8) return@runCatching true
+        val sampleCols = 12
+        val sampleRows = 16
+        val distinct = HashSet<Int>()
+        for (row in 0 until sampleRows) {
+            val y = (row * (h - 1) / (sampleRows - 1).coerceAtLeast(1))
+            for (col in 0 until sampleCols) {
+                val x = (col * (w - 1) / (sampleCols - 1).coerceAtLeast(1))
+                distinct.add(bmp.getPixel(x, y))
+                if (distinct.size > 4) return@runCatching false
+            }
+        }
+        // 采样点只有 <=4 种颜色 -> 视为空白/纯色帧
+        distinct.size <= 4
+    }.getOrDefault(true)
+
     fun captureFromWebView(
         context: Context,
         compositeKey: String?,
         webView: WebView?,
         heightDp: Int,
+        /** 是否在渲染确认完成(renderReady)之后捕获；false 表示可能是空白帧。 */
+        renderReadyAtCapture: Boolean = false,
     ): SnapshotEntry? {
         if (compositeKey.isNullOrEmpty() || webView == null || heightDp <= 0) return null
         val w = webView.width
         val h = webView.height
         if (w < 16 || h < 16) return null
+        // 超高面板：draw() 单次绘制超过 GPU 纹理上限会拿到空白图。
+        // 但下面的绘制逻辑本身已按 2048px 分块（h > 4096 分支），所以只有极端高度才该放弃。
+        // 原先的 h > 14000 提前 return 把分块路径彻底挡死 —— 超高大面板永远没有快照。
+        // 现改为：超过硬性物理阈值（32768px，ARGB_8888 单图上限量级）才放弃。
+        if (h > MAX_TILE_CAPTURE_HEIGHT_PX) {
+            runCatching {
+                TavernRuntimeManager.appendLog(
+                    "warn",
+                    "[panel-snapshot] skipped extremely tall panel key=$compositeKey h=${h}px > $MAX_TILE_CAPTURE_HEIGHT_PX (keep alive)",
+                )
+            }
+            return null
+        }
         return runCatching {
             val maxDimW = MAX_SNAPSHOT_WIDTH.toFloat()
             val maxDimH = MAX_SNAPSHOT_HEIGHT.toFloat()
@@ -1934,15 +2858,42 @@ internal object PanelSnapshotStore {
             val targetH = (h * uniformScale).toInt().coerceAtLeast(16)
             val bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bmp)
-            if (uniformScale != 1f) {
-                canvas.scale(uniformScale, uniformScale)
+            if (h > 4096) {
+                // 超高面板分块绘制（每块 2048px），避免单次 Canvas 绘制超出纹理上限
+                val tileHeightPx = 2048
+                var offsetY = 0
+                while (offsetY < h) {
+                    val sliceH = minOf(tileHeightPx, h - offsetY)
+                    canvas.save()
+                    canvas.scale(uniformScale, uniformScale)
+                    canvas.clipRect(0, offsetY, w, offsetY + sliceH)
+                    webView.draw(canvas)
+                    canvas.restore()
+                    offsetY += sliceH
+                }
+            } else {
+                if (uniformScale != 1f) {
+                    canvas.scale(uniformScale, uniformScale)
+                }
+                webView.draw(canvas)
             }
-            webView.draw(canvas)
             val ratio = (targetW.toFloat() / targetH.toFloat()).coerceIn(0.05f, 20f)
+            // 空白帧检测：整张图若几乎只有一种颜色（透明/纯白/纯黑），
+            // 说明这个时刻面板还没画出内容，不能作为可复用快照。
+            if (isLikelyBlankBitmap(bmp)) {
+                runCatching {
+                    TavernRuntimeManager.appendLog(
+                        "warn",
+                        "[panel-snapshot] blank frame rejected key=$compositeKey (${targetW}x${targetH})",
+                    )
+                }
+                return@runCatching null
+            }
             val entry = SnapshotEntry(
                 imageBitmap = bmp.asImageBitmap(),
                 heightDp = heightDp,
                 aspectRatio = ratio,
+                ready = renderReadyAtCapture,
             )
             putMemory(compositeKey, entry)
             val appCtx = context.applicationContext
@@ -1956,6 +2907,92 @@ internal object PanelSnapshotStore {
                 }
             }
             entry
+        }.getOrNull()
+    }
+}
+
+/**
+ * 阶段 4：冻结面板状态存储（表单值 / details[open] / 滚动位置 / active 标记 JSON + 导出 HTML）。
+ * 存盘路径：`filesDir/panel_states/state_<safeKey>.json` 与 `.html`。
+ */
+internal object PanelFrozenStateStore {
+    data class FrozenState(
+        val stateJson: String,
+        val exportedHtml: String,
+        val savedAtMs: Long = System.currentTimeMillis(),
+    )
+
+    private const val MAX_MEMORY_ENTRIES = 32
+    private val map = java.util.LinkedHashMap<String, FrozenState>(32, 0.75f, true)
+
+    private fun safeBaseName(compositeKey: String): String {
+        val sanitized = compositeKey.replace(Regex("[^a-zA-Z0-9._-]"), "_").take(80)
+        val hashHex = Integer.toHexString(compositeKey.hashCode())
+        return "state_${sanitized}_$hashHex"
+    }
+
+    fun getMemory(compositeKey: String?): FrozenState? {
+        if (compositeKey.isNullOrEmpty()) return null
+        return synchronized(map) { map[compositeKey] }
+    }
+
+    fun save(context: Context, compositeKey: String?, stateJson: String, exportedHtml: String) {
+        if (compositeKey.isNullOrEmpty()) return
+        val entry = FrozenState(stateJson = stateJson, exportedHtml = exportedHtml)
+        synchronized(map) {
+            map[compositeKey] = entry
+            while (map.size > MAX_MEMORY_ENTRIES) {
+                val it = map.keys.iterator()
+                if (!it.hasNext()) break
+                it.next()
+                it.remove()
+            }
+        }
+        val appCtx = context.applicationContext
+        val base = safeBaseName(compositeKey)
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                val dir = File(appCtx.filesDir, "panel_states").apply { mkdirs() }
+                File(dir, "$base.json").writeText(stateJson, Charsets.UTF_8)
+                if (exportedHtml.isNotEmpty()) {
+                    File(dir, "$base.html").writeText(exportedHtml, Charsets.UTF_8)
+                }
+            }
+        }
+    }
+
+    suspend fun loadIfNeeded(context: Context, compositeKey: String?): FrozenState? {
+        if (compositeKey.isNullOrEmpty()) return null
+        getMemory(compositeKey)?.let { return it }
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val dir = File(context.filesDir, "panel_states")
+                val base = safeBaseName(compositeKey)
+                val jsonFile = File(dir, "$base.json")
+                if (!jsonFile.isFile) return@withContext null
+                val stateJson = jsonFile.readText(Charsets.UTF_8)
+                val htmlFile = File(dir, "$base.html")
+                val exportedHtml = if (htmlFile.isFile) htmlFile.readText(Charsets.UTF_8) else ""
+                val entry = FrozenState(stateJson = stateJson, exportedHtml = exportedHtml)
+                synchronized(map) { map[compositeKey] = entry }
+                entry
+            }.getOrNull()
+        }
+    }
+
+    fun parseDehydratePayload(evalResult: String?): Pair<String, String>? {
+        if (evalResult.isNullOrBlank() || evalResult == "null" || evalResult == "\"\"") return null
+        return runCatching {
+            val unquoted = if (evalResult.startsWith("\"") && evalResult.endsWith("\"")) {
+                JSONObject("{\"v\":$evalResult}").getString("v")
+            } else {
+                evalResult
+            }
+            if (unquoted.isBlank()) return null
+            val obj = JSONObject(unquoted)
+            val stateObj = obj.optJSONObject("state") ?: return null
+            val htmlStr = obj.optString("html", "")
+            stateObj.toString() to htmlStr
         }.getOrNull()
     }
 }
@@ -2001,11 +3038,155 @@ internal object PanelHeightCache {
     }
 }
 
+/**
+ * 阶段 5：方向角手势锁容器。
+ * - `ACTION_DOWN` 先锁外层拦截，待超过 `touchSlop` 后判定方向：
+ *   - `dx >= dy * 0.7f` 视为横滑，持续锁死外层 `LazyColumn`，保留横滑与松手惯性；
+ *   - 否则视为竖滑：仅当 WebView 内部可竖滚时保留拦截，否则放行给外层聊天列表。
+ * - 触摸期间通知外层暂停更新 Compose 高度状态，避免重排打断滑动惯性。
+ */
+/**
+ * 面板触摸桥：决定「这次手势交给面板内部，还是让外层聊天列表接管」。
+ *
+ * ## 为什么不再用固定角度锁
+ * 旧实现用 `dx >= dy * 0.7` 单一判据：手指斜 35 度以上横滑就被判成竖滑，
+ * 事件交还外层，宽面板的横向标签页/横向滚动容器直接断掉，也拿不到惯性。
+ * 用户的诉求是「不要只有严格向左滑的趋势才认」。
+ *
+ * ## 现在的策略（按优先级）
+ * 1. 按下后先暂扣事件，等首个有效位移明确方向；
+ * 2. 横向位移占优（dx >= dy）即判为横向意图，整轮手势锁给面板 ——
+ *    横向容器获得完整连续事件流，WebView 自身的 fling/惯性得以保留；
+ * 3. 纵向占优时看面板此刻能否真的往该方向滚：
+ *    - 能滚 -> 锁给面板（如角色卡 12 人列表的内部滚动）；
+ *    - 已到边界（顶部继续上滑 / 底部继续下滑）-> 让外层列表接走，自然衔接；
+ * 4. 一旦锁定，同一轮手势内不再改判，避免中途横跳造成抖动。
+ *
+ * 注意：不调用 pauseTimers，也不替换 WebView 的滚动实现，
+ * 只为面板争取完整的事件流。
+ */
+/**
+ * 面板触摸桥：决定「手势交给面板内部 WebView，还是让外层聊天列表接管」。
+ *
+ * ## 设计原则（针对"卡手、没惯性"的修复）
+ * 旧实现在 ACTION_MOVE 里反复调用 requestDisallowInterceptTouchEvent，
+ * 而且先「暂扣」事件再判定 —— 这会让 WebView 内部的滚动被打断，
+ * 松手时的 fling/惯性被吃掉，手感发黏。
+ *
+ * 现在的做法：
+ * - 按下时**不抢**，让事件自然流向 WebView（保持原生手感与惯性）；
+ * - 只在手指位移超过 slop 的**第一瞬间**判定一次轴向，然后立刻做最终决定：
+ *   * 横向意图 -> 锁给面板，整轮不再干预；
+ *   * 纵向且面板能滚 -> 锁给面板，整轮不再干预；
+ *   * 纵向且面板已到边界 -> 让外层列表接管（自然衔接滚动）；
+ * - 判定完成后不再重判、不再反复 requestDisallow，避免抖动与惯性丢失。
+ */
+/**
+ * 面板触摸桥。
+ *
+ * ## 血泪教训（真机多次验证）
+ * 之前几版都试图在 dispatchTouchEvent 里"判定方向 + 抢/放事件"：
+ * 结果一律导致 WebView 收不到 ACTION_DOWN，
+ *  -> 面板内部纵向滚动失效
+ *  -> 横向标签栏完全不动
+ *  -> 按钮点不动
+ *  -> 松手没有惯性
+ *
+ * ## 现在：纯旁观者
+ * 只把触摸起止登记下来（用于暂停高度上报），**绝不拦截、绝不 requestDisallow**，
+ * 事件一律原样交给 WebView，由 WebView 自己处理滚动/惯性/点击。
+ *
+ * 外层 LazyColumn 与 WebView 的冲突交给 WebView 自己按需处理：
+ * WebView 在内容可滚动时会自己调用 requestDisallowInterceptTouchEvent(true)，
+ * 这是 Chromium 内建行为，比外层猜测可靠得多。
+ */
+/**
+ * 面板触摸桥：把「面板内部可滚动时的手势」保留给 WebView，只在到达边界时交给外层列表。
+ *
+ * ## 关键时序（真机调出来的）
+ * - ACTION_DOWN：**必须立刻 requestDisallowIntercept(true)**。
+ *   WebView 才能收到完整事件流；否则内层滚动与 DOM 点击都不会发生。
+ * - ACTION_MOVE（首次超过 slop）：判定轴向一次：
+ *   * 纵向且面板还能往该方向滚  -> 整轮锁给面板（保持 disallow=true）
+ *   * 纵向但已到边界            -> 放行外层（disallow=false），自然衔接列表滚动
+ *   * 横向                      -> 锁给面板（横向容器/标签栏需要连续事件流）
+ * - 判定后不再反复切换，避免抖动吃惯性。
+ */
 private class PanelScrollBridge(context: Context) : FrameLayout(context) {
+    /** 面板此刻能否上下滚动。 */
     var verticalScrollProbe: (() -> Boolean)? = null
 
+    /** 面板是否已到达纵向边界。dir=1 手指下滑查顶部，dir=-1 手指上滑查底部。 */
+    var verticalEdgeProbe: ((Int) -> Boolean)? = null
+
+    var onTouchActiveChanged: ((Boolean) -> Unit)? = null
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private var downX = 0f
+    private var downY = 0f
+    private var decided = false
+    private var moveCount = 0
+    private var lockedToPanel = false
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                decided = false
+                lockedToPanel = false
+                moveCount = 0
+                onTouchActiveChanged?.invoke(true)
+                // 先扣住：保证 WebView 收到完整事件流（内层滚动 + DOM 点击的前提）。
+                parent?.requestDisallowInterceptTouchEvent(true)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                moveCount++
+                if (!decided) {
+                    val dx = kotlin.math.abs(ev.x - downX)
+                    val dy = kotlin.math.abs(ev.y - downY)
+                    if (dx > touchSlop || dy > touchSlop) {
+                        decided = true
+                        lockedToPanel = if (dx > dy) {
+                            // 横向：交给面板里的横向容器
+                            true
+                        } else {
+                            // 纵向：能滚且未到边界才留在面板
+                            val canScroll = verticalScrollProbe?.invoke() == true
+                            val atEdge = verticalEdgeProbe?.invoke(if (ev.y > downY) 1 else -1) == true
+                            canScroll && !atEdge
+                        }
+                        parent?.requestDisallowInterceptTouchEvent(lockedToPanel)
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                // 诊断：确认 WebView 到底收到多少个 MOVE 事件
+                runCatching {
+                    TavernRuntimeManager.appendLog(
+                        "debug",
+                        "[gesture-probe] action=" + ev.actionMasked + " moveCount=" + moveCount +
+                            " lockedToPanel=" + lockedToPanel,
+                    )
+                }
+                decided = false
+                lockedToPanel = false
+                onTouchActiveChanged?.invoke(false)
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun requestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {
-        if (disallowIntercept && verticalScrollProbe?.invoke() == false) {
+        // 已判定交给面板：外层不许抢
+        if (decided && lockedToPanel && disallowIntercept) {
+            super.requestDisallowInterceptTouchEvent(true)
+            return
+        }
+        // 已判定交给外层：不再被锁回去
+        if (decided && !lockedToPanel) {
+            super.requestDisallowInterceptTouchEvent(false)
             return
         }
         super.requestDisallowInterceptTouchEvent(disallowIntercept)
@@ -2093,6 +3274,26 @@ internal class PanelMountState {
         private set
     var resourcesTimedOut by mutableStateOf(false)
         private set
+    var renderReady by mutableStateOf(false)
+        private set
+    var renderReadyHeightPx: Int = 0
+        private set
+    @Volatile
+    private var onRenderReadyListener: ((Int) -> Unit)? = null
+
+    fun setOnRenderReadyListener(listener: ((Int) -> Unit)?) {
+        onRenderReadyListener = listener
+        if (listener != null && renderReady && !isDisposed) {
+            listener(renderReadyHeightPx)
+        }
+    }
+
+    fun markRenderReady(scrollHeightPx: Int) {
+        if (isDisposed || !mounted) return
+        renderReadyHeightPx = scrollHeightPx
+        renderReady = true
+        onRenderReadyListener?.invoke(scrollHeightPx)
+    }
 
     fun markResourcesSettled(timedOut: Boolean) {
         if (isDisposed || !mounted) return
@@ -2103,6 +3304,8 @@ internal class PanelMountState {
     private fun resetResourceSettleState() {
         resourcesSettled = false
         resourcesTimedOut = false
+        renderReady = false
+        renderReadyHeightPx = 0
     }
 
     fun reloadNow() {
@@ -2280,6 +3483,35 @@ internal class PanelMountState {
             false
         }
     }
+
+    /**
+     * 冻结唤醒用：把「脚本执行后的真实 DOM 快照 HTML」作为挂载内容。
+     * 与 [submit] 的区别是会强制重新挂载（即使 html 相同），因为旧 DOM 已被丢弃。
+     */
+    fun submitFrozen(exportedHtml: String, foregroundHex: String?, messageKey: String? = null, viewportPx: Int = 0) {
+        if (isDisposed) return
+        frozenMountHtml = exportedHtml
+        pendingHtml = exportedHtml
+        pendingHtmlHash = exportedHtml.hashCode()
+        pendingForeground = foregroundHex
+        pendingKey = messageKey
+        if (viewportPx > 0) pendingViewportPx = viewportPx
+        resetResourceSettleState()
+        everMounted = false
+        mountedHtml = null
+        appliedForeground = null
+        appliedKey = null
+        appliedViewportPx = 0
+        tryMount()
+    }
+
+    /** 清除冻结挂载内容，回到常规 html 挂载路径（回退用）。 */
+    fun clearFrozenMount() {
+        frozenMountHtml = null
+    }
+
+    @Volatile
+    private var frozenMountHtml: String? = null
 
     fun submit(html: String, foregroundHex: String?, messageKey: String? = null, viewportPx: Int = 0) {
         if (isDisposed) return
@@ -2468,6 +3700,30 @@ private class PanelBridge(
             mountState.onPageReady()
             mountState.tryMountIfNeeded()
         }
+    }
+
+    @JavascriptInterface
+    fun onRenderReady(panelId: String, scrollHeight: Int) {
+        if (mountState.isDisposed) return
+        handler.post {
+            if (mountState.isDisposed) return@post
+            TavernRuntimeManager.appendLog(
+                "debug",
+                "[panel] onRenderReady panelId=$panelId scrollHeight=$scrollHeight",
+            )
+            mountState.markRenderReady(scrollHeight.coerceAtLeast(0))
+        }
+    }
+
+    @JavascriptInterface
+    fun onPanelClassProbed(contentHash: Int, className: String) {
+        if (mountState.isDisposed) return
+        val parsed = runCatching { PanelClass.valueOf(className.uppercase(Locale.US)) }.getOrNull() ?: return
+        PanelClassificationCache.recordRuntimeClass(contentHash, parsed)
+        TavernRuntimeManager.appendLog(
+            "debug",
+            "[panel-class] runtime probe hash=$contentHash class=$parsed",
+        )
     }
 
     @JavascriptInterface

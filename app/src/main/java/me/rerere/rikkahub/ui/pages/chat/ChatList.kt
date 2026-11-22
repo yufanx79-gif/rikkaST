@@ -400,8 +400,14 @@ private fun ChatListNormal(
             }
         }
 
-        // 判断最近是否滚动
+        // 判断最近是否滚动，并同步至面板加载调度器（阶段 6.2：快速滑动期间延后挂载 WebView）
+        DisposableEffect(Unit) {
+            onDispose {
+                me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.setListScrolling(false)
+            }
+        }
         LaunchedEffect(state.isScrollInProgress) {
+            me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.setListScrolling(state.isScrollInProgress)
             if (state.isScrollInProgress) {
                 isRecentScroll = true
                 delay(1500)

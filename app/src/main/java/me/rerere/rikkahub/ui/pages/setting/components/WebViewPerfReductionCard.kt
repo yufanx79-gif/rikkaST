@@ -10,7 +10,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import kotlin.math.roundToInt
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -99,6 +101,88 @@ fun WebViewPerfReductionCard(
                         onUpdateDisplaySetting(
                             displaySetting.copy(enableWebViewPerfReduction = enabled)
                         )
+                    },
+                )
+            },
+        )
+
+        item(
+            headlineContent = {
+                val cap = displaySetting.webViewMaxActiveOverride
+                Text(
+                    if (cap <= 0) {
+                        "活跃 WebView 数量上限：自动（按设备内存分级）"
+                    } else {
+                        "活跃 WebView 数量上限：手动 $cap 个（硬上限 16）"
+                    }
+                )
+            },
+            supportingContent = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("设为 0 时按设备内存自动分级（<=6GB: 4，8GB: 8，>=12GB: 16）；手动最高可设 16。")
+                    Slider(
+                        value = displaySetting.webViewMaxActiveOverride.coerceIn(0, 16).toFloat(),
+                        onValueChange = { v ->
+                            val next = v.roundToInt().coerceIn(0, 16)
+                            if (next != displaySetting.webViewMaxActiveOverride) {
+                                onUpdateDisplaySetting(displaySetting.copy(webViewMaxActiveOverride = next))
+                            }
+                        },
+                        valueRange = 0f..16f,
+                        steps = 15,
+                    )
+                }
+            },
+        )
+
+        item(
+            headlineContent = { Text("离屏暂停动画与粒子") },
+            supportingContent = { Text("面板滑出屏幕时自动暂停 CSS 动画与 requestAnimationFrame（不影响屏幕内其他面板）。") },
+            trailingContent = {
+                Switch(
+                    checked = displaySetting.enableWebViewOffscreenPause,
+                    onCheckedChange = { enabled ->
+                        onUpdateDisplaySetting(displaySetting.copy(enableWebViewOffscreenPause = enabled))
+                    },
+                )
+            },
+        )
+
+        item(
+            headlineContent = { Text("列表快滑时延后挂载 WebView") },
+            supportingContent = { Text("快速上下滑动聊天列表时优先展示快照，停止滑动 150ms 后再挂载 WebView。") },
+            trailingContent = {
+                Switch(
+                    checked = displaySetting.enableWebViewScrollDefer,
+                    onCheckedChange = { enabled ->
+                        onUpdateDisplaySetting(displaySetting.copy(enableWebViewScrollDefer = enabled))
+                    },
+                )
+            },
+        )
+
+        item(
+            headlineContent = { Text("GPU 减负（关闭模糊与阴影）") },
+            supportingContent = { Text("关闭 backdrop-filter / box-shadow / text-shadow / filter；会改变角色卡外观，默认关闭。") },
+            trailingContent = {
+                Switch(
+                    checked = displaySetting.enableWebViewGpuReduction,
+                    onCheckedChange = { enabled ->
+                        onUpdateDisplaySetting(displaySetting.copy(enableWebViewGpuReduction = enabled))
+                    },
+                )
+            },
+        )
+
+        item(
+            headlineContent = { Text("超大立绘降采样（实验）") },
+            supportingContent = { Text("对缓存中的超大静态图片限制解码宽度（1280px），降低低内存机型显存占用；默认关闭。") },
+            trailingContent = {
+                Switch(
+                    checked = displaySetting.enableWebViewImageDownsample,
+                    onCheckedChange = { enabled ->
+                        onUpdateDisplaySetting(displaySetting.copy(enableWebViewImageDownsample = enabled))
+                        me.rerere.rikkahub.data.st.runtime.TavernResourceRoute.downsampleLargeImages = enabled
                     },
                 )
             },

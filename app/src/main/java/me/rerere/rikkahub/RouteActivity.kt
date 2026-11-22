@@ -307,7 +307,13 @@ class RouteActivity : ComponentActivity() {
         }
         val migrationState by DatabaseMigrationTracker.state.collectAsStateWithLifecycle()
 
-        val startScreen = Screen.Chat(
+        // 【仅 debug】支持通过 intent extra 直接落到面板实验室，便于自动化回归。
+        // 用法：adb shell am start -n <pkg>/...RouteActivity --ez openPanelLab true
+        val debugPanelLabRequested = BuildConfig.DEBUG &&
+            intent?.getBooleanExtra("openPanelLab", false) == true
+        val startScreen = if (debugPanelLabRequested) {
+            Screen.DebugPanelLab
+        } else Screen.Chat(
             id = if (readBooleanPreference("create_new_conversation_on_start", true)) {
                 Uuid.random().toString()
             } else {
@@ -572,6 +578,10 @@ class RouteActivity : ComponentActivity() {
 
                             entry<Screen.SettingDeveloperLab> {
                                 SettingDeveloperLabPage()
+                            }
+
+                            entry<Screen.DebugPanelLab> {
+                                me.rerere.rikkahub.ui.pages.setting.PanelLabPage()
                             }
 
                             entry<Screen.SettingPreferencesUI> {
@@ -874,6 +884,10 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object SettingDeveloperLab : Screen
+
+    /** 【仅 debug】WebView 面板实验室（测试脚手架，验证完应删除）。 */
+    @Serializable
+    data object DebugPanelLab : Screen
 
     @Serializable
     data object SettingPreferencesUI : Screen
