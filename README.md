@@ -2,14 +2,15 @@
 
 ["简体中文"](README.md) | ["English"](README_EN.md)
 
-> 最新版本：v2.5.10-public-20261026
+> 最新版本：v2.5.16-1115.apk
 
 rikkaST 是一个基于 RikkaHub 定制的原生 Android 大模型聊天客户端，内建 SillyTavern（酒馆）兼容层，目标是让酒馆的角色卡、世界书、预设、提示词处理和第三方扩展生态更自然地运行在手机上。
 
 ["下载最新 APK"](https://github.com/yufanx79-gif/rikkaST/releases/tag/v2.5.10-public-20261026) · ["查看全部 Releases"](https://github.com/yufanx79-gif/rikkaST/releases) · ["查看更新记录"](RELEASE_NOTES_2.5.10.md)
 
 ---
-
+## 目前收到反馈就会更新。
+最新：已修复了工具调用 多选导入角色卡 记忆功能 备份兼容
 ## 写在前面
 
 这是一个在 AI 辅助下持续开发的个人开源项目。我还在学习，也在不断修复问题、补齐功能。项目能走到现在，离不开 RikkaHub、SillyTavern、Kelivo 等优秀开源项目提供的代码、文档与设计参考。
@@ -230,7 +231,7 @@ rikkaST 的目标是尽可能兼容 SillyTavern 的使用方式，但目前仍�
 
 前往 [GitHub Releases](https://github.com/yufanx79-gif/rikkaST/releases) 下载最新发布版本。
 
-当前发布版本：**v2.5.10-public-20261026**
+当前发布版本：**v2.5.16-1115.apk**
 
 - 安装包：`rikkaST-2.5.10-public-20261026.apk`
 - SHA-256：`01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
