@@ -195,4 +195,81 @@ class MessageHtmlDetectionTest {
         TavernPanelLoadScheduler.cancel("p1")
         TavernPanelLoadScheduler.resetForTest()
     }
+
+    @Test
+    fun classifyPanelStaticDistinguishesAllFivePanelClasses() {
+        PanelClassificationCache.resetForTest()
+
+        // 1. STATIC：纯样式卡片，无脚本、无事件、无动画、无交互元素
+        val staticCard = """
+            <style>.narration{border:1px solid #444;padding:12px;border-radius:8px;}</style>
+            <div class="narration"><p>雨声敲打着便利店的玻璃窗。</p></div>
+        """.trimIndent()
+        assertEquals(PanelClass.STATIC, classifyPanelStatic(staticCard))
+        assertEquals("雨声敲打着便利店的玻璃窗。", extractStaticPanelPlainText(staticCard))
+
+        // 2. ANIMATED：含 CSS 动画/粒子，无交互元素
+        val animatedCard = """
+            <style>@keyframes float{0%{opacity:.4}100%{opacity:1}}.particle{animation:float 2s infinite}</style>
+            <div class="scene"><span class="particle">✦</span></div>
+        """.trimIndent()
+        assertEquals(PanelClass.ANIMATED, classifyPanelStatic(animatedCard))
+
+        // 3. LIGHT：展开收起 / details 轻交互，不发消息
+        val lightDetails = """
+            <details class="thought"><summary>思考过程与好感度</summary><div>好感度 +3</div></details>
+        """.trimIndent()
+        assertEquals(PanelClass.LIGHT, classifyPanelStatic(lightDetails))
+
+        // 4. SEND：调用宿主桥发消息
+        val sendButtons = """
+            <div class="actions"><button onclick="TavernHelper.triggerSlash('/send 继续剧情')">继续剧情</button></div>
+        """.trimIndent()
+        assertEquals(PanelClass.SEND, classifyPanelStatic(sendButtons))
+
+        // 5. BIG：角色卡大面板（内部滚动容器 + 多角色切换）
+        val bigPanel = """
+            <style>.roster{max-height:320px;overflow-y:auto;display:flex;}</style>
+            <div class="roster"><button onclick="selectChar(1)">角色A</button><button onclick="selectChar(2)">角色B</button></div>
+        """.trimIndent()
+        assertEquals(PanelClass.BIG, classifyPanelStatic(bigPanel))
+
+        // 运行时探测缓存与升级
+        assertEquals(PanelClass.STATIC, PanelClassificationCache.getOrClassify(staticCard))
+        PanelClassificationCache.recordRuntimeClass(staticCard.hashCode(), PanelClass.LIGHT)
+        assertEquals(PanelClass.LIGHT, PanelClassificationCache.getCached(staticCard.hashCode()))
+        PanelClassificationCache.resetForTest()
+    }
+
+    @Test
+    fun priorityPoolProtectsLatestFloorAndRespectsMemoryTiersAndSnapshotKey() {
+        ActivePanelWebViewPool.resetForTest()
+
+        // 内存分级校验（初值：<=6GB -> 4, 8GB -> 8, >=12GB -> 16；手动覆盖上限 16）
+        assertEquals(4, ActivePanelWebViewPool.resolveMemoryTierMaxActive(6L * 1024L * 1024L * 1024L))
+        assertEquals(8, ActivePanelWebViewPool.resolveMemoryTierMaxActive(8L * 1024L * 1024L * 1024L))
+        assertEquals(16, ActivePanelWebViewPool.resolveMemoryTierMaxActive(12L * 1024L * 1024L * 1024L))
+        assertEquals(16, ActivePanelWebViewPool.resolveMemoryTierMaxActive(6L * 1024L * 1024L * 1024L, userOverride = 24))
+        assertEquals(10, ActivePanelWebViewPool.resolveMemoryTierMaxActive(6L * 1024L * 1024L * 1024L, userOverride = 10))
+
+        // 优先级淘汰：最新楼（LATEST_FLOOR）和正在交互（INTERACTING）绝不先于 BACKGROUND 被淘汰
+        ActivePanelWebViewPool.acquire("latest", maxActive = 2, priority = PanelPoolPriority.LATEST_FLOOR)
+        ActivePanelWebViewPool.acquire("bg1", maxActive = 2, priority = PanelPoolPriority.BACKGROUND)
+        ActivePanelWebViewPool.acquire("bg2", maxActive = 2, priority = PanelPoolPriority.BACKGROUND)
+        assertTrue("latest" in ActivePanelWebViewPool.activeKeysFlow.value)
+        assertFalse("bg1" in ActivePanelWebViewPool.activeKeysFlow.value)
+        assertTrue("bg2" in ActivePanelWebViewPool.activeKeysFlow.value)
+        assertEquals(1L, ActivePanelWebViewPool.stats().evictionCount)
+
+        // 快照 Key 随主题 / 宽度 / 字号变化而失效
+        val kLight = PanelSnapshotStore.compositeKey("m1", 123, isDarkTheme = false, widthPx = 1080, fontScale = 1.0f)
+        val kDark = PanelSnapshotStore.compositeKey("m1", 123, isDarkTheme = true, widthPx = 1080, fontScale = 1.0f)
+        val kWide = PanelSnapshotStore.compositeKey("m1", 123, isDarkTheme = false, widthPx = 1440, fontScale = 1.0f)
+        val kBigFont = PanelSnapshotStore.compositeKey("m1", 123, isDarkTheme = false, widthPx = 1080, fontScale = 1.25f)
+        assertTrue(kLight != kDark)
+        assertTrue(kLight != kWide)
+        assertTrue(kLight != kBigFont)
+
+        ActivePanelWebViewPool.resetForTest()
+    }
 }
