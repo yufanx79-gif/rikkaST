@@ -58,6 +58,9 @@ internal object TavernWorldInfoEvents {
         put("comment", entry.name)
         put("disable", !entry.enabled)          // ST disable = !本地 enabled
         put("constant", entry.constantActive)
+        // [v249] 此前漏发：ST 事件订阅方（插件）读到的条目没有 vectorized，
+        // 与 entryToStJson 的下发路径不一致，导致同一份世界书在两条路径上策略类型不同。
+        put("vectorized", entry.vectorized)
         put("selective", entry.selective)
         put("order", entry.priority)            // ST order = 本地 priority
         put("probability", entry.probability)

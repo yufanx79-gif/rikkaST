@@ -146,6 +146,9 @@ object CardExporter {
                                     put("content", entry.content)
                                     put("comment", entry.comment)
                                     put("constant", entry.constant)
+                                    // [v249] 导出必须带上 vectorized，否则来回一趟（导入→导出→再导入）
+                                    // 会永久丢掉卡原本的向量化标记。
+                                    put("vectorized", entry.vectorized)
                                     put("selective", entry.selective)
                                     put("selectiveLogic", entry.selectiveLogic)
                                     // 官方 convertWorldInfoToCharacterBook：顶层 position 只写 before_char/after_char 字符串，
@@ -199,6 +202,7 @@ object CardExporter {
                                             else -> 0
                                         }
                                     )
+                                    extMap["vectorized"] = JsonPrimitive(entry.vectorized)
                                     extMap["group"] = JsonPrimitive(entry.group)
                                     extMap["sticky"] = JsonPrimitive(entry.sticky)
                                     extMap["cooldown"] = JsonPrimitive(entry.cooldown)

@@ -587,6 +587,8 @@ private fun globalInjectionToTavernEntry(entry: PromptInjection.RegexInjection, 
         matchCreatorNotes = entry.matchCreatorNotes,
         ignoreBudget = entry.ignoreBudget,
         outletName = entry.outletName,
+        // [v249] 此前不透传：全局世界书库的 vectorized 条目经 lorebookToStJson 下发时恒为 false
+        vectorized = entry.vectorized,
     )
 
 /** 官方 world_info_logic：0=AND_ANY 1=NOT_ALL 2=NOT_ANY 3=AND_ALL（OR_ANY 为本地遗留 → 0）。 */
@@ -761,6 +763,9 @@ private fun jsrEntryToTavernBookEntry(obj: JsonObject, fallbackId: Int): TavernB
         content = content ?: "",
         // JSR strategy.type：constant / selective / vectorized
         constant = strategyType == "constant",
+        // [v249] 此前不映射：卡用 updateWorldbookWith 设 vectorized 会被静默丢弃，
+        // 回读时 strategy.type 又变回 'selective'，卡自己的往返校验就会失败。
+        vectorized = strategyType == "vectorized",
         selective = strategyType != "constant",
         selectiveLogic = jsrLogicToStNumber((secondary?.get("logic") as? JsonPrimitive)?.contentOrNull),
         position = jsrPositionTypeToStNumber((position?.get("type") as? JsonPrimitive)?.contentOrNull),
@@ -832,6 +837,8 @@ private fun jsrEntryToRegexInjection(obj: JsonObject): PromptInjection.RegexInje
         keywords = jsrKeyList(strategy?.get("keys")),
         secondaryKeys = jsrKeyList(secondary?.get("keys")),
         constantActive = strategyType == "constant",
+        // [v249] 同 jsrEntryToTavernBookEntry：全局世界书库也要能写入 vectorized。
+        vectorized = strategyType == "vectorized",
         selective = strategyType != "constant",
         selectiveLogic = jsrLogicToSelectiveLogic((secondary?.get("logic") as? JsonPrimitive)?.contentOrNull),
         scanDepth = scanDepth,
@@ -953,6 +960,9 @@ internal fun TavernBookEntry.keepingUnmappedFrom(old: TavernBookEntry?): TavernB
         matchCreatorNotes = old.matchCreatorNotes,
         ignoreBudget = old.ignoreBudget,
         outletName = old.outletName,
+        // [v249] vectorized 已由 jsrEntryToTavernBookEntry 映射，不能再无条件保留旧值，
+        // 否则卡把条目从 vectorized 改回 selective 时会被旧值覆盖，永远关不掉。
+        // （与 constant / selective 同一策略：strategy.type 是显式写入的权威来源。）
     )
 }
 
@@ -1051,6 +1061,8 @@ internal fun PromptInjection.RegexInjection.keepingUnmappedFrom(
         matchScenario = old.matchScenario,
         matchCreatorNotes = old.matchCreatorNotes,
         ignoreBudget = old.ignoreBudget,
+        // [v249] vectorized 已由 jsrEntryToRegexInjection 映射，同 constantActive：
+        // 显式写入的 strategy.type 是权威来源，不能再用旧值覆盖。
     )
 }
 
@@ -1070,7 +1082,9 @@ private fun entryToStJson(e: TavernBookEntry): JsonObject = buildJsonObject {
     put("content", e.content)
     put("disable", e.disable)
     put("constant", e.constant)
-    put("vectorized", false)
+    // [v249] 此前写死 false：卡里 vectorized=true 的条目下发到 JS 后 strategy.type 恒为
+    // 'selective'，第三方插件用 getLorebookEntries() 读到的策略类型是错的。
+    put("vectorized", e.vectorized)
     // ---- [v208] 以下 20 键此前缺失（审计 notes/audit-world-info-shim.md §3.2）----
     // selective：ST-PT worldinfo.ts:390 `data.selective && ...` —— 缺失 = 二级关键词全废（P1-1）
     put("selective", e.selective)

@@ -331,9 +331,17 @@ object PromptInjectionTransformer : InputMessageTransformer {
         // 做法：这里一次性算完，把「怎么算相似度」作为函数注入进去。
         val semanticScorer: ((String, String) -> Double)? = run {
             if (!vectorWorldInfoEnabled) return@run null
-            val vectorizedEntries = ctx.settings.lorebooks
-                .flatMap { it.entries }
-                .filter { it.vectorized }
+            val allVecEntries = ctx.settings.lorebooks.flatMap { it.entries }
+            val vectorizedEntries = allVecEntries.filter { it.vectorized }
+            // [v249] 诊断日志（debug 级）：确认世界书条目里的 vectorized 是否真的被读到
+            runCatching {
+                TavernRuntimeManager.appendLog(
+                    "debug",
+                    "[wi-vector-diag] books=" + ctx.settings.lorebooks.size +
+                        " entries=" + allVecEntries.size + " vectorized=" + vectorizedEntries.size +
+                        " enabled=" + vectorWorldInfoEnabled,
+                )
+            }
             if (vectorizedEntries.isEmpty()) return@run null
 
             // query 用与激活逻辑一致的上下文拼法：最近若干条消息
@@ -399,6 +407,7 @@ object PromptInjectionTransformer : InputMessageTransformer {
                 .firstOrNull { p -> p.id == ctx.settings.activePersonaId && p.enabled }
                 ?.description ?: "",
             semanticScorer = semanticScorer,
+            vectorMaxEntries = vectorMaxEntries,
             // 官方 outlet（position=7）汇聚结果发布给宏引擎（{{outlet::name}} 读取）
             outletSink = { outlets ->
                 WorldInfoOutlets.publish(ctx.conversationId?.toString(), outlets)
@@ -452,6 +461,8 @@ internal fun transformMessages(
      * 未配置 embedding 的场景行为完全不变。非 null 时由调用方注入真 embedding 版本。
      */
     semanticScorer: ((String, String) -> Double)? = null,
+    /** [v249] 每轮向量激活最多召回几条（ST vector_max_entries）；<=0 = 不限制 */
+    vectorMaxEntries: Int = 5,
     onOverflow: () -> Unit = {},
     regexScripts: List<RegexScript> = emptyList(),
     /**
@@ -496,6 +507,7 @@ internal fun transformMessages(
         cooldownEntries = cooldownEntries,
         delayOverrideEntries = delayOverrideEntries,
         semanticScorer = semanticScorer,
+        vectorMaxEntries = vectorMaxEntries,
         worldInfoBudget = worldInfoBudget,
         worldInfoBudgetCap = worldInfoBudgetCap,
         worldInfoMinActivations = worldInfoMinActivations,
@@ -593,6 +605,16 @@ internal fun collectInjections(
      * [v248] 语义相似度函数（query, doc → [0,1]）。null = 词袋余弦（旧行为）。
      */
     semanticScorer: ((String, String) -> Double)? = null,
+    /**
+     * [v249] 每轮向量激活最多召回几条（对应 ST vectors 扩展的 vector_max_entries）。
+     *
+     * 修复前的行为：只按阈值逐条放行，没有数量上限。一张卡若有 200 个 vectorized 条目、
+     * 而本轮 query 与其中 50 个都过阈值，50 条全被激活，只剩世界书 token 预算兜底，
+     * /vector-max-entries 5 设了完全不生效。
+     *
+     * 0 或负数 = 不限制（保持旧行为，供调试/兼容）。
+     */
+    vectorMaxEntries: Int = 5,
     onOverflow: () -> Unit = {},
     regexScripts: List<RegexScript> = emptyList(),
     /**
@@ -853,6 +875,9 @@ internal fun collectInjections(
             val newlyTriggered = mutableListOf<PromptInjection.RegexInjection>()
             // 触发时的关键词匹配分（酒馆 use_group_scoring 用）
             val triggeredScores = mutableMapOf<Uuid, Int>()
+            // [v249] 本轮向量命中候选（条目 to 相似度）。逐条放行时无法比较哪几条更像，
+            // 必须攒齐后统一按相似度取前 N 条（vector_max_entries 语义）。
+            val vectorHits = mutableListOf<Pair<PromptInjection.RegexInjection, Double>>()
 
             for ((lorebook, entry) in sortedEntries) {
                 // 官方：已激活条目和概率失败过的条目直接跳过
@@ -941,15 +966,48 @@ internal fun collectInjections(
                     newlyTriggered.add(entry)
                     triggeredScores[entry.id] = entry.matchedKeyScore(context)
                 } else if (entry.vectorized && PromptInjectionTransformer.vectorWorldInfoEnabled) {
+                    // [v249] 诊断：确认向量分支真的被进入（真机验证用，后续可降级）
+                    if (vectorHits.isEmpty()) {
+                        runCatching {
+                            TavernRuntimeManager.appendLog(
+                                "debug",
+                                "[wi-vector-probe] first vectorized entry reached: " + entry.name +
+                                    " scorer=" + (semanticScorer != null) + " threshold=" + PromptInjectionTransformer.vectorThreshold,
+                            )
+                        }
+                    }
                     val docText = (entry.keywords + entry.secondaryKeys + listOf(entry.name, entry.content)).joinToString(" ")
                     // [v248] 有 embedding 用真语义相似度，没有则回退词袋余弦（行为与旧版一致）
                     val sim = (semanticScorer ?: { q: String, d: String ->
                         PromptInjectionTransformer.computeVectorSimilarity(q, d)
                     })(context, docText)
                     if (sim >= PromptInjectionTransformer.vectorThreshold) {
-                        newlyTriggered.add(entry)
-                        triggeredScores[entry.id] = (sim * 100.0).roundToInt().coerceAtLeast(1)
+                        // [v249] 不立即放行：先攒候选，循环结束后按相似度取前 N 条
+                        vectorHits.add(entry to sim)
                     }
+                }
+            }
+
+            // [v249] 向量激活数量上限（ST vectors 扩展 vector_max_entries 语义）：
+            // 相似度降序取前 N 条。此前没有上限，vectorized 条目多时全部被激活，
+            // /vector-max-entries 设置完全不生效，只剩 token 预算兜底。
+            if (vectorHits.isNotEmpty()) {
+                val picked = if (vectorMaxEntries > 0) {
+                    vectorHits.sortedByDescending { it.second }.take(vectorMaxEntries)
+                } else {
+                    vectorHits.sortedByDescending { it.second }
+                }
+                // [v249] 真机诊断：证明上限真的截断了（出现即代表行为生效，不是仅仅不报错）
+                runCatching {
+                    TavernRuntimeManager.appendLog(
+                        "info",
+                        "[wi-vector] candidates=" + vectorHits.size + " cap=" + vectorMaxEntries +
+                            " picked=" + picked.size + " entries=" + picked.joinToString(",") { it.first.name },
+                    )
+                }
+                for ((vecEntry, vecSim) in picked) {
+                    newlyTriggered.add(vecEntry)
+                    triggeredScores[vecEntry.id] = (vecSim * 100.0).roundToInt().coerceAtLeast(1)
                 }
             }
 
