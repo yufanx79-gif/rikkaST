@@ -6680,6 +6680,80 @@ function installPanelMode() {
           [120, 400, 900, 1600, 2600].forEach(function(ms) { setTimeout(bindAll, ms); });
         })();
     } catch (e) { /* noop */ } })();
+// 内层纵向滚动区上报：供 Native 在手势判定时同步查询（落点 + 边界）
+(function () { try {
+  if (!window.__RIKKA_PANEL_MODE__) return;     // 只在面板 WebView 里启用
+  if (window.__rikkaZonesInstalled) return;
+  window.__rikkaZonesInstalled = true;
+
+  var root = document.getElementById('rikka-panel-root') || document.body;
+  var cands = [], rafId = 0, scanTimer = 0, lastJson = '';
+
+  function q(v) { return Math.round(v * 10) / 10; }
+
+  function bridge() {
+    var b = window.RikkaPanel;
+    return (b && typeof b.onInnerVScrollZones === 'function') ? b : null;
+  }
+
+  // 便宜：只重算已知候选元素的位置和边界状态
+  function report() {
+    rafId = 0;
+    var b = bridge();
+    if (!b) return;
+    var z = [];
+    for (var i = 0; i < cands.length; i++) {
+      var n = cands[i];
+      if (!n.isConnected) continue;
+      var h = n.clientHeight, sh = n.scrollHeight;
+      if (sh <= h + 2) continue;
+      var r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      z.push([q(r.left), q(r.top), q(r.right), q(r.bottom),
+              n.scrollTop > 1 ? 1 : 0,
+              (n.scrollTop + h < sh - 1) ? 1 : 0]);
+    }
+    var json = JSON.stringify({ vw: window.innerWidth, z: z });
+    if (json === lastJson) return;
+    lastJson = json;
+    try { b.onInnerVScrollZones(json); } catch (e) {}
+  }
+
+  // 贵：重新找出所有 overflow-y:auto|scroll 且内容溢出的元素，只在内容/尺寸变化时跑
+  function scan() {
+    scanTimer = 0;
+    var out = [];
+    try {
+      var nodes = root.querySelectorAll('*');
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        try {
+          var oy = getComputedStyle(n).overflowY;
+          if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 2) out.push(n);
+        } catch (e) {}
+      }
+    } catch (e) {}
+    cands = out;
+    // 动态出现的滚动容器也绑上原有的竖滑手势（幂等）
+    try { if (window.__rikkaBindVScroll) window.__rikkaBindVScroll(); } catch (e) {}
+    report();
+  }
+
+  function scheduleReport() { if (!rafId) rafId = requestAnimationFrame(report); }
+  function scheduleScan()   { if (!scanTimer) scanTimer = setTimeout(scan, 300); }
+
+  // scroll 事件不冒泡，必须用捕获；边界状态(canUp/canDown)靠它刷新
+  document.addEventListener('scroll', scheduleReport, true);
+  // 手指落下时强制重发一次（只做便宜的 report，不做 scan，避免触摸时卡顿）
+  document.addEventListener('touchstart', function () { lastJson = ''; report(); }, { capture: true, passive: true });
+  window.addEventListener('resize', scheduleScan);
+  try { new ResizeObserver(scheduleScan).observe(root); } catch (e) {}
+  // 只监听节点增删，不监听 attributes（带粒子/动画的卡会把属性变更刷爆）
+  try { new MutationObserver(scheduleScan).observe(root, { childList: true, subtree: true }); } catch (e) {}
+  [120, 400, 900, 1600, 2600].forEach(function (ms) { setTimeout(scan, ms); });
+
+  window.__rikkaReportZones = scan;
+} catch (e) { /* noop */ } })();
     // 横向滚动手势增强（虚拟长度 + 惯性，逐元素绑定）
     (function(){ try {
         (function(){

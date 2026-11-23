@@ -976,9 +976,11 @@ internal object DetachedPanelWebViewCache {
     }
 
     fun takeContainer(key: String): CachedPanelEntry? = synchronized(lock) {
-        val entry = map[key] ?: return null
+        // 取走即移出离屏池：容器从此归调用方的组合所有，不再参与离屏 LRU 淘汰。
+        // 原先用 map[key] 取出后条目仍留在池里，别的面板 park 触发淘汰时，
+        // 可能把"屏幕上正在显示"的 WebView release() 掉，UI 就会永远转圈。
+        val entry = map.remove(key) ?: return null
         if (entry.mountState.isDisposed || entry.mountState.webView == null) {
-            map.remove(key)
             return null
         }
         runCatching {
@@ -1002,7 +1004,12 @@ internal object DetachedPanelWebViewCache {
             runCatching {
                 (container.parent as? ViewGroup)?.removeView(container)
             }
-            map[key] = CachedPanelEntry(key = key, container = container, mountState = mountState)
+            val previous = map.put(key, CachedPanelEntry(key = key, container = container, mountState = mountState))
+            if (previous != null && previous.container !== container) {
+                // 同 key 之前还停着另一个容器（重叠组合的遗留）。直接覆盖会让它的 WebView 泄漏，
+                // 交给下面统一的 evictedList 释放。
+                evictedList += previous
+            }
             // 离屏立即暂停该面板自身的定时器/动画/媒体，减少多个 WebView 同时占用主线程。
             //
             // 边界说明（已按官方文档核实，勿改口径）：
@@ -1529,8 +1536,25 @@ fun MessageHtmlBlock(
     val isCappedScrollable = computedScrollable || heightDp > safetyMaxHeightDp
     val boundedHeightDp = computedHeightDp.coerceIn(minHeightDp, safetyMaxHeightDp)
 
-    val mountState = remember(effectiveQueueKey) {
-        DetachedPanelWebViewCache.getMountState(effectiveQueueKey) ?: PanelMountState()
+    // 组合刚创建时离屏池里可能还没有这个面板（上一份组合还没 park），这时先拿到一个空的占位实例。
+    // 等 factory 真正取回缓存容器时，把引用改成"容器所属的那一份"（见 factory 缓存命中分支），
+    // 保证 UI 观察的状态和 JS 桥写入的状态是同一个对象。
+    var mountStateRef by remember(effectiveQueueKey) {
+        mutableStateOf(
+            DetachedPanelWebViewCache.getMountState(effectiveQueueKey) ?: PanelMountState()
+        )
+    }
+    val mountState = mountStateRef
+    // 把"当前存活组合"的 heightDp 挂到 mountState 上。
+    // JS 桥(PanelBridge)是 WebView 创建时就绑定好的；容器被别的组合复用后，
+    // 它仍然只认 mountState。这里让它总是写到最新那份组合的 heightDp，
+    // 而不是创建它的那份已经销毁的组合。
+    DisposableEffect(mountState) {
+        val sink: (Int) -> Unit = { h -> heightDp = h }
+        mountState.heightSink = sink
+        onDispose {
+            if (mountState.heightSink === sink) mountState.heightSink = null
+        }
     }
     val handler = remember { Handler(Looper.getMainLooper()) }
     val onSurfaceColor = MaterialTheme.colorScheme.onSurface
@@ -2053,24 +2077,40 @@ fun MessageHtmlBlock(
                         // 优先从离屏保活池取回已渲染好的容器，杜绝切换页面或切换方案时重新创建 WebView
                         val cachedEntry = DetachedPanelWebViewCache.takeContainer(effectiveQueueKey)
                         if (cachedEntry != null) {
+                            // ① 先认领：容器里的 PanelBridge 绑定的是 cachedEntry.mountState，
+                            //    组合必须观察同一个实例，否则永远看不到 mounted / renderReady。
+                            if (mountStateRef !== cachedEntry.mountState) {
+                                TavernRuntimeManager.appendLog(
+                                    "info",
+                                    "[panel] adopt cached mountState key=$effectiveQueueKey " +
+                                        "composed=${System.identityHashCode(mountStateRef)} " +
+                                        "cached=${System.identityHashCode(cachedEntry.mountState)}",
+                                )
+                                mountStateRef = cachedEntry.mountState
+                            }
                             val frozenForCached = frozenExportHtml
                             if (frozenForCached != null) {
                                 cachedEntry.mountState.submitFrozen(frozenForCached, foregroundHex, messageKey, screenHeightDp)
                             } else {
                                 cachedEntry.mountState.submit(html, foregroundHex, messageKey, screenHeightDp)
                             }
-                            val cachedHeight = PanelHeightCache.get(messageKey, contentHash)
+                            // ② 高度和阶段无条件同步。原来整段包在 if (cachedHeight > 0) 里，
+                            //    高度缓存没命中时什么都不同步，面板高度会一直是 0。
+                            val cachedHeight = maxOf(
+                                PanelHeightCache.get(messageKey, contentHash),
+                                cachedEntry.mountState.lastReportedHeightDp,
+                            )
                             if (cachedHeight > 0) {
                                 heightDp = cachedHeight
-                                // 缓存高度只能用于占位，必须重新等本轮 resources_settled；
-                                // 否则缓存复挂载会瞬间显示“加载完成”，实际图片还没回来。
-                                stage = if (cachedEntry.mountState.resourcesSettled) {
-                                    PanelLoadStage.Ready
-                                } else {
-                                    PanelLoadStage.ResourcesLoading(panelTitle)
-                                }
-                                TavernPanelLoadScheduler.markDone(effectiveQueueKey)
                             }
+                            // 缓存高度只能用于占位，必须重新等本轮 resources_settled；
+                            // 否则缓存复挂载会瞬间显示“加载完成”，实际图片还没回来。
+                            stage = if (cachedEntry.mountState.resourcesSettled) {
+                                PanelLoadStage.Ready
+                            } else {
+                                PanelLoadStage.ResourcesLoading(panelTitle)
+                            }
+                            TavernPanelLoadScheduler.markDone(effectiveQueueKey)
                             return@AndroidView cachedEntry.container
                         }
 
@@ -2272,10 +2312,15 @@ fun MessageHtmlBlock(
                                                     "screenHeightDp=$screenHeightDp safetyMaxHeightDp=$safetyMaxHeightDp physicalPx=${physicalPx}px",
                                             )
                                         }
-                                        if (isPanelTouchingRef.get()) {
-                                            deferredTouchHeightRef.set(h)
+                                        if (mountState.panelTouching) {
+                                            mountState.deferredTouchHeightDp = h
                                         } else {
-                                            heightDp = h
+                                            val sink = mountState.heightSink
+                                            if (sink != null) {
+                                                sink(h)
+                                            } else {
+                                                heightDp = h
+                                            }
                                         }
                                         if (h > 0) {
                                             // 高度 > 0 只代表骨架已经排版，绝不再冒充“加载完成”。
@@ -2312,6 +2357,8 @@ fun MessageHtmlBlock(
                             loadUrl(TavernRuntimeManager.BASE_URL + "panel.html")
                         }
                         PanelScrollBridge(ctx).apply {
+                            // 这个容器里的 WebView 真正归属哪份 PanelMountState（onRelease 要用）
+                            ownerState = mountState
                             verticalScrollProbe = {
                                 webView.canScrollVertically(-1) || webView.canScrollVertically(1)
                             }
@@ -2322,12 +2369,32 @@ fun MessageHtmlBlock(
                             verticalEdgeProbe = { dir ->
                                 if (dir > 0) !webView.canScrollVertically(-1) else !webView.canScrollVertically(1)
                             }
+                            // 落点探测：手指按下的位置是否落在内层 overflow-y 滚动区里。
+                            // webView.canScrollVertically() 只看根文档，看不到 .roster 这类内部滚动容器。
+                            // 返回 null = 不在任何内层滚动区（回退到上面的整页探测）；
+                            // true/false = 该滑动方向内层还能不能继续滚。
+                            verticalZoneProbe = { x, y, fingerDown ->
+                                val zones = mountState.innerZones
+                                val pxPerCssPx = if (zones.viewportCssWidth > 0f && webView.width > 0) {
+                                    webView.width / zones.viewportCssWidth
+                                } else {
+                                    density.density
+                                }
+                                zones.canScrollAt(x / pxPerCssPx, y / pxPerCssPx, fingerDown)
+                            }
                             onTouchActiveChanged = { touching ->
                                 isPanelTouchingRef.set(touching)
+                                mountState.panelTouching = touching
                                 if (!touching) {
-                                    val deferredH = deferredTouchHeightRef.getAndSet(-1)
+                                    val deferredH = mountState.deferredTouchHeightDp
+                                    mountState.deferredTouchHeightDp = -1
                                     if (deferredH > 0) {
-                                        heightDp = deferredH
+                                        val sink = mountState.heightSink
+                                        if (sink != null) {
+                                            sink(deferredH)
+                                        } else {
+                                            heightDp = deferredH
+                                        }
                                     }
                                 }
                             }
@@ -2347,9 +2414,12 @@ fun MessageHtmlBlock(
                         }
                     },
                     onRelease = { container ->
+                        // 容器真正的归属状态：组合里的 mountState 可能是一个从未挂过 WebView 的占位实例，
+                        // 用它判断会把"其实已经挂载好"的容器当成未挂载，直接丢弃。
+                        val ownerState = (container as? PanelScrollBridge)?.ownerState ?: mountState
                         TavernPanelLoadScheduler.markDone(effectiveQueueKey)
-                        if (isInteractiveClass && mountState.mounted && !mountState.isDisposed && snapshotCompositeKey != null) {
-                            val wvForFreeze = mountState.webView
+                        if (isInteractiveClass && ownerState.mounted && !ownerState.isDisposed && snapshotCompositeKey != null) {
+                            val wvForFreeze = ownerState.webView
                             val keyForFreeze = snapshotCompositeKey
                             runCatching {
                                 wvForFreeze?.evaluateJavascript(
@@ -2360,7 +2430,7 @@ fun MessageHtmlBlock(
                                     }
                                 }
                             }
-                            if (snapshotEntry == null && mountState.renderReady) {
+                            if (snapshotEntry == null && ownerState.renderReady) {
                                 PanelSnapshotStore.captureFromWebView(
                                     context = context,
                                     compositeKey = keyForFreeze,
@@ -2371,11 +2441,11 @@ fun MessageHtmlBlock(
                         }
                         if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys) {
                             DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
-                            mountState.release()
-                        } else if (mountState.mounted && !mountState.isDisposed) {
-                            DetachedPanelWebViewCache.parkContainer(effectiveQueueKey, container, mountState)
+                            ownerState.release()
+                        } else if (ownerState.mounted && !ownerState.isDisposed) {
+                            DetachedPanelWebViewCache.parkContainer(effectiveQueueKey, container, ownerState)
                         } else {
-                            mountState.release()
+                            ownerState.release()
                         }
                     },
                 )
@@ -3119,6 +3189,12 @@ private class PanelScrollBridge(context: Context) : FrameLayout(context) {
     /** 面板是否已到达纵向边界。dir=1 手指下滑查顶部，dir=-1 手指上滑查底部。 */
     var verticalEdgeProbe: ((Int) -> Boolean)? = null
 
+    /** 落点判定：返回 null = 触点不在内层滚动区；true/false = 该滑动方向内层还能不能继续滚。 */
+    var verticalZoneProbe: ((x: Float, y: Float, fingerDown: Boolean) -> Boolean?)? = null
+
+    /** 这个容器里的 WebView 真正归属的 PanelMountState（onRelease 使用）。 */
+    var ownerState: PanelMountState? = null
+
     var onTouchActiveChanged: ((Boolean) -> Unit)? = null
 
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
@@ -3151,10 +3227,18 @@ private class PanelScrollBridge(context: Context) : FrameLayout(context) {
                             // 横向：交给面板里的横向容器
                             true
                         } else {
-                            // 纵向：能滚且未到边界才留在面板
-                            val canScroll = verticalScrollProbe?.invoke() == true
-                            val atEdge = verticalEdgeProbe?.invoke(if (ev.y > downY) 1 else -1) == true
-                            canScroll && !atEdge
+                            // 纵向：先看按下的位置是不是在内层滚动区里
+                            val fingerDown = ev.y > downY
+                            val zoneVerdict = verticalZoneProbe?.invoke(downX, downY, fingerDown)
+                            if (zoneVerdict != null) {
+                                // 在内层滚动区：还能朝这个方向滚就留给面板；已到顶/底就交还外层列表
+                                zoneVerdict
+                            } else {
+                                // 不在内层滚动区：沿用原逻辑（整页能不能滚 + 是否到边界）
+                                val canScroll = verticalScrollProbe?.invoke() == true
+                                val atEdge = verticalEdgeProbe?.invoke(if (fingerDown) 1 else -1) == true
+                                canScroll && !atEdge
+                            }
                         }
                         parent?.requestDisallowInterceptTouchEvent(lockedToPanel)
                     }
@@ -3202,6 +3286,31 @@ internal enum class PanelUpdateAction {
 
 /** 面板挂载状态（WebView 页面就绪后注入 HTML；`mountedHtml` 使用 Compose `mutableStateOf` 响应式状态）。 */
 internal class PanelMountState {
+    // ── 宿主回调：由"当前存活的组合"通过 DisposableEffect 注册 ──
+    @Volatile var heightSink: ((Int) -> Unit)? = null
+    @Volatile var panelTouching: Boolean = false
+    @Volatile var deferredTouchHeightDp: Int = -1
+    /** JS 最近一次上报的高度(dp)。缓存命中时用来恢复高度，不依赖 PanelHeightCache 是否命中。 */
+    @Volatile var lastReportedHeightDp: Int = 0
+
+    // ── 内层纵向滚动区（JS 上报，Native 手势判定时同步读取）──
+    @Volatile var innerZones: InnerScrollZones = InnerScrollZones.EMPTY
+        private set
+
+    fun updateInnerZones(json: String) {
+        if (isDisposed) return
+        runCatching {
+            val o = JSONObject(json)
+            val arr = o.getJSONArray("z")
+            val data = FloatArray(arr.length() * 6)
+            for (i in 0 until arr.length()) {
+                val a = arr.getJSONArray(i)
+                for (k in 0 until 6) data[i * 6 + k] = a.getDouble(k).toFloat()
+            }
+            innerZones = InnerScrollZones(o.optDouble("vw", 0.0).toFloat(), data)
+        }
+    }
+
     var webView: WebView? = null
         private set
     private var pageReady = false
@@ -3678,6 +3787,36 @@ internal class PanelMountState {
     }
 }
 
+/** JS 上报的内层纵向滚动区。每个区域 6 个值：left, top, right, bottom, canUp, canDown（CSS px，视口坐标）。 */
+internal class InnerScrollZones(
+    val viewportCssWidth: Float,
+    private val data: FloatArray,
+) {
+    /**
+     * 返回 null = 落点不在任何内层滚动区；
+     * true/false = 该滑动方向上内层还能不能继续滚（会沿着包含落点的祖先滚动区一路向外找，找到任何一个能滚的就返回 true）。
+     * fingerDown=true 表示手指向下滑（内容回滚，看 canUp）；false 表示手指向上滑（看 canDown）。
+     */
+    fun canScrollAt(xCss: Float, yCss: Float, fingerDown: Boolean): Boolean? {
+        var hit = false
+        var i = data.size / 6 - 1 // JS 按文档顺序上报，后者更深，从最内层开始找
+        while (i >= 0) {
+            val b = i * 6
+            if (xCss >= data[b] && xCss <= data[b + 2] && yCss >= data[b + 1] && yCss <= data[b + 3]) {
+                hit = true
+                val can = if (fingerDown) data[b + 4] else data[b + 5]
+                if (can > 0f) return true
+            }
+            i--
+        }
+        return if (hit) false else null
+    }
+
+    companion object {
+        val EMPTY = InnerScrollZones(0f, FloatArray(0))
+    }
+}
+
 @Keep
 private class PanelBridge(
     private val handler: Handler,
@@ -3685,6 +3824,7 @@ private class PanelBridge(
     private val onHeight: (Int) -> Unit,
 ) {
     private var firstMountLogged = false
+    private var firstZonesLogged = false
 
     @JavascriptInterface
     fun onPanelRuntimeReady() {
@@ -3756,7 +3896,21 @@ private class PanelBridge(
                 )
             }
             TavernRuntimeManager.appendLog("debug", "[panel] resize h=$height")
+            mountState.lastReportedHeightDp = height.coerceIn(0, 2_000_000)
             onHeight(height.coerceIn(0, 2_000_000))
+        }
+    }
+
+    @JavascriptInterface
+    fun onInnerVScrollZones(json: String) {
+        if (mountState.isDisposed) return
+        mountState.updateInnerZones(json)
+        if (!firstZonesLogged) {
+            firstZonesLogged = true
+            TavernRuntimeManager.appendLog(
+                "debug",
+                "[panel] inner-zones key=" + mountState.currentPendingKey() + " json=" + json.take(260),
+            )
         }
     }
 

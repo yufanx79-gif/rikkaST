@@ -81,7 +81,7 @@ internal fun rememberPanelLabFloors(): List<PanelLabFloor> {
     val total = 30
     return (0 until total).map { index ->
         // 最后一楼固定 BIG，模拟真实场景里"最新一楼是角色卡大面板"
-        val pick = if (index == total - 1) base[4] else base[index % base.size]
+        val pick = if (index == total - 1) base[5] else base[index % base.size]
         val suffix = if (index >= base.size) "（第 ${index + 1} 楼）" else ""
         PanelLabFloor(index, pick.first, pick.second + suffix, pick.third)
     }
