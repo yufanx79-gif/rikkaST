@@ -1,337 +1,215 @@
-# rikkaST — Bringing SillyTavern to Android
+<div align="center">
 
-["简体中文"](README.md) | ["English"](README_EN.md)
+<img src="docs/icon.png" alt="rikkaST Icon" width="128" height="128" />
 
-> Latest version: v2.5.10-public-20261026
+# rikkaST
 
-rikkaST is a customized native Android LLM chat client based on RikkaHub, with a built-in SillyTavern compatibility layer. Its goal is to bring SillyTavern's character cards, World Info, presets, prompt processing, and third-party extension ecosystem to Android as naturally as possible.
+**Native Android AI Chat Client · SillyTavern 1.19.0 Compatible**
 
-["Download Latest APK"](https://github.com/yufanx79-gif/rikkaST/releases/tag/v2.5.10-public-20261026) · ["All Releases"](https://github.com/yufanx79-gif/rikkaST/releases) · ["Changelog"](RELEASE_NOTES_2.5.10.md)
+*Side-by-side install · Native Tavern cards/lorebooks/presets · Third-party extensions & dual-engine companion server · Long-chat HTML panel pool*
 
----
+<p>
+<a href="README.md">简体中文</a> ·
+<b>English</b> ·
+<a href="README_JA.md">日本語</a>
+</p>
 
-## A Note from the Developer
+<p>
+<a href="https://github.com/yufanx79-gif/rikkaST/releases"><img src="https://img.shields.io/github/v/release/yufanx79-gif/rikkaST?style=flat-square&label=Release&color=111111" alt="Release" /></a>
+<a href="https://github.com/yufanx79-gif/rikkaST/stargazers"><img src="https://img.shields.io/github/stars/yufanx79-gif/rikkaST?style=flat-square&color=f59e0b" alt="Stars" /></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-2563eb?style=flat-square" alt="License" /></a>
+<img src="https://img.shields.io/badge/Android-8.0%2B%20(API%2026)-3DDC84%3Fstyle%3Dflat-square" alt="Android" />
+<img src="https://img.shields.io/badge/ABI-arm64--v8a-555555?style=flat-square" alt="ABI" />
+</p>
 
-This is a personal open-source project under continuous development with the assistance of AI. I am still learning, fixing issues, and filling in missing features. The project has benefited greatly from the code, documentation, and design references provided by excellent open-source projects such as RikkaHub, SillyTavern, and Kelivo.
+<p>
+<a href="https://github.com/yufanx79-gif/rikkaST/releases"><b>Download Latest APK</b></a> ·
+<a href="https://github.com/yufanx79-gif/rikkaST/issues">Report an Issue</a> ·
+<a href="THIRD-PARTY-NOTICES.md">Third-Party Notices</a> ·
+<a href="docs/PRIVACY-NETWORK.md">Privacy &amp; Network</a>
+</p>
 
-My goal is not simply to give a chat application a different interface. I want to bring as much of the SillyTavern experience as possible to Android: importing character cards, managing World Info and prompts, running scripts, and gradually supporting SillyTavern's third-party extensions.
+</div>
 
-However, rikkaST is not a complete implementation of SillyTavern, and not every SillyTavern extension is guaranteed to work. Native features, compatibility implementations, and known gaps will be documented separately wherever possible.
+**rikkaST** is an independent open-source fork of [RikkaHub](https://github.com/rikkahub/rikkahub), built natively with Kotlin and Jetpack Compose.
 
-If you encounter a problem, feel free to open an Issue or suggest an improvement. I will continue iterating on features that are incomplete.
+* **Looking for a solid Android AI client?** Plug in an API key and start chatting. Multi-provider protocols, streaming, voice mode, web search, proactive memory, local knowledge base, MCP / Skills, built-in Python 3.12, and a PRoot Linux workspace all stay intact, while Tavern features stay out of your way until you need them.
 
-## Table of Contents
+* **Want a native SillyTavern experience on Android?** Character cards, World Info / Lorebooks, Chat Completion presets & SPreset, regex scripts, macros, slash commands, interactive HTML status panels, and third-party extensions run directly inside the app — without juggling Termux web tabs or background process kills.
 
-- [Project Overview](#project-overview)
-- [Feature Overview](#feature-overview)
-- [SillyTavern Compatibility](#sillytavern-compatibility)
-- [Installation and Updates](#installation-and-updates)
-- [Building the Project](#building-the-project)
-- [Relationship with Upstream Projects](#relationship-with-upstream-projects)
-- [Privacy and Networking](#privacy-and-networking)
-- [Known Limitations](#known-limitations)
-- [Acknowledgments](#acknowledgments)
-- [License](#license)
+> [!TIP]
+> rikkaST uses an independent package ID (`me.rerere.rikkahub.st`), so it installs alongside official RikkaHub without overwriting your data. You can directly import RikkaHub backups (excluding SSH remote workspaces) as well as SillyTavern backup ZIP archives.
 
----
+<!-- Recommended: add 3–4 device screenshots here (Chat & HTML Panel / Character Card & Lorebook / Extensions / Themes) -->
 
-## Project Overview
+## ✨ Feature Highlights
 
-SillyTavern's character cards, World Info, presets, macros, regex scripts, and third-party extensions form an interconnected ecosystem. However, this ecosystem is primarily designed around a web environment. On mobile devices, browser performance, interface interactions, and extension compatibility can all become obstacles.
+| Area | What's Built In | 
+| ----- | ----- | 
+| 🍺 **SillyTavern 1.19.0 Compatibility** | Pins 205 upstream SillyTavern 1.19.0 public modules; end-to-end support for character cards, lorebooks, presets, regex, macros, slash commands, and Quick Replies | 
+| 🧩 **Third-Party Extension Host** | Install extensions from local ZIP or Git URL; serves `/scripts/extensions/third-party/` over same-origin HTTPS with bundled MVU and offline frontend libraries | 
+| ⚙️ **Dual-Engine Companion Server** | Zero-config in-process JVM companion server on `127.0.0.1:18181` out of the box; hands off seamlessly to a PRoot Node.js v20.18.1 daemon when installed | 
+| 🖼️ **Long-Chat HTML Panel Pool** | 5-tier static panel classification, priority-based LRU WebView pooling, bitmap snapshot freezing with tap-to-hydrate, nested scroll coordination, and crash recovery | 
+| 🤖 **Multi-Model & Multi-Protocol** | Native OpenAI (Chat Completions & Responses API), Anthropic Claude, Google Gemini (Vertex AI & Interactions API), xAI Grok, ChatGPT login, and multi-key rotation | 
+| 🧠 **Memory & Knowledge Base** | File-based memory, proactive memory reminders (customizable prompt), scheduled consolidation, and local document parsing (PDF / DOCX / XLSX) | 
+| 🛠️ **Agent Tools & Local Compute** | MCP & Skills support, embedded Python 3.12 (Chaquopy), PRoot Linux workspace with PTY terminal, JS sandbox, and 19+ web search providers | 
+| 🔊 **Voice, Group Chat & Media** | Multi-character group chat scheduling, character expressions/sprites, Tavern audio bridge, voice mode (multi-provider ASR / TTS), and image/video generation | 
+| 🖥️ **Multi-Device & Sync** | Built-in LAN Web UI with NSD discovery, WebDAV & S3 (AWS SigV4) cloud sync, plus Chatbox and CherryStudio import | 
+| 🛡️ **Privacy & Test Coverage** | Firebase / Crashlytics stripped, SPreset `LogUpload` telemetry blocked by design, backed by **175 unit test files** covering core regressions | 
 
-rikkaST builds on RikkaHub's native Android application and progressively implements SillyTavern-compatible data formats, prompt-processing logic, and an extension runtime.
+## 🚀 Quick Start
 
-The project follows two approaches:
+1. Download the latest `arm64-v8a` APK from [Releases](https://github.com/yufanx79-gif/rikkaST/releases) (Android 8.0 / API 26+).
 
-- **Native implementation:** Features suited to native implementation, such as character cards, World Info, macros, preset management, prompt injection, and slash commands, are integrated directly into the Android application.
-- **WebView compatibility runtime:** A compatibility environment provides selected SillyTavern JavaScript extensions with the frontend APIs, modules, DOM containers, and event mechanisms they require. The aim is to reuse existing extensions where possible instead of rewriting each one individually.
+2. Open **Settings → Providers** to add your model API and pick a default model.
 
-The goal is to continuously improve compatibility with the SillyTavern ecosystem while retaining RikkaHub's existing model integrations, chat functionality, tools, and knowledge base.
+3. Bring over your existing data:
 
-Related technical documentation:
+   * **Character Cards**: One-tap import for `.png`, `.json`, `.charx`, and `.byaf` (extension-first detection to avoid Android file manager MIME mismatches).
 
-- [SillyTavern Compatibility Report](docs/ST-COMPATIBILITY.md)
-- [SillyTavern Feature Matrix](docs/ST-FEATURE-MATRIX.md)
-- [Code Differences from Upstream](UPSTREAM-COMPATIBILITY.md)
-- [Build Instructions](BUILDING.md)
-- [Privacy and Networking](docs/PRIVACY-NETWORK.md)
+   * **SillyTavern Archives**: Import a SillyTavern data folder or backup ZIP; automatically detects `characters/`, `worlds/`, `OpenAI Settings/`, `QuickReplies/`, and global regex in `settings.json`.
 
-## Feature Overview
+   * **RikkaHub & Other Clients**: Restore RikkaHub backup archives directly (except SSH remote workspaces), or import configs from Chatbox / CherryStudio.
 
-### 1. Character Cards: Import, Edit, and Export
+## 🍺 SillyTavern Compatibility (Aligned to 1.19.0)
 
-rikkaST includes dedicated compatibility handling for SillyTavern character cards.
+rikkaST embeds a dedicated `st-runtime` aligned with SillyTavern 1.19.0 semantics rather than flattening cards into plain system prompts.
 
-- Supports the primary data structures used by SillyTavern character cards, including fields from V2/V3 cards such as description, personality, scenario, first message, example dialogue, creator's notes, alternate greetings, and depth prompts.
-- Attempts to preserve extension fields and original data to reduce information loss during import and export.
-- Supports processing related data embedded in character cards, including World Info, regex scripts, and scripts.
-- Provides a native visual editing interface.
-- Supports character card export in PNG and JSON formats.
-- Supports `.charx` character cards and embedded resources, attempting to convert resource references such as `embeded://`, `embedded://`, and `ccdefault:` into locally accessible resource addresses.
+| Asset / Subsystem | Verified Implementation | 
+| ----- | ----- | 
+| **Character Cards** | Import and edit `.png` / `.json` / `.charx` / `.byaf` cards while preserving character fields, embedded lorebooks, and extension payloads | 
+| **World Info / Lorebook** | Constant & keyword triggers, recursive scanning, Sticky / Cooldown / Delay state tracking, decorators (`@@activate`, `@@dont_activate`, etc.), Outlet injection, and local semantic vector triggers | 
+| **Presets & SPreset** | Chat Completion presets and SPreset keys (`ChatSquash`, `RegexBinding`, `MacroNest`, etc.) with safe QuickJS fallback; explicitly skips `LogUpload` third-party debug uploads | 
+| **Macros & Regex Scripts** | Dedicated macro engine (variables, random, time, state, nested macros); multi-source regex engine (global / card / preset) with deduplication and staged execution | 
+| **Slash Commands & Quick Replies** | Full slash command parser and executor with closures and variable scopes, plus Quick Replies import and execution | 
+| **Context & Immersion** | Author's Note, Instruct Mode, Persona, group chat speaker scheduling, local TikToken counting (`cl100k_base` / `o200k_base`), character expressions/sprites, and Tavern audio bridge | 
 
-Complex character cards may still encounter compatibility issues involving individual fields or special resources. Keep the original files for important character cards.
+<details>
+<summary><b>📖 Architecture Details: Third-Party Extensions, Dual-Engine Companion Server &amp; HTML Panel Pool</b></summary>
 
-### 2. World Info: Keywords, Recursive Scanning, and Injection
+### Third-Party Extension Host
 
-World Info is an important component of character settings and narrative memory in SillyTavern. rikkaST provides independent World Info management and prompt-injection capabilities.
+* **Native Asset Endpoints**: Install extensions from local ZIP archives (enforcing 64 MB archive size, 256 MB extraction caps against zip bombs, and path-traversal checks) or Git URLs. The WebView asset interceptor serves `/scripts/extensions/third-party/<folder>/` over same-origin HTTPS.
 
-- Supports primary keywords, secondary keywords, and multiple matching logic options.
-- Supports whole-word matching, regular-expression matching, and case-sensitive settings.
-- Supports constant entries, trigger probabilities, delayed activation, sticky entries, cooldowns, and group logic.
-- Supports recursive scanning, scan-depth settings, and token budgets.
-- Supports controlling entry insertion positions, ordering, and related generation behavior.
-- Supports managing and synchronizing external and embedded World Info.
-- Supports exporting World Info as SillyTavern World Info JSON.
+* **Bundled Offline Libraries**: Ships an MVU bundle alongside locally intercepted copies of EJS, KaTeX, Mermaid, jQuery, Lodash, Showdown, DOMPurify, Zod, and YAML to avoid blank panels on flaky mobile networks.
 
-The World Info engine aims to follow SillyTavern's relevant semantics, but it should not be considered an exact reproduction of every edge case in the official implementation.
+### Dual-Engine Companion Server (`127.0.0.1:18181`)
 
-### 3. Separate Preset Management and Prompt Injection
+For extensions that expect a server plugin backend (such as `littlewhitebox-server`), rikkaST runs a two-stage local daemon:
 
-rikkaST provides separate entry points for preset management and prompt injection, reducing the maintenance burden caused by mixing different configuration responsibilities.
+1. **Zero-Config Built-In JVM Companion (`BuiltinNodeCompanionServer`)**: Starts in-process with zero extra downloads, handling `/health`, per-assistant/per-conversation isolated host context, `/api/backends/chat-completions/{status,generate}`, and plugin routes.
 
-- Preset management handles preset configurations and related imported content.
-- Prompt injection manages injection settings associated with the generation context.
-- Supports importing SillyTavern preset files and related backup data.
-- Parses and applies supported SillyTavern preset parameters.
-- Processes stop sequences, sampling parameters, forced reply prefixes, and selected message post-processing strategies according to configuration.
+2. **PRoot Linux + Node.js v20.18.1 Daemon (`NodeRuntimeManager`)**: Once you opt in to install the shared Linux rootfs and Node.js runtime, it seamlessly takes over `127.0.0.1:18181` running `server-bootstrap.cjs` with an Express-compatible router for server plugins.
 
-Whether a specific parameter takes effect also depends on the model provider, generation API, and compatibility of the corresponding parameter.
+Both modes bind strictly to `127.0.0.1`, enforce random per-session token auth (Bearer / X-CSRF-Token), cap request body sizes, and redact API keys and tokens from logs.
 
-### 4. Macros and Prompt Templates
+### Long-Chat HTML / JS Panel Engine (`MessageHtmlBlock.kt`)
 
-rikkaST includes macro-processing logic for handling dynamic content before messages are sent.
+Interactive status bars and rich HTML cards can easily lag or crash mobile WebViews across long chats. rikkaST manages panel lifecycles explicitly:
 
-- Supports reading, writing, and modifying conversation variables.
-- Supports conditional expressions, comparison operators, and nested conditions.
-- Supports random selection, dice, time, and selected conversation-state-related macros.
-- Supports template processing for relevant content in prompts, character cards, and World Info.
-- Supports EJS-style template rendering to provide partial compatibility with ST-Prompt-Template workflows.
-- Attempts to preserve the original text of unrecognized macros to avoid damaging user content.
+* **5-Class Automatic Classification**: Statically classifies panels into `STATIC`, `ANIMATED`, `LIGHT`, `SEND`, or `BIG` to match lifecycle cost to actual interactivity.
 
-### 5. Slash Commands and STscript
+* **Priority-Based Active Pool**: Keeps concurrent live panel WebViews strictly bounded (default 2–3 active, configurable up to a hard cap of 16) with priority-aware LRU eviction.
 
-rikkaST provides a native slash-command interface and implements part of SillyTavern STscript syntax and execution logic.
+* **Snapshot Freezing & Tap-to-Hydrate**: Captures snapshots for older floors and releases their WebViews, remounting on tap when needed.
 
-Supported areas include:
+* **Nested Scroll & Crash Guard**: Coordinates inner JS scroll zones with the outer Compose list, falls back to software layers for tall panels to avoid GPU texture overflow, and auto-rebuilds crashed renderer processes (capped at 5 retries).
 
-- Conversation control and message operations.
-- Character card, persona, and variable-related operations.
-- Message branches, Swipe operations, and selected checkpoint operations.
-- Pipelines, parameter passing, and selected script-control commands.
-- Native dialog interactions corresponding to commands such as `/popup`, `/input`, and `/buttons`.
-- Quick Reply automatic execution and related paths for extensions to invoke slash commands.
+</details>
 
-STscript remains an evolving compatibility implementation. Not all official commands, parameters, or execution details are supported.
+## 🤖 Native AI Client Capabilities
 
-### 6. Persona, Author's Note, and Group Chats
+* **Multi-Provider & Protocols**: OpenAI (Chat Completions & Responses API), Anthropic Claude, Google Gemini (Vertex AI & Interactions API), xAI Grok, and ChatGPT account login; multi-key rotation and quota checks.
 
-- **Persona:** Supports persona management, character binding, and multiple injection positions.
-- **Author's Note:** Supports settings such as injection interval, depth, character association, and enable/disable controls.
-- **Group chats:** Supports conversations involving multiple characters, with character-selection strategies and automatic turn-taking.
+* **Memory & Knowledge Base**: File-backed memory management, proactive memory reminders with customizable prompts, scheduled background consolidation, and local RAG parsing for PDF (MuPDF / PDFBox), DOCX, and XLSX.
 
-These modules use SillyTavern's relevant usage semantics as a reference. Their behavior may differ from the official implementation.
+* **Agent Toolbox & Local Runtimes**:
 
-### 7. Regex, Quick Reply, and Script Management
+  * MCP (Model Context Protocol) and Skills system.
 
-- **Regex scripts:** Supports multiple scopes and processing positions for input, output, and related prompt-processing workflows.
-- **Quick Reply:** Supports quick-reply sets, command execution, and selected automatic-trigger mechanisms.
-- **Script source management:** Supports managing scripts from sources such as character cards, global scripts, and presets.
-- **Automatic triggers:** Integrates selected lifecycle events and related workflows, including startup, conversation switching, user message submission, AI response completion, and associated interactions.
+  * Embedded **Python 3.12** via Chaquopy (pre-installed with `requests`, `beautifulsoup4`, `pypdf`, `openpyxl`, `markdownify`, `tabulate`, etc.).
 
-The actual behavior of each trigger depends on whether the corresponding event has been integrated and which APIs the script uses.
+  * **PRoot Linux workspace & PTY terminal**, plus local file tools, JavaScript sandbox, calculator, calendar, clipboard, and chart rendering.
 
-### 8. Third-Party Extension Runtime
+  * 19+ web search and fetch engines (Bing, Brave, Tavily, Exa, Perplexity, Firecrawl, Jina, SearXNG, Serper, Bocha, Metaso, Zhipu, and more).
 
-rikkaST includes a WebView runtime that attempts to provide a compatibility environment for SillyTavern third-party JavaScript extensions.
+* **Voice, Media & Multi-Device**:
 
-Current work includes:
+  * Voice mode supporting multiple ASR (OpenAI Realtime, DashScope, Volcengine, Step, MiMo) and TTS (ElevenLabs, Fish Audio, OpenAI, Gemini, MiniMax, Qwen, Volcengine, Groq, xAI, System TTS, etc.) providers.
 
-- Installing third-party extensions from ZIP files or supported HTTP(S) URLs.
-- Loading extension scripts, dependencies, and related resources.
-- Providing compatibility implementations for selected SillyTavern core modules.
-- Providing compatibility entry points for frontend APIs such as `SillyTavern.getContext()`, `eventSource`, and `TavernHelper`.
-- Providing selected DOM containers required by extension settings interfaces.
-- Connecting selected SillyTavern events to native generation, message, and World Info processing workflows.
-- Providing chat-generation interfaces for selected extensions so they can invoke the application's generation workflow.
-- Localizing selected third-party JavaScript dependencies where possible to improve repeated loading and usability in network-restricted environments.
+  * Conversation branching, context checkpoints, message queue, and image/video generation.
 
-Currently targeted extensions and capabilities:
+  * Built-in **LAN Web UI** (Ktor + NSD discovery), plus **WebDAV** and **S3 (AWS SigV4)** cloud sync.
 
-| Extension or Module | Current Focus |
-| --- | --- |
-| Tavern Helper (JS-Slash-Runner) | Scripts, buttons, variables, World Info, slash commands, and selected generation interfaces |
-| ST-Prompt-Template | EJS template rendering, PromptManager, and related variable semantics |
-| MVU (MagVarUpdate) | Variable-update parsing, runtime support, and related panel functionality |
-| Other third-party extensions | Progressive adaptation based on their API, event, and DOM dependencies |
+* **Themes & Localization**: Built-in themes (Minimal, Claude, Ocean, Sakura, Spring, Autumn, Black), custom JSON themes, frosted message bubbles, and 7 UI languages (Simplified Chinese, Traditional Chinese, English, Japanese, Korean, Russian, Arabic).
 
-This list indicates areas with targeted compatibility work. It does not mean every feature has been fully tested across all versions of each extension.
+## 🛡️ Privacy & Engineering Quality
 
-### 9. Native Tools, Skills, and Knowledge Base
+* **No Built-In Telemetry**: Firebase and Crashlytics plugins are removed from the build configuration.
 
-rikkaST also retains and extends RikkaHub's native capabilities.
+* **Defensive Defaults**: SPreset `LogUpload` uploads are intentionally skipped; extension ZIPs enforce size and path-traversal limits; companion server binds to `127.0.0.1` only with log secret redaction.
 
-- **Models and chat:** Multiple model providers, streaming output, conversation branches, message editing, regeneration, and more.
-- **Tool calling:** Selected tools such as file operations, Shell, calculator, database queries, Python, and web scraping.
-- **Skills:** Supports skill loading, management, and related installation workflows.
-- **Workspace:** Provides a working directory and terminal capabilities for Agents.
-- **Knowledge base (RAG):** Supports importing documents, folders, text, and chat histories, combining full-text and vector retrieval to provide contextual information.
-- **Native multimedia:** Retains the application's own image generation, TTS, and ASR capabilities. Availability depends on the relevant configuration and services.
+* **175 Unit Test Files**: Regression suites covering real-world character card & preset imports, World Info decorators and vector fallback chains, macro/regex/slash contracts, event bus & host bridge wiring, HTML panel pool priorities, Compose performance guards, database migrations, and backup path healing.
 
-Note that the application's native image-generation and voice features do not use the same interfaces as SillyTavern's official Image Generation and TTS extensions. Their availability does not imply that the corresponding SillyTavern extensions will work.
+## 🛠️ Building from Source
 
-### 10. WebView Panels and Stability Improvements
+> [!NOTE]
+> Requires **JDK 21**, **Android SDK** (`compileSdk 37` / `minorApiLevel 2`, `minSdk 26`), and **Python 3.12** (for Chaquopy packaging). Current toolchain: Gradle 9.6.0, AGP 9.4.0, Kotlin 2.4.21.
 
-rikkaST continues to improve WebView resource loading and rendering for HTML panels, status bars, and interactive content embedded in SillyTavern character cards.
+<details>
+<summary><b>📦 Module Layout &amp; Tech Stack</b></summary>
 
-- Adds MIME-type mappings for common images, fonts, audio, and video resources.
-- Improves compatibility for loading selected external images.
-- Improves the detection and mounting logic for selected HTML/CSS panels.
-- Reduces full-page reloads and flickering during selected streaming updates and variable refreshes.
-- Persists runtime logs to help diagnose extension loading and execution problems.
-- Improves background-generation process retention and exception handling.
+| Module / Path | Responsibility | 
+| ----- | ----- | 
+| `:app` | Main app, Jetpack Compose UI, Room / DataStore persistence, Tavern compatibility pipeline (`data/st/`, `data/ai/transformers/`), HTML panel pool, and LAN Web UI | 
+| `app/src/main/assets/st-runtime` | SillyTavern 1.19.0 runtime, shims, MVU bundle, offline vendor libraries, and `node-host` bootstrap daemon | 
+| `:ai` | Multi-provider abstractions, SSE stream decoders, Agent loop, key rotation, and quota runner | 
+| `:workspace` | PRoot Linux rootfs installer & patcher, native C++ PTY terminal, and shared Node.js runtime manager | 
+| `:search` / `:speech` / `:document` | Web search engines, ASR/TTS controllers, and local PDF/Office parsers | 
+| `:mediagen` / `:videogen` / `:oauth` | Image/video generation and OAuth credential flows | 
+| `:highlight` / `:material3` / `:ui` / `:common` / `:web` | Syntax highlighting, Material 3 components, shared utilities, and Web UI assets | 
 
-Different panels have different structures and dependencies. Complex third-party pages may still require targeted compatibility work.
+Core stack: Kotlin · Jetpack Compose · Material 3 Expressive · Navigation 3 · Koin · Room · DataStore · OkHttp · Ktor · Coil 3 · Chaquopy · QuickJS
 
----
+</details>
 
-## SillyTavern Compatibility
-
-rikkaST aims to support SillyTavern workflows as closely as possible, but clear technical limitations remain.
-
-| Area | Current Status | Description |
-| --- | --- | --- |
-| Character cards and basic data | Under continuous development | Supports primary fields and related import, editing, and export workflows |
-| World Info and prompt processing | Under continuous development | Many core behaviors have been implemented, but some edge cases still require verification |
-| Macros, regex, and STscript | Partial compatibility | Multiple common capabilities are implemented, but not all official behaviors are covered |
-| Third-party extension runtime | Partial compatibility | Provides a runtime environment and targeted adaptations, but extensions have widely varying dependencies |
-| SillyTavern server APIs | Limited coverage | Currently integrates only selected chat-generation-related endpoints |
-| Official SillyTavern built-in extensions | Incomplete | Some required server APIs and runtime modules have not yet been implemented |
-
-### Known Compatibility Gaps
-
-- SillyTavern server APIs are not fully implemented. Some extension requests to `/api/*` endpoints will fail.
-- Some official events have been integrated, but not every defined event is emitted at the correct time.
-- Third-party extensions that depend on unimplemented events, server APIs, or official built-in extensions may not work correctly.
-- Some extensions depend on complex iframe or DOM structures, network proxies, or specific runtime environments and still require individual adaptation.
-- Successful extension installation does not mean every feature of that extension is functional.
-
-For implementation details, known gaps, and corresponding code evidence, see:
-
-- [ST-COMPATIBILITY.md: Compatibility Report](docs/ST-COMPATIBILITY.md)
-- [ST-FEATURE-MATRIX.md: Feature Matrix](docs/ST-FEATURE-MATRIX.md)
-
-I would rather clearly distinguish what has been implemented from what remains incomplete than conceal limitations behind claims of "full compatibility."
-
----
-
-## Installation and Updates
-
-### Download
-
-Visit [GitHub Releases](https://github.com/yufanx79-gif/rikkaST/releases) to download the latest published version.
-
-Current release: **v2.5.10-public-20261026**
-
-- Package: `rikkaST-2.5.10-public-20261026.apk`
-- SHA-256: `01573d4f07e12a8aef02bcc6413f0292f5829f4b87d87b9ddb24f9afc7e6f0cc`
-- Prebuilt architecture: `arm64-v8a`
-- Database: Room v33 (upgrades from v29 / v30 / v31 / v32)
-- Upgrade: install over the existing app; do not uninstall or clear app data.
-- APK signature: This project has changed signing keys in the past, so older versions may not support direct in-place upgrades.
-
-### Update Notes
-
-If installation reports a signature mismatch, the old and current versions may have been signed with different keys. Uninstalling the old version and installing the new one may resolve the issue, but uninstalling can result in the loss of local data. Make sure your chats, configurations, and other important data are backed up before proceeding.
-
-After a new version is released, use the version and APK provided on the GitHub Releases page.
-
----
-
-## Building the Project
-
-For detailed build procedures, environment requirements, and configuration instructions, see [BUILDING.md](BUILDING.md).
-
-Basic build commands:
-
-```bash
-# Build the Release APK
-./gradlew :app:assembleRelease
+```
+git clone https://github.com/yufanx79-gif/rikkaST.git
+cd rikkaST
+cp local.properties.example local.properties
+# Set sdk.dir and chaquopy.python in local.properties (add release signing keys locally if needed; never commit them)
 
 # Run unit tests
-./gradlew :app:testDebugUnitTest
+./gradlew :app:testDebugUnitTest --console=plain
+
+# Build Debug APK
+./gradlew :app:assembleDebug --console=plain
+
+# Build Release APK (requires signing config)
+./gradlew :app:assembleRelease --console=plain
+
 ```
 
-The build requires a compatible JDK, Android SDK, and other environment components appropriate for the project configuration. Some features also involve the NDK, Chaquopy, and local configuration.
+On Windows, replace `./gradlew` with `gradlew.bat`.
 
-Refer to the build documentation for Release signing and related local configuration. Do not commit signing keys, tokens, or personal configuration files to a public repository.
+## 🙏 Credits & License
 
----
+| Project | Relationship | License | 
+| ----- | ----- | ----- | 
+| [rikkahub/rikkahub](https://github.com/rikkahub/rikkahub) | Upstream project providing the native Android multi-LLM client foundation and UI | AGPL-3.0 | 
+| [SillyTavern/SillyTavern](https://github.com/SillyTavern/SillyTavern) | Compatibility target (aligned to 1.19.0 core semantics and public modules) | AGPL-3.0 | 
+| MVU / Chaquopy / PRoot / Termux & others | Runtime, sandbox, and toolchain components — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | See notices | 
 
-## Relationship with Upstream Projects
+Licensed under the [**GNU Affero General Public License v3.0 (AGPL-3.0)**](LICENSE).
 
-rikkaST is a derivative project that modifies and extends existing open-source projects.
+## ⭐ Star History
 
-- [RikkaHub](https://github.com/rikkahub/rikkahub): Provides the foundation and related functionality for the native Android chat client.
-- [SillyTavern](https://github.com/SillyTavern/SillyTavern): Serves as a reference for SillyTavern compatibility targets, data formats, and extension contracts.
-- [Kelivo](https://github.com/Chevey339/kelivo): Provides references for selected UI and interaction designs.
+If rikkaST is useful to you, consider giving it a Star ⭐
 
-This project retains substantial upstream functionality while adding a SillyTavern compatibility layer and other native implementations. For details about modified files, newly added files, and upstream migration records, see [UPSTREAM-COMPATIBILITY.md](UPSTREAM-COMPATIBILITY.md).
-
-The project will continue maintaining its differences from upstream and evaluating future updates according to its needs.
-
----
-
-## Privacy and Networking
-
-The project's privacy and networking behavior should be understood through its code and related documentation.
-
-- The project states that it does not integrate analytics or crash-reporting SDKs in the Analytics / Crashlytics category.
-- Model requests are sent to the corresponding services according to the provider and configuration selected by the user.
-- Third-party extensions, skills, web scraping, and network features explicitly invoked by users may access external services.
-- For details about network requests, permissions, and triggering conditions associated with different features, see [Privacy and Networking](docs/PRIVACY-NETWORK.md).
-
-When using third-party model services or extensions, also review the privacy policies and data-handling practices of the relevant services.
-
----
-
-## Known Limitations
-
-- SillyTavern compatibility is still under development. Some character cards, macros, scripts, and third-party extensions may have compatibility issues.
-- Not all SillyTavern server APIs have been implemented. Extensions that depend on unavailable endpoints may not work correctly.
-- Official SillyTavern image-generation and TTS extensions are not guaranteed to work. The application's native image-generation and speech-synthesis features use a separate implementation.
-- Prebuilt APKs currently support only the `arm64-v8a` architecture.
-- Signing keys may differ between versions. Back up local data before upgrading from an older version.
-- The project is under continuous development. Implemented features, compatibility levels, and known issues may change between releases.
-
-If you encounter a problem, please provide reproduction steps, the application version, and relevant logs. For extension compatibility issues, including the extension name and version, relevant settings, and error logs will make diagnosis easier.
-
----
-
-## Acknowledgments
-
-Thanks to the following projects and their contributors:
-
-- [RikkaHub](https://github.com/rikkahub/rikkahub): The upstream project for the native Android LLM chat client.
-- [SillyTavern](https://github.com/SillyTavern/SillyTavern): A reference for SillyTavern data formats, feature semantics, and the extension ecosystem.
-- [Kelivo](https://github.com/Chevey339/kelivo): A reference for UI and interaction design.
-- All third-party library and tool developers and maintainers whose work is used by this project.
-
-For third-party components and related license information, see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-
----
-
-## License
-
-This project is released under the GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE) for details.
-
-This project modifies and extends upstream open-source code. When distributing binaries or modified versions, comply with the applicable license requirements and include the necessary license files and third-party notices.
-
-### Trademarks and Project Relationship
-
-"SillyTavern" and the names and trademarks of other projects belong to their respective owners. rikkaST is an independent compatibility implementation. It is not an official product of SillyTavern, RikkaHub, or any other related project, and it does not imply endorsement by those projects.
-
----
-
-If rikkaST is useful to you, feel free to use it, report issues, suggest improvements, or give the repository a ⭐.
-
-The project is still evolving. Thank you to everyone who tries it, points out problems, and helps make it better.
+<a href="https://www.star-history.com/#yufanx79-gif/rikkaST&Date">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=yufanx79-gif/rikkaST&type=Date&theme=dark" />
+<source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=yufanx79-gif/rikkaST&type=Date" />
+<img alt="Star History Chart" src="https://api.star-history.com/svg?repos=yufanx79-gif/rikkaST&type=Date" />
+</picture>
+</a>
