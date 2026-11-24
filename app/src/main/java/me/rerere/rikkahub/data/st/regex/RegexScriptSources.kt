@@ -72,6 +72,15 @@ fun mergeRegexScripts(
 ): List<RegexScript> {
     val cardList = card.orEmpty()
     if (cardList.isEmpty() && preset.isEmpty() && presetByGroup.isEmpty()) return global
+    // [v2] 全局列表中已有快照的预设组：快照为权威，避免同一预设正则执行两遍。
+    // 背景：mergePresetRegexScripts 会把预设正则带 sourcePresetGroup 写进 Settings.regexScripts，
+    // 而这里又从 tavernPresets 取了一份；dedupKey 的 sourceTag 不同（global vs preset:<group>），
+    // 两份都会保留 → 同一条正则在同一次消息里跑两遍（第二遍在折叠后的 HTML 上再命中，输出膨胀）。
+    val snapshotGroups = HashSet<String>()
+    for (script in global) {
+        val g = script.sourcePresetGroup
+        if (!g.isNullOrBlank()) snapshotGroups.add(g)
+    }
     val seenKeys = HashSet<String>(global.size + preset.size + cardList.size)
     return buildList(global.size + preset.size + cardList.size) {
         for (script in global) {
@@ -81,6 +90,7 @@ fun mergeRegexScripts(
         }
         if (presetByGroup.isNotEmpty()) {
             for ((group, scripts) in presetByGroup) {
+                if (group in snapshotGroups) continue
                 val tag = "preset:$group"
                 for (script in scripts) {
                     if (seenKeys.add(dedupKey(tag, script))) {
@@ -90,6 +100,8 @@ fun mergeRegexScripts(
             }
         } else {
             for (script in preset) {
+                val g = script.sourcePresetGroup
+                if (g != null && g in snapshotGroups) continue
                 if (seenKeys.add(dedupKey("preset", script))) {
                     add(script)
                 }

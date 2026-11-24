@@ -107,3 +107,6 @@ _testshots/
 _tools/
 _backup_bridge.txt
 _backup_stage1_mine/
+
+# 历史开发过程记录与真机取证大文件（不入库）
+/docs/progress/

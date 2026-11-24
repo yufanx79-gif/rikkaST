@@ -1431,12 +1431,37 @@ internal object PanelClassificationCache {
 
 
 /**
+ * 单个 HTML 面板 WebView 纹理层的像素预算（高度方向）。
+ *
+ * [v251 根因修复] 原实现直接用 GPU 硬上限 4096px 当预算 —— 这是「频闪」的真因：
+ *
+ *  - Android 单层硬件加速纹理的硬上限确实是 4096px，但**贴着上限分配 = 零余量**。
+ *    Chromium 的合成器还需要额外的 tile 来支持滚动/重绘，一旦总量超预算就打印
+ *    `tile_manager.cc: tile memory limits exceeded, some content may not draw`
+ *    并**随机丢弃部分 tile** —— 用户看到的就是「一半闪一半不闪」。
+ *  - 真机日志实证（2026-11-24 21:39~21:43）：该警告出现 **164 次**，
+ *    且每次都紧跟面板高度上报（1365dp × 3 = 4095px，正好贴死 4096）。
+ *  - 4 个面板同时存活时：4 × 1080 × 4095px ≈ 71MB 纯纹理，远超合成器预算。
+ *
+ * 取 2048px 的理由：
+ *  - 留出 2× 余量给合成器 tile（这是「不闪」的充要条件）；
+ *  - 2048 / 3(dpi) ≈ 682dp，仍覆盖手机视口高度的 85%，视觉上几乎无感；
+ *  - 超过此高度的面板本来就已经启用内部滚动（`isCappedScrollable = true`），
+ *    多给的那部分高度用户根本看不到，纯属浪费。
+ */
+internal const val MAX_PANEL_TEXTURE_PX = 2048
+
+/** 面板高度的 dp 上限（由 [MAX_PANEL_TEXTURE_PX] 与当前 density 共同决定）。 */
+internal fun panelMaxHeightDp(density: Float): Int =
+    minOf(1600, (MAX_PANEL_TEXTURE_PX / density.coerceAtLeast(1f)).toInt()).coerceAtLeast(480)
+
+/**
  * 计算 HTML 面板在 GPU 硬件加速纹理限制下的安全显示高度（dp）与是否启用内部滚动。
  */
 internal fun computePanelHeightConstraint(
     rawContentHeightDp: Int,
     density: Float,
-    maxTexturePx: Int = 4096,
+    maxTexturePx: Int = MAX_PANEL_TEXTURE_PX,
 ): Pair<Int, Boolean> {
     val safeDensity = density.coerceAtLeast(1f)
     val gpuSafeMaxDp = minOf(1600, (maxTexturePx / safeDensity).toInt()).coerceAtLeast(480)
@@ -1497,7 +1522,9 @@ fun MessageHtmlBlock(
     }
     val screenHeightDp = configuration.screenHeightDp.coerceAtLeast(480)
     val minHeightDp = 48
-    val gpuSafeMaxDp = minOf(1600, (4096f / density.density.coerceAtLeast(1f)).toInt()).coerceAtLeast(480)
+    // [v251] 统一走 panelMaxHeightDp()：与 computePanelHeightConstraint 共享同一份纹理预算，
+    // 杜绝「两处各写一个 4096」这种迟早会漂移的重复定义。
+    val gpuSafeMaxDp = panelMaxHeightDp(density.density)
     val safetyMaxHeightDp = if (unboundedHeight) {
         gpuSafeMaxDp
     } else {

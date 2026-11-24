@@ -70,6 +70,10 @@ var NOOP = () => {};
 var isOn = (key) => key.charCodeAt(0) === 111 && key.charCodeAt(1) === 110 && (key.charCodeAt(2) > 122 || key.charCodeAt(2) < 97);
 var isModelListener = (key) => key.startsWith("onUpdate:");
 var extend$1 = Object.assign;
+var remove = (arr, el) => {
+	const i = arr.indexOf(el);
+	if (i > -1) arr.splice(i, 1);
+};
 var hasOwnProperty$1 = Object.prototype.hasOwnProperty;
 var hasOwn = (val, key) => hasOwnProperty$1.call(val, key);
 var isArray = Array.isArray;
@@ -87,7 +91,7 @@ var toTypeString = (value) => objectToString.call(value);
 var toRawType = (value) => {
 	return toTypeString(value).slice(8, -1);
 };
-var isPlainObject$1 = (val) => toTypeString(val) === "[object Object]";
+var isPlainObject$2 = (val) => toTypeString(val) === "[object Object]";
 var isIntegerKey = (key) => isString(key) && key !== "NaN" && key[0] !== "-" && "" + parseInt(key, 10) === key;
 var cacheStringFunction$1 = (fn) => {
 	const cache = /* @__PURE__ */ Object.create(null);
@@ -181,18 +185,160 @@ var replacer = (_key, val) => {
 	}, {}) };
 	else if (isSet(val)) return { [`Set(${val.size})`]: [...val.values()].map((v) => stringifySymbol(v)) };
 	else if (isSymbol(val)) return stringifySymbol(val);
-	else if (isObject$2(val) && !isArray(val) && !isPlainObject$1(val)) return String(val);
+	else if (isObject$2(val) && !isArray(val) && !isPlainObject$2(val)) return String(val);
 	return val;
 };
 var stringifySymbol = (v, i = "") => {
 	var _a;
 	return isSymbol(v) ? `Symbol(${(_a = v.description) != null ? _a : i})` : v;
 };
+// node_modules/.pnpm/@vue+reactivity@3.5.45/node_modules/@vue/reactivity/dist/reactivity.esm-bundler.js
 /**
 * @vue/reactivity v3.5.45
 * (c) 2018-present Yuxi (Evan) You and Vue contributors
 * @license MIT
 **/
+var activeEffectScope;
+var EffectScope = class {
+	constructor(detached = false) {
+		this.detached = detached;
+		/**
+		* @internal
+		*/
+		this._active = true;
+		/**
+		* @internal track `on` calls, allow `on` call multiple times
+		*/
+		this._on = 0;
+		/**
+		* @internal
+		*/
+		this.effects = [];
+		/**
+		* @internal
+		*/
+		this.cleanups = [];
+		this._isPaused = false;
+		this._warnOnRun = true;
+		this.__v_skip = true;
+		if (!detached && activeEffectScope) {
+			if (activeEffectScope.active) {
+				this.parent = activeEffectScope;
+				this.index = (activeEffectScope.scopes || (activeEffectScope.scopes = [])).push(this) - 1;
+			} else {
+				this._active = false;
+				this._warnOnRun = false;
+			}
+		}
+	}
+	get active() {
+		return this._active;
+	}
+	pause() {
+		if (this._active) {
+			this._isPaused = true;
+			let i, l;
+			if (this.scopes) {
+				const scopes = this.scopes.slice();
+				for (i = 0, l = scopes.length; i < l; i++) scopes[i].pause();
+			}
+			for (i = 0, l = this.effects.length; i < l; i++) this.effects[i].pause();
+		}
+	}
+	/**
+	* Resumes the effect scope, including all child scopes and effects.
+	*/
+	resume() {
+		if (this._active) {
+			if (this._isPaused) {
+				this._isPaused = false;
+				let i, l;
+				if (this.scopes) {
+					const scopes = this.scopes.slice();
+					for (i = 0, l = scopes.length; i < l; i++) scopes[i].resume();
+				}
+				const effects = this.effects.slice();
+				for (i = 0, l = effects.length; i < l; i++) effects[i].resume();
+			}
+		}
+	}
+	run(fn) {
+		if (this._active) {
+			const currentEffectScope = activeEffectScope;
+			try {
+				activeEffectScope = this;
+				return fn();
+			} finally {
+				activeEffectScope = currentEffectScope;
+			}
+		}
+	}
+	/**
+	* This should only be called on non-detached scopes
+	* @internal
+	*/
+	on() {
+		if (++this._on === 1) {
+			this.prevScope = activeEffectScope;
+			activeEffectScope = this;
+		}
+	}
+	/**
+	* This should only be called on non-detached scopes
+	* @internal
+	*/
+	off() {
+		if (this._on > 0 && --this._on === 0) {
+			if (activeEffectScope === this) activeEffectScope = this.prevScope;
+			else {
+				let current = activeEffectScope;
+				while (current) {
+					if (current.prevScope === this) {
+						current.prevScope = this.prevScope;
+						break;
+					}
+					current = current.prevScope;
+				}
+			}
+			this.prevScope = void 0;
+		}
+	}
+	stop(fromParent) {
+		if (this._active) {
+			this._active = false;
+			let i, l;
+			for (i = 0, l = this.effects.length; i < l; i++) this.effects[i].stop();
+			this.effects.length = 0;
+			for (i = 0, l = this.cleanups.length; i < l; i++) this.cleanups[i]();
+			this.cleanups.length = 0;
+			if (this.scopes) {
+				const scopes = this.scopes.slice();
+				for (i = 0, l = scopes.length; i < l; i++) scopes[i].stop(true);
+				this.scopes.length = 0;
+			}
+			if (!this.detached && this.parent && !fromParent) {
+				const last = this.parent.scopes.pop();
+				if (last && last !== this) {
+					this.parent.scopes[this.index] = last;
+					last.index = this.index;
+				}
+			}
+			this.parent = void 0;
+		}
+	}
+};
+function effectScope(detached) {
+	return new EffectScope(detached);
+}
+function getCurrentScope() {
+	return activeEffectScope;
+}
+function onScopeDispose(fn, failSilently = false) {
+	if (activeEffectScope) {
+		if (activeEffectScope.active) activeEffectScope.cleanups.push(fn);
+		else fn();
+	}
+}
 var activeSub;
 var pausedQueueEffects = /* @__PURE__ */ new WeakSet();
 var ReactiveEffect = class {
@@ -219,6 +365,10 @@ var ReactiveEffect = class {
 		*/
 		this.cleanup = void 0;
 		this.scheduler = void 0;
+		if (activeEffectScope) {
+			if (activeEffectScope.active) activeEffectScope.effects.push(this);
+			else this.flags &= -2;
+		}
 	}
 	pause() {
 		this.flags |= 64;
@@ -822,9 +972,9 @@ var BaseReactiveHandler = class {
 		if (isShallow2) return res;
 		if (/* @__PURE__ */ isRef(res)) {
 			const value = targetIsArray && isIntegerKey(key) ? res : res.value;
-			return isReadonly2 && isObject$2(value) ? /* @__PURE__ */ readonly$2(value) : value;
+			return isReadonly2 && isObject$2(value) ? /* @__PURE__ */ readonly$1(value) : value;
 		}
-		if (isObject$2(res)) return isReadonly2 ? /* @__PURE__ */ readonly$2(res) : /* @__PURE__ */ reactive(res);
+		if (isObject$2(res)) return isReadonly2 ? /* @__PURE__ */ readonly$1(res) : /* @__PURE__ */ reactive(res);
 		return res;
 	}
 };
@@ -1055,7 +1205,7 @@ function reactive(target) {
 	return createReactiveObject(target, false, mutableHandlers, mutableCollectionHandlers, reactiveMap);
 }
 // @__NO_SIDE_EFFECTS__
-function readonly$2(target) {
+function readonly$1(target) {
 	return createReactiveObject(target, true, readonlyHandlers, readonlyCollectionHandlers, readonlyMap);
 }
 function createReactiveObject(target, isReadonly2, baseHandlers, collectionHandlers, proxyMap) {
@@ -1097,13 +1247,13 @@ function markRaw(value) {
 	return value;
 }
 var toReactive = (value) => isObject$2(value) ? /* @__PURE__ */ reactive(value) : value;
-var toReadonly = (value) => isObject$2(value) ? /* @__PURE__ */ readonly$2(value) : value;
+var toReadonly = (value) => isObject$2(value) ? /* @__PURE__ */ readonly$1(value) : value;
 // @__NO_SIDE_EFFECTS__
 function isRef(r) {
 	return r ? r["__v_isRef"] === true : false;
 }
 // @__NO_SIDE_EFFECTS__
-function ref$1(value) {
+function ref(value) {
 	return createRef(value, false);
 }
 // @__NO_SIDE_EFFECTS__
@@ -1138,14 +1288,14 @@ var RefImpl = class {
 		}
 	}
 };
-function unref$1(ref2) {
+function unref(ref2) {
 	return /* @__PURE__ */ isRef(ref2) ? ref2.value : ref2;
 }
 function toValue(source) {
-	return isFunction(source) ? source() : unref$1(source);
+	return isFunction(source) ? source() : unref(source);
 }
 var shallowUnwrapHandlers = {
-	get: (target, key, receiver) => key === "__v_raw" ? target : unref$1(Reflect.get(target, key, receiver)),
+	get: (target, key, receiver) => key === "__v_raw" ? target : unref(Reflect.get(target, key, receiver)),
 	set: (target, key, value, receiver) => {
 		const oldValue = target[key];
 		if (/* @__PURE__ */ isRef(oldValue) && !/* @__PURE__ */ isRef(value)) {
@@ -1176,6 +1326,12 @@ var CustomRefImpl = class {
 function customRef(factory) {
 	return new CustomRefImpl(factory);
 }
+// @__NO_SIDE_EFFECTS__
+function toRefs(object) {
+	const ret = isArray(object) ? new Array(object.length) : {};
+	for (const key in object) ret[key] = propertyToRef(object, key);
+	return ret;
+}
 var ObjectRefImpl = class {
 	constructor(_object, key, _defaultValue) {
 		this._object = _object;
@@ -1193,7 +1349,7 @@ var ObjectRefImpl = class {
 	}
 	get value() {
 		let val = this._object[this._key];
-		if (this._shallow) val = unref$1(val);
+		if (this._shallow) val = unref(val);
 		return this._value = val === void 0 ? this._defaultValue : val;
 	}
 	set value(newVal) {
@@ -1222,11 +1378,11 @@ var GetterRefImpl = class {
 	}
 };
 // @__NO_SIDE_EFFECTS__
-function toRef$1(source, key, defaultValue) {
+function toRef(source, key, defaultValue) {
 	if (/* @__PURE__ */ isRef(source)) return source;
 	else if (isFunction(source)) return new GetterRefImpl(source);
 	else if (isObject$2(source) && arguments.length > 1) return propertyToRef(source, key, defaultValue);
-	else return /* @__PURE__ */ ref$1(source);
+	else return /* @__PURE__ */ ref(source);
 }
 function propertyToRef(source, key, defaultValue) {
 	return new ObjectRefImpl(source, key, defaultValue);
@@ -1364,8 +1520,10 @@ function watch$1(source, cb, options = EMPTY_OBJ) {
 		const depth = deep === true ? Infinity : deep;
 		getter = () => traverse(baseGetter(), depth);
 	}
+	const scope = getCurrentScope();
 	const watchHandle = () => {
 		effect.stop();
+		if (scope && scope.active) remove(scope.effects, effect);
 	};
 	if (once && cb) {
 		const _cb = cb;
@@ -1435,7 +1593,7 @@ function traverse(value, depth = Infinity, seen) {
 	else if (isSet(value) || isMap$1(value)) value.forEach((v) => {
 		traverse(v, depth, seen);
 	});
-	else if (isPlainObject$1(value)) {
+	else if (isPlainObject$2(value)) {
 		for (const key in value) traverse(value[key], depth, seen);
 		for (const key of Object.getOwnPropertySymbols(value)) if (Object.prototype.propertyIsEnumerable.call(value, key)) traverse(value[key], depth, seen);
 	}
@@ -1659,6 +1817,9 @@ function inject(key, defaultValue, treatDefaultAsFactory = false) {
 		else if (arguments.length > 1) return treatDefaultAsFactory && isFunction(defaultValue) ? defaultValue.call(instance && instance.proxy) : defaultValue;
 	}
 }
+function hasInjectionContext() {
+	return !!(getCurrentInstance() || currentApp);
+}
 var ssrContextKey = /* @__PURE__ */ Symbol.for("v-scx");
 var useSSRContext = () => {
 	{
@@ -1670,7 +1831,7 @@ var useSSRContext = () => {
 function watchSyncEffect(effect, options) {
 	return doWatch(effect, null, { flush: "sync" });
 }
-function watch$2(source, cb, options) {
+function watch(source, cb, options) {
 	return doWatch(source, cb, options);
 }
 function doWatch(source, cb, options = EMPTY_OBJ) {
@@ -1940,10 +2101,10 @@ function useTransitionState() {
 		isUnmounting: false,
 		leavingVNodes: /* @__PURE__ */ new Map()
 	};
-	onMounted$1(() => {
+	onMounted(() => {
 		state.isMounted = true;
 	});
-	onBeforeUnmount$1(() => {
+	onBeforeUnmount(() => {
 		state.isUnmounting = true;
 	});
 	return state;
@@ -2232,9 +2393,9 @@ function injectHook(type, hook, target = currentInstance, prepend = false) {
 var createHook = (lifecycle) => (hook, target = currentInstance) => {
 	if (!isInSSRComponentSetup || lifecycle === "sp") injectHook(lifecycle, (...args) => hook(...args), target);
 };
-var onMounted$1 = createHook("m");
-var onBeforeUnmount$1 = createHook("bum");
-var onUnmounted$1 = createHook("um");
+var onMounted = createHook("m");
+var onBeforeUnmount = createHook("bum");
+var onUnmounted = createHook("um");
 var NULL_DYNAMIC_COMPONENT = /* @__PURE__ */ Symbol.for("v-ndc");
 function renderList(source, renderItem, cache, index) {
 	let ret;
@@ -2728,7 +2889,7 @@ function getComponentPublicInstance(instance) {
 function isClassComponent(value) {
 	return isFunction(value) && "__vccOpts" in value;
 }
-var computed$2 = (getterOrOptions, debugOptions) => {
+var computed = (getterOrOptions, debugOptions) => {
 	return /* @__PURE__ */ computed$1(getterOrOptions, debugOptions, isInSSRComponentSetup);
 };
 function h(type, propsOrChildren, children) {
@@ -3054,6 +3215,19 @@ var withKeys = (fn, modifiers) => {
 		if (modifiers.some((k) => k === eventKey || keyNames[k] === eventKey)) return fn(event);
 	}));
 };
+// node_modules/.pnpm/@vueuse+shared@14.4.0_vue@3.5.45_typescript@6.0.3_/node_modules/@vueuse/shared/dist/index.js
+/**
+* Call onScopeDispose() if it's inside an effect scope lifecycle, if not, do nothing
+*
+* @param fn
+*/
+function tryOnScopeDispose(fn, failSilently) {
+	if (getCurrentScope()) {
+		onScopeDispose(fn, failSilently);
+		return true;
+	}
+	return false;
+}
 var isClient = typeof window !== "undefined" && typeof document !== "undefined";
 typeof WorkerGlobalScope !== "undefined" && globalThis instanceof WorkerGlobalScope;
 var notNullish = (val) => val != null;
@@ -3072,7 +3246,7 @@ function getLifeCycleTarget(target) {
 * @param target
 */
 function tryOnUnmounted(fn, target) {
-	if (getLifeCycleTarget(target)) onUnmounted$1(fn, target);
+	if (getLifeCycleTarget(target)) onUnmounted(fn, target);
 }
 /**
 * Shorthand for watching value with {immediate: true}
@@ -3080,7 +3254,7 @@ function tryOnUnmounted(fn, target) {
 * @see https://vueuse.org/watchImmediate
 */
 function watchImmediate$1(source, cb, options) {
-	return watch$2(source, cb, {
+	return watch(source, cb, {
 		...options,
 		immediate: true
 	});
@@ -3105,7 +3279,7 @@ function useEventListener$1(...args) {
 		el.addEventListener(event, listener, options);
 		return () => el.removeEventListener(event, listener, options);
 	};
-	const firstParamTargets = computed$2(() => {
+	const firstParamTargets = computed(() => {
 		const test = toArray(toValue(args[0])).filter((e) => e != null);
 		return test.every((e) => typeof e !== "string") ? test : void 0;
 	});
@@ -3114,7 +3288,7 @@ function useEventListener$1(...args) {
 		return [
 			(_firstParamTargets$va = (_firstParamTargets$va2 = firstParamTargets.value) === null || _firstParamTargets$va2 === void 0 ? void 0 : _firstParamTargets$va2.map((e) => unrefElement(e))) !== null && _firstParamTargets$va !== void 0 ? _firstParamTargets$va : [defaultWindow].filter((e) => e != null),
 			toArray(toValue(firstParamTargets.value ? args[1] : args[0])),
-			toArray(unref$1(firstParamTargets.value ? args[2] : args[1])),
+			toArray(unref(firstParamTargets.value ? args[2] : args[1])),
 			toValue(firstParamTargets.value ? args[3] : args[2])
 		];
 	}, ([raw_targets, raw_events, raw_listeners, raw_options], _, onCleanup) => {
@@ -4105,7 +4279,7 @@ function useFocusTrap(target, options = {}) {
 			isPaused.value = false;
 		}
 	};
-	watch$2(computed$2(() => {
+	watch(computed(() => {
 		return toArray(toValue(target)).map((el) => {
 			const _el = toValue(el);
 			return typeof _el === "string" ? _el : unrefElement(_el);
@@ -4131,6 +4305,7 @@ function useFocusTrap(target, options = {}) {
 			if (!isActive && immediate) activate();
 		}
 	}, { flush: "post" });
+	tryOnScopeDispose(() => deactivate());
 	return {
 		hasFocus,
 		isPaused,
@@ -4431,7 +4606,7 @@ var co = {
 	}
 };
 function Oe(e = !1) {
-	const o = /* @__PURE__ */ ref$1(e), l = /* @__PURE__ */ ref$1(o.value ? 0 : void 0);
+	const o = /* @__PURE__ */ ref(e), l = /* @__PURE__ */ ref(o.value ? 0 : void 0);
 	return [
 		o,
 		l,
@@ -4452,22 +4627,22 @@ function Oe(e = !1) {
 	];
 }
 function fo(e, o) {
-	const { modelValueLocal: l, onEntering: s, onEnter: u, onLeaving: c, onLeave: a } = o, n = /* @__PURE__ */ ref$1(l.value), [t, r, m] = Oe(n.value), [f, M, S] = Oe(n.value), V = computed$2(() => typeof e.contentTransition == "string" ? {
+	const { modelValueLocal: l, onEntering: s, onEnter: u, onLeaving: c, onLeave: a } = o, n = /* @__PURE__ */ ref(l.value), [t, r, m] = Oe(n.value), [f, M, S] = Oe(n.value), V = computed(() => typeof e.contentTransition == "string" ? {
 		name: e.contentTransition,
 		appear: !0
 	} : {
 		appear: !0,
 		...e.contentTransition
-	}), O = computed$2(() => typeof e.overlayTransition == "string" ? {
+	}), O = computed(() => typeof e.overlayTransition == "string" ? {
 		name: e.overlayTransition,
 		appear: !0
 	} : {
 		appear: !0,
 		...e.overlayTransition
 	});
-	watch$2(computed$2(() => (e.hideOverlay || M.value === 2) && r.value === 2), (k) => {
+	watch(computed(() => (e.hideOverlay || M.value === 2) && r.value === 2), (k) => {
 		k && (n.value = !1);
-	}), watch$2(r, (k) => {
+	}), watch(r, (k) => {
 		if (k === 1) {
 			if (!n.value) return;
 			s?.();
@@ -4495,7 +4670,7 @@ function fo(e, o) {
 	};
 }
 function vo(e, o, l) {
-	const { vfmRootEl: s, vfmContentEl: u, visible: c, modelValueLocal: a } = l, n = /* @__PURE__ */ ref$1();
+	const { vfmRootEl: s, vfmContentEl: u, visible: c, modelValueLocal: a } = l, n = /* @__PURE__ */ ref();
 	function t() {
 		c.value && e.escToClose && (a.value = !1);
 	}
@@ -4514,7 +4689,7 @@ function vo(e, o, l) {
 }
 function po(e, o, l) {
 	let s = !1;
-	const { open: u, close: c } = l, a = /* @__PURE__ */ ref$1(!1), n = {
+	const { open: u, close: c } = l, a = /* @__PURE__ */ ref(!1), n = {
 		get value() {
 			return a.value;
 		},
@@ -4527,7 +4702,7 @@ function po(e, o, l) {
 			s = !1;
 		}));
 	}
-	return watch$2(() => e.modelValue, (r) => {
+	return watch(() => e.modelValue, (r) => {
 		s || (n.value = !!r);
 	}), { modelValueLocal: n };
 }
@@ -4630,11 +4805,11 @@ var ko = (e) => {
 function Vo(e, o) {
 	const { lockScrollEl: l, modelValueLocal: s } = o;
 	let u;
-	watch$2(l, (n) => {
+	watch(l, (n) => {
 		n && (u = n);
-	}, { immediate: !0 }), watch$2(() => e.lockScroll, (n) => {
+	}, { immediate: !0 }), watch(() => e.lockScroll, (n) => {
 		n ? a() : c();
-	}), onBeforeUnmount$1(() => {
+	}), onBeforeUnmount(() => {
 		c();
 	});
 	function c() {
@@ -4658,7 +4833,7 @@ function Vo(e, o) {
 	};
 }
 function Eo(e) {
-	const o = /* @__PURE__ */ ref$1();
+	const o = /* @__PURE__ */ ref();
 	function l(u) {
 		var c;
 		o.value = (c = e.zIndexFn) == null ? void 0 : c.call(e, { index: u <= -1 ? 0 : u });
@@ -4720,7 +4895,7 @@ function Oo(e, { threshold: o = 0, onSwipeStart: l, onSwipe: s, onSwipeEnd: u, p
 	}), n = /* @__PURE__ */ reactive({
 		x: 0,
 		y: 0
-	}), t = computed$2(() => a.x - n.x), r = computed$2(() => a.y - n.y), { max: m, abs: f } = Math, M = computed$2(() => m(f(t.value), f(r.value)) >= o), S = /* @__PURE__ */ ref$1(!1), V = computed$2(() => M.value ? f(t.value) > f(r.value) ? t.value > 0 ? "left" : "right" : r.value > 0 ? "up" : "down" : "none"), O = (p, h) => {
+	}), t = computed(() => a.x - n.x), r = computed(() => a.y - n.y), { max: m, abs: f } = Math, M = computed(() => m(f(t.value), f(r.value)) >= o), S = /* @__PURE__ */ ref(!1), V = computed(() => M.value ? f(t.value) > f(r.value) ? t.value > 0 ? "left" : "right" : r.value > 0 ? "up" : "down" : "none"), O = (p, h) => {
 		a.x = p, a.y = h;
 	}, E = (p, h) => {
 		n.x = p, n.y = h;
@@ -4745,7 +4920,7 @@ function Oo(e, { threshold: o = 0, onSwipeStart: l, onSwipe: s, onSwipeEnd: u, p
 		S.value && u?.(p, V.value), S.value = !1, D.forEach((h) => h());
 	}
 	let b = [];
-	return onMounted$1(() => {
+	return onMounted(() => {
 		const p = Bo(window == null ? void 0 : window.document);
 		c ? w = p ? { passive: !0 } : { capture: !1 } : w = p ? {
 			passive: !1,
@@ -4764,9 +4939,9 @@ function Oo(e, { threshold: o = 0, onSwipeStart: l, onSwipe: s, onSwipeEnd: u, p
 	};
 }
 function Do(e, o) {
-	const { vfmContentEl: l, modelValueLocal: s } = o, u = .1, c = 300, a = /* @__PURE__ */ ref$1(), n = computed$2(() => {
+	const { vfmContentEl: l, modelValueLocal: s } = o, u = .1, c = 300, a = /* @__PURE__ */ ref(), n = computed(() => {
 		if (!(e.swipeToClose === void 0 || e.swipeToClose === "none")) return e.showSwipeBanner ? a.value : l.value;
-	}), t = /* @__PURE__ */ ref$1(0), r = /* @__PURE__ */ ref$1(!0);
+	}), t = /* @__PURE__ */ ref(0), r = /* @__PURE__ */ ref(!0);
 	let m = q, f = !0, M, S = !1;
 	const { lengthX: V, lengthY: O, direction: E, isSwiping: w } = Oo(n, {
 		threshold: e.threshold,
@@ -4810,7 +4985,7 @@ function Do(e, o) {
 			}
 			t.value = 0;
 		}
-	}), D = computed$2(() => {
+	}), D = computed(() => {
 		if (e.swipeToClose === "none") return;
 		const i = (() => {
 			switch (e.swipeToClose) {
@@ -4825,11 +5000,11 @@ function Do(e, o) {
 			style: { transform: `${i}(${-t.value}px)` }
 		};
 	});
-	watch$2(() => r.value, (i) => {
+	watch(() => r.value, (i) => {
 		i || (t.value = 0);
-	}), watch$2(() => s.value, (i) => {
+	}), watch(() => s.value, (i) => {
 		i && (t.value = 0);
-	}), watch$2(() => t.value, (i, b) => {
+	}), watch(() => t.value, (i, b) => {
 		switch (e.swipeToClose) {
 			case "down":
 			case "right":
@@ -4871,7 +5046,7 @@ var Po = {
 	openedModals: [],
 	openedModalOverlays: [],
 	dynamicModals: [],
-	modalsContainers: /* @__PURE__ */ ref$1([]),
+	modalsContainers: /* @__PURE__ */ ref([]),
 	get: () => {},
 	toggle: () => {},
 	open: () => {},
@@ -4896,7 +5071,7 @@ var Ro = /* @__PURE__ */ defineComponent({
 		"clickOutside"
 	],
 	setup(e, { expose: o, emit: l }) {
-		const s = e, u = l, c = useAttrs(), a = getCurrentInstance(), { modals: n, openedModals: t, openedModalOverlays: r } = K(), m = /* @__PURE__ */ ref$1(), f = /* @__PURE__ */ ref$1(), { focus: M, blur: S } = yo(s, { focusEl: m }), { zIndex: V, refreshZIndex: O, resetZIndex: E } = Eo(s), { modelValueLocal: w } = po(s, u, {
+		const s = e, u = l, c = useAttrs(), a = getCurrentInstance(), { modals: n, openedModals: t, openedModalOverlays: r } = K(), m = /* @__PURE__ */ ref(), f = /* @__PURE__ */ ref(), { focus: M, blur: S } = yo(s, { focusEl: m }), { zIndex: V, refreshZIndex: O, resetZIndex: E } = Eo(s), { modelValueLocal: w } = po(s, u, {
 			open: We,
 			close: Xe
 		}), { enableBodyScroll: D, disableBodyScroll: k } = Vo(s, {
@@ -4925,10 +5100,10 @@ var Ro = /* @__PURE__ */ defineComponent({
 		}), { swipeBannerEl: $e, bindSwipe: Ue, onTouchStartSwipeBanner: Se } = Do(s, {
 			vfmContentEl: f,
 			modelValueLocal: w
-		}), Me = computed$2(() => a ? t.indexOf(a) : -1);
-		watch$2([() => s.zIndexFn, Me], () => {
+		}), Me = computed(() => a ? t.indexOf(a) : -1);
+		watch([() => s.zIndexFn, Me], () => {
 			i.value && O(Me.value);
-		}), onMounted$1(() => {
+		}), onMounted(() => {
 			ve(n, a);
 		}), s.modelValue && (w.value = !0);
 		function We() {
@@ -4942,7 +5117,7 @@ var Ro = /* @__PURE__ */ defineComponent({
 		function Ze() {
 			w.value = !1;
 		}
-		onBeforeUnmount$1(() => {
+		onBeforeUnmount(() => {
 			D(), $$1(n, a), $$1(t, a), S(), ae();
 		});
 		async function ae() {
@@ -4957,8 +5132,8 @@ var Ro = /* @__PURE__ */ defineComponent({
 				A != null && A.value && (A.value.overlayVisible.value = T === d.length - 1);
 			});
 		}
-		const Ke = /* @__PURE__ */ toRef$1(() => s.modalId), ge = /* @__PURE__ */ toRef$1(() => s.hideOverlay), qe = /* @__PURE__ */ toRef$1(() => s.overlayBehavior);
-		return o({ modalExposed: computed$2(() => ({
+		const Ke = /* @__PURE__ */ toRef(() => s.modalId), ge = /* @__PURE__ */ toRef(() => s.hideOverlay), qe = /* @__PURE__ */ toRef(() => s.overlayBehavior);
+		return o({ modalExposed: computed(() => ({
 			modalId: Ke,
 			hideOverlay: ge,
 			overlayBehavior: qe,
@@ -4973,38 +5148,38 @@ var Ro = /* @__PURE__ */ defineComponent({
 		})) }), (d, y) => (openBlock(), createBlock(Teleport, {
 			to: d.teleportTo ? d.teleportTo : void 0,
 			disabled: !d.teleportTo
-		}, [d.displayDirective !== "if" || unref$1(i) ? withDirectives((openBlock(), createElementBlock("div", mergeProps({ key: 0 }, unref$1(c), {
+		}, [d.displayDirective !== "if" || unref(i) ? withDirectives((openBlock(), createElementBlock("div", mergeProps({ key: 0 }, unref(c), {
 			ref_key: "vfmRootEl",
 			ref: m,
 			class: ["vfm vfm--fixed vfm--inset", { "vfm--prevent-none": d.background === "interactive" }],
-			style: { zIndex: unref$1(V) },
+			style: { zIndex: unref(V) },
 			role: "dialog",
 			"aria-modal": "true",
-			onKeydown: y[7] || (y[7] = withKeys(() => unref$1(ze)(), ["esc"])),
-			onMouseup: y[8] || (y[8] = withModifiers(() => unref$1(Ge)(), ["self"])),
-			onMousedown: y[9] || (y[9] = withModifiers((T) => unref$1(Te)(T), ["self"]))
-		}), [ge.value ? createCommentVNode("", !0) : (openBlock(), createBlock(Transition, mergeProps({ key: 0 }, unref$1(J), toHandlers(unref$1(R))), {
-			default: withCtx(() => [d.displayDirective !== "if" || unref$1(h) ? withDirectives((openBlock(), createElementBlock("div", {
+			onKeydown: y[7] || (y[7] = withKeys(() => unref(ze)(), ["esc"])),
+			onMouseup: y[8] || (y[8] = withModifiers(() => unref(Ge)(), ["self"])),
+			onMousedown: y[9] || (y[9] = withModifiers((T) => unref(Te)(T), ["self"]))
+		}), [ge.value ? createCommentVNode("", !0) : (openBlock(), createBlock(Transition, mergeProps({ key: 0 }, unref(J), toHandlers(unref(R))), {
+			default: withCtx(() => [d.displayDirective !== "if" || unref(h) ? withDirectives((openBlock(), createElementBlock("div", {
 				key: 0,
 				class: normalizeClass(["vfm__overlay vfm--overlay vfm--absolute vfm--inset vfm--prevent-none", d.overlayClass]),
 				style: normalizeStyle(d.overlayStyle),
 				"aria-hidden": "true"
-			}, null, 6)), [[vShow, d.displayDirective !== "show" || unref$1(h)], [unref$1(pe), d.displayDirective !== "visible" || unref$1(h)]]) : createCommentVNode("", !0)]),
+			}, null, 6)), [[vShow, d.displayDirective !== "show" || unref(h)], [unref(pe), d.displayDirective !== "visible" || unref(h)]]) : createCommentVNode("", !0)]),
 			_: 1
-		}, 16)), createVNode(Transition, mergeProps(unref$1(p), toHandlers(unref$1(L))), {
-			default: withCtx(() => [d.displayDirective !== "if" || unref$1(b) ? withDirectives((openBlock(), createElementBlock("div", mergeProps({
+		}, 16)), createVNode(Transition, mergeProps(unref(p), toHandlers(unref(L))), {
+			default: withCtx(() => [d.displayDirective !== "if" || unref(b) ? withDirectives((openBlock(), createElementBlock("div", mergeProps({
 				key: 0,
 				ref_key: "vfmContentEl",
 				ref: f,
 				class: ["vfm__content vfm--outline-none", [d.contentClass, { "vfm--prevent-auto": d.background === "interactive" }]],
 				style: d.contentStyle,
 				tabindex: "0"
-			}, unref$1(Ue), { onMousedown: y[6] || (y[6] = () => unref$1(Te)()) }), [renderSlot(d.$slots, "default", normalizeProps(guardReactiveProps({ close: Ze }))), d.showSwipeBanner ? (openBlock(), createElementBlock("div", {
+			}, unref(Ue), { onMousedown: y[6] || (y[6] = () => unref(Te)()) }), [renderSlot(d.$slots, "default", normalizeProps(guardReactiveProps({ close: Ze }))), d.showSwipeBanner ? (openBlock(), createElementBlock("div", {
 				key: 0,
 				ref_key: "swipeBannerEl",
 				ref: $e,
 				class: "vfm-swipe-banner-container",
-				onTouchstart: y[2] || (y[2] = (T) => unref$1(Se)(T))
+				onTouchstart: y[2] || (y[2] = (T) => unref(Se)(T))
 			}, [renderSlot(d.$slots, "swipe-banner", {}, () => [createBaseVNode("div", {
 				class: "vfm-swipe-banner-back",
 				onTouchstart: y[0] || (y[0] = (T) => d.swipeToClose === "left" && T.preventDefault())
@@ -5014,16 +5189,16 @@ var Ro = /* @__PURE__ */ defineComponent({
 			}, null, 32)])], 544)) : !d.showSwipeBanner && d.preventNavigationGestures ? (openBlock(), createElementBlock("div", {
 				key: 1,
 				class: "vfm-swipe-banner-container",
-				onTouchstart: y[5] || (y[5] = (T) => unref$1(Se)(T))
+				onTouchstart: y[5] || (y[5] = (T) => unref(Se)(T))
 			}, [createBaseVNode("div", {
 				class: "vfm-swipe-banner-back",
 				onTouchstart: y[3] || (y[3] = (T) => d.swipeToClose === "left" && T.preventDefault())
 			}, null, 32), createBaseVNode("div", {
 				class: "vfm-swipe-banner-forward",
 				onTouchstart: y[4] || (y[4] = (T) => d.swipeToClose === "right" && T.preventDefault())
-			}, null, 32)], 32)) : createCommentVNode("", !0)], 16)), [[vShow, d.displayDirective !== "show" || unref$1(b)], [unref$1(pe), d.displayDirective !== "visible" || unref$1(b)]]) : createCommentVNode("", !0)]),
+			}, null, 32)], 32)) : createCommentVNode("", !0)], 16)), [[vShow, d.displayDirective !== "show" || unref(b)], [unref(pe), d.displayDirective !== "visible" || unref(b)]]) : createCommentVNode("", !0)]),
 			_: 3
-		}, 16)], 16)), [[vShow, d.displayDirective !== "show" || unref$1(i)], [unref$1(pe), d.displayDirective !== "visible" || unref$1(i)]]) : createCommentVNode("", !0)], 8, ["to", "disabled"]));
+		}, 16)], 16)), [[vShow, d.displayDirective !== "show" || unref(i)], [unref(pe), d.displayDirective !== "visible" || unref(i)]]) : createCommentVNode("", !0)], 8, ["to", "disabled"]));
 	}
 });
 function K() {
@@ -5132,7 +5307,7 @@ var Popup_default = /* @__PURE__ */ defineComponent({
 			visible.value = false;
 		}
 		return (_ctx, _cache) => {
-			return openBlock(), createBlock(unref$1(Ro), {
+			return openBlock(), createBlock(unref(Ro), {
 				modelValue: visible.value,
 				"onUpdate:modelValue": _cache[0] || (_cache[0] = ($event) => visible.value = $event),
 				class: "TH-popup TH-custom-tailwind absolute! flex h-full w-full items-center justify-center",
@@ -5359,7 +5534,7 @@ var allowsEval = /* @__PURE__*/ cached(() => {
 		return false;
 	}
 });
-function isPlainObject(o) {
+function isPlainObject$1(o) {
 	if (isObject(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
@@ -5370,7 +5545,7 @@ function isPlainObject(o) {
 	return true;
 }
 function shallowClone(o) {
-	if (isPlainObject(o)) return { ...o };
+	if (isPlainObject$1(o)) return { ...o };
 	if (Array.isArray(o)) return [...o];
 	if (o instanceof Map) return new Map(o);
 	if (o instanceof Set) return new Set(o);
@@ -5453,7 +5628,7 @@ function omit(schema, mask) {
 	}));
 }
 function extend(schema, shape) {
-	if (!isPlainObject(shape)) throw new Error("Invalid input to extend: expected a plain object");
+	if (!isPlainObject$1(shape)) throw new Error("Invalid input to extend: expected a plain object");
 	const checks = schema._zod.def.checks;
 	if (checks && checks.length > 0) {
 		const existingShape = schema._zod.def.shape;
@@ -5469,7 +5644,7 @@ function extend(schema, shape) {
 	} }));
 }
 function safeExtend(schema, shape) {
-	if (!isPlainObject(shape)) throw new Error("Invalid input to safeExtend: expected a plain object");
+	if (!isPlainObject$1(shape)) throw new Error("Invalid input to safeExtend: expected a plain object");
 	return clone(schema, mergeDefs(schema._zod.def, { get shape() {
 		const _shape = {
 			...schema._zod.def.shape,
@@ -7078,7 +7253,7 @@ function mergeValues(a, b) {
 		valid: true,
 		data: a
 	};
-	if (isPlainObject(a) && isPlainObject(b)) {
+	if (isPlainObject$1(a) && isPlainObject$1(b)) {
 		const bKeys = Object.keys(b);
 		const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
 		const newObj = {
@@ -7154,7 +7329,7 @@ var $ZodRecord = /*@__PURE__*/ $constructor("$ZodRecord", (inst, def) => {
 	$ZodType.init(inst, def);
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isPlainObject(input)) {
+		if (!isPlainObject$1(input)) {
 			payload.issues.push({
 				expected: "record",
 				code: "invalid_type",
@@ -8852,7 +9027,7 @@ var ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 			return pipe(this, target);
 		},
 		readonly() {
-			return readonly$1(this);
+			return readonly(this);
 		},
 		describe(description) {
 			const cl = this.clone();
@@ -9524,7 +9699,7 @@ var ZodReadonly = /*@__PURE__*/ $constructor("ZodReadonly", (inst, def) => {
 	inst._zod.processJSONSchema = (ctx, json, params) => readonlyProcessor(inst, ctx, json, params);
 	inst.unwrap = () => inst._zod.def.innerType;
 });
-function readonly$1(innerType) {
+function readonly(innerType) {
 	return new ZodReadonly({
 		type: "readonly",
 		innerType
@@ -10298,6 +10473,456 @@ async function writeExtensionField(id, field, value, affect_memory = true) {
 	});
 	if (!response.ok) console.error("Failed to save extension field", await response.text());
 }
+// node_modules/.pnpm/pinia@3.0.4_typescript@6.0.3_vue@3.5.45_typescript@6.0.3_/node_modules/pinia/dist/pinia.mjs
+/*!
+* pinia v3.0.4
+* (c) 2025 Eduardo San Martin Morote
+* @license MIT
+*/
+var IS_CLIENT = typeof window !== "undefined";
+/**
+* setActivePinia must be called to handle SSR at the top of functions like
+* `fetch`, `setup`, `serverPrefetch` and others
+*/
+var activePinia;
+/**
+* Sets or unsets the active pinia. Used in SSR and internally when calling
+* actions and getters
+*
+* @param pinia - Pinia instance
+*/
+var setActivePinia = (pinia) => activePinia = pinia;
+var piniaSymbol = Symbol();
+function isPlainObject(o) {
+	return o && typeof o === "object" && Object.prototype.toString.call(o) === "[object Object]" && typeof o.toJSON !== "function";
+}
+/**
+* Possible types for SubscriptionCallback
+*/
+var MutationType;
+(function(MutationType) {
+	/**
+	* Direct mutation of the state:
+	*
+	* - `store.name = 'new name'`
+	* - `store.$state.name = 'new name'`
+	* - `store.list.push('new item')`
+	*/
+	MutationType["direct"] = "direct";
+	/**
+	* Mutated the state with `$patch` and an object
+	*
+	* - `store.$patch({ name: 'newName' })`
+	*/
+	MutationType["patchObject"] = "patch object";
+	/**
+	* Mutated the state with `$patch` and a function
+	*
+	* - `store.$patch(state => state.name = 'newName')`
+	*/
+	MutationType["patchFunction"] = "patch function";
+})(MutationType || (MutationType = {}));
+var _global = /*#__PURE__*/ (() => typeof window === "object" && window.window === window ? window : typeof self === "object" && self.self === self ? self : typeof global === "object" && global.global === global ? global : typeof globalThis === "object" ? globalThis : { HTMLElement: null })();
+function bom(blob, { autoBom = false } = {}) {
+	if (autoBom && /^\s*(?:text\/\S*|application\/xml|\S*\/\S*\+xml)\s*;.*charset\s*=\s*utf-8/i.test(blob.type)) return new Blob([String.fromCharCode(65279), blob], { type: blob.type });
+	return blob;
+}
+function download(url, name, opts) {
+	const xhr = new XMLHttpRequest();
+	xhr.open("GET", url);
+	xhr.responseType = "blob";
+	xhr.onload = function() {
+		saveAs(xhr.response, name, opts);
+	};
+	xhr.onerror = function() {
+		console.error("could not download file");
+	};
+	xhr.send();
+}
+function corsEnabled(url) {
+	const xhr = new XMLHttpRequest();
+	xhr.open("HEAD", url, false);
+	try {
+		xhr.send();
+	} catch (e) {}
+	return xhr.status >= 200 && xhr.status <= 299;
+}
+function click(node) {
+	try {
+		node.dispatchEvent(new MouseEvent("click"));
+	} catch (e) {
+		const evt = new MouseEvent("click", {
+			bubbles: true,
+			cancelable: true,
+			view: window,
+			detail: 0,
+			screenX: 80,
+			screenY: 20,
+			clientX: 80,
+			clientY: 20,
+			ctrlKey: false,
+			altKey: false,
+			shiftKey: false,
+			metaKey: false,
+			button: 0,
+			relatedTarget: null
+		});
+		node.dispatchEvent(evt);
+	}
+}
+var _navigator = typeof navigator === "object" ? navigator : { userAgent: "" };
+var isMacOSWebView = /*#__PURE__*/ (() => /Macintosh/.test(_navigator.userAgent) && /AppleWebKit/.test(_navigator.userAgent) && !/Safari/.test(_navigator.userAgent))();
+var saveAs = !IS_CLIENT ? () => {} : typeof HTMLAnchorElement !== "undefined" && "download" in HTMLAnchorElement.prototype && !isMacOSWebView ? downloadSaveAs : "msSaveOrOpenBlob" in _navigator ? msSaveAs : fileSaverSaveAs;
+function downloadSaveAs(blob, name = "download", opts) {
+	const a = document.createElement("a");
+	a.download = name;
+	a.rel = "noopener";
+	if (typeof blob === "string") {
+		a.href = blob;
+		if (a.origin !== location.origin) {
+			if (corsEnabled(a.href)) download(blob, name, opts);
+			else {
+				a.target = "_blank";
+				click(a);
+			}
+		} else click(a);
+	} else {
+		a.href = URL.createObjectURL(blob);
+		setTimeout(function() {
+			URL.revokeObjectURL(a.href);
+		}, 4e4);
+		setTimeout(function() {
+			click(a);
+		}, 0);
+	}
+}
+function msSaveAs(blob, name = "download", opts) {
+	if (typeof blob === "string") {
+		if (corsEnabled(blob)) download(blob, name, opts);
+		else {
+			const a = document.createElement("a");
+			a.href = blob;
+			a.target = "_blank";
+			setTimeout(function() {
+				click(a);
+			});
+		}
+	} else navigator.msSaveOrOpenBlob(bom(blob, opts), name);
+}
+function fileSaverSaveAs(blob, name, opts, popup) {
+	popup = popup || open("", "_blank");
+	if (popup) popup.document.title = popup.document.body.innerText = "downloading...";
+	if (typeof blob === "string") return download(blob, name, opts);
+	const force = blob.type === "application/octet-stream";
+	const isSafari = /constructor/i.test(String(_global.HTMLElement)) || "safari" in _global;
+	const isChromeIOS = /CriOS\/[\d]+/.test(navigator.userAgent);
+	if ((isChromeIOS || force && isSafari || isMacOSWebView) && typeof FileReader !== "undefined") {
+		const reader = new FileReader();
+		reader.onloadend = function() {
+			let url = reader.result;
+			if (typeof url !== "string") {
+				popup = null;
+				throw new Error("Wrong reader.result type");
+			}
+			url = isChromeIOS ? url : url.replace(/^data:[^;]*;/, "data:attachment/file;");
+			if (popup) popup.location.href = url;
+			else location.assign(url);
+			popup = null;
+		};
+		reader.readAsDataURL(blob);
+	} else {
+		const url = URL.createObjectURL(blob);
+		if (popup) popup.location.assign(url);
+		else location.href = url;
+		popup = null;
+		setTimeout(function() {
+			URL.revokeObjectURL(url);
+		}, 4e4);
+	}
+}
+var { assign: assign$1 } = Object;
+/**
+* Creates a Pinia instance to be used by the application
+*/
+function createPinia() {
+	const scope = effectScope(true);
+	const state = scope.run(() => /* @__PURE__ */ ref({}));
+	let _p = [];
+	let toBeInstalled = [];
+	const pinia = markRaw({
+		install(app) {
+			setActivePinia(pinia);
+			pinia._a = app;
+			app.provide(piniaSymbol, pinia);
+			app.config.globalProperties.$pinia = pinia;
+			toBeInstalled.forEach((plugin) => _p.push(plugin));
+			toBeInstalled = [];
+		},
+		use(plugin) {
+			if (!this._a) toBeInstalled.push(plugin);
+			else _p.push(plugin);
+			return this;
+		},
+		_p,
+		_a: null,
+		_e: scope,
+		_s: /* @__PURE__ */ new Map(),
+		state
+	});
+	return pinia;
+}
+var noop = () => {};
+function addSubscription(subscriptions, callback, detached, onCleanup = noop) {
+	subscriptions.add(callback);
+	const removeSubscription = () => {
+		subscriptions.delete(callback) && onCleanup();
+	};
+	if (!detached && getCurrentScope()) onScopeDispose(removeSubscription);
+	return removeSubscription;
+}
+function triggerSubscriptions(subscriptions, ...args) {
+	subscriptions.forEach((callback) => {
+		callback(...args);
+	});
+}
+var fallbackRunWithContext = (fn) => fn();
+/**
+* Marks a function as an action for `$onAction`
+* @internal
+*/
+var ACTION_MARKER = Symbol();
+/**
+* Action name symbol. Allows to add a name to an action after defining it
+* @internal
+*/
+var ACTION_NAME = Symbol();
+function mergeReactiveObjects(target, patchToApply) {
+	if (target instanceof Map && patchToApply instanceof Map) patchToApply.forEach((value, key) => target.set(key, value));
+	else if (target instanceof Set && patchToApply instanceof Set) patchToApply.forEach(target.add, target);
+	for (const key in patchToApply) {
+		if (!patchToApply.hasOwnProperty(key)) continue;
+		const subPatch = patchToApply[key];
+		const targetValue = target[key];
+		if (isPlainObject(targetValue) && isPlainObject(subPatch) && target.hasOwnProperty(key) && !/* @__PURE__ */ isRef(subPatch) && !/* @__PURE__ */ isReactive(subPatch)) target[key] = mergeReactiveObjects(targetValue, subPatch);
+		else target[key] = subPatch;
+	}
+	return target;
+}
+var skipHydrateSymbol = Symbol();
+/**
+* Returns whether a value should be hydrated
+*
+* @param obj - target variable
+* @returns true if `obj` should be hydrated
+*/
+function shouldHydrate(obj) {
+	return !isPlainObject(obj) || !Object.prototype.hasOwnProperty.call(obj, skipHydrateSymbol);
+}
+var { assign } = Object;
+function isComputed(o) {
+	return !!(/* @__PURE__ */ isRef(o) && o.effect);
+}
+function createOptionsStore(id, options, pinia, hot) {
+	const { state, actions, getters } = options;
+	const initialState = pinia.state.value[id];
+	let store;
+	function setup() {
+		if (!initialState && true)
+ /* istanbul ignore if */
+		pinia.state.value[id] = state ? state() : {};
+		return assign(/* @__PURE__ */ toRefs(pinia.state.value[id]), actions, Object.keys(getters || {}).reduce((computedGetters, name) => {
+			computedGetters[name] = markRaw(computed(() => {
+				setActivePinia(pinia);
+				const store = pinia._s.get(id);
+				return getters[name].call(store, store);
+			}));
+			return computedGetters;
+		}, {}));
+	}
+	store = createSetupStore(id, setup, options, pinia, hot, true);
+	return store;
+}
+function createSetupStore($id, setup, options = {}, pinia, hot, isOptionsStore) {
+	let scope;
+	const optionsForPlugin = assign({ actions: {} }, options);
+	const $subscribeOptions = { deep: true };
+	let isListening;
+	let isSyncListening;
+	let subscriptions = /* @__PURE__ */ new Set();
+	let actionSubscriptions = /* @__PURE__ */ new Set();
+	let debuggerEvents;
+	const initialState = pinia.state.value[$id];
+	if (!isOptionsStore && !initialState && true)
+ /* istanbul ignore if */
+	pinia.state.value[$id] = {};
+	let activeListener;
+	function $patch(partialStateOrMutator) {
+		let subscriptionMutation;
+		isListening = isSyncListening = false;
+		if (typeof partialStateOrMutator === "function") {
+			partialStateOrMutator(pinia.state.value[$id]);
+			subscriptionMutation = {
+				type: MutationType.patchFunction,
+				storeId: $id,
+				events: debuggerEvents
+			};
+		} else {
+			mergeReactiveObjects(pinia.state.value[$id], partialStateOrMutator);
+			subscriptionMutation = {
+				type: MutationType.patchObject,
+				payload: partialStateOrMutator,
+				storeId: $id,
+				events: debuggerEvents
+			};
+		}
+		const myListenerId = activeListener = Symbol();
+		nextTick().then(() => {
+			if (activeListener === myListenerId) isListening = true;
+		});
+		isSyncListening = true;
+		triggerSubscriptions(subscriptions, subscriptionMutation, pinia.state.value[$id]);
+	}
+	const $reset = isOptionsStore ? function $reset() {
+		const { state } = options;
+		const newState = state ? state() : {};
+		this.$patch(($state) => {
+			assign($state, newState);
+		});
+	} : noop;
+	function $dispose() {
+		scope.stop();
+		subscriptions.clear();
+		actionSubscriptions.clear();
+		pinia._s.delete($id);
+	}
+	/**
+	* Helper that wraps function so it can be tracked with $onAction
+	* @param fn - action to wrap
+	* @param name - name of the action
+	*/
+	const action = (fn, name = "") => {
+		if (ACTION_MARKER in fn) {
+			fn[ACTION_NAME] = name;
+			return fn;
+		}
+		const wrappedAction = function() {
+			setActivePinia(pinia);
+			const args = Array.from(arguments);
+			const afterCallbackSet = /* @__PURE__ */ new Set();
+			const onErrorCallbackSet = /* @__PURE__ */ new Set();
+			function after(callback) {
+				afterCallbackSet.add(callback);
+			}
+			function onError(callback) {
+				onErrorCallbackSet.add(callback);
+			}
+			triggerSubscriptions(actionSubscriptions, {
+				args,
+				name: wrappedAction[ACTION_NAME],
+				store,
+				after,
+				onError
+			});
+			let ret;
+			try {
+				ret = fn.apply(this && this.$id === $id ? this : store, args);
+			} catch (error) {
+				triggerSubscriptions(onErrorCallbackSet, error);
+				throw error;
+			}
+			if (ret instanceof Promise) return ret.then((value) => {
+				triggerSubscriptions(afterCallbackSet, value);
+				return value;
+			}).catch((error) => {
+				triggerSubscriptions(onErrorCallbackSet, error);
+				return Promise.reject(error);
+			});
+			triggerSubscriptions(afterCallbackSet, ret);
+			return ret;
+		};
+		wrappedAction[ACTION_MARKER] = true;
+		wrappedAction[ACTION_NAME] = name;
+		return wrappedAction;
+	};
+	const store = /* @__PURE__ */ reactive({
+		_p: pinia,
+		$id,
+		$onAction: addSubscription.bind(null, actionSubscriptions),
+		$patch,
+		$reset,
+		$subscribe(callback, options = {}) {
+			const removeSubscription = addSubscription(subscriptions, callback, options.detached, () => stopWatcher());
+			const stopWatcher = scope.run(() => watch(() => pinia.state.value[$id], (state) => {
+				if (options.flush === "sync" ? isSyncListening : isListening) callback({
+					storeId: $id,
+					type: MutationType.direct,
+					events: debuggerEvents
+				}, state);
+			}, assign({}, $subscribeOptions, options)));
+			return removeSubscription;
+		},
+		$dispose
+	});
+	pinia._s.set($id, store);
+	const setupStore = (pinia._a && pinia._a.runWithContext || fallbackRunWithContext)(() => pinia._e.run(() => (scope = effectScope()).run(() => setup({ action }))));
+	for (const key in setupStore) {
+		const prop = setupStore[key];
+		if (/* @__PURE__ */ isRef(prop) && !isComputed(prop) || /* @__PURE__ */ isReactive(prop)) {
+			if (!isOptionsStore) {
+				if (initialState && shouldHydrate(prop)) {
+					if (/* @__PURE__ */ isRef(prop)) prop.value = initialState[key];
+					else mergeReactiveObjects(prop, initialState[key]);
+				}
+				pinia.state.value[$id][key] = prop;
+			}
+		} else if (typeof prop === "function") {
+			setupStore[key] = action(prop, key);
+			optionsForPlugin.actions[key] = prop;
+		}
+	}
+	/* istanbul ignore if */
+	assign(store, setupStore);
+	assign(/* @__PURE__ */ toRaw(store), setupStore);
+	Object.defineProperty(store, "$state", {
+		get: () => pinia.state.value[$id],
+		set: (state) => {
+			$patch(($state) => {
+				assign($state, state);
+			});
+		}
+	});
+	pinia._p.forEach((extender) => {
+		assign(store, scope.run(() => extender({
+			store,
+			app: pinia._a,
+			pinia,
+			options: optionsForPlugin
+		})));
+	});
+	if (initialState && isOptionsStore && options.hydrate) options.hydrate(store.$state, initialState);
+	isListening = true;
+	isSyncListening = true;
+	return store;
+}
+/*! #__NO_SIDE_EFFECTS__ */
+function defineStore(id, setup, setupOptions) {
+	let options;
+	const isSetupStore = typeof setup === "function";
+	options = isSetupStore ? setupOptions : setup;
+	function useStore(pinia, hot) {
+		const hasContext = hasInjectionContext();
+		pinia = pinia || (hasContext ? inject(piniaSymbol, null) : null);
+		if (pinia) setActivePinia(pinia);
+		pinia = activePinia;
+		if (!pinia._s.has(id)) {
+			if (isSetupStore) createSetupStore(id, setup, options, pinia);
+			else createOptionsStore(id, options, pinia);
+		}
+		return pinia._s.get(id);
+	}
+	useStore.$id = id;
+	return useStore;
+}
 // src/store/settings/character.ts
 function getSettings$3(id) {
 	const character = characters.at(id);
@@ -10328,9 +10953,9 @@ async function saveSettings$1(id, avatar, settings, affect_memory = true) {
 	if (avatar === characters[id]?.avatar) await writeExtensionField(id, setting_field, settings, affect_memory);
 }
 var useCharacterSettingsStore = defineStore("character_setttings", () => {
-	const id = ref(this_chid);
-	const name = ref(characters?.[this_chid]?.name);
-	const avatar = ref(characters?.[this_chid]?.avatar);
+	const id = /* @__PURE__ */ ref(this_chid);
+	const name = /* @__PURE__ */ ref(characters?.[this_chid]?.name);
+	const avatar = /* @__PURE__ */ ref(characters?.[this_chid]?.avatar);
 	eventSource.makeFirst(event_types.CHAT_CHANGED, () => {
 		const new_avatar = characters?.[this_chid]?.avatar;
 		if (avatar.value !== new_avatar) {
@@ -10339,7 +10964,7 @@ var useCharacterSettingsStore = defineStore("character_setttings", () => {
 			avatar.value = new_avatar;
 		}
 	});
-	const settings = ref(getSettings$3(id.value));
+	const settings = /* @__PURE__ */ ref(getSettings$3(id.value));
 	watch([id, avatar], ([new_id]) => {
 		ignoreUpdates(() => {
 			settings.value = getSettings$3(new_id);
@@ -10414,9 +11039,9 @@ var useCharacterSettingsStore = defineStore("character_setttings", () => {
 		});
 	};
 	return {
-		id: readonly(id),
-		name: readonly(name),
-		avatar: readonly(avatar),
+		id: /* @__PURE__ */ readonly$1(id),
+		name: /* @__PURE__ */ readonly$1(name),
+		avatar: /* @__PURE__ */ readonly$1(avatar),
 		settings,
 		forceReload
 	};
@@ -10432,11 +11057,11 @@ function getSettings$2() {
 	return ChatSettings.parse(parsed.data);
 }
 var useChatSettingsStore = defineStore("chat_settings", () => {
-	const id = ref(getCurrentChatId());
+	const id = /* @__PURE__ */ ref(getCurrentChatId());
 	eventSource.makeFirst(event_types.CHAT_CHANGED, (new_chat_id) => {
 		if (id.value !== new_chat_id) id.value = new_chat_id;
 	});
-	const settings = ref(getSettings$2());
+	const settings = /* @__PURE__ */ ref(getSettings$2());
 	watch(id, () => {
 		ignoreUpdates(() => {
 			settings.value = getSettings$2();
@@ -10449,7 +11074,7 @@ var useChatSettingsStore = defineStore("chat_settings", () => {
 		}
 	}, { deep: true });
 	return {
-		id: readonly(id),
+		id: /* @__PURE__ */ readonly$1(id),
 		settings
 	};
 });
@@ -10472,11 +11097,11 @@ function getSettings$1() {
 	return GlobalSettings$1.parse(parsed.data);
 }
 var useGlobalSettingsStore = defineStore("global_settings", () => {
-	const app_ready = ref(false);
+	const app_ready = /* @__PURE__ */ ref(false);
 	APP_READY_EVENTS.forEach((event) => eventSource.once(event, () => {
 		app_ready.value = true;
 	}));
-	const settings = ref(getSettings$1());
+	const settings = /* @__PURE__ */ ref(getSettings$1());
 	if (settings.value.script.enabled.characters.length > 0 && !settings.value.script.enabled.characters[0].endsWith(".png")) settings.value.script.enabled.characters = settings.value.script.enabled.characters.map((item) => item.endsWith(".png") ? item : item + ".png");
 	if (settings.value.script.popuped.characters.length > 0 && !settings.value.script.popuped.characters[0].endsWith(".png")) settings.value.script.popuped.characters = settings.value.script.popuped.characters.map((item) => item.endsWith(".png") ? item : item + ".png");
 	watch(settings, (new_settings) => {
@@ -10514,8 +11139,8 @@ async function saveSettingsToFile(_id, name, settings) {
 }
 var saveSettingsToFileDebounced = _.debounce(saveSettingsToFile, 1e3);
 var usePresetSettingsStore = defineStore("preset_settings", () => {
-	const id = ref(preset_manager.getSelectedPreset());
-	const name = ref(preset_manager.getSelectedPresetName());
+	const id = /* @__PURE__ */ ref(preset_manager.getSelectedPreset());
+	const name = /* @__PURE__ */ ref(preset_manager.getSelectedPresetName());
 	eventSource.makeFirst(event_types.OAI_PRESET_CHANGED_AFTER, () => {
 		const new_id = String(preset_manager.getSelectedPreset());
 		const new_name = String(preset_manager.getSelectedPresetName());
@@ -10524,7 +11149,7 @@ var usePresetSettingsStore = defineStore("preset_settings", () => {
 			name.value = new_name;
 		}
 	});
-	const settings = ref(getSettings(id.value));
+	const settings = /* @__PURE__ */ ref(getSettings(id.value));
 	watch([id, name], ([new_id]) => {
 		ignoreUpdates(() => {
 			settings.value = getSettings(new_id);
@@ -10544,8 +11169,8 @@ var usePresetSettingsStore = defineStore("preset_settings", () => {
 		saveSettingsToFileDebounced(id.value, name.value, klona(new_settings));
 	}, { deep: true });
 	return {
-		id: readonly(id),
-		name: readonly(name),
+		id: /* @__PURE__ */ readonly$1(id),
+		name: /* @__PURE__ */ readonly$1(name),
 		settings
 	};
 });
@@ -10553,22 +11178,21 @@ var usePresetSettingsStore = defineStore("preset_settings", () => {
 function createAudioStore(type) {
 	return defineStore(`${type}_audio`, () => {
 		const global_settings = useGlobalSettingsStore();
-		const src = ref("");
-		const playing = ref(false);
-		const progress = ref(0);
-		const settings = computed({
+		const src = /* @__PURE__ */ ref("");
+		const playing = /* @__PURE__ */ ref(false);
+		const progress = /* @__PURE__ */ ref(0);
+		const { enabled, mode, muted, volume } = /* @__PURE__ */ toRefs(computed({
 			get: () => global_settings.settings.audio[type],
 			set: (value) => {
 				global_settings.settings.audio[type] = value;
 			}
-		});
-		const { enabled, mode, muted, volume } = toRefs(settings.value);
+		}).value);
 		watchDebounced(volume, (new_volume) => {
 			if (new_volume > 0 && muted.value) muted.value = false;
 			else if (new_volume === 0 && !muted.value) muted.value = true;
 		}, { debounce: 100 });
 		const chat_settings = useChatSettingsStore();
-		const playlist = ref(chat_settings.settings[type]);
+		const playlist = /* @__PURE__ */ ref(chat_settings.settings[type]);
 		watch(() => chat_settings.id, () => {
 			src.value = "";
 			playing.value = false;
@@ -10985,7 +11609,7 @@ function rerenderAll(depth, ignore_hidden) {
 }
 defineStore("message_iframe_runtimes", () => {
 	const global_settings = useGlobalSettingsStore();
-	const runtimes = ref([]);
+	const runtimes = /* @__PURE__ */ ref([]);
 	watch(() => [
 		global_settings.settings.render.enabled,
 		global_settings.settings.render.allow_streaming,
@@ -11056,7 +11680,7 @@ function createScriptsStore(type) {
 						store.settings.script.scripts = value;
 					}
 				});
-				source = ref("global");
+				source = /* @__PURE__ */ ref("global");
 				break;
 			}
 			case "preset": {
@@ -11132,7 +11756,7 @@ var useScriptIframeRuntimesStore = defineStore("script_iframe_runtimes", () => {
 	const global_scripts = useGlobalScriptsStore();
 	const preset_scripts = usePresetScriptsStore();
 	const character_scripts = useCharacterScriptsStore();
-	const reload_memos = ref({});
+	const reload_memos = /* @__PURE__ */ ref({});
 	const reload = (id) => {
 		_.set(reload_memos.value, id, uuidv4());
 	};
@@ -11169,7 +11793,7 @@ var useScriptIframeRuntimesStore = defineStore("script_iframe_runtimes", () => {
 		return enabled_scripts_with_source.value.find((item) => item.script.id === script_id)?.script;
 	};
 	return {
-		reload_memos: readonly(reload_memos),
+		reload_memos: /* @__PURE__ */ readonly$1(reload_memos),
 		enabled_scripts: enabled_scripts_with_source,
 		runtimes,
 		button_map,
@@ -11180,15 +11804,15 @@ var useScriptIframeRuntimesStore = defineStore("script_iframe_runtimes", () => {
 });
 // src/store/variable_schemas.ts
 var useVariableSchemasStore = defineStore("variable_schemas", () => {
-	const global = ref();
-	const preset = ref();
+	const global = /* @__PURE__ */ ref();
+	const preset = /* @__PURE__ */ ref();
 	const preset_settings = usePresetSettingsStore();
 	watch(() => preset_settings.name, () => {
 		preset.value = void 0;
 	});
-	const character = ref();
-	const chat = ref();
-	const message = ref();
+	const character = /* @__PURE__ */ ref();
+	const chat = /* @__PURE__ */ ref();
+	const message = /* @__PURE__ */ ref();
 	const character_settings = useCharacterSettingsStore();
 	watch(() => character_settings.avatar, () => {
 		character.value = void 0;
@@ -11282,12 +11906,12 @@ function replaceVariables(variables, option = { type: "chat" }) {
 		case "character": {
 			const store = useCharacterSettingsStore();
 			if (store.avatar === void 0) throw new Error("当前没有打开角色卡，保存角色卡变量失败");
-			toRef(store.settings, "variables").value = variables;
+			(/* @__PURE__ */ toRef(store.settings, "variables")).value = variables;
 			break;
 		}
 		case "preset": {
 			const store = usePresetSettingsStore();
-			toRef(store.settings, "variables").value = variables;
+			(/* @__PURE__ */ toRef(store.settings, "variables")).value = variables;
 			break;
 		}
 		case "global":
@@ -22494,7 +23118,7 @@ function audioSelect(args, url) {
 }
 // src/store/iframe_logs.ts
 var useIframeLogsStore = defineStore("iframe_logs", () => {
-	const iframe_logs = ref(/* @__PURE__ */ new Map());
+	const iframe_logs = /* @__PURE__ */ ref(/* @__PURE__ */ new Map());
 	const init = (iframe_id) => {
 		iframe_logs.value.set(iframe_id, []);
 	};
@@ -22741,16 +23365,43 @@ function initTavernHelperObject() {
 * 所以我们走它，再从 globalThis 取回来。
 */
 /**
+* [v251 根因修复] 必须自建并激活一个 pinia 实例。
+*
+* 为什么：上游 `src/index.ts` 用 `const pinia = createPinia(); app.use(pinia);` 完成初始化，
+* 之后 `getTavernHelper()` 内部才会调 `useIframeLogsStore()` 等 store。
+* 本入口把 Vue app 整棵摇掉了，**连带着 `createPinia()` 也没了** —— 于是：
+*
+*   useStore() → `pinia = activePinia` → undefined
+*   → `pinia._s.has(id)` → TypeError: Cannot read properties of undefined (reading '_s')
+*   → initTavernHelperObject() 抛出 → installTavernHelper() 抛出
+*   → runtime.js 的 mergeTavernHelperApi() 落到 catch
+*   → 真机日志：`[TH] merge failed ... reading '_s'` + `Tavern Helper merged, +0 APIs, total=115`
+*
+* 后果远不止「少几个 API」：上游 77 个 API（角色卡/人设/预设 CRUD/脚本树/文件/音频）全部缺失，
+* 脚本库面板读不到 store 全空 —— 用户看到的就是「导入了一大堆脚本却什么都看不到」。
+*
+* 修复方式与上游语义完全一致（同样 createPinia + setActivePinia），只是不 mount Vue app。
+* 幂等：多次调用 installTavernHelper 复用同一个实例，不会产生多个 pinia 竞争。
+*/
+var __rikkaPinia = null;
+function ensurePinia() {
+	if (!__rikkaPinia) __rikkaPinia = createPinia();
+	setActivePinia(__rikkaPinia);
+	return __rikkaPinia;
+}
+/**
 * rikkaST 侧统一初始化入口。
 *
 * 行为：
-*  1. 调用上游 `initTavernHelperObject()` 装配 API（内部是纯对象构造，不碰 DOM）；
-*  2. 把 API 对象逐个挂到目标 scope，供脚本以裸全局方式调用（对齐上游行为）；
-*  3. 返回 API 对象，便于宿主显式引用。
+*  1. 建好并激活 pinia（上游 store 层的前置条件）；
+*  2. 调用上游 `initTavernHelperObject()` 装配 API（内部是纯对象构造，不碰 DOM）；
+*  3. 把 API 对象逐个挂到目标 scope，供脚本以裸全局方式调用（对齐上游行为）；
+*  4. 返回 API 对象，便于宿主显式引用。
 *
 * 不做任何 DOM 操作，可在无 jQuery 环境调用。
 */
 function installTavernHelper(target) {
+	ensurePinia();
 	initTavernHelperObject();
 	const g = typeof globalThis !== "undefined" ? globalThis : null;
 	const api = g?.TavernHelper ?? null;

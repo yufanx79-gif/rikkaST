@@ -369,14 +369,26 @@ private fun ModeInjectionTab(
                     // 保留来源定义的 enabled 状态（不做强制篡改）
                     val enabledCount = importedList.count { it.enabled }
                     onUpdate(currentModeInjections + importedList)
-                    // B6：提取预设内嵌的「酒馆助手」脚本（若有）
+                    // [v251 根因修复] 导入预设时**不再**把内嵌脚本复制进 tavernPresetScripts 桶。
+                    //
+                    // 旧行为：同一批脚本被写进两处 ——
+                    //   a) Settings.tavernPresets[group] 的原始预设 JSON（extensions.tavern_helper.scripts）
+                    //   b) Settings.tavernPresetScripts[group] 的「脚本桶」
+                    // 于是管理页出现两个分区、显示同一批脚本（用户原话：「这个和预设脚本不就重叠了吗」），
+                    // 而且改一处另一处不跟着变 —— 用户关了 (b) 的副本，装载时 (a) 的副本还在，脚本照样跑。
+                    //
+                    // 现在只保留唯一真源 (a)：预设文件自己带的脚本就跟着预设文件走。
+                    // (b) 只留给「用户手动往某个预设组里额外挂脚本」这一个用途，
+                    // 管理页的「预设脚本」分区因此变成真正的「附加脚本」，不再重叠。
+                    //
+                    // 兼容性：已按旧版导入过的用户，(b) 里已有副本 —— buildTavernScriptsJson
+                    // 的 scriptDedupeKey 会按 id 去重（先到先得），不会产生双 iframe。
                     val presetScripts = withContext(Dispatchers.IO) {
                         ModeInjectionSerializer.importPresetScripts(context, uri)
                     }
                     if (presetScripts != null) {
-                        onPresetScripts(presetScripts.first, presetScripts.second)
                         toaster.show(
-                            "$importSuccessMsg（共 ${importedList.size} 条，启用 $enabledCount 条，含 ${presetScripts.second.size} 个预设脚本）"
+                            "$importSuccessMsg（共 ${importedList.size} 条，启用 $enabledCount 条，含 ${presetScripts.second.size} 个预设脚本，可在「助手→扩展→脚本」的「预设内嵌脚本」中管理）"
                         )
                     } else {
                         toaster.show(

@@ -153,6 +153,8 @@ fun TavernExtensionSettingsPage(folder: String) {
                     val (newJson, added) = appendGlobalScripts(settings.tavernGlobalScripts, scripts)
                     settingsStore.update { cur -> cur.copy(tavernGlobalScripts = newJson) }
                     toaster.show("已导入 $added 个酒馆助手全局脚本")
+                    // [v251 根因修复] 导入后要让聊天页运行时立刻装载新脚本，不能只刷新本页。
+                    runCatching { TavernRuntimeManager.reloadTavernScripts() }
                     webViewHolder[0]?.reload()
                     return@launch
                 }
@@ -336,6 +338,10 @@ fun TavernExtensionSettingsPage(folder: String) {
                 onToggleGlobalScripts = { checked ->
                     scope.launch {
                         settingsStore.update { cur -> cur.copy(tavernGlobalScriptsEnabled = checked) }
+                        // [v251 根因修复] 关闭总开关后必须让**聊天页运行时**重新装载脚本，
+                        // 否则已挂载的全局脚本 iframe 会继续跑（真机实测：关掉全局脚本后
+                        // 双马尾插件仍启用、按钮仍响应）。webViewHolder.reload() 只刷新扩展设置页自己。
+                        runCatching { TavernRuntimeManager.reloadTavernScripts() }
                         webViewHolder[0]?.reload()
                     }
                 },

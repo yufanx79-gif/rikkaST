@@ -73,6 +73,11 @@ class TavernWiringAuditTest {
         // [今晚 P0] ST `ConnectionProfile[]` → ConnectionManagerRequestService 的数据源。
         // JS 侧 runtime.js 的 cmrsPullProfiles() → callBridge('getConnectionProfilesJson')。
         Wiring("connectionProfilesSupplier", "getConnectionProfilesJson", jsCalls = true),
+        // [v250] ST `chatCompletionSettings` 真值：社区脚本读「当前模型」的唯一标准接口。
+        // 由 ChatService 接线（非 ChatPage）。JS 侧 pullChatCompletionSettings() 调用。
+        Wiring("chatCompletionSettingsSupplier", "getChatCompletionSettingsJson", jsCalls = true, requireChatPageWiring = false),
+        // [v251] 脚本库逐条启停：JS 侧 callBridge('setTavernScriptEnabled') 必须真的接到宿主。
+        Wiring("tavernScriptToggleSupplier", "setTavernScriptEnabled", jsCalls = true, requireChatPageWiring = true),
         // 这些 supplier 由非 ChatPage 的地方接线（ChatService / 设置页），只校验声明与桥
         Wiring("generationModelIdsSupplier", "getModelListJson", jsCalls = true, requireChatPageWiring = false),
         Wiring("currentModelIdSupplier", null, jsCalls = false, requireChatPageWiring = false),

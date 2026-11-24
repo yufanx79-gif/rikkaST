@@ -36,6 +36,11 @@ import * as chatDom from './st-compat/chat-dom.js';
 import { MessageFormatter, formatting_stage } from './st-compat/message-formatter.js';
 import { accountStorage } from './st-compat/util/AccountStorage.js';
 import { ChatCompletionService } from './st-compat/custom-request.js';
+// [v250] ST 的 `oai_settings` 是 st-compat/openai.js 导出的**同一个对象**，
+// 上游 TH 产物（rikkast-entry.js）里的 `getChatCompletionModel(oai_settings)` 直接读它。
+// 必须与 chatCompletionSettingsStub 保持同一份数据，否则「两处模型名不一致」——
+// 这正是旧实现「面板显示未知模型、而 getChatCompletionModel 却返回另一值」的来源。
+import { oai_settings as stCompatOaiSettings } from './st-compat/openai.js';
 
 // ---------------------------------------------------------------- ESM 库（zod / yaml）
 import * as zodModule from './vendor/lib/zod.esm.js';
@@ -1265,6 +1270,8 @@ function refreshAll() {
     pullChat(true);
     pullMetadata();
     pullSettings();
+    // [v250] 每次全量刷新都同步当前模型（脚本面板 / 按模型分流逻辑依赖它）
+    try { pullChatCompletionSettings(); } catch (_e) { /* noop */ }
     pullThirdPartySettings(false);
     pullCharacter();
     pullPersonas();
@@ -1502,13 +1509,53 @@ const toolManagerStub = {
     },
 };
 
+/**
+ * [v250 根治] ST `oai_settings` / `context.chatCompletionSettings`。
+ *
+ * 这里**必须是可变对象且由宿主真值覆盖**：社区预设脚本判断「当前用什么模型」的唯一标准接口
+ * 就是它（ST st-context.js:166 / openai.js:520），双马尾 / TRANS-AM / 各种按模型分流脚本全读它。
+ *
+ * 旧实现是写死的 `{chat_completion_source:'custom', openai_model:'unknown'}` 且没有 `custom_model`：
+ *   - 双马尾 `detectActiveModelName()` 读 `custom_model` → 空 → 面板显示「未读取到酒馆当前模型」；
+ *   - 其它脚本读 `${source}_model` → 'unknown' → 按模型分支全部落到 unknown。
+ * 现在每次 `refreshAll()` / `pullChat` 都会从宿主 `getChatCompletionSettingsJson()` 覆盖回来。
+ */
 const chatCompletionSettingsStub = {
     chat_completion_source: 'custom',
     openai_model: 'unknown',
+    custom_model: '',
+    model: '',
     reverse_proxy: '',
     temperature: 1,
     max_tokens: 4096,
+    preset_settings_openai: '',
 };
+
+/**
+ * 从宿主拉取真实 chat completion 设置并**原地合并**进 [chatCompletionSettingsStub]。
+ * 用原地合并（Object.assign）而不是替换引用：脚本/插件在初始化时可能缓存了该对象引用，
+ * 换引用会让它们读到旧副本（ST 侧 oai_settings 也是同一个对象被各处持有）。
+ */
+function pullChatCompletionSettings() {
+    let obj = null;
+    try {
+        // 统一走 callBridge：宿主注入的是 `window.RikkaBridge`，但各 WebView 实例的注入时机不同，
+        // callBridge 里做了兜底解析（并兼容旧命名）。这里也便于接线审计（TavernWiringAuditTest）。
+        obj = JSON.parse(callBridge('getChatCompletionSettingsJson') || '{}');
+    } catch (_e) { obj = null; }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+    for (const key of Object.keys(obj)) {
+        const v = obj[key];
+        if (v === undefined || v === null) continue;
+        chatCompletionSettingsStub[key] = v;
+        // 同步 st-compat 的 oai_settings（上游 TH 产物直接读这个对象）
+        try { if (stCompatOaiSettings) stCompatOaiSettings[key] = v; } catch (_e2) { /* noop */ }
+    }
+    // ST 兼容：`max_tokens` 与 `openai_max_tokens` 同名不同键，两边都写，脚本读哪个都对
+    if (obj.openai_max_tokens !== undefined && obj.max_tokens === undefined) {
+        chatCompletionSettingsStub.max_tokens = obj.openai_max_tokens;
+    }
+}
 
 async function callGenericPopupStub(content, type, defaultResult /*, options */) {
     try {
@@ -4263,6 +4310,8 @@ window.__rikkaEmit = function __rikkaEmit(name, payload) {
                 thirdPartySettingsDirty = false;
                 refreshSettings();
                 pullThirdPartySettings(true);
+                // [v250] 模型可能随助手/会话切换而变：同步给所有读 chatCompletionSettings 的脚本
+                try { pullChatCompletionSettings(); } catch (_eCm) { /* noop */ }
                 const nextIphonieJson = JSON.stringify((state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null);
                 if (prevIphonieJson !== nextIphonieJson && loadedExtensionHooks) {
                     const ipKey = Object.keys(loadedExtensionHooks).find((k) => k.toLowerCase().includes('iphonie'));
@@ -4351,6 +4400,17 @@ window.addEventListener('message', (ev) => {
 });
 
 // ---------------------------------------------------------------- 脚本执行入口（/js）
+/** [v250] 宿主切换脚本启停后强制重装（签名不含 enabled，必须 force）。 */
+window.__rikkaReloadTavernScripts = async function __rikkaReloadTavernScripts() {
+    try {
+        refreshAll();
+        await loadTavernScripts(true);
+        try { callBridge('log', 'info', '[scripts] force reload after enable/disable toggle'); } catch (_e) { /* noop */ }
+    } catch (e) {
+        safeWarn('__rikkaReloadTavernScripts failed', e);
+    }
+};
+
 window.__rikkaRunScript = async function __rikkaRunScript(code) {
     refreshAll();
     let result, error = null;
@@ -4875,61 +4935,81 @@ let scriptsLoadGen = 0;
  * 两边必须一致，否则「宿主 emit 的事件名」和「脚本监听的事件名」对不上 → 点了没反应。
  */
 function buttonEventName(scriptId, buttonName) {
+    // [v250 BUGFIX] 旧代码引用了**本文件里从未定义过的** `buttonHub`，
+    // 于是每次都在 try 里抛 ReferenceError 被吞掉 → 永远走下面那条「不带 hash」的兜底，
+    // 而脚本监听的是 `${scriptId}_${getStringHash(name)}`（上游 getButtonId），
+    // 两边对不上 ⇒ 声明式按钮「能显示、点了没反应」。
+    // 正确来源是 shims 里的同名导出（与 _eventNameOf 逐字一致）。
     try {
-        if (buttonHub && typeof buttonHub.event === 'function') return buttonHub.event(String(scriptId), String(buttonName));
+        if (shimButton && typeof shimButton.buttonEvent === 'function') {
+            return shimButton.buttonEvent(String(scriptId), String(buttonName));
+        }
+    } catch (_e) { /* noop */ }
+    try {
+        if (window.__rikkaButtonHub && typeof window.__rikkaButtonHub.event === 'function') {
+            return window.__rikkaButtonHub.event(String(scriptId), String(buttonName));
+        }
     } catch (_e) { /* noop */ }
     return String(scriptId) + '_' + String(buttonName);
 }
 
 function syncDeclaredScriptButtons(scripts) {
     try {
-        const out = [];
-        const seen = new Set();
+        // [v250 根治] 声明式按钮不再「现算后直接上报」，而是写进 shims 的**同一个 store**，
+        // 由 button-shims 的 _notify() 统一上报「声明式 + 运行时」的并集。
+        //
+        // 旧实现的致命缺陷：声明式只上报、不入库；一旦任何脚本在运行期调
+        // appendInexistentScriptButtons()，_notify() 就只带运行时按钮整包替换宿主列表
+        // → 之前声明的按钮全部被顶掉（真机日志 n=3 → n=1）。
+        const declared = [];
+        const keepIds = [];
         for (const sc of scripts || []) {
-            const btnCfg = sc && sc.button;
+            if (!sc) continue;
+            const scriptId = String(sc.id == null ? '' : sc.id);
+            if (!scriptId) continue;
+            keepIds.push(scriptId);
+            const btnCfg = sc.button;
             if (!btnCfg || btnCfg.enabled === false) continue;
             const btns = Array.isArray(btnCfg.buttons) ? btnCfg.buttons : [];
+            const visible = [];
             for (const b of btns) {
                 if (!b) continue;
                 // visible === false 表示作者主动隐藏（如由其它脚本托管）
                 if (b.visible === false) continue;
                 const name = String(b.name == null ? '' : b.name).trim();
                 if (!name) continue;
-                const scriptId = String(sc.id == null ? '' : sc.id);
-                const key = scriptId + '::' + name;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push({
-                    scriptId: scriptId,
-                    scriptName: String(sc.name == null ? '' : sc.name),
-                    name: name,
-                    // [v247 BUGFIX] 必须与上游 getButtonId() 的事件名逐字一致：
-                    // `${script_id}_${getStringHash(button_name)}`（rikkast-entry.js:11127-11129）。
-                    // 此前这里是自造的 `script_button::id::name`，宿主 fire 后脚本监听不到。
-                    event: buttonEventName(scriptId, name),
-                });
+                visible.push({ name: name, visible: true });
             }
+            if (visible.length === 0) continue;
+            declared.push({
+                scriptId: scriptId,
+                scriptName: String(sc.name == null ? '' : sc.name),
+                buttons: visible,
+            });
         }
-        // 与运行时已注册的按钮合并（buttonHub 里可能已有 replaceScriptButtons 注册的）
-        let runtimeButtons = [];
-        try {
-            if (buttonHub && typeof buttonHub.allEnabled === 'function') runtimeButtons = buttonHub.allEnabled() || [];
-            else if (typeof allEnabledButtons === 'function') runtimeButtons = allEnabledButtons() || [];
-        } catch (_e) { runtimeButtons = []; }
-        const merged = [];
-        const mergedSeen = new Set();
-        for (const b of [...out, ...runtimeButtons]) {
-            const key = String(b.scriptId || '') + '::' + String(b.name || '');
-            if (mergedSeen.has(key)) continue;
-            mergedSeen.add(key);
-            merged.push(b);
-        }
-        try {
-            if (window.RikkaBridge && typeof window.RikkaBridge.onScriptButtons === 'function') {
-                window.RikkaBridge.onScriptButtons(JSON.stringify(merged));
+        let merged = [];
+        if (shimButton && typeof shimButton.syncDeclared === 'function') {
+            merged = shimButton.syncDeclared(declared, keepIds) || [];
+        } else {
+            // 兜底（旧 shim）：保持原行为，至少不让按钮彻底消失
+            merged = [];
+            for (const item of declared) {
+                for (const b of item.buttons) {
+                    merged.push({
+                        scriptId: item.scriptId,
+                        scriptName: item.scriptName,
+                        name: b.name,
+                        event: buttonEventName(item.scriptId, b.name),
+                    });
+                }
             }
-        } catch (_e) { /* noop */ }
-        try { callBridge('log', 'info', `[buttons] declared=${out.length} runtime=${runtimeButtons.length} total=${merged.length}`); } catch (_e) { /* noop */ }
+            try {
+                if (window.RikkaBridge && typeof window.RikkaBridge.onScriptButtons === 'function') {
+                    window.RikkaBridge.onScriptButtons(JSON.stringify(merged));
+                }
+            } catch (_e) { /* noop */ }
+        }
+        try { callBridge('log', 'info', `[buttons] declared scripts=${declared.length} total=${merged.length}`); } catch (_e) { /* noop */ }
         return merged;
     } catch (e) {
         safeWarn('[buttons] syncDeclaredScriptButtons failed', e);
@@ -4938,6 +5018,9 @@ function syncDeclaredScriptButtons(scripts) {
 }
 
 async function loadTavernScripts(force) {
+    // [v250] 挂载脚本前先同步模型：脚本顶层代码（如双马尾的 registerLauncher → 面板首屏）
+    // 会在初始化阶段读 chatCompletionSettings，晚同步一步就会显示「未读取到模型」。
+    try { pullChatCompletionSettings(); } catch (_e) { /* noop */ }
     let raw = '';
     try { raw = callBridge('getTavernScriptsJson') || '{}'; } catch (_e) { raw = '{}'; }
     let helper = null;
@@ -7945,8 +8028,26 @@ function installUniversalFloatingAndTtsBridge() {
                 const helper = (JSON.parse(rawScripts) || {}).tavern_helper || {};
                 scripts = Array.isArray(helper.scripts) ? helper.scripts : [];
             } catch (_e) { scripts = []; }
+            // [v251 根因修复] 脚本库必须能**逐条启停**。
+            //
+            // 旧实现只渲染「✅ 已启用 / ⏸ 已停用」徽标，**没有任何可点击的开关** ——
+            // 于是用户在真机上只能「启用」不能「关闭」，想关掉某个脚本只能把整个全局脚本总开关关掉
+            // （而那样会把所有脚本一起关掉，双马尾等也一起没了）。这不是 UI 少个按钮，
+            // 是「脚本库」这个面板缺少了它存在的核心能力。
+            //
+            // 现在每条右侧是真正的开关：点击 → 写回宿主 Settings → 运行时强制重载。
+            // 三种来源（全局 / 卡内 / 预设内嵌）统一走 bridge，由宿主决定落到哪个存储。
             const scriptItemsHtml = scripts.length
-                ? scripts.map((s, idx) => `<div class="list-group-item" style="justify-content:space-between;"><span><b>#${idx + 1}</b> ${String(s.name || s.id || '未命名脚本')}</span><span class="rikka-save-badge">${scriptEnabled(s.enabled) ? '✅ 已启用' : '⏸ 已停用'}</span></div>`).join('')
+                ? scripts.map((s, idx) => {
+                    const sid = String(s.id == null ? '' : s.id);
+                    const enabled = scriptEnabled(s.enabled);
+                    const safeId = sid.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+                    return `<div class="list-group-item" style="justify-content:space-between;gap:8px;">
+                        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;"><b>#${idx + 1}</b> ${String(s.name || s.id || '未命名脚本')}</span>
+                        <button type="button" class="menu_button rikka-jsr-toggle" data-script-id="${safeId}" data-enabled="${enabled ? '1' : '0'}"
+                            style="min-width:64px;padding:2px 8px;">${enabled ? '✅ 已启用' : '⏸ 已停用'}</button>
+                    </div>`;
+                }).join('')
                 : `<div class="notes">当前未导入额外的脚本条目（可通过顶部「导入 JSR 脚本 JSON」按钮一键导入）。</div>`;
             card.innerHTML = `
                 <h3>🛠 酒馆助手 (JS-Slash-Runner) 脚本库与变量管理器</h3>
@@ -7971,6 +8072,32 @@ function installUniversalFloatingAndTtsBridge() {
                 } catch (_e) { editor.value = '{}'; }
             };
             loadVarsToEditor();
+            // [v251 根因修复] 脚本库逐条启停：点击 → 写回宿主 → 宿主触发运行时重载。
+            // 旧实现没有任何可点控件，用户只能整包关闭全局脚本，等于「脚本库不可用」。
+            card.querySelectorAll('.rikka-jsr-toggle').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    const scriptId = btn.getAttribute('data-script-id') || '';
+                    const nextEnabled = btn.getAttribute('data-enabled') !== '1';
+                    if (!scriptId) return;
+                    let ok = false;
+                    try {
+                        ok = !!callBridge('setTavernScriptEnabled', scriptId, nextEnabled);
+                    } catch (err) {
+                        ok = false;
+                    }
+                    if (ok) {
+                        btn.setAttribute('data-enabled', nextEnabled ? '1' : '0');
+                        btn.textContent = nextEnabled ? '✅ 已启用' : '⏸ 已停用';
+                        if (statusBox) {
+                            statusBox.style.display = 'block';
+                            statusBox.textContent = nextEnabled ? '✅ 已启用该脚本（运行时已重载）' : '⏸ 已停用该脚本（运行时已重载）';
+                        }
+                    } else if (statusBox) {
+                        statusBox.style.display = 'block';
+                        statusBox.textContent = '❌ 宿主未接受该脚本的启停请求（可能不在当前会话的脚本集合内）';
+                    }
+                });
+            });
             card.querySelector('#rikka-jsr-refresh-vars').addEventListener('click', loadVarsToEditor);
             card.querySelector('#rikka-jsr-save-vars').addEventListener('click', () => {
                 try {

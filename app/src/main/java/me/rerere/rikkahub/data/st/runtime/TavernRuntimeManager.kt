@@ -755,6 +755,20 @@ object TavernRuntimeManager {
     /** 由 UI 层注入：当前助手卡内 `tavern_helper` 原始 JSON（JSR 卡脚本语义）。 */
     @Volatile var tavernScriptsSupplier: (() -> String)? = null
 
+    /**
+     * [v251 根因修复] 由 UI 层注入：按脚本 id 切换启用状态。
+     *
+     * 入参 (scriptId, enabled)，返回是否成功写入。
+     *
+     * 为什么需要它：脚本库面板此前**只能看不能改**（只渲染 ✅/⏸ 徽标，没有任何可点控件），
+     * 用户在真机上「想关掉某个脚本只能把全局脚本总开关一起关掉」。这不是少一个按钮，
+     * 而是「脚本库」缺少了它存在的核心能力。
+     *
+     * 三种来源（全局 / 卡内 / 预设内嵌）由宿主决定落到哪个存储 —— JS 侧不需要知道，
+     * 这样以后新增第四种脚本来源时，脚本库面板不用改。
+     */
+    @Volatile var tavernScriptToggleSupplier: ((String, Boolean) -> Boolean)? = null
+
     /** 由 UI 层注入：卡内嵌世界书读取（入参世界书名，返回 ST 风格 world info JSON）。 */
     @Volatile var tavernLorebookSupplier: ((String) -> String)? = null
 
@@ -790,6 +804,20 @@ object TavernRuntimeManager {
 
     /** [v246] 由 UI 层注入：可用模型 id 列表 JSON（JSR `getModelList` 简化版）。 */
     @Volatile var modelListSupplier: (() -> String)? = null
+
+    /**
+     * [v250] 由 UI 层注入：ST `chatCompletionSettings`（`oai_settings` 形状）JSON。
+     *
+     * 为什么必须一劳永逸：大量预设脚本（双马尾 / TRANS-AM / 各种「按模型分流」脚本）
+     * 都靠 `SillyTavern.getContext().chatCompletionSettings.<source>_model` 判断当前模型。
+     * 而我们此前给的是**硬编码 stub**（`openai_model: 'unknown'`、没有 `custom_model`），
+     * 于是所有按模型分支的逻辑全部落到「未知」，面板显示「未读取到酒馆当前模型」。
+     * 这不是某个插件的个性化问题 —— 是宿主对外契约缺字段，改一次全体受益。
+     *
+     * 数据源 = 当前生效模型 + 该模型所属 provider（见 ChatService）。
+     * 未接线时退回 stub（保持旧行为，不崩）。
+     */
+    @Volatile var chatCompletionSettingsSupplier: (() -> String)? = null
 
     /**
      * [今晚 P0] 由 UI 层注入：ST `ConnectionProfile[]` JSON（对齐 ST 1.19.0
@@ -2494,6 +2522,17 @@ object TavernRuntimeManager {
         )
     }
 
+    /**
+     * [v250] 强制重装角色卡/全局/预设脚本（脚本启停变化后调用）。
+     *
+     * 为什么必须 force：runtime 侧 `loadTavernScripts(force)` 用「脚本 id:name 签名」判重，
+     * 单纯切换 enabled 不改变签名 → 不 force 时会直接跳过，停用的脚本 iframe 仍在跑、
+     * 新启用的脚本不会挂载。用户看到的就是「开关点了没反应」。
+     */
+    fun reloadTavernScripts() {
+        broadcast("window.__rikkaReloadTavernScripts && window.__rikkaReloadTavernScripts();")
+    }
+
     /** 重新扫描并通知主运行时与辅助 WebView 重载第三方扩展。 */
     fun reloadThirdPartyExtensions() {
         broadcast("window.__rikkaReloadThirdPartyExtensions && window.__rikkaReloadThirdPartyExtensions();")
@@ -3710,6 +3749,28 @@ object TavernRuntimeManager {
             return buildJsonObject {
                 put("variables", TavernVariableStore.getChat(id))
             }.toString()
+        }
+
+        /**
+         * [v250] ST `oai_settings` / `context.chatCompletionSettings` 的宿主真实值。
+         *
+         * 返回 ST 形状的 Chat Completion 设置（至少 `chat_completion_source` 与全套
+         * `<source>_model` 字段），供运行时 `chatCompletionSettingsStub` 合并覆盖。
+         * 未接线时返回 `"{}"`（运行时保持 stub 默认值）。
+         */
+        @JavascriptInterface
+        fun getChatCompletionSettingsJson(): String =
+            chatCompletionSettingsSupplier?.invoke()?.takeIf { it.isNotBlank() } ?: "{}"
+
+        /**
+         * [v251] 脚本库面板逐条启停（JS → 宿主）。
+         *
+         * 写入成功后由宿主侧触发运行时重载，JS 侧无需自己 reload。
+         */
+        @JavascriptInterface
+        fun setTavernScriptEnabled(scriptId: String, enabled: Boolean): Boolean {
+            val supplier = tavernScriptToggleSupplier ?: return false
+            return runCatching { supplier(scriptId, enabled) }.getOrDefault(false)
         }
 
         /** ST `extension_settings`（含 variables.global）。 */

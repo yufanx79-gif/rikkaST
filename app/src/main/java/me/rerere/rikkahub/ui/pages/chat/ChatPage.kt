@@ -75,6 +75,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import me.rerere.rikkahub.data.st.runtime.buildTavernPresetJson
 import me.rerere.rikkahub.data.st.runtime.buildTavernScriptsJson
+import me.rerere.rikkahub.data.st.runtime.setCardScriptEnabled
+import me.rerere.rikkahub.data.st.runtime.setGlobalScriptEnabled
 import me.rerere.rikkahub.data.st.runtime.buildWorldNamesJson
 import me.rerere.rikkahub.data.st.script.StSlashExecutor
 import androidx.compose.runtime.getValue
@@ -213,6 +215,45 @@ fun ChatPage(
                 tavernLatestSettings.value.getAssistantById(tavernLatestConversation.value.assistantId),
                 tavernLatestSettings.value,
             )
+        }
+        // [v251 根因修复] 脚本库面板的逐条启停：宿主决定落到哪个存储。
+        //
+        // 三源优先级与 buildTavernScriptsJson 的装载顺序一致（全局 → 卡内 → 预设桶 → 预设内嵌），
+        // 命中哪个就改哪个。这样脚本库面板不需要知道脚本来自哪里，
+        // 以后新增第四种来源也只需在这里加一个分支。
+        TavernRuntimeManager.tavernScriptToggleSupplier = toggle@{ scriptId, enabled ->
+            if (scriptId.isBlank()) return@toggle false
+            val settings = tavernLatestSettings.value
+            val assistant = settings.getAssistantById(tavernLatestConversation.value.assistantId)
+            // 1) 全局脚本
+            val globalJson = settings.tavernGlobalScripts
+            setGlobalScriptEnabled(globalJson, scriptId, enabled)?.let { newJson ->
+                if (newJson != globalJson) {
+                    vm.patchSettings { it.copy(tavernGlobalScripts = newJson) }
+                    return@toggle true
+                }
+            }
+            // 2) 卡内脚本
+            setCardScriptEnabled(assistant, scriptId, enabled)?.let { newRaw ->
+                val tav = assistant?.tavernData ?: return@toggle false
+                vm.updateAssistant(assistant.copy(tavernData = tav.copy(extensionsRaw = newRaw)))
+                return@toggle true
+            }
+            // 3) 预设内嵌脚本（按组遍历，命中即写回）
+            var presetHandled = false
+            runCatching {
+                val groups = me.rerere.rikkahub.data.st.runtime.listPresetEmbeddedScriptBuckets(settings.tavernPresets)
+                for ((group, list) in groups) {
+                    if (list.none { it.id == scriptId }) continue
+                    val newPresets = me.rerere.rikkahub.data.st.runtime.setPresetEmbeddedScriptEnabled(
+                        settings.tavernPresets, group, scriptId, enabled,
+                    ) ?: continue
+                    vm.patchSettings { it.copy(tavernPresets = newPresets) }
+                    presetHandled = true
+                    break
+                }
+            }
+            presetHandled
         }
         // [v246] JSR getPreset()/replacePreset() 接线：TRANS-AM/SPreset 系脚本靠它读条目开关。
         TavernRuntimeManager.tavernPresetSupplier = {
@@ -1094,9 +1135,24 @@ private fun ChatPageContent(
         // （原话：不仅是气泡磨砂了，输入框没有磨砂，反而背景磨砂了），本轮撤掉。
         // 输入栏的模糊走 Haze 真实 backdrop blur（只糊输入栏那一小块，见 ChatInput.kt）；
         // 气泡保持「半透明底 + hairline 细边框」，不做「背后模糊」。
+        // [v251 根因修复] hazeSource 必须**跟着磨砂开关走**，不能无条件挂载。
+        //
+        // Haze 2.x 的 hazeSource 会为整块区域建立一张离屏图层（offscreen layer），
+        // 供 hazeBlur/hazeGlass 做 backdrop 采样。它是纯 GPU 纹理开销，且**与面板 WebView 抢同一份预算**。
+        //
+        // 真机实证（2026-11-24 23:30~23:31）：当时面板高度只有 57dp（几乎没占地方），
+        // 却仍然出现 20 条 `tile_manager.cc: tile memory limits exceeded`。
+        // 说明压力不来自面板尺寸，而来自这张覆盖整个聊天区的离屏图层。
+        //
+        // 用户看到的「面板滑到屏幕中间就消失一半、继续滑就频闪」正是合成器
+        // 在纹理预算不足时**随机丢弃 tile** 的表现：被丢弃的恰好是面板所在的那几块 tile。
+        //
+        // 修复：只有真的需要磨砂时才挂 hazeSource。磨砂关闭时零开销（不建图层、不采样）。
+        // 这同时修掉一个隐性浪费：绝大多数用户不开磨砂，却一直在付这份纹理代价。
+        val blurEffectOn = setting.displaySetting.enableBlurEffect
         AssistantBackground(
             setting = setting,
-            modifier = Modifier.hazeSource(hazeState),
+            modifier = if (blurEffectOn) Modifier.hazeSource(hazeState) else Modifier,
         )
         Scaffold(
             containerColor = Color.Transparent,
@@ -1600,7 +1656,6 @@ private fun ChatPageContent(
                 processingStatus = processingStatus,
                 previewMode = previewMode,
                 settings = setting,
-                hazeState = hazeState,
                 errors = errors,
                 onDismissError = onDismissError,
                 onClearAllErrors = onClearAllErrors,

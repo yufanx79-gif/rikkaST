@@ -68,14 +68,17 @@ import me.rerere.rikkahub.data.export.ModeInjectionSerializer
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.st.regex.RegexScript
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.runtime.TavernScriptBrief
 import me.rerere.rikkahub.data.st.runtime.appendGlobalScripts
 import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.data.st.runtime.extractScriptsFromJson
 import me.rerere.rikkahub.data.st.runtime.listCardScripts
 import me.rerere.rikkahub.data.st.runtime.listGlobalScripts
+import me.rerere.rikkahub.data.st.runtime.listPresetEmbeddedScriptBuckets
 import me.rerere.rikkahub.data.st.runtime.listPresetScriptBuckets
 import me.rerere.rikkahub.data.st.runtime.removeGlobalScript
+import me.rerere.rikkahub.data.st.runtime.setPresetEmbeddedScriptEnabled
 import me.rerere.rikkahub.data.st.runtime.setCardScriptEnabled
 import me.rerere.rikkahub.data.st.runtime.setGlobalScriptEnabled
 import me.rerere.rikkahub.data.st.runtime.setPresetScriptEnabled
@@ -216,6 +219,12 @@ internal fun TavernScriptsSection(
     val presetBuckets = remember(settings.tavernPresetScripts) {
         listPresetScriptBuckets(settings.tavernPresetScripts)
     }
+    // [v250] 预设**文件内嵌**的脚本（tavernPresets[group].extensions.tavern_helper.scripts）。
+    // 与上面的 presetBuckets（用户手动挂的桶）是两套存储；之前完全没在 UI 里暴露，
+    // 于是「导入预设后脚本一条都看不到，只能看到它已生效」。
+    val presetEmbeddedBuckets = remember(settings.tavernPresets) {
+        listPresetEmbeddedScriptBuckets(settings.tavernPresets)
+    }
     val enabledGroups = remember(assistant.modeInjectionIds, settings.modeInjections) {
         enabledPresetGroups(assistant, settings)
     }
@@ -241,6 +250,8 @@ internal fun TavernScriptsSection(
                 val (newJson, added) = appendGlobalScripts(settings.tavernGlobalScripts, imported)
                 onUpdateSettings(settings.copy(tavernGlobalScripts = newJson))
                 scriptsToaster.show("已导入 $added 个全局脚本")
+                // [v251 根因修复] 导入后立即让运行时装载（与所有开关行为统一）
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
             }
         }
     }
@@ -250,28 +261,48 @@ internal fun TavernScriptsSection(
         globalScripts = globalScripts,
         globalScriptsEnabled = settings.tavernGlobalScriptsEnabled,
         presetBuckets = presetBuckets,
+        presetEmbeddedBuckets = presetEmbeddedBuckets,
         enabledGroups = enabledGroups,
+        // [v251 根因修复] 任何一条脚本开关都必须触发运行时重载。
+        //
+        // 旧实现只给「预设内嵌脚本」加了 reloadTavernScripts()，另外四个开关（卡内/全局/全局总开关/预设桶）
+        // 只写 Settings 就结束了 —— 于是真机上「关掉脚本 → 按钮还在、面板还能打开、事件还在响应」，
+        // 用户必须新建对话或重进对话才生效（本次真机测试原话：「需要新建一个对话才能消失」）。
+        // 这不是四条独立 bug，是同一个缺失：Settings 变了但 runtime 不知道。
+        // 统一在写入成功后 reload 一次，彻底消除这类不一致。
         onToggleCard = { brief, checked ->
             // 传完整 Assistant：旧持久化卡可能 extensionsRaw 为空、脚本只在 extensions Map 中；
             // 只传 raw 会导致「列表可见但开关写回 null」。
             val newRaw = setCardScriptEnabled(assistant, brief.id, checked)
             if (newRaw != null) {
                 onUpdateAssistant(assistant.copy(tavernData = scriptTavData?.copy(extensionsRaw = newRaw)))
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
             }
         },
         onToggleGlobal = { brief, checked ->
             val newJson = setGlobalScriptEnabled(settings.tavernGlobalScripts, brief.id, checked)
             if (newJson != null) {
                 onUpdateSettings(settings.copy(tavernGlobalScripts = newJson))
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
             }
         },
         onToggleGlobalMaster = { checked ->
             onUpdateSettings(settings.copy(tavernGlobalScriptsEnabled = checked))
+            // 总开关也要重载：关闭后所有全局脚本 iframe 必须立即拆除。
+            runCatching { TavernRuntimeManager.reloadTavernScripts() }
         },
         onTogglePresetScript = { group, brief, checked ->
             val newJson = setPresetScriptEnabled(settings.tavernPresetScripts, group, brief.id, checked)
             if (newJson != null) {
                 onUpdateSettings(settings.copy(tavernPresetScripts = newJson))
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
+            }
+        },
+        onTogglePresetEmbeddedScript = { group, brief, checked ->
+            val newJson = setPresetEmbeddedScriptEnabled(settings.tavernPresets, group, brief.id, checked)
+            if (newJson != null) {
+                onUpdateSettings(settings.copy(tavernPresets = newJson))
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
             }
         },
         onTogglePresetGroup = { group, checked ->
@@ -291,6 +322,8 @@ internal fun TavernScriptsSection(
             val newJson = removeGlobalScript(settings.tavernGlobalScripts, brief.id)
             if (newJson != null) {
                 onUpdateSettings(settings.copy(tavernGlobalScripts = newJson))
+                // [v251 根因修复] 删除后立即卸载 iframe（与所有开关行为统一）
+                runCatching { TavernRuntimeManager.reloadTavernScripts() }
             }
             viewingScript = null
         }
@@ -406,11 +439,13 @@ private fun ScriptsContent(
     globalScripts: List<TavernScriptBrief>,
     globalScriptsEnabled: Boolean,
     presetBuckets: Map<String, List<TavernScriptBrief>>,
+    presetEmbeddedBuckets: Map<String, List<TavernScriptBrief>>,
     enabledGroups: Set<String>,
     onToggleCard: (TavernScriptBrief, Boolean) -> Unit,
     onToggleGlobal: (TavernScriptBrief, Boolean) -> Unit,
     onToggleGlobalMaster: (Boolean) -> Unit,
     onTogglePresetScript: (String, TavernScriptBrief, Boolean) -> Unit,
+    onTogglePresetEmbeddedScript: (String, TavernScriptBrief, Boolean) -> Unit,
     onTogglePresetGroup: (String, Boolean) -> Unit,
     onImportGlobal: () -> Unit,
     onView: (TavernScriptBrief, String) -> Unit,
@@ -506,6 +541,49 @@ private fun ScriptsContent(
                 }
             }
         }
+        // [v250] 预设**文件内嵌**脚本：与上面的「预设脚本桶」是两套存储。
+        // 这里补上是为了让用户能看到「导入预设时带了哪些脚本、哪些被关掉了」。
+        item(key = "hdr:presetEmbedded") { ScriptSectionHeader("预设内嵌脚本（随预设导入）") }
+        if (presetEmbeddedBuckets.isEmpty()) {
+            item(key = "empty:presetEmbedded") {
+                ScriptHint("暂无预设内嵌脚本。导入带「酒馆助手」脚本的酒馆预设（如 Meowssiah / TRANS-AM）后会自动显示。")
+            }
+        } else {
+            presetEmbeddedBuckets.forEach { (group, list) ->
+                val active = enabledGroups.contains(group)
+                item(key = "pe:" + group) {
+                    ListItem(
+                        headlineContent = { Text(group) },
+                        supportingContent = {
+                            Text(
+                                text = buildString {
+                                    append(if (active) "预设已启用" else "预设未启用")
+                                    append(" · ")
+                                    append("${list.size} 个脚本")
+                                    val off = list.count { !it.enabled }
+                                    if (off > 0) append("（${off} 个已停用）")
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                            )
+                        },
+                        trailingContent = {
+                            Switch(checked = active, onCheckedChange = { c -> onTogglePresetGroup(group, c) })
+                        },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    )
+                }
+                items(list, key = { "pe:" + group + ":" + it.id }) { s ->
+                    ScriptRow(
+                        script = s,
+                        onToggle = { c -> onTogglePresetEmbeddedScript(group, s, c) },
+                        onClick = { onView(s, "preset-embedded:" + group) },
+                        indented = true,
+                    )
+                }
+            }
+        }
+
         item(key = "tail") { Spacer(modifier = Modifier.height(32.dp)) }
     }
 }
@@ -1183,9 +1261,15 @@ internal fun PresetManagementTab(
                     val mergedInjections = modeInjections.filterNot { it.presetGroup == bundle.presetGroup } + bundle.injections
                     onUpdate(mergedInjections)
                     bundle.rawPresetJson?.let { json -> onStoreRawPreset(bundle.presetGroup, json) }
-                    if (bundle.scriptsFieldState != me.rerere.rikkahub.data.export.PresetSubfieldState.CORRUPTED) {
-                        onPresetScripts(bundle.presetGroup, bundle.presetScripts)
-                    }
+                    // [v251 根因修复] 不再把预设内嵌脚本复制进「脚本桶」。
+                    //
+                    // 与 PromptPage 的导入路径同源同因：`rawPresetJson` 已经原样保存了
+                    // `extensions.tavern_helper.scripts`（唯一真源），再往 `tavernPresetScripts`
+                    // 复制一份就会让管理页出现两个分区显示同一批脚本，且两处开关互不同步。
+                    // 装载侧 buildTavernScriptsJson 直接读 rawPresetJson，无需这份副本。
+                    //
+                    // 保留 bundle.scriptsFieldState 的 CORRUPTED 判定语义（用于提示），
+                    // 只是不再产生写入。
                 }
                 val parts = mutableListOf("${bundle.injections.size} 条注入（启用 $enabledCount 条）")
                 if (bundle.presetScripts.isNotEmpty()) parts += "${bundle.presetScripts.size} 个预设脚本"

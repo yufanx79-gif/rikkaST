@@ -49,16 +49,44 @@ data class TavernScriptBrief(
 // 装载：三源合并（runtime.js 消费）
 // ============================================================
 
+/**
+ * [v250 根治] 脚本去重键。
+ *
+ * 与正则那批「快照 + 预设副本」完全同源的坑：预设自带脚本会同时出现在
+ *  a) `Settings.tavernPresetScripts[group]`（管理页可编辑的桶）
+ *  b) `Settings.tavernPresets[group].extensions.tavern_helper.scripts`（预设原文）
+ * 两处都读 → 同一个脚本被挂**两个** iframe。真机日志实证：
+ *   `[scripts] loaded 7: 4A专用版, 双马尾插件 v4.6.1, 音乐盒·独立版, SPreset, 菜单, SPreset, 菜单`
+ * 后果不只是浪费：同 id 的两个 iframe 会抢同一批事件监听、重复注册按钮、
+ * 同一条 slash 命令执行两次、MVU 变量被写两遍。
+ *
+ * 去重键优先级：id 优先（同一脚本的稳定身份）；无 id 时退回「名字 + 内容哈希」。
+ */
+private fun scriptDedupeKey(obj: JsonObject): String {
+    val id = (obj["id"] as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
+    if (id.isNotEmpty()) return "id:" + id
+    val name = (obj["name"] as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
+    val content = (obj["content"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+    return "sig:" + name + "#" + content.hashCode()
+}
+
 fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
     val helper = cardHelper(assistant)
+    // 三源合并时统一去重（先到先得：全局 → 卡内 → 预设桶 → 预设原文）
+    val seen = LinkedHashSet<String>()
     val merged = buildJsonArray {
+        // 去重助手必须定义在 builder 作用域内：`add` 是 JsonArrayBuilder 的方法，
+        // 定义在外层会被解析成 List.add（编译失败）。
+        fun addUnique(obj: JsonObject) {
+            if (seen.add(scriptDedupeKey(obj))) add(obj)
+        }
         // 1) 全局脚本（JSR global；总开关关闭则跳过）
         if (settings?.tavernGlobalScriptsEnabled != false) {
-            flattenTree(parseScriptItems(settings?.tavernGlobalScripts)).forEach { add(it) }
+            flattenTree(parseScriptItems(settings?.tavernGlobalScripts)).forEach { addUnique(it) }
         }
         // 2) 卡内脚本（JSR character）
         (helper?.get("scripts") as? JsonArray)?.let { arr ->
-            flattenTree(arr.toList()).forEach { add(it) }
+            flattenTree(arr.toList()).forEach { addUnique(it) }
         }
         // 3) 预设脚本（JSR preset；仅装载「当前助手已启用预设组」旗下的）
         //
@@ -76,9 +104,10 @@ fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
                 Json.parseToJsonElement(settings?.tavernPresets ?: "{}") as? JsonObject
             }.getOrNull()
             groups.forEach { g ->
-                // (a) UI 手动挂的脚本桶
-                flattenTree(buckets[g].orEmpty()).forEach { add(it) }
+                // (a) UI 手动挂的脚本桶（用户可在此改启停 → 优先保留）
+                flattenTree(buckets[g].orEmpty()).forEach { addUnique(it) }
                 // (b) 预设文件自带脚本（extensions.tavern_helper.scripts）
+                //     与 (a) 重复的条目会被 addUnique 丢弃，避免同 id 双 iframe。
                 val rawPreset = when (val el = presetRoot?.get(g)) {
                     is JsonPrimitive -> el.contentOrNull
                     is JsonObject -> el.toString()
@@ -91,7 +120,7 @@ fun buildTavernScriptsJson(assistant: Assistant?, settings: Settings?): String {
                             ?.get("tavern_helper")?.let { it as? JsonObject }
                     }.getOrNull()
                     (helperObj?.get("scripts") as? JsonArray)?.let { arr ->
-                        flattenTree(arr.toList()).forEach { add(it) }
+                        flattenTree(arr.toList()).forEach { addUnique(it) }
                     }
                 }
             }
@@ -163,6 +192,77 @@ fun listGlobalScripts(scriptsJson: String?): List<TavernScriptBrief> =
 
 fun listPresetScriptBuckets(scriptsJson: String?): Map<String, List<TavernScriptBrief>> =
     parsePresetBucketsRaw(scriptsJson).mapValues { (_, v) -> briefsOf(v) }
+
+/**
+ * [v250] 预设**内嵌**脚本（`tavernPresets[group].extensions.tavern_helper.scripts`）。
+ *
+ * 为什么需要：预设文件自带的酒馆助手脚本存在这里（Meowssiah 的 SPreset/菜单、
+ * TRANS-AM 的 7 个），而 [listPresetScriptBuckets] 读的是用户手动挂的
+ * `Settings.tavernPresetScripts`。两者是**不同**的存储 —— 于是「导入预设后
+ * 管理页一条脚本都看不到」，用户只能看到「已启用」的效果，无法查看/关闭单条。
+ *
+ * 只读解析，不做归一化写回；写回见 [setPresetEmbeddedScriptEnabled]。
+ */
+fun listPresetEmbeddedScriptBuckets(tavernPresetsJson: String?): Map<String, List<TavernScriptBrief>> {
+    if (tavernPresetsJson.isNullOrBlank()) return emptyMap()
+    val root = runCatching {
+        Json.parseToJsonElement(tavernPresetsJson) as? JsonObject
+    }.getOrNull() ?: return emptyMap()
+    val out = LinkedHashMap<String, List<TavernScriptBrief>>()
+    for ((group, el) in root) {
+        val raw = when (el) {
+            is JsonPrimitive -> el.contentOrNull
+            is JsonObject -> el.toString()
+            else -> null
+        }
+        if (raw.isNullOrBlank()) continue
+        val helper = runCatching {
+            (Json.parseToJsonElement(raw) as? JsonObject)
+                ?.get("extensions")?.let { it as? JsonObject }
+                ?.get("tavern_helper")?.let { it as? JsonObject }
+        }.getOrNull() ?: continue
+        val scripts = helper["scripts"] as? JsonArray ?: continue
+        val briefs = briefsOf(scripts.toList())
+        if (briefs.isNotEmpty()) out[group] = briefs
+    }
+    return out
+}
+
+/**
+ * [v250] 切换预设内嵌脚本的 enabled（写回 `tavernPresets[group]` 的原始 JSON）。
+ *
+ * @return 新的 `tavernPresets` JSON；未找到该组/该脚本或解析失败时返回 null。
+ */
+fun setPresetEmbeddedScriptEnabled(
+    tavernPresetsJson: String?,
+    group: String,
+    scriptId: String,
+    enabled: Boolean,
+): String? {
+    if (tavernPresetsJson.isNullOrBlank() || group.isBlank() || scriptId.isBlank()) return null
+    return try {
+        val root = Json.parseToJsonElement(tavernPresetsJson) as? JsonObject ?: return null
+        val rawEl = root[group] ?: return null
+        val (rawText, wasString) = when (rawEl) {
+            is JsonPrimitive -> (rawEl.contentOrNull ?: return null) to true
+            is JsonObject -> rawEl.toString() to false
+            else -> return null
+        }
+        val presetObj = Json.parseToJsonElement(rawText) as? JsonObject ?: return null
+        val extensions = presetObj["extensions"] as? JsonObject ?: return null
+        val helper = extensions["tavern_helper"] as? JsonObject ?: return null
+        val scripts = helper["scripts"] as? JsonArray ?: return null
+        val (newScripts, found) = TavernScriptCompat.updateEnabled(scripts.toList(), scriptId, enabled)
+        if (!found) return null
+        val newHelper = helper.withField("scripts", JsonArray(newScripts))
+        val newExtensions = extensions.withField("tavern_helper", newHelper)
+        val newPreset = presetObj.withField("extensions", newExtensions)
+        val newRoot = root.withField(group, if (wasString) JsonPrimitive(newPreset.toString()) else newPreset)
+        newRoot.toString()
+    } catch (_: Exception) {
+        null
+    }
+}
 
 // ============================================================
 // 写回辅助（UI 开关 / 导入 / 删除）

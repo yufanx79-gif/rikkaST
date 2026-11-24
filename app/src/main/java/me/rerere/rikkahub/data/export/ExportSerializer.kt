@@ -262,6 +262,8 @@ object ModeInjectionSerializer : ExportSerializer<PromptInjection.ModeInjection>
                 sourcePresetGroup = label,
             )
         }.distinctBy { it.id }
+            // [v2] 两个来源数组缺 id 时各自生成随机 UUID，id 去重失效 → 再按内容（除 id 外全部字段）去重
+            .distinctBy { it.copy(id = "") }
         return PresetSubfieldState.PRESENT_VALID to tagged
     }
 

@@ -809,10 +809,22 @@ internal fun rememberStRegexedTextWithStatus(
             lastRenderedHolder.value = fastKotlin
             StRegexRenderResult(text = fastKotlin, isComputing = false)
         } else {
-            StRegexRenderResult(
-                text = extractQuickPlainPreview(text).ifBlank { text.take(1000) },
-                isComputing = true,
-            )
+            // [v251 根因修复] > 50KB 且未命中缓存：后台正则还在算。
+            //
+            // 这里**绝对不能**返回「剥标签后的纯文本」——这是「发下一条消息，历史面板集体变回原文」
+            // 的真因，完整因果链：
+            //   1. 预设里有带 minDepth 的显示正则（如 Meowssiah 的「思维过程AI风格」minDepth=1）
+            //      → StRegexTextCache.scriptsUseDepthFilter == true → depth 进入缓存键；
+            //   2. 用户发一条新消息 → lastMessageIndex +1 → **每一层**的 depth 全部变化；
+            //   3. → 所有楼层的缓存键同时失效 → 全部重新计算；
+            //   4. → 大面板消息（75903 字符）走本分支，旧代码返回 extractQuickPlainPreview(text)：
+            //      它把 <style>/<div>/<details> 全部剥掉，只剩正文；
+            //   5. → 下游 shouldRenderAsHtmlPanel(正文) == false → 当 Markdown 渲染
+            //      → 用户看到的就是「整个面板没有了，变成了原来的样子（原文）」。
+            //
+            // 正确做法：返回空串 + isComputing，让 UI 显示「正在应用…」占位卡，
+            // 后台算完（通常 <100ms）立刻换成真实面板。这样面板永远不会退化成原文。
+            StRegexRenderResult(text = "", isComputing = true)
         }
     }
     val asyncResult by produceState(

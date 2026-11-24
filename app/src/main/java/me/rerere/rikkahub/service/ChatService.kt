@@ -468,6 +468,58 @@ class ChatService(
             settings.findModelById(settings.chatModelId)
                 ?.let { it.displayName.ifBlank { it.modelId } }
         }
+        // [v250] ST chatCompletionSettings 真实值（模型 / source / 采样默认）。
+        //
+        // 这不是给某个插件打补丁：`getContext().chatCompletionSettings` 是 ST 对外契约里
+        // 「当前模型」的唯一标准来源，社区预设脚本一律读它。此前我们只给硬编码 stub，
+        // 所有按模型分流的逻辑都会落到 unknown（双马尾面板显示「未读取到酒馆当前模型」即此）。
+        // 该 supplier 会被 JS 桥在 JavaBridge 线程同步调用，**不能**用 suspend 的仓库读取。
+        // 活跃会话由运行时自己维护（activeConversationId），助手按 settings.assistantId 解析；
+        // 会话级 modeInjectionIds 只在 UI 层有，运行时侧用助手级绑定即可（模型名不受影响）。
+        TavernRuntimeManager.chatCompletionSettingsSupplier = {
+            runCatching {
+                val settings = settingsStore.settingsFlow.value
+                val assistant = settings.getCurrentAssistant()
+                val groups = enabledPresetGroups(assistant, settings)
+                val presetCfg = parseActiveStPresetConfig(settings.tavernPresets, groups)
+                // ST `oai_settings` 的 prompts / prompt_order / extensions 三件套：
+                // 扩展脚本（SPreset inject.js 等）直接遍历它们，缺字段会抛 "is not iterable"。
+                val rawPreset = runCatching {
+                    (kotlinx.serialization.json.Json.parseToJsonElement(settings.tavernPresets)
+                        as? kotlinx.serialization.json.JsonObject)
+                        ?.let { root ->
+                            groups.firstNotNullOfOrNull { g ->
+                                when (val el = root[g]) {
+                                    is kotlinx.serialization.json.JsonObject -> el
+                                    is kotlinx.serialization.json.JsonPrimitive ->
+                                        el.contentOrNull?.takeIf { it.isNotBlank() }?.let { raw ->
+                                            runCatching {
+                                                kotlinx.serialization.json.Json.parseToJsonElement(raw)
+                                                    as? kotlinx.serialization.json.JsonObject
+                                            }.getOrNull()
+                                        }
+                                    else -> null
+                                }
+                            }
+                        }
+                }.getOrNull()
+                me.rerere.rikkahub.data.st.runtime.StChatCompletionSettings.buildJson(
+                    settings = settings,
+                    assistantChatModelId = assistant.chatModelId,
+                    assistantTemperature = assistant.temperature,
+                    assistantTopP = assistant.topP,
+                    assistantMaxTokens = assistant.maxTokens,
+                    assistantStreamOutput = assistant.streamOutput,
+                    presetName = groups.firstOrNull().orEmpty(),
+                    presetTemperature = presetCfg.temperature,
+                    presetTopP = presetCfg.topP,
+                    presetMaxTokens = presetCfg.maxTokens,
+                    presetPrompts = rawPreset?.get("prompts") as? kotlinx.serialization.json.JsonArray,
+                    presetPromptOrder = rawPreset?.get("prompt_order") as? kotlinx.serialization.json.JsonArray,
+                    presetExtensions = (rawPreset?.get("extensions") as? kotlinx.serialization.json.JsonObject)?.get("SPreset") as? kotlinx.serialization.json.JsonObject,
+                )
+            }.getOrElse { "{}" }
+        }
         Log.i(TAG, "wireTavernChatCompletions: A1 hook installed")
     }
 
