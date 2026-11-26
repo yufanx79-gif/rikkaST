@@ -534,16 +534,15 @@ internal fun transformMessages(
         return messages
     }
 
-    // 按位置分组：
-    // - 预设条目（presetGroup != null）与世界书条目（RegexInjection）按 priority 升序保持 prompt_order / insertion_order；
-    // - 用户自建独立 ModeInjection（presetGroup == null）按 priority 降序（高权重在前）。
-    val sortedInjections = injections.sortedWith { a, b ->
-        when {
-            a is PromptInjection.ModeInjection && b is PromptInjection.ModeInjection &&
-                a.presetGroup == null && b.presetGroup == null -> b.priority.compareTo(a.priority)
-            else -> a.priority.compareTo(b.priority)
-        }
-    }
+    // 按位置分组（严格满足传递性的全序比较器，杜绝混排触发 JVM TimSort 传递性异常）：
+    // - 预设条目（presetGroup != null）与世界书条目（RegexInjection）归为第 0 桶，按 priority 升序保持 prompt_order / insertion_order；
+    // - 用户自建独立 ModeInjection（presetGroup == null）归为第 1 桶，按 priority 降序（高权重在前）。
+    val sortedInjections = injections.sortedWith(
+        compareBy<PromptInjection>(
+            { if (it is PromptInjection.ModeInjection && it.presetGroup == null) 1 else 0 },
+            { if (it is PromptInjection.ModeInjection && it.presetGroup == null) -it.priority else it.priority },
+        )
+    )
     val byPosition = sortedInjections.groupBy { it.position }
 
     // 官方 outlet（position=7）：自身不注入任何位置，按 outlet_name 汇聚（多个同名 "\n" 连接），
@@ -1366,8 +1365,10 @@ internal fun applyInjections(
     val result = messages.toMutableList()
     val charSlotMarkers = setOf("charDescription", "charPersonality", "scenario")
 
-    // 若预设 orderedMarkers 显式指定了 dialogueExamples 在角色卡字段之前，按 orderedMarkers 调整两者相对顺序
-    if (orderedMarkers.isNotEmpty()) {
+    // 若已由 UnifiedPromptOrderEngine 完成自定义 12-Marker 排序，保留其精确槽位顺序不再强行聚拢；
+    // 否则在默认顺序基础上，仅按旧规则兼容 dialogueExamples 位于角色卡之前的场景。
+    val hasCustomOrder = me.rerere.rikkahub.data.st.preview.UnifiedPromptOrderEngine.hasCustomMarkerOrder(orderedMarkers)
+    if (orderedMarkers.isNotEmpty() && !hasCustomOrder) {
         val exOrderIdx = orderedMarkers.indexOf("dialogueExamples")
         val firstCharOrderIdx = orderedMarkers.indexOfFirst { it in charSlotMarkers }
         if (exOrderIdx >= 0 && firstCharOrderIdx >= 0 && exOrderIdx < firstCharOrderIdx) {
@@ -1488,8 +1489,16 @@ internal fun applyInjections(
         }
     }
 
-    // 找到系统消息的索引（通常是第一条）
-    val systemIndex = result.indexOfFirst { it.role == MessageRole.SYSTEM }
+    // 找到主系统提示词消息的索引（自定义重排后角色卡/人设/合成头可能排在 main 前面，优先定位真正的 main 系统消息）
+    val systemIndex = result.indexOfFirst { msg ->
+        msg.role == MessageRole.SYSTEM &&
+            !msg.isSynthetic &&
+            msg.annotations.none { a ->
+                a is UIMessageAnnotation.CharacterCardData || a is UIMessageAnnotation.ExampleMessage
+            } &&
+            !msg.toText().startsWith("[User Persona]") &&
+            !msg.toText().startsWith("[Author's Note]")
+    }.takeIf { it >= 0 } ?: result.indexOfFirst { it.role == MessageRole.SYSTEM }
 
     // 处理 BEFORE_SYSTEM_PROMPT 和 AFTER_SYSTEM_PROMPT
     if (systemIndex >= 0) {
@@ -1568,10 +1577,23 @@ internal fun applyInjections(
         }
     }
 
-    // 处理 BOTTOM_OF_CHAT：在最后一条消息之前插入
+    // 计算聊天记录区的尾部边界（默认顺序下等于 result.size；若 chatHistory 被拖到前面则精确锚定在聊天区末尾）
+    fun resolveChatEndExclusive(): Int {
+        if (!hasCustomOrder) return result.size
+        val lastChatIdx = result.indexOfLast { msg ->
+            !msg.isSynthetic &&
+                (msg.role == MessageRole.USER || msg.role == MessageRole.ASSISTANT) &&
+                msg.annotations.none { a ->
+                    a is UIMessageAnnotation.ExampleMessage || a is UIMessageAnnotation.CharacterCardData
+                }
+        }
+        return if (lastChatIdx >= 0) lastChatIdx + 1 else result.size
+    }
+
+    // 处理 BOTTOM_OF_CHAT：在聊天记录最后一条消息之前插入
     val bottomInjections = byPosition[InjectionPosition.BOTTOM_OF_CHAT]
     if (!bottomInjections.isNullOrEmpty()) {
-        var insertIndex = (result.size - 1).coerceAtLeast(0)
+        var insertIndex = (resolveChatEndExclusive() - 1).coerceAtLeast(0)
         insertIndex = findSafeInsertIndex(result, insertIndex)
         createMergedInjectionMessages(bottomInjections).forEach { message ->
             result.add(insertIndex, message)
@@ -1602,9 +1624,10 @@ internal fun applyInjections(
             // [system, user, assistant] 生成多条消息（各角色内容 '\n' 连接），再整体 splice 到该深度。
             // 此处先按该角色序稳定排序（同角色保持 priority 升序），再交给合并函数。
             val ordered = injections.sortedWith(compareBy { atDepthRoleRank(it.role) })
-            // 计算插入位置：result.size - depth，但要确保在有效范围内
-            // depth=0 表示在最后一条消息之后，depth=1 表示在最后一条消息之前...
-            var insertIndex = (result.size - depth).coerceIn(0, result.size)
+            // 计算插入位置：以聊天记录区尾部 chatEndExclusive 为基准向前数 depth 条
+            // depth=0 表示在聊天区最后一条消息之后，depth=1 表示在最后一条消息之前...
+            val chatEnd = resolveChatEndExclusive()
+            var insertIndex = (chatEnd - depth).coerceIn(0, chatEnd)
             insertIndex = findSafeInsertIndex(result, insertIndex)
             createMergedInjectionMessages(ordered).forEach { message ->
                 result.add(insertIndex, message)
@@ -1642,11 +1665,21 @@ internal fun applyInjections(
             val targetIdx = when (authorNotePosition) {
                 AuthorNotePosition.BEFORE_PROMPT -> 0
                 AuthorNotePosition.IN_PROMPT -> {
-                    (result.indexOfFirst { it.role == MessageRole.SYSTEM } + 1).coerceAtLeast(0)
+                    val mainSysIdx = result.indexOfFirst { msg ->
+                        msg.role == MessageRole.SYSTEM &&
+                            !msg.isSynthetic &&
+                            msg.annotations.none { a ->
+                                a is UIMessageAnnotation.CharacterCardData || a is UIMessageAnnotation.ExampleMessage
+                            } &&
+                            !msg.toText().startsWith("[User Persona]") &&
+                            !msg.toText().startsWith("[Author's Note]")
+                    }.takeIf { it >= 0 } ?: result.indexOfFirst { it.role == MessageRole.SYSTEM }
+                    (mainSysIdx + 1).coerceAtLeast(0)
                 }
                 AuthorNotePosition.IN_CHAT -> {
                     val d = authorNoteDepth.coerceAtLeast(0)
-                    findSafeInsertIndex(result, (result.size - d).coerceIn(0, result.size))
+                    val chatEnd = resolveChatEndExclusive()
+                    findSafeInsertIndex(result, (chatEnd - d).coerceIn(0, chatEnd))
                 }
             }
             var curIdx = targetIdx.coerceIn(0, result.size)

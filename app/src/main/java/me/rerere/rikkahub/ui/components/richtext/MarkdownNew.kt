@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -80,7 +81,9 @@ import me.rerere.rikkahub.utils.toDp
 import org.intellij.markdown.flavours.gfm.GFMFlavourDescriptor
 import org.intellij.markdown.html.HtmlGenerator
 import org.intellij.markdown.parser.MarkdownParser
+import android.util.LruCache
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
@@ -90,6 +93,10 @@ import org.jsoup.nodes.TextNode
 private val INLINE_LATEX_REGEX = Regex("\\\\\\((.+?)\\\\\\)")
 private val BLOCK_LATEX_REGEX = Regex("\\\\\\[(.+?)\\\\\\]", RegexOption.DOT_MATCHES_ALL)
 private val CODE_BLOCK_REGEX = Regex("```[\\s\\S]*?```|`[^`\\n]*`", RegexOption.DOT_MATCHES_ALL)
+
+private val jsoupDocumentCache = object : LruCache<String, Document>(256 * 1024) {
+    override fun sizeOf(key: String, value: Document): Int = key.length.coerceAtLeast(1)
+}
 
 internal val QUOTE_REGEX = Regex(
     "\"(.+?)\"|\\u201C(.+?)\\u201D|\\u00AB(.+?)\\u00BB|\\u300C(.+?)\\u300D|\\u300E(.+?)\\u300F|\\uFF02(.+?)\\uFF02"
@@ -132,9 +139,15 @@ fun MarkdownNew(
     style: TextStyle = LocalTextStyle.current,
     onClickCitation: (String) -> Unit = {},
 ) {
-    var html by remember {
+    var document by remember {
         mutableStateOf(
-            value = generateMarkdownHtml(content),
+            jsoupDocumentCache.get(content) ?: if (content.length <= 2048) {
+                val parsed = runCatching { Jsoup.parse(generateMarkdownHtml(content)) }.getOrElse { Jsoup.parse("") }
+                jsoupDocumentCache.put(content, parsed)
+                parsed
+            } else {
+                null
+            }
         )
     }
 
@@ -142,19 +155,27 @@ fun MarkdownNew(
     LaunchedEffect(Unit) {
         snapshotFlow { updatedContent }
             .distinctUntilChanged()
-            .mapLatest { generateMarkdownHtml(it) }
+            .mapLatest { raw ->
+                jsoupDocumentCache.get(raw)?.let { return@mapLatest it }
+                val generatedHtml = generateMarkdownHtml(raw)
+                val parsed = runCatching { Jsoup.parse(generatedHtml) }.getOrElse { Jsoup.parse("") }
+                jsoupDocumentCache.put(raw, parsed)
+                parsed
+            }
             .catch { it.printStackTrace() }
             .flowOn(Dispatchers.Default)
-            .collect { html = it }
-    }
-
-    val document = remember(html) {
-        runCatching { Jsoup.parse(html) }.getOrElse { Jsoup.parse("") }
+            .collect { document = it }
     }
 
     ProvideTextStyle(style) {
-        Column(modifier = modifier.padding(start = 4.dp)) {
-            document.body().childNodes().fastForEach { node ->
+        Column(
+            modifier = if (document == null) {
+                modifier.padding(start = 4.dp).defaultMinSize(minHeight = 20.dp)
+            } else {
+                modifier.padding(start = 4.dp)
+            }
+        ) {
+            document?.body()?.childNodes()?.fastForEach { node ->
                 HtmlBodyNode(node = node, onClickCitation = onClickCitation)
             }
         }

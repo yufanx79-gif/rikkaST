@@ -183,7 +183,14 @@ object TavernRuntimeManager {
     private val logs = ConcurrentLinkedQueue<String>()
     /** 日志文件写入锁（append 可能由主线程 / JavaBridge 线程并发触发）。 */
     private val logFileLock = Any()
-    private val logTimeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    private val logTimeFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    }
+    private val logWriteChannel = kotlinx.coroutines.channels.Channel<String>(
+        capacity = 256,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    private val logWriterStarted = java.util.concurrent.atomic.AtomicBoolean(false)
     private val _lastJsResult = MutableStateFlow<JsResult?>(null)
     /** 脚本按钮列表（跨脚本汇总，聊天页 UI 订阅渲染）。 */
     val scriptButtonsFlow = MutableStateFlow<List<TavernScriptButton>>(emptyList())
@@ -2839,7 +2846,7 @@ object TavernRuntimeManager {
     // ==================== 日志 ====================
 
     fun appendLog(level: String, message: String) {
-        val ts = synchronized(logTimeFormat) { logTimeFormat.format(Date()) }
+        val ts = logTimeFormat.get()!!.format(Date())
         val line = "[$ts][$level] $message"
         logs.offer(line)
         while (logs.size > MAX_LOGS) logs.poll()
@@ -2847,15 +2854,33 @@ object TavernRuntimeManager {
         persistLogAsync(line)
     }
 
-    /** 异步追加写入持久化日志文件（在 Dispatchers.IO 后台执行，杜绝阻塞主线程造成 UI 卡顿）。 */
+    /** 异步批量写入持久化日志文件（单 IO 消费者聚合写盘，杜绝高频单行开协程与主线程锁竞争）。 */
     private fun persistLogAsync(line: String) {
         if (appContext == null) return
-        runtimeScope.launch(Dispatchers.IO) {
-            persistLogSync(line)
+        logWriteChannel.trySend(line)
+        if (logWriterStarted.compareAndSet(false, true)) {
+            runtimeScope.launch(Dispatchers.IO) {
+                try {
+                    val batch = StringBuilder(4096)
+                    for (first in logWriteChannel) {
+                        batch.setLength(0)
+                        batch.append(first).append('\n')
+                        var count = 1
+                        while (count < 64) {
+                            val next = logWriteChannel.tryReceive().getOrNull() ?: break
+                            batch.append(next).append('\n')
+                            count++
+                        }
+                        persistLogBatchSync(batch.toString())
+                    }
+                } finally {
+                    logWriterStarted.set(false)
+                }
+            }
         }
     }
 
-    private fun persistLogSync(line: String) {
+    private fun persistLogBatchSync(text: String) {
         val ctx = appContext ?: return
         runCatching {
             val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
@@ -2865,7 +2890,7 @@ object TavernRuntimeManager {
                     val tail = file.readText().takeLast((LOG_FILE_MAX_BYTES / 2).toInt())
                     file.writeText(tail.substringAfter('\n', tail))
                 }
-                file.appendText(line + "\n")
+                file.appendText(text)
             }
         }
     }

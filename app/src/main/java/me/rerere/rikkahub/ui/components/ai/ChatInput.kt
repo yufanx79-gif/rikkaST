@@ -54,11 +54,16 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -208,15 +213,21 @@ fun ChatInput(
     onStartVoiceMode: (() -> Unit)? = null,
     voiceState: VoiceSessionState = VoiceSessionState(),
     onStopVoiceMode: () -> Unit = {},
+    onOpenPromptPreview: (() -> Unit)? = null,
 ) {
     val toaster = LocalToaster.current
     val assistant = settings.getCurrentAssistant()
     val skillManager: SkillManager = koinInject()
     val slashContext = LocalContext.current
-    val slashCommands = remember(assistant.enabledSkills) {
-        val allSkills = skillManager.listSkills()
-        val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
-        collectSlashCommands(enabledSkills, slashContext)
+    val slashCommands by produceState(
+        initialValue = emptyList<SlashCommand>(),
+        key1 = assistant.enabledSkills,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val allSkills = skillManager.listSkills()
+            val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
+            collectSlashCommands(enabledSkills, slashContext)
+        }
     }
     val hazeTintColor = MaterialTheme.colorScheme.surfaceContainerLow
     // [v225 F3] 输入栏模糊/磨砂由「消息样式」驱动（v222~v224 只读旧的 displaySetting 开关，
@@ -568,6 +579,13 @@ fun ChatInput(
                                 )
                             }
 
+                            // 上游消息结构预览与拖拽调序面板入口（对所有模型可见）
+                            if (onOpenPromptPreview != null) {
+                                PromptPreviewButton(
+                                    onClick = onOpenPromptPreview,
+                                )
+                            }
+
                         }
 
                         ActionIconButton(
@@ -620,11 +638,12 @@ fun ChatInput(
                             enter = fadeIn() + scaleIn(),
                             exit = fadeOut() + scaleOut(),
                         ) {
+                            val isInputEmpty by remember(state) { derivedStateOf { state.isEmpty() } }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                if (loading && !state.isEmpty()) {
+                                if (loading && !isInputEmpty) {
                                     SendButton(
                                         loading = true,
                                         empty = true,
@@ -657,7 +676,7 @@ fun ChatInput(
                                 }
                                 SendButton(
                                     loading = loading,
-                                    empty = state.isEmpty(),
+                                    empty = isInputEmpty,
                                     isStopping = isStopping,
                                     onClick = {
                                         if (loading && state.isEmpty()) {
@@ -785,33 +804,41 @@ private fun TextInputRow(
     val quickMessages = remember(settings.quickMessages, assistant.id, assistant.quickMessageIds) {
         settings.getQuickMessagesOfAssistant(assistant)
     }
-    // 斜杠命令
+    // 斜杠命令（异步在 IO 线程扫描技能目录，避免主线程卡顿）
     val slashContext = LocalContext.current
-    val slashCommands = remember(assistant.enabledSkills) {
-        val allSkills = skillManager.listSkills()
-        val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
-        collectSlashCommands(enabledSkills, slashContext)
+    val slashCommands by produceState(
+        initialValue = emptyList<SlashCommand>(),
+        key1 = assistant.enabledSkills,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val allSkills = skillManager.listSkills()
+            val enabledSkills = allSkills.filter { it.name in assistant.enabledSkills }
+            collectSlashCommands(enabledSkills, slashContext)
+        }
     }
     var showSlashPopup by remember { mutableStateOf(false) }
     var slashFilter by remember { mutableStateOf("") }
     var slashArgs by remember { mutableStateOf("") }
 
-    // 监听文本变化，检测斜杠命令
-    val currentText = state.textContent.text
-    LaunchedEffect(currentText) {
-        if (currentText.startsWith("/") && currentText.length <= 30) {
-            val parts = currentText.split(" ", limit = 2)
-            val cmdName = parts[0].removePrefix("/").lowercase()
-            slashArgs = parts.getOrElse(1) { "" }
-            if (slashCommands.any { it.name.lowercase().startsWith(cmdName) }) {
-                slashFilter = cmdName
-                showSlashPopup = true
-            } else {
-                showSlashPopup = false
+    // 监听文本变化，检测斜杠命令（通过 snapshotFlow 避免每敲一个字重组整行 TextInputRow）
+    LaunchedEffect(state, slashCommands) {
+        snapshotFlow { state.textContent.text }
+            .distinctUntilChanged()
+            .collect { currentText ->
+                if (currentText.startsWith("/") && currentText.length <= 30) {
+                    val parts = currentText.split(" ", limit = 2)
+                    val cmdName = parts[0].removePrefix("/").lowercase()
+                    slashArgs = parts.getOrElse(1) { "" }
+                    if (slashCommands.any { it.name.lowercase().startsWith(cmdName) }) {
+                        slashFilter = cmdName
+                        showSlashPopup = true
+                    } else {
+                        showSlashPopup = false
+                    }
+                } else {
+                    showSlashPopup = false
+                }
             }
-        } else {
-            showSlashPopup = false
-        }
     }
 
     Column(

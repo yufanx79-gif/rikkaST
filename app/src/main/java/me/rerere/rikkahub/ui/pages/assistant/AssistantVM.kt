@@ -162,11 +162,16 @@ class AssistantVM(
         }
     }
 
-    fun getMemories(assistant: Assistant) =
-        if (assistant.useGlobalMemory) {
-            memoryRepository.getGlobalMemoriesFlow()
-        } else {
-            memoryRepository.getMemoriesOfAssistantFlow(assistant.id.toString())
+    private val memoriesFlowCache = java.util.concurrent.ConcurrentHashMap<String, StateFlow<List<me.rerere.rikkahub.data.model.AssistantMemory>>>()
+
+    fun getMemories(assistant: Assistant): StateFlow<List<me.rerere.rikkahub.data.model.AssistantMemory>> =
+        memoriesFlowCache.getOrPut(if (assistant.useGlobalMemory) "__global__" else assistant.id.toString()) {
+            val source = if (assistant.useGlobalMemory) {
+                memoryRepository.getGlobalMemoriesFlow()
+            } else {
+                memoryRepository.getMemoriesOfAssistantFlow(assistant.id.toString())
+            }
+            source.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
         }
 
     /**

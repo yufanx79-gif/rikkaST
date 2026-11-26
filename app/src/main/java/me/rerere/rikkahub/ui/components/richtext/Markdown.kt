@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.ui.components.richtext
 
 import android.content.ClipData
+import android.util.LruCache
 import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -47,6 +48,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -126,6 +128,10 @@ private val INLINE_LATEX_REGEX = Regex("\\\\\\((.+?)\\\\\\)")
 private val BLOCK_LATEX_REGEX = Regex("\\\\\\[(.+?)\\\\\\]", RegexOption.DOT_MATCHES_ALL)
 val THINKING_REGEX = Regex("<think>([\\s\\S]*?)(?:</think>|$)", RegexOption.DOT_MATCHES_ALL)
 private val CODE_BLOCK_REGEX = Regex("```[\\s\\S]*?```|`[^`\n]*`", RegexOption.DOT_MATCHES_ALL)
+private val HTML_OR_IMG_PROTECT_REGEX = Regex(
+    "<(style|script)\\b[^>]*>[\\s\\S]*?</\\1>|<[^>]+>|!\\[[^\\]]*\\]\\([^)]*\\)",
+    RegexOption.IGNORE_CASE,
+)
 private val BREAK_LINE_REGEX = Regex("(?i)<br\\s*/?>")
 private val LATEX_BLOCK_LINE_BREAK_REGEX = Regex("""[ \t]*\r?\n[ \t]*""")
 
@@ -226,10 +232,70 @@ private fun ASTNode.containsHtml(): Boolean {
     return children.any { it.containsHtml() }
 }
 
+private val markdownParseCache = object : LruCache<String, MarkdownParseResult>(512 * 1024) {
+    override fun sizeOf(key: String, value: MarkdownParseResult): Int = key.length.coerceAtLeast(1)
+}
+private val LocalMarkdownQuoteColor = staticCompositionLocalOf<Color?> { null }
+
 private fun parseMarkdown(content: String): MarkdownParseResult {
+    markdownParseCache.get(content)?.let { return it }
     val preprocessed = preProcess(content)
     val astTree = parser.buildMarkdownTreeFromString(preprocessed)
-    return MarkdownParseResult(preprocessed, astTree, astTree.containsHtml())
+    val result = MarkdownParseResult(preprocessed, astTree, astTree.containsHtml())
+    markdownParseCache.put(content, result)
+    return result
+}
+
+private fun applyQuoteColorHtml(content: String, quoteColor: String): String {
+    val protectedRanges = buildList {
+        CODE_BLOCK_REGEX.findAll(content).forEach { add(it.range) }
+        HTML_OR_IMG_PROTECT_REGEX.findAll(content).forEach { add(it.range) }
+    }
+    return QUOTE_REGEX.replace(content) { match ->
+        if (protectedRanges.any { match.range.first in it || match.range.last in it }) match.value
+        else "<span style=\"color:$quoteColor\">${match.value}</span>"
+    }
+}
+
+private fun applyNativeQuoteColor(base: AnnotatedString, quoteColor: Color): AnnotatedString {
+    val text = base.text
+    if (text.isEmpty()) return base
+    val matches = QUOTE_REGEX.findAll(text).toList()
+    if (matches.isEmpty()) return base
+    val protectedRanges = buildList {
+        base.spanStyles.forEach { span ->
+            if (span.start < span.end && (span.item.fontFamily == JetbrainsMono || span.item.fontFamily == FontFamily.Monospace)) {
+                add(span.start until span.end)
+            }
+        }
+        base.getStringAnnotations("androidx.compose.foundation.text.inlineContent", 0, text.length)
+            .forEach { if (it.start < it.end) add(it.start until it.end) }
+        base.getLinkAnnotations(0, text.length)
+            .forEach { if (it.start < it.end) add(it.start until it.end) }
+    }
+    val sortedProtected = protectedRanges.sortedBy { it.first }
+    return buildAnnotatedString {
+        append(base)
+        matches.forEach { match ->
+            val start = match.range.first
+            val endExclusive = match.range.last + 1
+            // 若引号本身起点或终点落在受保护区间内（如行内代码中），跳过整段；否则仅挖空内部的受保护子区间
+            val delimiterProtected = sortedProtected.any { start in it || (endExclusive - 1) in it }
+            if (delimiterProtected) return@forEach
+            var cursor = start
+            for (pr in sortedProtected) {
+                if (pr.last + 1 <= cursor) continue
+                if (pr.first >= endExclusive) break
+                if (pr.first > cursor) {
+                    addStyle(SpanStyle(color = quoteColor), cursor, pr.first)
+                }
+                cursor = maxOf(cursor, pr.last + 1)
+            }
+            if (cursor < endExclusive) {
+                addStyle(SpanStyle(color = quoteColor), cursor, endExclusive)
+            }
+        }
+    }
 }
 
 @Composable
@@ -241,28 +307,19 @@ fun MarkdownBlock(
 ) {
     val settings = LocalSettings.current.displaySetting
     val darkMode = LocalDarkMode.current
-    val quoteColor = if (settings.enableTextColor) {
+    val quoteColorHex = if (settings.enableTextColor) {
         settings.quoteColor.ifBlank { if (darkMode) "#E18A24" else "#C7731E" }
     } else null
+    val quoteComposeColor = remember(quoteColorHex) {
+        quoteColorHex?.let { runCatching { Color(android.graphics.Color.parseColor(it)) }.getOrNull() }
+    }
 
-    val coloredContent = if (quoteColor != null) {
-        val protectedRanges = buildList {
-            CODE_BLOCK_REGEX.findAll(content).forEach { add(it.range) }
-            Regex("<(style|script)\\b[^>]*>[\\s\\S]*?</\\1>|<[^>]+>|!\\[[^\\]]*\\]\\([^)]*\\)", RegexOption.IGNORE_CASE)
-                .findAll(content)
-                .forEach { add(it.range) }
-        }
-        QUOTE_REGEX.replace(content) { match ->
-            if (protectedRanges.any { match.range.first in it || match.range.last in it }) match.value
-            else "<span style=\"color:$quoteColor\">${match.value}</span>"
-        }
-    } else content
-
-    var (data, setData) = remember { mutableStateOf(parseMarkdown(coloredContent)) }
+    // 先解析原始 content（走 LRU 缓存），避免纯文本因引号着色注入 <span> 被强行拖入 MarkdownNew + Jsoup 双重解析
+    var (data, setData) = remember { mutableStateOf(parseMarkdown(content)) }
 
     // 监听内容变化，重新解析AST树
     // 这里在后台线程解析AST树, 防止频繁更新的时候掉帧
-    val updatedContent by rememberUpdatedState(coloredContent)
+    val updatedContent by rememberUpdatedState(content)
     LaunchedEffect(Unit) {
         snapshotFlow { updatedContent }
             .distinctUntilChanged()
@@ -273,21 +330,26 @@ fun MarkdownBlock(
     }
 
     if (data.hasHtml) {
+        val htmlContentWithQuotes = remember(content, quoteColorHex) {
+            if (quoteColorHex != null) applyQuoteColorHtml(content, quoteColorHex) else content
+        }
         MarkdownNew(
-            content = coloredContent,
+            content = htmlContentWithQuotes,
             modifier = modifier,
             style = style,
             onClickCitation = onClickCitation,
         )
     } else {
-        ProvideTextStyle(style) {
-            Column(
-                modifier = modifier.padding(horizontal = 4.dp)
-            ) {
-                data.astTree.children.fastForEach { child ->
-                    MarkdownNode(
-                        node = child, content = data.preprocessed, onClickCitation = onClickCitation
-                    )
+        CompositionLocalProvider(LocalMarkdownQuoteColor provides quoteComposeColor) {
+            ProvideTextStyle(style) {
+                Column(
+                    modifier = modifier.padding(horizontal = 4.dp)
+                ) {
+                    data.astTree.children.fastForEach { child ->
+                        MarkdownNode(
+                            node = child, content = data.preprocessed, onClickCitation = onClickCitation
+                        )
+                    }
                 }
             }
         }
@@ -656,10 +718,20 @@ private fun MarkdownNode(
 
         MarkdownTokenTypes.TEXT -> {
             val text = node.getTextInNode(content)
-            Text(
-                text = text,
-                modifier = modifier,
-            )
+            val quoteColor = LocalMarkdownQuoteColor.current
+            if (quoteColor != null && quoteColor != Color.Unspecified) {
+                Text(
+                    text = remember(text, quoteColor) {
+                        applyNativeQuoteColor(AnnotatedString(text), quoteColor)
+                    },
+                    modifier = modifier,
+                )
+            } else {
+                Text(
+                    text = text,
+                    modifier = modifier,
+                )
+            }
         }
 
         MarkdownElementTypes.HTML_BLOCK -> {
@@ -834,8 +906,9 @@ private fun Paragraph(
             else Modifier
         )
     ) {
-        val annotatedString = remember(content, enableLatexRendering, latexColorArgb) {
-            buildAnnotatedString {
+        val quoteColor = LocalMarkdownQuoteColor.current
+        val annotatedString = remember(content, enableLatexRendering, latexColorArgb, quoteColor) {
+            val built = buildAnnotatedString {
                 node.children.fastForEach { child ->
                     appendMarkdownNodeContent(
                         node = child,
@@ -851,6 +924,7 @@ private fun Paragraph(
                     )
                 }
             }
+            if (quoteColor != null) applyNativeQuoteColor(built, quoteColor) else built
         }
         Text(
             text = annotatedString,

@@ -96,6 +96,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getAssistantById
+import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.withConversation
@@ -194,22 +195,72 @@ fun ChatList(
 
 // 顶部渐隐：消息滚到标题栏下面时逐渐透明，从状态栏一直淡出到标题栏下沿之外，保证标题可读。
 // 让内容自己变透明而不是盖一层背景色，背景图和动态渐变背景才不会被盖住。
-private fun Modifier.topFadingEdge(height: Dp): Modifier = this
-    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-    .drawWithCache {
+private fun Modifier.topFadingEdge(
+    height: Dp,
+    hasCustomBackground: Boolean,
+    backgroundColor: Color,
+): Modifier = if (hasCustomBackground) {
+    this
+        .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+        .drawWithCache {
+            val fadeHeight = height.toPx()
+            val brush = Brush.verticalGradient(
+                0f to Color.Transparent,
+                0.6f to Color.Black.copy(alpha = 0.15f),
+                1f to Color.Black,
+                startY = 0f,
+                endY = fadeHeight,
+            )
+            onDrawWithContent {
+                drawContent()
+                drawRect(brush, size = Size(size.width, fadeHeight), blendMode = BlendMode.DstIn)
+            }
+        }
+} else {
+    // 纯色背景改用顶部渐变遮罩，避免整屏 LazyColumn 每帧走 CompositingStrategy.Offscreen 离屏 FBO
+    this.drawWithCache {
         val fadeHeight = height.toPx()
         val brush = Brush.verticalGradient(
-            0f to Color.Transparent,
-            0.6f to Color.Black.copy(alpha = 0.15f),
-            1f to Color.Black,
+            0f to backgroundColor,
+            0.6f to backgroundColor.copy(alpha = 0.85f),
+            1f to Color.Transparent,
             startY = 0f,
             endY = fadeHeight,
         )
         onDrawWithContent {
             drawContent()
-            drawRect(brush, size = Size(size.width, fadeHeight), blendMode = BlendMode.DstIn)
+            drawRect(brush, size = Size(size.width, fadeHeight))
         }
     }
+}
+
+@Composable
+private fun BoxScope.ChatScrollStateObserverAndJumper(
+    state: LazyListState,
+    showMessageJumper: Boolean,
+    messageJumperOnLeft: Boolean,
+    captureProgress: Boolean,
+    scope: CoroutineScope,
+) {
+    var isRecentScroll by remember { mutableStateOf(false) }
+    LaunchedEffect(state.isScrollInProgress) {
+        me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.setListScrolling(state.isScrollInProgress)
+        if (state.isScrollInProgress) {
+            isRecentScroll = true
+            delay(1500)
+            isRecentScroll = false
+        } else {
+            delay(1500)
+            isRecentScroll = false
+        }
+    }
+    MessageJumper(
+        show = isRecentScroll && !state.isScrollInProgress && showMessageJumper && !captureProgress,
+        onLeft = messageJumperOnLeft,
+        scope = scope,
+        state = state,
+    )
+}
 
 @Composable
 private fun ChatListNormal(
@@ -242,7 +293,6 @@ private fun ChatListNormal(
 ) {
     val scope = rememberCoroutineScope()
     val loadingState by rememberUpdatedState(loading)
-    var isRecentScroll by remember { mutableStateOf(false) }
     val conversationUpdated by rememberUpdatedState(conversation)
     val density = LocalDensity.current
     val activity = LocalContext.current as? me.rerere.rikkahub.RouteActivity
@@ -400,17 +450,12 @@ private fun ChatListNormal(
                 me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.setListScrolling(false)
             }
         }
-        LaunchedEffect(state.isScrollInProgress) {
-            me.rerere.rikkahub.ui.components.message.TavernPanelLoadScheduler.setListScrolling(state.isScrollInProgress)
-            if (state.isScrollInProgress) {
-                isRecentScroll = true
-                delay(1500)
-                isRecentScroll = false
-            } else {
-                delay(1500)
-                isRecentScroll = false
-            }
-        }
+        val currentAssistant = settings.getCurrentAssistant()
+        val hasCustomBackground = assistant?.useGradientBackground == true ||
+            assistant?.background != null ||
+            currentAssistant.useGradientBackground ||
+            currentAssistant.background != null
+        val backgroundColor = MaterialTheme.colorScheme.background
 
         ChatFontProvider(displaySetting = settings.displaySetting) {
             LazyColumn(
@@ -424,11 +469,16 @@ private fun ChatListNormal(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier
                     .fillMaxSize()
-                    .topFadingEdge(innerPadding.calculateTopPadding() + 24.dp),
+                    .topFadingEdge(
+                        height = innerPadding.calculateTopPadding() + 24.dp,
+                        hasCustomBackground = hasCustomBackground,
+                        backgroundColor = backgroundColor,
+                    ),
             ) {
             itemsIndexed(
                 items = conversation.messageNodes,
                 key = { index, item -> item.id },
+                contentType = { _, item -> item.currentMessage.role.name },
             ) { index, node ->
                 Column {
                     ListSelectableItem(
@@ -626,18 +676,22 @@ private fun ChatListNormal(
                     selectedItems.clear()
                 },
                 conversation = conversation,
-                selectedMessages = conversation.messageNodes.filter { it.id in selectedItems }
-                    .map { it.currentMessage }
+                selectedMessages = if (showExportSheet) {
+                    conversation.messageNodes.filter { it.id in selectedItems }.map { it.currentMessage }
+                } else {
+                    emptyList()
+                }
             )
 
             val captureProgress = LocalScrollCaptureInProgress.current
 
-            // 消息快速跳转
-            MessageJumper(
-                show = isRecentScroll && !state.isScrollInProgress && settings.displaySetting.showMessageJumper && !captureProgress,
-                onLeft = settings.displaySetting.messageJumperOnLeft,
+            // 隔离滚动状态读取，避免开始/停止滚动触发整个 ChatListNormal 重组
+            ChatScrollStateObserverAndJumper(
+                state = state,
+                showMessageJumper = settings.displaySetting.showMessageJumper,
+                messageJumperOnLeft = settings.displaySetting.messageJumperOnLeft,
+                captureProgress = captureProgress,
                 scope = scope,
-                state = state
             )
 
             // Suggestion

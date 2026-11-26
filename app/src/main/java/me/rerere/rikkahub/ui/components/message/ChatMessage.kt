@@ -609,6 +609,7 @@ private fun MessagePartsBlock(
                                                     content = segRendered,
                                                     loading = loading,
                                                     onClickCitation = handleClickCitation,
+                                                    isHistoricalFloor = isHistoricalFloor,
                                                 )
                                             }
                                         },

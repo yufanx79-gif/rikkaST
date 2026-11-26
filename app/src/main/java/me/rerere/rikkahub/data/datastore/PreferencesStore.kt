@@ -27,6 +27,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.retryWhen
@@ -1006,6 +1008,11 @@ class SettingsStore internal constructor(
         }
     }
 
+    private val persistMutex = Mutex()
+    private val persistWriteSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile
+    private var lastFullPersistedSeq: Long = 0L
+
     suspend fun update(settings: Settings) {
         if (settings.init) {
             Log.w(TAG, "Cannot update dummy settings")
@@ -1024,12 +1031,23 @@ class SettingsStore internal constructor(
         //   2. 调用方显式需要时自行 normalized()
         val previous = settingsFlow.value
         markLocalWrite(settings)
+        // 必须在 markLocalWrite（更新 settingsFlow.value）之后再递增序号，
+        // 保证 persister 先读 persistWriteSeq 再读 settingsFlow.value 时必然看到 >= targetSeq 的最新值。
+        val mySeq = persistWriteSeq.incrementAndGet()
         fireSettingsEvents(previous, settings)
         // 内存状态已经改好，落盘这一步必须跑完。
         // 否则「用户改完设置立刻退出页面/切走」时 viewModelScope 被取消，
         // 这次修改只停留在内存里，重启后就丢了（真机 2026-11-15 排查）。
-        withContext(NonCancellable) {
-            persistSettings(dataStore, settings)
+        withContext(NonCancellable + Dispatchers.IO) {
+            persistMutex.withLock {
+                if (lastFullPersistedSeq >= mySeq) return@withLock
+                val targetSeq = persistWriteSeq.get()
+                val latest = settingsFlow.value
+                if (!latest.init) {
+                    persistSettings(dataStore, latest)
+                    lastFullPersistedSeq = targetSeq
+                }
+            }
         }
     }
 
@@ -1080,12 +1098,17 @@ class SettingsStore internal constructor(
         val next = transform(current)
         if (next == current) return false
         markLocalWrite(next)
-        settingsFlow.value = next
+        persistWriteSeq.incrementAndGet()
         fireSettingsEvents(current, next)
         // 同 update(): 内存已更新，落盘不能被取消，否则改动会丢。
-        withContext(NonCancellable) {
-            dataStore.edit { preferences ->
-                preferences[key] = encode(next)
+        withContext(NonCancellable + Dispatchers.IO) {
+            persistMutex.withLock {
+                val latest = settingsFlow.value
+                if (!latest.init) {
+                    dataStore.edit { preferences ->
+                        preferences[key] = encode(latest)
+                    }
+                }
             }
         }
         return true

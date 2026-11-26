@@ -401,7 +401,7 @@ class ChatService(
         when (event) {
             Lifecycle.Event.ON_START -> {
                 _isForeground.value = true
-                stopGenerationForeground()
+                stopGenerationForeground(force = true)
             }
             Lifecycle.Event.ON_STOP -> _isForeground.value = false
             else -> {}
@@ -2053,6 +2053,7 @@ class ChatService(
             model.displayName
         }
         val useExternalWebSearch = shouldUseExternalWebSearch(assistant, model)
+        var activeFgToken: String? = null
 
         runCatching {
 
@@ -2128,13 +2129,15 @@ class ChatService(
             // start generating
             val session = sessionManager.getOrCreate(conversationId)
             val myGenerationEpoch = session.currentGenerationEpoch()
+            val fgToken = "${conversationId}#${myGenerationEpoch}"
+            activeFgToken = fgToken
 
-            // 如果不在前台，提前启动前台 Service：异步启动 + 失败兜底，绝不让 Service 启动阻塞/中断生成
-            if (!isForeground.value && settings.displaySetting.enableNotificationOnMessageGeneration) {
+            // 如果不在前台，提前启动前台 Service：异步启动 + 失败兜底，并持有 Job 以便结束/取消时立刻取消防止竞态残留
+            val initFgJob: Job? = if (!isForeground.value && settings.displaySetting.enableNotificationOnMessageGeneration) {
                 appScope.launch {
-                    runCatching { startGenerationForeground(senderName, conversationId.toString()) }
+                    runCatching { startGenerationForeground(senderName, conversationId.toString(), fgToken) }
                 }
-            }
+            } else null
 
             // 监听前后台切换：切后台 600ms 后才启动 FG Service 保活（防短暂切走造成反复启停），
             // 启动失败不影响生成（Android 12+ 后台启动限制等）
@@ -2142,13 +2145,20 @@ class ChatService(
                 appScope.launch {
                     isForeground.drop(1).debounce(600).collect { foreground ->
                         if (!foreground) {
-                            runCatching { startGenerationForeground(senderName, conversationId.toString()) }
+                            runCatching { startGenerationForeground(senderName, conversationId.toString(), fgToken) }
                         } else {
-                            stopGenerationForeground()
+                            stopGenerationForeground(fgToken = fgToken)
                         }
                     }
                 }
             } else null
+
+            val throttleLock = Any()
+            var hasEmittedUi = false
+            var lastUiEmitMs = 0L
+            var pendingUiMessages: List<UIMessage>? = null
+            var pendingFlushJob: Job? = null
+            var streamCompleted = false
 
             generationLoop.generateText(
                 settings = settings,
@@ -2207,10 +2217,24 @@ class ChatService(
                 outputTransformers = outputTransformers,
                 tools = tools,
             ).onCompletion {
-                // 取消前台服务；通知由 ChatNotificationManager 通过 AppEventBus 消费
+                // 取消前台服务与待刷新的流式节流任务；通知由 ChatNotificationManager 通过 AppEventBus 消费
+                initFgJob?.cancel()
                 fgJob?.cancel()
+                stopGenerationForeground(fgToken = fgToken)
+                val jobToCancel: Job?
+                synchronized(throttleLock) {
+                    streamCompleted = true
+                    jobToCancel = pendingFlushJob
+                    pendingFlushJob = null
+                    val trailingMsgs = pendingUiMessages
+                    pendingUiMessages = null
+                    if (trailingMsgs != null && session.currentGenerationEpoch() == myGenerationEpoch) {
+                        val latestConv = getConversationFlow(conversationId).value.updateCurrentMessages(trailingMsgs)
+                        updateConversation(conversationId, latestConv, checkFiles = false)
+                    }
+                }
+                jobToCancel?.cancel()
                 if (session.currentGenerationEpoch() == myGenerationEpoch) {
-                    stopGenerationForeground()
 
                     // 可能被取消了，或者意外结束，兜底更新（仅在未被新世代接管时执行，防止取消后立即重发被旧完成回调打断）
                     val updatedConversation = session.finishGeneration { conversation ->
@@ -2251,15 +2275,48 @@ class ChatService(
                 if (session.currentGenerationEpoch() != myGenerationEpoch) return@collect
                 when (chunk) {
                     is GenerationChunk.Messages -> {
-                        val updatedConversation = getConversationFlow(conversationId).value
-                            .updateCurrentMessages(chunk.messages)
-                        // [Bug C 修复] 流式逐 token 更新仅追加/刷新当前消息内容，不会删除历史附件，
-                        // 跳过 checkFilesDelete 全会话节点扫描，消除长对话流式输出时的主线程 GC 与掉帧。
-                        updateConversation(conversationId, updatedConversation, checkFiles = false)
+                        // [Bug C + 流式节流] 仅缓存最新消息列表，在刷新瞬间基于最新 Conversation 合并，
+                        // 避免 50ms 窗口内覆盖并发更新的标题/建议/置顶元数据，同时全程加锁杜绝乱序覆写。
+                        val nowMs = System.nanoTime() / 1_000_000L
+                        var cancelJob: Job? = null
+                        synchronized(throttleLock) {
+                            if (streamCompleted) return@synchronized
+                            if (!hasEmittedUi || nowMs - lastUiEmitMs >= 50L) {
+                                cancelJob = pendingFlushJob
+                                pendingFlushJob = null
+                                pendingUiMessages = null
+                                hasEmittedUi = true
+                                lastUiEmitMs = nowMs
+                                if (session.currentGenerationEpoch() == myGenerationEpoch) {
+                                    val latestConv = getConversationFlow(conversationId).value.updateCurrentMessages(chunk.messages)
+                                    updateConversation(conversationId, latestConv, checkFiles = false)
+                                }
+                            } else {
+                                pendingUiMessages = chunk.messages
+                                if (pendingFlushJob?.isActive != true) {
+                                    val waitMs = (50L - (nowMs - lastUiEmitMs)).coerceAtLeast(16L)
+                                    pendingFlushJob = appScope.launch {
+                                        delay(waitMs)
+                                        synchronized(throttleLock) {
+                                            pendingFlushJob = null
+                                            if (streamCompleted) return@synchronized
+                                            val flushedMsgs = pendingUiMessages ?: return@synchronized
+                                            pendingUiMessages = null
+                                            lastUiEmitMs = System.nanoTime() / 1_000_000L
+                                            if (session.currentGenerationEpoch() == myGenerationEpoch) {
+                                                val latestConv = getConversationFlow(conversationId).value.updateCurrentMessages(flushedMsgs)
+                                                updateConversation(conversationId, latestConv, checkFiles = false)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cancelJob?.cancel()
 
                         // 前台时停止前台 Service（用户切回来了）
                         if (isForeground.value) {
-                            stopGenerationForeground()
+                            stopGenerationForeground(fgToken = fgToken)
                         }
 
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
@@ -2276,6 +2333,7 @@ class ChatService(
             // 兜底取消 Live Update 通知（生成开始前失败时 onCompletion 不会执行）
             appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null))
             if (it is CancellationException) {
+                activeFgToken?.let { token -> stopGenerationForeground(fgToken = token) }
                 TavernRuntimeManager.recordSendDiagnostic(
                     stage = TavernRuntimeManager.SendDiagnosticStage.STAGE_7_GENERATION_FINISHED,
                     conversationId = conversationId.toString(),
@@ -2290,8 +2348,8 @@ class ChatService(
                 detail = "status=FAILED error=${it.javaClass.simpleName}:${it.message}",
             )
 
-            // 取消前台服务
-            stopGenerationForeground()
+            // 取消前台服务（仅移除当前生成会话计数，不误杀其他并发后台生成会话）
+            activeFgToken?.let { token -> stopGenerationForeground(fgToken = token) }
 
             it.printStackTrace()
             // [P0 修复] 中止类错误单独给文案：让用户知道「请求根本没发出去」，而不是一个泛化的失败。
@@ -2464,12 +2522,10 @@ class ChatService(
                 params = backgroundTextGenerationParams(model, conversationId, settings.fastModelReasoningLevel),
             )
 
-            // 生成完，conversation可能不是最新了，因此需要重新获取
-            conversationRepo.getConversationById(conversation.id)?.let {
-                saveConversation(
-                    conversationId,
-                    it.copy(title = result.message.toText().trim())
-                )
+            // 原子元数据单列更新标题 + FTS 同步，避免全会话 message_node 全删全插与并发覆盖
+            val newTitle = result.message.toText().trim()
+            if (newTitle.isNotEmpty()) {
+                updateTitle(conversationId, newTitle)
             }
         }.onFailure {
             // [P3] 标题生成是**后台辅助功能**，失败不该在聊天界面弹红框。
@@ -2580,16 +2636,12 @@ class ChatService(
                 result.message.toText().split("\n").map { it.trim() }
                     .filter { it.isNotBlank() }
 
-            val latestConversation = conversationRepo.getConversationById(conversationId)
-                ?: sessionManager.get(conversationId)?.state?.value
-                ?: conversation
-            saveConversation(
-                conversationId,
-                latestConversation.copy(
-                    chatSuggestions = suggestions.take(
-                        10
-                    )
-                )
+            // 原子元数据单列更新建议列表，避免全会话 message_node 全删全插与并发覆盖
+            val limitedSuggestions = suggestions.take(10)
+            val session = loadedSession(conversationId)
+            session.updateMetadata(
+                transform = { it.copy(chatSuggestions = limitedSuggestions) },
+                persist = { conversationRepo.updateChatSuggestions(conversationId, limitedSuggestions) },
             )
         }.onFailure {
             it.printStackTrace()
@@ -2839,20 +2891,42 @@ class ChatService(
 
     // region Foreground Service — 后台生成时保持进程存活
 
-    private fun startGenerationForeground(title: String, conversationId: String) {
+    // [P0 闪退修复] 这组状态必须放在 **companion object** 里：
+    // 字段初始化按源码顺序执行，而 init 块（第 411 行）注册的 ProcessLifecycleOwner 观察者
+    // 会在实例化过程中同步回调 ON_START -> stopGenerationForeground(force = true)，
+    // 此时若 fgServiceLock 还是尚未赋值的实例字段（null），synchronized(null) 抛
+    // NullPointerException，Koin 把 ChatService 创建失败包成
+    // "Could not create instance for '[Singleton: ChatService]'" -> ChatVM 失败 -> 冷启动闪退。
+    // companion object 在构造前完成初始化，彻底消除这个构造期竞态。
+    companion object {
+        private val fgServiceLock = Any()
+
+        @Volatile
+        private var isGenerationForegroundRunning = false
+
+        private val activeForegroundGenerationIds =
+            java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    }
+
+    private fun startGenerationForeground(title: String, conversationId: String, fgToken: String = conversationId) {
         val intent = Intent(context, GenerationForegroundService::class.java).apply {
             action = GenerationForegroundService.ACTION_START
             putExtra(GenerationForegroundService.EXTRA_TITLE, title)
             putExtra(GenerationForegroundService.EXTRA_CONVERSATION_ID, conversationId)
         }
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
+        synchronized(fgServiceLock) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+            activeForegroundGenerationIds.add(fgToken)
+            isGenerationForegroundRunning = true
         }
     }
 
     private fun updateGenerationForeground(text: String) {
+        if (!isGenerationForegroundRunning) return
         val intent = Intent(context, GenerationForegroundService::class.java).apply {
             action = GenerationForegroundService.ACTION_UPDATE
             putExtra(GenerationForegroundService.EXTRA_TEXT, text.take(200))
@@ -2860,11 +2934,19 @@ class ChatService(
         context.startService(intent)
     }
 
-    private fun stopGenerationForeground() {
-        val intent = Intent(context, GenerationForegroundService::class.java).apply {
-            action = GenerationForegroundService.ACTION_STOP
+    private fun stopGenerationForeground(fgToken: String? = null, force: Boolean = false) {
+        synchronized(fgServiceLock) {
+            if (force) {
+                activeForegroundGenerationIds.clear()
+            } else if (fgToken != null) {
+                activeForegroundGenerationIds.remove(fgToken)
+                if (activeForegroundGenerationIds.isNotEmpty()) return
+            }
+            if (!force && !isGenerationForegroundRunning) return
+            isGenerationForegroundRunning = false
+            val intent = Intent(context, GenerationForegroundService::class.java)
+            runCatching { context.stopService(intent) }
         }
-        context.startService(intent)
     }
 
     // endregion

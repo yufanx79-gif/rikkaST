@@ -45,7 +45,12 @@ class GenerationForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        when (intent.action) {
             ACTION_START -> {
                 title = intent.getStringExtra(EXTRA_TITLE) ?: "正在生成回复"
                 conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID) ?: ""
@@ -60,7 +65,7 @@ class GenerationForegroundService : Service() {
                 stopSelf()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun buildNotification(): Notification {

@@ -24,29 +24,57 @@ import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
  * 避免不同来源的脚本因复用默认 id（如 `"1"` / `"default"`）或空 id 而互相覆盖，
  * 同时消除同一来源内的重复条目。
  */
+private data class ParsedPresetRegexCacheKey(
+    val rawTavernPresets: String,
+    val activeGroups: Set<String>,
+)
+
+private val parsedPresetRegexCacheLock = Any()
+private val parsedPresetRegexCache = object : LinkedHashMap<ParsedPresetRegexCacheKey, Map<String, List<RegexScript>>>(8, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ParsedPresetRegexCacheKey, Map<String, List<RegexScript>>>?): Boolean =
+        size > 4
+}
+
 fun mergeActiveRegexScripts(
     settings: Settings,
     assistant: Assistant?,
     extraModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
 ): List<RegexScript> {
     val activeGroups = enabledPresetGroups(assistant, settings, extraModeInjectionIds)
-    val presetScriptsByGroup = LinkedHashMap<String, List<RegexScript>>()
-    val presetRoot = runCatching {
-        Json.parseToJsonElement(settings.tavernPresets) as? JsonObject
-    }.getOrNull()
-    for (group in activeGroups) {
-        val rawPreset = when (val el = presetRoot?.get(group)) {
-            is JsonPrimitive -> el.contentOrNull
-            is JsonObject -> el.toString()
-            else -> null
+    val rawPresets = settings.tavernPresets
+    val presetScriptsByGroup: Map<String, List<RegexScript>> = if (activeGroups.isEmpty() || rawPresets.isBlank()) {
+        emptyMap()
+    } else {
+        val cacheKey = ParsedPresetRegexCacheKey(rawPresets, activeGroups.toSet())
+        val cached = synchronized(parsedPresetRegexCacheLock) {
+            parsedPresetRegexCache[cacheKey]
         }
-        val scripts = if (rawPreset.isNullOrBlank()) {
-            emptyList()
+        if (cached != null) {
+            cached
         } else {
-            ModeInjectionSerializer.inspectPresetRegexScripts(rawPreset, group).second
-        }
-        if (scripts.isNotEmpty()) {
-            presetScriptsByGroup[group] = scripts
+            val computed = LinkedHashMap<String, List<RegexScript>>()
+            val presetRoot = runCatching {
+                Json.parseToJsonElement(rawPresets) as? JsonObject
+            }.getOrNull()
+            for (group in activeGroups) {
+                val rawPreset = when (val el = presetRoot?.get(group)) {
+                    is JsonPrimitive -> el.contentOrNull
+                    is JsonObject -> el.toString()
+                    else -> null
+                }
+                val scripts = if (rawPreset.isNullOrBlank()) {
+                    emptyList()
+                } else {
+                    ModeInjectionSerializer.inspectPresetRegexScripts(rawPreset, group).second
+                }
+                if (scripts.isNotEmpty()) {
+                    computed[group] = scripts
+                }
+            }
+            synchronized(parsedPresetRegexCacheLock) {
+                parsedPresetRegexCache[cacheKey] = computed
+            }
+            computed
         }
     }
     val flatPresetScripts = presetScriptsByGroup.values.flatten()

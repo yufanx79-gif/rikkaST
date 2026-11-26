@@ -112,7 +112,7 @@ fun ChatDrawerContent(
     navController: Navigator,
     vm: ChatVM,
     settings: Settings,
-    current: Conversation,
+    currentConversationId: Uuid,
     drawerState: DrawerState = rememberDrawerState(DrawerValue.Closed),
 ) {
     val scope = rememberCoroutineScope()
@@ -316,7 +316,7 @@ fun ChatDrawerContent(
             }
 
             ConversationList(
-                current = current,
+                currentConversationId = currentConversationId,
                 conversations = conversations,
                 conversationJobs = conversationJobs.keys,
                 listState = conversationListState,
@@ -340,7 +340,7 @@ fun ChatDrawerContent(
                     scope.launch {
                         vm.deleteConversation(it).join()
                         conversations.refresh()
-                        if (it.id == current.id) {
+                        if (it.id == currentConversationId) {
                             navigateToChatPage(navController)
                         }
                     }
@@ -576,7 +576,7 @@ fun ChatDrawerContent(
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(folders) { folder ->
+                    items(folders, key = { it.id.toString() }) { folder ->
                         val isCurrent = folder.id == conversationToMoveFolder?.folderId
                         Surface(
                             onClick = { doMove(folder.id) },
@@ -725,7 +725,7 @@ fun ChatDrawerContent(
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(settings.assistants) { assistant ->
+                    items(settings.assistants, key = { it.id.toString() }) { assistant ->
                         AssistantItem(
                             assistant = assistant,
                             isCurrentAssistant = assistant.id == conversationToMove?.assistantId,
@@ -924,7 +924,7 @@ private fun FolderBar(
                 onLongClick = {},
             )
         }
-        items(folders) { folder ->
+        items(folders, key = { it.id.toString() }) { folder ->
             var menuExpanded by remember { mutableStateOf(false) }
             Box {
                 FolderChip(

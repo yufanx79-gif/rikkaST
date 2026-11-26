@@ -248,7 +248,7 @@ internal fun extractQuickPlainPreview(rawText: String): String {
  *   彻底杜绝每次点击发送时全会话所有楼层缓存集体失效、所有内嵌 WebView 面板被瞬间销毁并二次重建引发的卡死与崩溃。
  */
 internal object StRegexTextCache {
-    private const val MAX_ENTRIES = 160
+    private const val MAX_ENTRIES = 256
 
     data class CacheKey(
         val textHash: Int,

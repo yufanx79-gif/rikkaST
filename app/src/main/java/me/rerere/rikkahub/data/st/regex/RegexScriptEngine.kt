@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.data.st.regex
 
+import java.util.concurrent.ConcurrentHashMap
+
 /**
  * ST 1.19 正则脚本引擎移植与增强
  *
@@ -75,6 +77,29 @@ object RegexScriptEngine {
      * 保留字面量检测不变：真正病态的模式在任何长度下都不该跑。
      */
     internal const val MIN_CATASTROPHIC_INPUT_LENGTH = 4096
+    private const val MAX_REDOS_CACHE_ENTRIES = 1024
+    private val catastrophicRegexCache = ConcurrentHashMap<String, Boolean>()
+    private val variableLookbehindCache = ConcurrentHashMap<String, Boolean>()
+
+    private fun isPotentiallyCatastrophicRegexCached(pattern: String): Boolean {
+        catastrophicRegexCache[pattern]?.let { return it }
+        if (catastrophicRegexCache.size >= MAX_REDOS_CACHE_ENTRIES) {
+            catastrophicRegexCache.clear()
+        }
+        val result = isPotentiallyCatastrophicRegex(pattern)
+        catastrophicRegexCache[pattern] = result
+        return result
+    }
+
+    private fun isDangerousVariableLookbehindCached(pattern: String): Boolean {
+        variableLookbehindCache[pattern]?.let { return it }
+        if (variableLookbehindCache.size >= MAX_REDOS_CACHE_ENTRIES) {
+            variableLookbehindCache.clear()
+        }
+        val result = isDangerousVariableLookbehind(pattern)
+        variableLookbehindCache[pattern] = result
+        return result
+    }
     internal const val MAX_CATASTROPHIC_INPUT_LENGTH = 4096
     internal const val MAX_REGEX_CHAR_ACCESS_STEPS = 250_000
     internal const val MAX_REGEX_EXECUTION_NANOS = 50_000_000L // 50ms per script invocation
@@ -1129,7 +1154,7 @@ object RegexScriptEngine {
             }
             else -> script.findRegex
         }
-        if (isPotentiallyCatastrophicRegex(pattern) && normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH) {
+        if (normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH && isPotentiallyCatastrophicRegexCached(pattern)) {
             val msg = "[regex] skipped potentially catastrophic regex on input (${normalizedRaw.length} chars): pattern=$pattern"
             warn(msg)
             onCompileDegraded?.invoke(msg)
@@ -1138,7 +1163,7 @@ object RegexScriptEngine {
         // [P0 根治 2026-10-28] 变长后顾 + 全文扫描量词 = 隐性 ReDoS。
         // 真机实测 2000 字符就要 32 秒（O(N²)），20000 字符必然数百秒 —— 直接跳过并留痕。
         // 这条必须在真正执行正则**之前**判定：一旦进了 Matcher，主流程只能等它跑完。
-        if (normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH && isDangerousVariableLookbehind(pattern)) {
+        if (normalizedRaw.length >= MIN_CATASTROPHIC_INPUT_LENGTH && isDangerousVariableLookbehindCached(pattern)) {
             val msg = "[regex] skipped variable-lookbehind ReDoS risk (${normalizedRaw.length} chars): pattern=$pattern"
             warn(msg)
             onCompileDegraded?.invoke(msg)

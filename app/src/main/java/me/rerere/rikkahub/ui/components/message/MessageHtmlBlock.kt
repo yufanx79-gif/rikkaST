@@ -62,6 +62,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -80,6 +81,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -1486,7 +1490,6 @@ fun MessageHtmlBlock(
     val displaySetting = LocalSettings.current.displaySetting
     val perfEnabled = displaySetting.enableWebViewPerfReduction
     val perfMode = displaySetting.webViewPerfMode
-    val isListScrolling by TavernPanelLoadScheduler.isListScrollingFlow.collectAsState()
     LaunchedEffect(
         displaySetting.enableWebViewOffscreenPause,
         displaySetting.enableWebViewScrollDefer,
@@ -1572,6 +1575,14 @@ fun MessageHtmlBlock(
         )
     }
     val mountState = mountStateRef
+    val initialScrolling = TavernPanelLoadScheduler.isListScrollingFlow.value &&
+        displaySetting.enableWebViewScrollDefer &&
+        !mountState.mounted
+    val isListScrolling by remember(mountState, displaySetting.enableWebViewScrollDefer) {
+        TavernPanelLoadScheduler.isListScrollingFlow
+            .map { scrolling -> scrolling && displaySetting.enableWebViewScrollDefer && !mountState.mounted }
+            .distinctUntilChanged()
+    }.collectAsState(initial = initialScrolling)
     // 把"当前存活组合"的 heightDp 挂到 mountState 上。
     // JS 桥(PanelBridge)是 WebView 创建时就绑定好的；容器被别的组合复用后，
     // 它仍然只认 mountState。这里让它总是写到最新那份组合的 heightDp，
@@ -1590,10 +1601,22 @@ fun MessageHtmlBlock(
     }
 
     // 串行分步加载队列状态：若 DetachedPanelWebViewCache 已有存活实例，则直接放行（0ms 恢复，不重新排队渲染）
-    val queueKeys by TavernPanelLoadScheduler.queueSnapshot.collectAsState()
     var slotGranted by remember(effectiveQueueKey) {
         mutableStateOf(DetachedPanelWebViewCache.has(effectiveQueueKey))
     }
+    val queueProgress by remember(effectiveQueueKey, slotGranted) {
+        TavernPanelLoadScheduler.queueSnapshot
+            .map { keys ->
+                if (slotGranted) {
+                    0 to 0
+                } else {
+                    val pos = (keys.indexOf(effectiveQueueKey) + 1).coerceAtLeast(1)
+                    val total = keys.size.coerceAtLeast(pos)
+                    pos to total
+                }
+            }
+            .distinctUntilChanged()
+    }.collectAsState(initial = 0 to 0)
     var stage by remember(effectiveQueueKey) {
         mutableStateOf<PanelLoadStage>(
             if (DetachedPanelWebViewCache.has(effectiveQueueKey)) {
@@ -1604,14 +1627,15 @@ fun MessageHtmlBlock(
         )
     }
 
-    LaunchedEffect(queueKeys, slotGranted, panelTitle) {
+    LaunchedEffect(queueProgress, slotGranted, panelTitle) {
         if (!slotGranted) {
-            val pos = (queueKeys.indexOf(effectiveQueueKey) + 1).coerceAtLeast(1)
-            val total = queueKeys.size.coerceAtLeast(pos)
-            stage = if (!TavernRuntimeManager.isPageReady && pos == 1) {
+            val (pos, total) = queueProgress
+            val safePos = pos.coerceAtLeast(1)
+            val safeTotal = total.coerceAtLeast(safePos)
+            stage = if (!TavernRuntimeManager.isPageReady && safePos == 1) {
                 PanelLoadStage.WaitingHost(panelTitle)
             } else {
-                PanelLoadStage.Queued(panelTitle, pos, total)
+                PanelLoadStage.Queued(panelTitle, safePos, safeTotal)
             }
         }
     }
@@ -1699,7 +1723,8 @@ fun MessageHtmlBlock(
     // 快照可用性 = 快照标记 ready（捕获时已渲染完成）
     //               且 该内容已被登记为「至少真实渲染成功过一次」。
     // 后者是用户提出的兜底规则：避免任何异常路径下用空白图顶替渲染。
-    val contentRenderedOnce = remember(contentSnapshotKey) {
+    val renderedOnceVersion by PanelSnapshotStore.renderedOnceVersion.collectAsState()
+    val contentRenderedOnce = remember(contentSnapshotKey, renderedOnceVersion) {
         PanelSnapshotStore.isRenderedOnce(contentSnapshotKey, context)
     }
     val hasUsableSnapshot = contentRenderedOnce &&
@@ -1771,7 +1796,11 @@ fun MessageHtmlBlock(
         return
     }
 
-    val activePoolKeys by ActivePanelWebViewPool.activeKeysFlow.collectAsState()
+    val isInActivePool by remember(effectiveQueueKey) {
+        ActivePanelWebViewPool.activeKeysFlow
+            .map { effectiveQueueKey in it }
+            .distinctUntilChanged()
+    }.collectAsState(initial = effectiveQueueKey in ActivePanelWebViewPool.activeKeysFlow.value)
 
     LaunchedEffect(effectiveQueueKey, useBoundedWebViewPool, maxActivePoolSize) {
         if (!slotGranted) {
@@ -1927,7 +1956,7 @@ fun MessageHtmlBlock(
     }
 
     // 活跃池之外的面板一律休眠（不仅历史楼层），确保“活跃 WebView 数量上限”是真实上限。
-    val isHibernated = useBoundedWebViewPool && slotGranted && effectiveQueueKey !in activePoolKeys
+    val isHibernated = useBoundedWebViewPool && slotGranted && !isInActivePool
     val isPanelVisiblyReady = slotGranted && !isHibernated && mountState.mounted && heightDp > 0
 
     // 面板完成渲染后：
@@ -2000,29 +2029,36 @@ fun MessageHtmlBlock(
             val readyForSnapshot = mountState.renderReady
             // 捕获「内容级快照」（跨楼层共享）。注意：必须等 readyForSnapshot，
             // 否则会抓到未完成渲染的空图 —— 真机上已因此出现过整块面板空白。
-            val shouldCaptureSnapshot = readyForSnapshot && snapshotEntry == null && snapshotCompositeKey != null
-            if (shouldCaptureSnapshot) {
-                val captured = PanelSnapshotStore.captureFromWebView(
-                    context = context,
-                    compositeKey = snapshotCompositeKey,
-                    webView = mountState.webView,
-                    heightDp = boundedHeightDp,
-                    // 只有 renderReady 之后捕获的帧才可信；否则标记未就绪，
-                    // 该快照不会被用来顶替渲染（避免把空白图固化下来）。
-                    renderReadyAtCapture = mountState.renderReady,
-                )
-                if (captured != null) {
-                    snapshotEntry = captured
-                    // 同时写入**内容级** key：同内容的其它楼层可立即复用，
-                    // 不必各自再排队渲染一遍。
-                    contentSnapshot = captured
-                    PanelSnapshotStore.putContentEntry(contentSnapshotKey, captured, context)
-                    // 登记「已成功真实渲染一次」，之后该内容的快照才允许复用。
-                    PanelSnapshotStore.markRenderedOnce(contentSnapshotKey, context)
+            if (readyForSnapshot && snapshotEntry == null && snapshotCompositeKey != null) {
+                // 若面板在滑动中就绪或停滑 220ms 内再次起滑，循环等待真正静止后再捕获，避免永久漏抓快照
+                while (!mountState.isDisposed && mountState.mounted && TavernPanelLoadScheduler.isListScrollingFlow.value) {
+                    TavernPanelLoadScheduler.isListScrollingFlow.first { !it }
+                    delay(220L)
+                }
+                if (!mountState.isDisposed && mountState.mounted && !TavernPanelLoadScheduler.isListScrollingFlow.value) {
+                    val captured = PanelSnapshotStore.captureFromWebView(
+                        context = context,
+                        compositeKey = snapshotCompositeKey,
+                        webView = mountState.webView,
+                        heightDp = boundedHeightDp,
+                        // 只有 renderReady 之后捕获的帧才可信；否则标记未就绪，
+                        // 该快照不会被用来顶替渲染（避免把空白图固化下来）。
+                        renderReadyAtCapture = mountState.renderReady,
+                        contentKey = contentSnapshotKey,
+                    )
+                    if (captured != null) {
+                        snapshotEntry = captured
+                        // 同时写入**内容级** key：同内容的其它楼层可立即复用，
+                        // 磁盘文件已由 captureFromWebView 复用同一份 Bitmap 异步写入，避免二次拷贝与二次 PNG 压缩。
+                        contentSnapshot = captured
+                        PanelSnapshotStore.putContentEntry(contentSnapshotKey, captured, context, writeDisk = false)
+                        // 登记「已成功真实渲染一次」，之后该内容的快照才允许复用。
+                        PanelSnapshotStore.markRenderedOnce(contentSnapshotKey, context)
                     // 捕获后**不主动释放** WebView。
                     // 真机反复验证：一旦释放，滚回来时该面板已不在活跃池，会退化成
                     //「面板过多已自动休眠/唤醒面板」占位卡（用户明确反馈这是最糟的观感）。
-                    // 让淘汰完全交给池子的优先级 + LRU 自然处理即可。
+                        // 让淘汰完全交给池子的优先级 + LRU 自然处理即可。
+                    }
                 }
             }
             if (useLiveQuiescent && (perfEnabled || isHistoricalFloor)) {
@@ -2457,16 +2493,10 @@ fun MessageHtmlBlock(
                                     }
                                 }
                             }
-                            if (snapshotEntry == null && ownerState.renderReady) {
-                                PanelSnapshotStore.captureFromWebView(
-                                    context = context,
-                                    compositeKey = keyForFreeze,
-                                    webView = wvForFreeze,
-                                    heightDp = boundedHeightDp,
-                                )
-                            }
+                            // 滑出视口（onRelease）正处于滑动关键帧，禁止在此主线程同步截大图；
+                            // 快照由上方 renderReady + 列表静止时的异步路径统一捕获。
                         }
-                        if (useBoundedWebViewPool && effectiveQueueKey !in activePoolKeys) {
+                        if (useBoundedWebViewPool && !isInActivePool) {
                             DetachedPanelWebViewCache.evictAndDestroy(effectiveQueueKey)
                             ownerState.release()
                         } else if (ownerState.mounted && !ownerState.isDisposed) {
@@ -2597,7 +2627,7 @@ internal fun StTextContent(
     isHistoricalFloor: Boolean = false,
 ) {
     val html = if (!loading) rememberAfterMarkdownHtml(content) else content
-    val panelCandidate = shouldRenderAsHtmlPanel(html)
+    val panelCandidate = remember(html) { shouldRenderAsHtmlPanel(html) }
     if (loading) {
         // [P0 修复] 流式生成期间绝不能把 HTML 面板原文交给 MarkdownBlock。
         //
@@ -2618,10 +2648,23 @@ internal fun StTextContent(
             // produceState 会每 token 重启一次协程并跑一遍正则（长开场白上等于逐字做重活）。
             // 这里按「长度分桶」取样 + 120ms 去抖：视觉上仍然是持续增长的正文，
             // 但计算次数从 O(字符数) 降到 O(秒数)。
-            var previewSource by remember(content) { mutableStateOf(content) }
-            LaunchedEffect(content) {
-                delay(120)
-                previewSource = content
+            var previewSource by remember(messageKey) { mutableStateOf(content) }
+            val latestContent by rememberUpdatedState(content)
+            LaunchedEffect(messageKey) {
+                var lastUpdateMs = 0L
+                androidx.compose.runtime.snapshotFlow { latestContent }
+                    .collect { current ->
+                        val now = android.os.SystemClock.uptimeMillis()
+                        val elapsed = now - lastUpdateMs
+                        if (lastUpdateMs == 0L || elapsed >= 150L) {
+                            previewSource = current
+                            lastUpdateMs = now
+                        } else {
+                            delay(150L - elapsed)
+                            previewSource = latestContent
+                            lastUpdateMs = android.os.SystemClock.uptimeMillis()
+                        }
+                    }
             }
             val preview by produceState(initialValue = "", previewSource) {
                 value = withContext(Dispatchers.Default) { extractQuickPlainPreview(previewSource) }
@@ -2780,15 +2823,18 @@ internal object PanelSnapshotStore {
      *
      * 只记录 key（很小），不记图；图仍由 panel_snapshots 管理。
      */
+    private val snapshotIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val renderedOnceKeys = java.util.Collections.synchronizedSet(HashSet<String>())
-    private var renderedOnceLoaded = false
+    private val renderedOnceLoadStarted = AtomicBoolean(false)
+    private val _renderedOnceVersion = MutableStateFlow(0)
+    val renderedOnceVersion: StateFlow<Int> = _renderedOnceVersion.asStateFlow()
 
-    /** 标记该内容已真实渲染完成一次（renderReady 之后调用）。 */
+    /** 标记该内容已真实渲染完成一次（renderReady 之后调用）。仅首次新增时追加落盘，防止文件无限膨胀。 */
     fun markRenderedOnce(contentKey: String, context: Context?) {
         if (contentKey.isEmpty()) return
-        renderedOnceKeys.add(contentKey)
+        if (!renderedOnceKeys.add(contentKey)) return
         val ctx = context?.applicationContext ?: return
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        snapshotIoScope.launch {
             runCatching {
                 val dir = File(ctx.filesDir, "panel_snapshots").apply { mkdirs() }
                 File(dir, "rendered_once.txt").appendText(contentKey + "\n")
@@ -2796,18 +2842,22 @@ internal object PanelSnapshotStore {
         }
     }
 
-    /** 该内容是否已经真实渲染完成过一次。 */
+    /** 该内容是否已经真实渲染完成过一次。首次调用异步加载磁盘登记表，杜绝主线程同步 readLines。 */
     fun isRenderedOnce(contentKey: String, context: Context?): Boolean {
         if (contentKey.isEmpty()) return false
-        if (!renderedOnceLoaded) {
-            renderedOnceLoaded = true
-            runCatching {
-                val ctx = context?.applicationContext ?: return false
-                val f = File(ctx.filesDir, "panel_snapshots/rendered_once.txt")
-                if (f.isFile) {
-                    f.readLines(Charsets.UTF_8).forEach { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty()) renderedOnceKeys.add(trimmed)
+        if (renderedOnceLoadStarted.compareAndSet(false, true)) {
+            val ctx = context?.applicationContext
+            if (ctx != null) {
+                snapshotIoScope.launch {
+                    runCatching {
+                        val f = File(ctx.filesDir, "panel_snapshots/rendered_once.txt")
+                        if (f.isFile) {
+                            f.readLines(Charsets.UTF_8).forEach { line ->
+                                val trimmed = line.trim()
+                                if (trimmed.isNotEmpty()) renderedOnceKeys.add(trimmed)
+                            }
+                            _renderedOnceVersion.value = _renderedOnceVersion.value + 1
+                        }
                     }
                 }
             }
@@ -2816,13 +2866,19 @@ internal object PanelSnapshotStore {
     }
 
     /**
-     * 写入内容级快照（同一段 HTML 跨楼层共享），并落盘以便下次冷启动复用。
+     * 写入内容级快照（同一段 HTML 跨楼层共享），可选落盘以便下次冷启动复用。
      */
-    fun putContentEntry(contentKey: String, entry: SnapshotEntry, context: Context?) {
+    fun putContentEntry(
+        contentKey: String,
+        entry: SnapshotEntry,
+        context: Context?,
+        writeDisk: Boolean = true,
+    ) {
         if (contentKey.isEmpty()) return
         putMemory(contentKey, entry)
+        if (!writeDisk) return
         val ctx = context?.applicationContext ?: return
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        snapshotIoScope.launch {
             runCatching {
                 val dir = File(ctx.filesDir, "panel_snapshots").apply { mkdirs() }
                 val outFile = File(dir, safeFileName(contentKey))
@@ -2928,6 +2984,7 @@ internal object PanelSnapshotStore {
         heightDp: Int,
         /** 是否在渲染确认完成(renderReady)之后捕获；false 表示可能是空白帧。 */
         renderReadyAtCapture: Boolean = false,
+        contentKey: String? = null,
     ): SnapshotEntry? {
         if (compositeKey.isNullOrEmpty() || webView == null || heightDp <= 0) return null
         val w = webView.width
@@ -2994,12 +3051,19 @@ internal object PanelSnapshotStore {
             )
             putMemory(compositeKey, entry)
             val appCtx = context.applicationContext
-            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            snapshotIoScope.launch {
                 runCatching {
                     val dir = File(appCtx.filesDir, "panel_snapshots").apply { mkdirs() }
                     val outFile = File(dir, safeFileName(compositeKey))
-                    FileOutputStream(outFile).use { fos ->
-                        bmp.compress(Bitmap.CompressFormat.PNG, 92, fos)
+                    val baos = java.io.ByteArrayOutputStream()
+                    bmp.compress(Bitmap.CompressFormat.PNG, 92, baos)
+                    val pngBytes = baos.toByteArray()
+                    outFile.writeBytes(pngBytes)
+                    if (!contentKey.isNullOrEmpty() && contentKey != compositeKey) {
+                        val contentFile = File(dir, safeFileName(contentKey))
+                        if (!contentFile.isFile) {
+                            contentFile.writeBytes(pngBytes)
+                        }
                     }
                 }
             }

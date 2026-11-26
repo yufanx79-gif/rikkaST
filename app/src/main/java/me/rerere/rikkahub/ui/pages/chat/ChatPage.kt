@@ -765,7 +765,7 @@ fun ChatPage(
                 drawerContent = {
                     ChatDrawerContent(
                         navController = navController,
-                        current = conversation,
+                        currentConversationId = conversation.id,
                         vm = vm,
                         settings = setting,
                         drawerState = drawerState,
@@ -799,7 +799,7 @@ fun ChatPage(
                 drawerContent = {
                     ChatDrawerContent(
                         navController = navController,
-                        current = conversation,
+                        currentConversationId = conversation.id,
                         vm = vm,
                         settings = setting,
                         drawerState = drawerState,
@@ -1211,8 +1211,103 @@ private fun ChatPageContent(
                     TavernScriptButtonsRow()
                     val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
                     val voiceState by vm.voiceSession.state.collectAsStateWithLifecycle()
+                    val promptPreviewSettingsStore: me.rerere.rikkahub.data.datastore.SettingsStore = koinInject()
+                    var showPromptPreviewDialog by remember { mutableStateOf(false) }
+                    var isSavingPromptPreview by remember { mutableStateOf(false) }
+                    var promptPreviewSnapshot by remember {
+                        mutableStateOf<me.rerere.rikkahub.data.st.preview.PromptPreviewSnapshot?>(null)
+                    }
+                    LaunchedEffect(showPromptPreviewDialog) {
+                        if (showPromptPreviewDialog) {
+                            val targetAssistant = setting.getAssistantById(conversation.assistantId)
+                                ?: setting.getCurrentAssistant()
+                            val assembler = me.rerere.rikkahub.data.st.preview.PromptPreviewAssembler(context)
+                            runCatching {
+                                assembler.buildSnapshot(
+                                    settings = setting,
+                                    assistant = targetAssistant,
+                                    conversation = conversation,
+                                    draftUserText = inputState.textContent.text.toString(),
+                                )
+                            }.onSuccess { built ->
+                                promptPreviewSnapshot = built
+                            }.onFailure { err ->
+                                showPromptPreviewDialog = false
+                                promptPreviewSnapshot = null
+                                toaster.show(
+                                    message = "组装上游消息结构失败：${err.message ?: "未知错误"}",
+                                    type = ToastType.Error,
+                                )
+                            }
+                        } else {
+                            promptPreviewSnapshot = null
+                        }
+                    }
+                    if (showPromptPreviewDialog) {
+                        val snap = promptPreviewSnapshot
+                        if (snap == null) {
+                            androidx.compose.ui.window.Dialog(
+                                onDismissRequest = { if (!isSavingPromptPreview) showPromptPreviewDialog = false },
+                            ) {
+                                Surface(
+                                    shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+                                    color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        androidx.compose.material3.CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            strokeWidth = 2.dp,
+                                        )
+                                        Text(
+                                            text = "正在组装上游消息结构…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            me.rerere.rikkahub.ui.components.ai.PromptStructurePreviewDialog(
+                                snapshot = snap,
+                                isSaving = isSavingPromptPreview,
+                                onDismiss = { if (!isSavingPromptPreview) showPromptPreviewDialog = false },
+                                onSave = { draftBlocks, dirtyKeys ->
+                                    if (isSavingPromptPreview) return@PromptStructurePreviewDialog
+                                    isSavingPromptPreview = true
+                                    scope.launch {
+                                        runCatching {
+                                            me.rerere.rikkahub.data.st.preview.PromptOrderSyncWriter(
+                                                promptPreviewSettingsStore
+                                            ).commitDraft(
+                                                draftBlocks = draftBlocks,
+                                                dirtyKeys = dirtyKeys,
+                                                activePresetGroup = snap.activePresetGroup,
+                                            )
+                                        }.onSuccess {
+                                            isSavingPromptPreview = false
+                                            showPromptPreviewDialog = false
+                                            toaster.show(
+                                                message = "已保存并同步上游消息结构",
+                                                type = ToastType.Success,
+                                            )
+                                        }.onFailure { err ->
+                                            isSavingPromptPreview = false
+                                            toaster.show(
+                                                message = "保存消息结构失败：${err.message ?: "未知错误"}",
+                                                type = ToastType.Error,
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
                     ChatInput(
                         onStartVoiceMode = onStartVoiceMode,
+                        onOpenPromptPreview = { showPromptPreviewDialog = true },
                         voiceState = voiceState,
                         onStopVoiceMode = vm.voiceSession::stop,
                         state = inputState,

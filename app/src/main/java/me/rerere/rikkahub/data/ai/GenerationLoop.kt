@@ -1057,27 +1057,25 @@ class GenerationLoop(
                 append(tool.systemPrompt(model, messages))
             }
             }
-            if (prebuiltSystemMessages.isNotEmpty()) {
-                addAll(prebuiltSystemMessages)
-            } else if (fallbackSystem.isNotBlank()) {
-                add(UIMessage.system(prompt = fallbackSystem))
-            }
-
             val activePresetCfg = parseActiveStPresetConfig(
                 settings.tavernPresets,
                 enabledPresetGroups(assistant, settings, conversationModeInjectionIds),
             )
-            // ── 官方 mes_example：作为示例消息注入（若预设 prompt_order 中显式禁用 dialogueExamples 则跳过）──
-            if (assistant.tavernData != null && "dialogueExamples" !in activePresetCfg.disabledMarkers) {
-                addAll(
-                    assistant.buildExampleMessages(
-                        userName = settings.displaySetting.userNickname.ifBlank { "User" },
-                        newExampleChatPrompt = activePresetCfg.newExampleChatPrompt,
-                    )
-                )
+            val mainAndCard = if (prebuiltSystemMessages.isNotEmpty()) {
+                prebuiltSystemMessages
+            } else if (fallbackSystem.isNotBlank()) {
+                listOf(UIMessage.system(prompt = fallbackSystem))
+            } else {
+                emptyList()
             }
-
-            // 用户上下文已在 generateText 里算好并拼进 system，这里不再插入任何合成 user 消息。
+            val exampleMessages = if (assistant.tavernData != null && "dialogueExamples" !in activePresetCfg.disabledMarkers) {
+                assistant.buildExampleMessages(
+                    userName = settings.displaySetting.userNickname.ifBlank { "User" },
+                    newExampleChatPrompt = activePresetCfg.newExampleChatPrompt,
+                )
+            } else {
+                emptyList()
+            }
 
             val activeGroupChat = settings.groupChats.firstOrNull { gc ->
                 (conversationId != null && gc.conversationId == conversationId) || assistant.id in gc.memberIds
@@ -1087,7 +1085,7 @@ class GenerationLoop(
             } else {
                 activePresetCfg.newChatPrompt
             }
-            if ((assistant.tavernData != null || activeGroupChat != null) && !startChatPromptRaw.isNullOrBlank()) {
+            val startChatMessages = if ((assistant.tavernData != null || activeGroupChat != null) && !startChatPromptRaw.isNullOrBlank()) {
                 val groupNames = activeGroupChat?.memberIds?.mapNotNull { mid ->
                     settings.assistants.firstOrNull { it.id == mid }?.name
                 }?.joinToString(", ").orEmpty().ifBlank { assistant.name }
@@ -1096,10 +1094,82 @@ class GenerationLoop(
                     .replace("{{charIfNotGroup}}", groupNames, ignoreCase = true)
                     .replace("{{char}}", assistant.name, ignoreCase = true)
                     .replace("{{user}}", settings.displaySetting.userNickname.ifBlank { "User" }, ignoreCase = true)
-                add(UIMessage.system(prompt = expandedStartPrompt).copy(isSynthetic = true))
+                listOf(UIMessage.system(prompt = expandedStartPrompt).copy(isSynthetic = true))
+            } else {
+                emptyList()
             }
-            if ("chatHistory" !in activePresetCfg.disabledMarkers) {
-                addAll(limitedChat.withMessageNames())
+            val chatHistoryMessages = if ("chatHistory" !in activePresetCfg.disabledMarkers) {
+                startChatMessages + limitedChat.withMessageNames()
+            } else {
+                startChatMessages
+            }
+
+            if (me.rerere.rikkahub.data.st.preview.UnifiedPromptOrderEngine.hasCustomMarkerOrder(activePresetCfg.orderedMarkers)) {
+                val mainOnly = mainAndCard.filter { msg ->
+                    msg.annotations.none { it is me.rerere.ai.ui.UIMessageAnnotation.CharacterCardData }
+                }
+                val useOfficialSplit = assistant.tavernData != null &&
+                    (assistant.contextTemplate.isBlank() ||
+                        assistant.contextTemplate.trim() == me.rerere.rikkahub.data.model.DEFAULT_CONTEXT_TEMPLATE)
+                val conversationOverride =
+                    assistant.allowConversationSystemPrompt && !conversationSystemPrompt.isNullOrBlank()
+                val slotMap = linkedMapOf<String, List<UIMessage>>(
+                    "main" to mainOnly,
+                    "dialogueExamples" to exampleMessages,
+                    "chatHistory" to chatHistoryMessages,
+                )
+                if (useOfficialSplit && !conversationOverride) {
+                    for (cardSlot in listOf("charDescription", "charPersonality", "scenario")) {
+                        if (cardSlot !in activePresetCfg.disabledMarkers) {
+                            val slotMsgs = assistant.assembleCharacterCardMessages(
+                                personalityFormat = activePresetCfg.personalityFormat,
+                                scenarioFormat = activePresetCfg.scenarioFormat,
+                                orderedMarkers = listOf(cardSlot),
+                                disabledMarkers = setOf("charDescription", "charPersonality", "scenario") - cardSlot,
+                            )
+                            if (slotMsgs.isNotEmpty()) {
+                                slotMap[cardSlot] = slotMsgs
+                            }
+                        }
+                    }
+                } else {
+                    val cardOnly = mainAndCard.filter { msg ->
+                        msg.annotations.any { it is me.rerere.ai.ui.UIMessageAnnotation.CharacterCardData }
+                    }
+                    if (cardOnly.isNotEmpty()) {
+                        val cardKey = listOf("charDescription", "charPersonality", "scenario")
+                            .firstOrNull { it !in activePresetCfg.disabledMarkers }
+                            ?: "__charCardFallback"
+                        slotMap[cardKey] = cardOnly
+                    }
+                }
+                // IN_PROMPT 人设同步纳入统一槽位，使拖动 personaDescription 真正生效
+                val customPersona = settings.personas.find { it.id == settings.activePersonaId }
+                if ("personaDescription" !in activePresetCfg.disabledMarkers &&
+                    customPersona != null && customPersona.enabled && customPersona.description.isNotBlank() &&
+                    customPersona.position == me.rerere.rikkahub.data.model.PersonaInjectionPosition.IN_PROMPT &&
+                    (customPersona.lockedCharacterIds.isEmpty() || assistant.id in customPersona.lockedCharacterIds)
+                ) {
+                    val template = assistant.contextTemplate.ifBlank { me.rerere.rikkahub.data.model.DEFAULT_CONTEXT_TEMPLATE }
+                    val embedded = assistant.tavernData != null && !useOfficialSplit && !conversationOverride &&
+                        template.contains("{{persona}}")
+                    if (!embedded) {
+                        slotMap["personaDescription"] = listOf(UIMessage.system("[User Persona]\n${customPersona.description}"))
+                    }
+                }
+                // main（含工具系统提示词）与 chatHistory（含 startChatMessages）在构造 slotMap 时已处理禁用状态，
+                // 此处不再重复跳过，避免误丢工具提示词或新会话起始指令。
+                addAll(
+                    me.rerere.rikkahub.data.st.preview.UnifiedPromptOrderEngine.assembleSlotsInOrder(
+                        orderedIdentifiers = activePresetCfg.orderedMarkers,
+                        disabledIdentifiers = activePresetCfg.disabledMarkers - setOf("main", "chatHistory"),
+                        slotMessages = slotMap,
+                    )
+                )
+            } else {
+                addAll(mainAndCard)
+                addAll(exampleMessages)
+                addAll(chatHistoryMessages)
             }
         }.let { base ->
             val activePresetCfgForPersona = parseActiveStPresetConfig(
@@ -1114,6 +1184,10 @@ class GenerationLoop(
                 val personaText = "[User Persona]\n${persona.description}"
                 when (persona.position) {
                     me.rerere.rikkahub.data.model.PersonaInjectionPosition.IN_PROMPT -> {
+                        // 若已由 UnifiedPromptOrderEngine 按自定义 marker 顺序注入，跳过重复注入
+                        if (me.rerere.rikkahub.data.st.preview.UnifiedPromptOrderEngine.hasCustomMarkerOrder(activePresetCfgForPersona.orderedMarkers)) {
+                            base
+                        } else {
                         // 官方拆分路径（主提示词不含人设）才注入独立 SYSTEM 消息；
                         // 自定义上下文模板已通过 {{persona}} 嵌入时不重复注入
                         val template = assistant.contextTemplate.ifBlank { me.rerere.rikkahub.data.model.DEFAULT_CONTEXT_TEMPLATE }
@@ -1135,20 +1209,31 @@ class GenerationLoop(
                         } else {
                             base
                         }
+                        }
                     }
 
                     me.rerere.rikkahub.data.model.PersonaInjectionPosition.AT_DEPTH -> {
                         val depth = persona.depth.coerceAtLeast(0)
+                        val lastChatIdx = base.indexOfLast { msg ->
+                            !msg.isSynthetic &&
+                                (msg.role == MessageRole.USER || msg.role == MessageRole.ASSISTANT) &&
+                                msg.annotations.none { a ->
+                                    a is me.rerere.ai.ui.UIMessageAnnotation.ExampleMessage ||
+                                        a is me.rerere.ai.ui.UIMessageAnnotation.CharacterCardData
+                                }
+                        }
+                        val chatEndExclusive = if (lastChatIdx >= 0) lastChatIdx + 1 else base.size
+                        val chatStart = (chatEndExclusive - limitedChat.size).coerceAtLeast(0)
                         val idx = findSafeInsertIndex(
                             base,
-                            (base.size - minOf(depth, limitedChat.size))
-                                .coerceIn(base.size - limitedChat.size, base.size),
+                            (chatEndExclusive - minOf(depth, limitedChat.size))
+                                .coerceIn(chatStart, chatEndExclusive),
                         )
                         val personaMsg = when (persona.role) {
                             MessageRole.ASSISTANT -> UIMessage.assistant(personaText)
                             MessageRole.USER -> UIMessage.user(personaText)
                             else -> UIMessage.system(personaText)
-                        }
+                        }.copy(isSynthetic = true)
                         base.take(idx) + personaMsg + base.drop(idx)
                     }
 
