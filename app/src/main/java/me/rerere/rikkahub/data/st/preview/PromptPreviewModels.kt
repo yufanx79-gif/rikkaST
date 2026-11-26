@@ -23,6 +23,41 @@ val ST_BUILTIN_MARKERS: List<String> = listOf(
 )
 
 /**
+ * 真实发送路径**没有**对应槽位、因此拖动后不会改变发送顺序的 marker。
+ *
+ * 这 12 个 marker 里，[UnifiedPromptOrderEngine] 只接管了 main / charDescription /
+ * charPersonality / scenario / dialogueExamples / chatHistory / personaDescription 这 7 个；
+ * worldInfoBefore / worldInfoAfter / jailbreak 由 [PromptInjectionTransformer] 按
+ * InjectionPosition 锚定，只能在其相对区内换序，不能跨区自由移动。
+ *
+ * 剩下这两个连相对区都没有实现：预设 JSON 里根本不存在同名 prompts 条目
+ * （SillyTavern 把它们算进 main 模板），所以拖动它们**不会**产生任何发送顺序变化。
+ *
+ * 面板据此把条目显示为「锚定 · 不可拖动」，避免 UI 承诺超过引擎能力。
+ */
+val ST_ANCHORED_MARKERS: Set<String> = setOf(
+    "enhanceDefinitions",
+    "nsfw",
+)
+
+/**
+ * 相对区锚定的 marker：可以拖动，但只能在所属相对区内换序，无法跨区自由移动。
+ */
+val ST_RELATIVE_ANCHORED_MARKERS: Set<String> = setOf(
+    "worldInfoBefore",
+    "worldInfoAfter",
+    "jailbreak",
+)
+
+/** 面板上用于解释「为什么这一条拖不动」的文案 */
+fun anchoredMarkerReason(identifier: String): String? = when (identifier) {
+    in ST_ANCHORED_MARKERS -> "该槽位在发送链路中无对应实现，拖动不会改变顺序"
+    "worldInfoBefore", "worldInfoAfter" -> "世界书位置由注入锚点决定，只能在相对区内换序"
+    "jailbreak" -> "破限指令由注入锚定，只能调整相对优先级"
+    else -> null
+}
+
+/**
  * 每一块预览条目的精确溯源坐标，用于点击“保存”时 100% 可逆回写配置。
  */
 sealed interface PromptSlotOrigin {

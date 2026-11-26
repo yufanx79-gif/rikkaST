@@ -558,14 +558,48 @@ class PromptPreviewAssembler(
                                     categoryLabel = "预设",
                                     title = "破限/后置指令 (jailbreak)",
                                     role = MessageRole.SYSTEM,
-                                    plainBodyPreview = lightweightMacroPreview(PlainBodyPreviewExtractor.extract(jb), charName, userName),
                                     position = InjectionPosition.AFTER_DIALOG,
                                     injectDepth = null,
                                     priority = null,
+                                    // 相对区锚定：能在 AFTER_DIALOG 区内调优先级，但不能跨区自由移动。
+                                    // 它仍然可以拖动，所以不能用 inactiveReason（那是「灰显 + 红字」的
+                                    // 未生效标记，会让用户误以为这条坏了）；提示放进正文预览里。
                                     draggable = primaryGroup != null,
+                                    plainBodyPreview = lightweightMacroPreview(
+                                        PlainBodyPreviewExtractor.extract(jb),
+                                        charName,
+                                        userName,
+                                    ) + "\n（可调整相对优先级；跨区位置由注入锚点决定）",
                                 )
                             )
                         }
+                    }
+                    // nsfw / enhanceDefinitions：SillyTavern 把它们算进 main 模板，预设 JSON 里
+                    // 通常没有同名 prompts 条目，发送链路也没有对应槽位。这里显式渲染成
+                    // 「锚定 · 不可拖动」，而不是让它们从面板上凭空消失——用户至少能知道
+                    // 这两个槽位存在、为什么拖不动，而不是以为面板漏了。
+                    "nsfw", "enhanceDefinitions" -> {
+                        add(
+                            PromptPreviewBlock(
+                                key = "marker_$marker",
+                                origin = PromptSlotOrigin.PresetMarker(primaryGroup.orEmpty(), marker),
+                                categoryLabel = "预设",
+                                title = if (marker == "nsfw") {
+                                    "NSFW 开关槽位 (nsfw)"
+                                } else {
+                                    "角色定义增强 (enhanceDefinitions)"
+                                },
+                                role = MessageRole.SYSTEM,
+                                // 注意：被禁用的 marker 在上面的循环入口就 continue 掉了，
+                                // 走不到这里，所以不需要再判断 disabledMarkers。
+                                plainBodyPreview = "发送链路无独立槽位，内容随 main 模板一起下发",
+                                position = null,
+                                injectDepth = null,
+                                priority = null,
+                                draggable = false,
+                                inactiveReason = anchoredMarkerReason(marker),
+                            )
+                        )
                     }
                 }
             }

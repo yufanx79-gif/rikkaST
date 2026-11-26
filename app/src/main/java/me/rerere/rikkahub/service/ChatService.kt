@@ -2216,6 +2216,20 @@ class ChatService(
                 },
                 outputTransformers = outputTransformers,
                 tools = tools,
+                // [消息粘连修复] 判断本轮第 0 步能否复用会话末尾那条 assistant 消息。
+                //
+                // 只有两种入口本来就该「写回同一条消息」：
+                // 1. `/continue`：续写最后一条助手回复，必须接在同一楼层；
+                // 2. 末尾那条消息还有待续跑的工具调用（工具审批后继续生成），
+                //    此时继续往同一条消息里写 tool 结果是正确语义。
+                //
+                // 其余情况（普通发送 / `/trigger` / 带 messageRange 的重生成）一律不复用：
+                // 会话末尾若已是写完的 assistant 回复，必须新开一条，否则两条回复会粘成一条，
+                // 标签配对被打破后面板解析失败、整片面板消失（真机 2026-11-24 21:40 复现）。
+                allowReuseTrailingAssistant = generationType == GenerationType.CONTINUE ||
+                    conversation.currentMessages.lastOrNull()?.let { last ->
+                        last.role == MessageRole.ASSISTANT && last.getTools().any { it.canResumeExecution }
+                    } == true,
             ).onCompletion {
                 // 取消前台服务与待刷新的流式节流任务；通知由 ChatNotificationManager 通过 AppEventBus 消费
                 initFgJob?.cancel()

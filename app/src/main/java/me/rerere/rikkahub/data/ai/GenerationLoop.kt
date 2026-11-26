@@ -97,6 +97,35 @@ sealed interface GenerationChunk {
     ) : GenerationChunk
 }
 
+/**
+ * 决定「本轮生成要写进哪条消息」：复用会话末尾那条 assistant，还是新开一条空占位。
+ *
+ * 抽成纯函数是为了能被 JVM 单测直接覆盖 —— 「两条回复粘成一条」这类事故一旦回归，
+ * 面板会整片消失，而它只在特定时序下触发，靠真机手测很容易漏掉。
+ *
+ * @param forceNewAssistantMessage 为 true 时，即使末尾已是 assistant 也不复用。
+ * @return 新列表：复用则原样返回，新开则在末尾追加一条空助手消息。
+ */
+internal fun resolveResponseBaseMessages(
+    messages: List<UIMessage>,
+    forceNewAssistantMessage: Boolean,
+    modelId: Uuid?,
+    newMessageId: Uuid = Uuid.random(),
+): List<UIMessage> {
+    val canReuseTrailingAssistant = !forceNewAssistantMessage &&
+        messages.lastOrNull()?.role == MessageRole.ASSISTANT
+    return if (canReuseTrailingAssistant) {
+        messages
+    } else {
+        messages + UIMessage(
+            id = newMessageId,
+            role = MessageRole.ASSISTANT,
+            parts = emptyList(),
+            modelId = modelId,
+        )
+    }
+}
+
 class GenerationLoop(
     private val context: Context,
     private val providerManager: ProviderManager,
@@ -329,6 +358,19 @@ class GenerationLoop(
         maxTokensOverride: Int? = null,
         /** messageId → swipe 元数据（宏 `{{currentSwipeId}}` / `{{lastSwipeId}}` 数据源） */
         swipeMeta: Map<Uuid, me.rerere.rikkahub.data.model.SwipeMeta> = emptyMap(),
+        /**
+         * 允许本轮第 0 步复用会话末尾已有的 assistant 消息（把新内容追加进那条消息）。
+         *
+         * 只有「本来就该续写同一条消息」的入口才置 true：
+         * - `/continue`：续写最后一条助手回复，结果必须接在同一楼层里；
+         * - 重生成第 0 楼（messageRange == null 的 REGENERATE）：等价于对该楼层做 swipe，
+         *   必须复用同一条消息才能形成新分支，否则会变成在末尾多插一层楼。
+         *
+         * 其余入口（普通发送 / `/trigger` / 带 messageRange 的重生成）一律 false：
+         * 会话末尾若已是写完的 assistant 回复，必须新开一条，否则两条回复会粘成一条。
+         * 详见 [generateInternal] 里 responseBaseMessages 处的说明。
+         */
+        allowReuseTrailingAssistant: Boolean = false,
     ): Flow<GenerationChunk> = flow {
         // [v222] ST `GENERATION_STARTED`（vendor/st/events.js:23）：生成流真正开始的第一件事。
         // 走可复用的事件出口（焦点守卫 + developerMode 懒同步），codex 与 ChatService 的语义一致。
@@ -517,6 +559,9 @@ class GenerationLoop(
                     // 连续多步只有工具没有正文时解除 REQUIRED：否则模型被强制一直调工具、永远出不来正文
                     forceToolsAuto = consecutiveToolOnlySteps >= MAX_CONSECUTIVE_TOOL_ONLY_STEPS,
                     proactiveMemoryReminder = proactiveMemoryReminder,
+                    // [消息粘连修复] 只有第 0 步才需要判断要不要新开一条：后续步必须复用本轮
+                    // 自己刚产出的那条助手消息（接着 tool part 往下写）。
+                    forceNewAssistantMessage = stepIndex == 0 && !allowReuseTrailingAssistant,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -977,6 +1022,14 @@ class GenerationLoop(
         swipeMeta: Map<Uuid, me.rerere.rikkahub.data.model.SwipeMeta> = emptyMap(),
         /** 当前是否已是本次生成的最后一步：是则不允许再强制 REQUIRED，否则永远出不来正文。 */
         isFinalStep: Boolean = false,
+        /**
+         * 本轮第 0 步是否强制新开一条助手消息（不复用会话末尾已有的 assistant 消息）。
+         *
+         * 用于修掉「两条回复粘成一条」：/trigger 这类不新增用户消息的生成入口，会话末尾
+         * 已经是一条写完的 assistant 回复，旧实现会直接把新回复追加进那条消息。由
+         * [generateText] 按调用方给出的 allowReuseTrailingAssistant 计算后传下来。
+         */
+        forceNewAssistantMessage: Boolean = false,
         /** 连续多步只有工具调用没有正文时置 true：解除 REQUIRED，逼模型本轮写出正文。 */
         forceToolsAuto: Boolean = false,
         /**
@@ -1522,16 +1575,27 @@ class GenerationLoop(
                 // 每次重试都从本次模型调用开始前的消息快照重新合并，避免将重试响应
                 // 追加到已经展示的半截回复后面。预先创建助手消息可让所有尝试复用同一 ID，
                 // ChatService 因而会覆盖当前分支，而不是创建新的候选消息。
-                val responseBaseMessages =
-                    if (messages.lastOrNull()?.role == MessageRole.ASSISTANT) {
-                        messages
-                    } else {
-                        messages + UIMessage(
-                            role = MessageRole.ASSISTANT,
-                            parts = emptyList(),
-                            modelId = model.id,
-                        )
-                    }
+                //
+                // [消息粘连修复] 这里不能无条件复用末尾的 assistant 消息。
+                //
+                // 旧实现是「末尾是 assistant 就直接复用」。多步工具续跑确实需要复用本轮
+                // 自己刚产出的那条助手消息（第 2 步要接着第 1 步的 tool part 继续写），
+                // 但一次全新生成的第 0 步同样会命中这个条件——只要会话末尾恰好是一条
+                // 已经写完的 assistant 回复（/trigger 不新增消息、连点续写、生成被取消后
+                // 立刻重发……），新回复就会被追加进那条旧消息里，两条回复粘成一条。
+                //
+                // 真机证据（2026-11-24 21:40，conv 7d1ae95f）：一条 assistant 消息里塞了
+                // 3 段完整回复，usage.completionTokens 只有 1782 却装着 8103 字正文；
+                // <think_nya> 出现 3 次、<game> 开标签 4 个而闭标签只有 3 个。标签配对被
+                // 打破后，面板解析器切不出完整块，整片面板就消失了。
+                //
+                // 修复：只有「允许复用的场景」才复用，判据由调用方（ChatService）按
+                // generationType / messageRange / 待续跑工具给出，见 allowReuseTrailingAssistant。
+                val responseBaseMessages = resolveResponseBaseMessages(
+                    messages = messages,
+                    forceNewAssistantMessage = forceNewAssistantMessage,
+                    modelId = model.id,
+                )
                 var retryCount = 0
 
                 while (true) {
