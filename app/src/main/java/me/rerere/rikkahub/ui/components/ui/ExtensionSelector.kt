@@ -322,7 +322,18 @@ fun ExtensionSelector(
                             }
                         },
                         onUpdateEntries = { newList ->
-                            onUpdateSettings(settings.copy(modeInjections = newList))
+                            // [v252] 条目编辑保存时同样回写预设原始 JSON，保持与悬浮窗一致。
+                            val patched = me.rerere.rikkahub.data.st.runtime.applyModeInjectionEnabledDiffToPresets(
+                                tavernPresetsJson = settings.tavernPresets,
+                                previous = settings.modeInjections,
+                                next = newList,
+                            )
+                            onUpdateSettings(
+                                settings.copy(
+                                    modeInjections = newList,
+                                    tavernPresets = patched ?: settings.tavernPresets,
+                                )
+                            )
                         },
                         onNavigateToPrompts = onNavigateToPrompts,
                         modifier = Modifier.fillMaxSize(),

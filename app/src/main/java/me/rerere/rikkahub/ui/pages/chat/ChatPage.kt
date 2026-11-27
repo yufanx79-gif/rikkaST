@@ -318,8 +318,28 @@ fun ChatPage(
             runCatching {
                 val cur = tavernLatestSettings.value
                 val obj = (Json.parseToJsonElement(cur.tavernPresets) as? JsonObject) ?: JsonObject(emptyMap())
+                // buildTavernPresetJson 为了 getPreset(name) 匹配会临时补一个 name 字段，
+                // 那是只读视图用的，不该被写进存储（否则预设 JSON 里多出一个永久冗余键）。
+                val storedRaw = runCatching {
+                    val el = Json.parseToJsonElement(rawJson)
+                    val o = el as? JsonObject ?: return@runCatching rawJson
+                    val transientName = (o["name"] as? JsonPrimitive)?.content
+                    if (transientName != null && transientName == name) JsonObject(o - "name").toString() else rawJson
+                }.getOrDefault(rawJson)
+                val nextPresets = JsonObject(obj + (name to JsonPrimitive(storedRaw))).toString()
+                // [v252] 悬浮窗（JSR replacePreset）改的是预设原始 JSON 的 prompts[].enabled，
+                // 而真实发送链路读的是 Settings.modeInjections[].enabled —— 两份存储互不相干。
+                // 这里把刚写回的 JSON 立刻回灌到 modeInjections，否则「悬浮窗里关了条目，消息里照样发」。
+                // [v253] 同时同步助手绑定：发送链路的判据是
+                //   it.enabled && assistant.modeInjectionIds.contains(it.id)
+                // 只改前两份存储的话，面板显示「开着」但消息里照样不发。
                 vm.updateSettings(
-                    cur.copy(tavernPresets = JsonObject(obj + (name to JsonPrimitive(rawJson))).toString()),
+                    me.rerere.rikkahub.data.st.runtime.reconcileModeInjectionsFromPreset(
+                        current = cur.copy(tavernPresets = nextPresets),
+                        group = name,
+                        rawPresetJson = storedRaw,
+                        assistantId = tavernLatestConversation.value.assistantId,
+                    ),
                 )
                 true
             }.getOrDefault(false)

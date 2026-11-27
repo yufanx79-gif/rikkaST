@@ -217,7 +217,19 @@ fun PromptPage(vm: PromptVM = koinViewModel()) {
                 0 -> PresetManagementTab(
                     modeInjections = settings.modeInjections,
                     onUpdate = { newList ->
-                        vm.patchSettings { current -> current.copy(modeInjections = newList) }
+                        vm.patchSettings { current ->
+                            // [v252] 预设管理页改条目开关时，同步回写预设原始 JSON（悬浮窗 getPreset() 的数据源），
+                            // 否则「预设管理里关了 / 悬浮窗里还是开」。
+                            val patched = me.rerere.rikkahub.data.st.runtime.applyModeInjectionEnabledDiffToPresets(
+                                tavernPresetsJson = current.tavernPresets,
+                                previous = current.modeInjections,
+                                next = newList,
+                            )
+                            current.copy(
+                                modeInjections = newList,
+                                tavernPresets = patched ?: current.tavernPresets,
+                            )
+                        }
                     },
                     onPresetScripts = { label, scripts ->
                         vm.patchSettings { current ->

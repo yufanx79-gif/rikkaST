@@ -71,6 +71,7 @@ import me.rerere.rikkahub.data.st.regex.RegexScript
 import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 import me.rerere.rikkahub.data.st.runtime.TavernScriptBrief
 import me.rerere.rikkahub.data.st.runtime.appendGlobalScripts
+import me.rerere.rikkahub.data.st.runtime.applyModeInjectionEnabledDiffToPresets
 import me.rerere.rikkahub.data.st.runtime.enabledPresetGroups
 import me.rerere.rikkahub.data.st.runtime.extractScriptsFromJson
 import me.rerere.rikkahub.data.st.runtime.listCardScripts
@@ -729,9 +730,16 @@ internal fun togglePresetGroupForAssistant(
             a
         }
     }
+    // [v252] 整组开关同样要回写预设原始 JSON（否则悬浮窗看到的整组状态与预设管理页不一致）。
+    val updatedPresets = applyModeInjectionEnabledDiffToPresets(
+        tavernPresetsJson = current.tavernPresets,
+        previous = current.modeInjections,
+        next = updatedModeInjections,
+    )
     return current.copy(
         modeInjections = updatedModeInjections,
         assistants = updatedAssistants,
+        tavernPresets = updatedPresets ?: current.tavernPresets,
     )
 }
 
@@ -760,9 +768,16 @@ internal fun togglePresetEntryForAssistant(
             a
         }
     }
+    // [v252] 预设管理页的开关必须同时落到预设原始 JSON，否则悬浮窗 getPreset() 读到的还是旧状态。
+    val updatedPresets = applyModeInjectionEnabledDiffToPresets(
+        tavernPresetsJson = current.tavernPresets,
+        previous = current.modeInjections,
+        next = updatedModeInjections,
+    )
     return current.copy(
         modeInjections = updatedModeInjections,
         assistants = updatedAssistants,
+        tavernPresets = updatedPresets ?: current.tavernPresets,
     )
 }
 

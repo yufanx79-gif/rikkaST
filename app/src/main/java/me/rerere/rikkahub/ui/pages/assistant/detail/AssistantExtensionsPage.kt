@@ -310,7 +310,20 @@ fun AssistantExtensionsPage(id: String) {
                                     }
                                 }
                             },
-                            onUpdateEntries = { newList -> vm.patchSettings { current -> current.copy(modeInjections = newList) } },
+                            onUpdateEntries = { newList ->
+                                vm.patchSettings { current ->
+                                    // [v252] 条目编辑保存时同样回写预设原始 JSON，保持与悬浮窗一致。
+                                    val patched = me.rerere.rikkahub.data.st.runtime.applyModeInjectionEnabledDiffToPresets(
+                                        tavernPresetsJson = current.tavernPresets,
+                                        previous = current.modeInjections,
+                                        next = newList,
+                                    )
+                                    current.copy(
+                                        modeInjections = newList,
+                                        tavernPresets = patched ?: current.tavernPresets,
+                                    )
+                                }
+                            },
                             onNavigateToPrompts = { navController.navigate(Screen.Prompts) },
                             modifier = Modifier.fillMaxSize(),
                         )

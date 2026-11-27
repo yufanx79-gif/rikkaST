@@ -1373,6 +1373,10 @@ function saveSettingsDebounced() {
             window.__rikkaSyncPowerUserToExt();
         }
     } catch (_e) { /* noop */ }
+    // [v253] ST 语义：saveSettingsDebounced 会把 oai_settings 整体落盘。
+    // 猫神菜单 / TRANS-AM 控制台改条目开关后调的就是它 —— 不回写的话，
+    // 改动只活在 chatCompletionSettingsStub 里，下次 pull 就被宿主真值覆盖回去。
+    try { pushPromptTogglesToPreset(); } catch (_eP) { safeWarn('pushPromptTogglesToPreset failed', _eP); }
     clearTimeout(tGlobal);
     const delayMs = window.__RIKKA_EXT_SETTINGS_MODE__ ? 40 : 400;
     tGlobal = setTimeout(() => { pushGlobalVars(); pushThirdPartySettingsNow(); }, delayMs);
@@ -1555,6 +1559,138 @@ function pullChatCompletionSettings() {
     if (obj.openai_max_tokens !== undefined && obj.max_tokens === undefined) {
         chatCompletionSettingsStub.max_tokens = obj.openai_max_tokens;
     }
+    // [v253] 记下宿主真值的「逐条开关」基线，供 saveSettingsDebounced 做差量回写。
+    __pulledPromptBaseline = __promptToggleMap();
+}
+
+// ---------------------------------------------------------------- 预设条目开关回写（悬浮窗 → 宿主）
+//
+// [v253] 根因（真机取证：改完开关后 Settings.modeInjections / tavern_presets 全无变化）：
+//
+// 猫神菜单（Meowssiah 的「菜单」脚本）与 TRANS-AM 控制台改条目开关时走的是 ST 原生写法：
+//     const ctx = SillyTavern.getContext();
+//     ctx.chatCompletionSettings.prompt_order[0].order[i].enabled = false;
+//     (ctx.saveSettingsDebounced || SillyTavern.saveSettingsDebounced)();
+//
+// ST 里 saveSettingsDebounced 的语义是「把整个 oai_settings 落盘」，所以酒馆中这样改是生效的。
+// 而宿主的 saveSettingsDebounced 此前只做了「第三方扩展设置落盘」
+// （pushGlobalVars + pushThirdPartySettingsNow → saveThirdPartySettings），
+// **完全没有处理 prompts / prompt_order**。
+//
+// 后果：脚本改的是 chatCompletionSettingsStub 这份内存副本，
+// 下一次 pullChatCompletionSettings() 立刻用宿主真值把它覆盖回去 ——
+// 用户侧表现就是「悬浮窗里把条目关了，消息里照样发，面板一刷新开关自己弹回来」。
+//
+// 这里补上 ST 的缺省语义：saveSettingsDebounced 时对比指纹，变了就整份回写宿主。
+var __pulledPromptBaseline = null;
+
+/**
+ * 把当前 stub 里的条目开关摊平成「identifier → enabled」。
+ *
+ * 只读 prompt_order[character_id=100001].order[]（ST 的权威开关，菜单脚本改的就是它）。
+ * 不用 prompts[].enabled 做基线 —— 那一份在宿主侧是历史遗留值，与 order 经常不一致，
+ * 拿它当基线会把陈年旧值当成「脚本改过的」回写出去（v253 首版就栽在这）。
+ */
+function __promptToggleMap() {
+    try {
+        const map = {};
+        const orders = Array.isArray(chatCompletionSettingsStub.prompt_order) ? chatCompletionSettingsStub.prompt_order : [];
+        let bucket = null;
+        for (const b of orders) {
+            if (!b || typeof b !== 'object') continue;
+            if (String(b.character_id) === '100001') { bucket = b; break; }
+            if (!bucket && Array.isArray(b.order) && b.order.length) bucket = b;
+        }
+        if (!bucket || !Array.isArray(bucket.order)) return map;
+        for (const item of bucket.order) {
+            if (!item || typeof item.identifier !== 'string') continue;
+            map[item.identifier] = item.enabled !== false;
+        }
+        return map;
+    } catch (_e) { return {}; }
+}
+
+/**
+ * 把脚本改动过的条目开关**差量**回写成宿主预设 JSON。
+ *
+ * v253 首版的教训：当时整份替换 prompts + prompt_order，结果把 stub 里陈旧的
+ * `prompts[].enabled` 一起写了回去 —— 宿主那份原本是对的，被覆盖成旧值后
+ * 「预设管理里开了，面板里还是关的」，而且怎么刷新都不回来。
+ *
+ * 现在只做两件事：
+ * 1. 拿 pull 时记下的基线 [__pulledPromptBaseline] 与当前 stub 逐条比对，
+ *    只有**脚本真的改过**的 identifier 才进 changed；
+ * 2. 只改 `prompt_order[].order[]` 里这些 identifier 的 enabled，
+ *    `prompts[]` 一个字都不动（ST 的权威开关是 prompt_order）。
+ *
+ * @returns {boolean} 是否真的写回了（无变化 / 非编辑上下文 → false）
+ */
+function pushPromptTogglesToPreset() {
+    // 消息内嵌面板与扩展设置弹窗都不是预设编辑者，绝不回写。
+    if (window.__RIKKA_PANEL_MODE__ || window.__RIKKA_EXT_SETTINGS_MODE__) return false;
+    // 没有基线 = 还没成功 pull 过宿主真值，此时「有差异」不代表脚本改过东西，
+    // 贸然回写会拿空壳覆盖真预设。直接跳过。
+    if (!__pulledPromptBaseline) return false;
+    const current = __promptToggleMap();
+    // 只挑**真的变了**的 identifier。整份覆盖会把脚本没碰过的字段一起写旧值，
+    // 这正是 v253 首版把 prompts[].enabled 写坏的原因。
+    const changed = {};
+    let changedCount = 0;
+    for (const ident of Object.keys(current)) {
+        if (!(ident in __pulledPromptBaseline)) continue;
+        if (__pulledPromptBaseline[ident] === current[ident]) continue;
+        changed[ident] = current[ident];
+        changedCount++;
+    }
+    if (changedCount === 0) return false;
+
+    // 必须读**最新**宿主值：readActivePresetRaw 有 500ms 缓存，
+    // 用它会在连续开关时拿到上一轮快照，把中间那次改动丢掉。
+    let preset = null;
+    try {
+        const raw = callBridge('getTavernPresetJson') || '';
+        if (raw && raw !== 'null') preset = JSON.parse(raw);
+    } catch (_e) { preset = null; }
+    if (!preset || typeof preset !== 'object') return false;
+
+    // 只改 prompt_order[].order[] 里对应 identifier 的 enabled；
+    // prompts[] 一个字都不动（ST 的权威开关是 prompt_order，prompts[].enabled 只是导入时的快照）。
+    const next = Object.assign({}, preset);
+    let patched = 0;
+    const patchList = (arr) => arr.map((el) => {
+        if (!el || typeof el !== 'object') return el;
+        const ident = el.identifier;
+        if (typeof ident !== 'string' || !(ident in changed)) return el;
+        if ((el.enabled !== false) === changed[ident]) return el;
+        patched++;
+        return Object.assign({}, el, { enabled: changed[ident] });
+    });
+    if (Array.isArray(next.prompt_order)) {
+        next.prompt_order = next.prompt_order.map((bucket) => {
+            if (!bucket || typeof bucket !== 'object' || !Array.isArray(bucket.order)) return bucket;
+            return Object.assign({}, bucket, { order: patchList(bucket.order) });
+        });
+    }
+    if (patched === 0) return false;
+
+    // buildTavernPresetJson 为了 getPreset(name) 匹配会临时补一个 name 字段；
+    // 那是只读视图用的，不该被写回存储。宿主侧 saveTavernPreset 知道组名，
+    // 由它负责剥掉这个临时键（见 ChatPage.tavernPresetUpdater）。
+    const name = String(next.name != null ? next.name : (next.presetName != null ? next.presetName : 'in_use'));
+    let ok = false;
+    try { ok = callBridge('saveTavernPreset', name, JSON.stringify(next)); } catch (_e) { ok = false; }
+    if (ok === true) {
+        __pulledPromptBaseline = current;
+        invalidatePresetCache();
+        try {
+            callBridge('log', 'info', '[preset] 条目开关已回写宿主 name=' + name +
+                ' 变更=' + Object.keys(changed).map((k) => k + '=' + changed[k]).join(','));
+        } catch (_e2) { /* noop */ }
+        return true;
+    }
+    try { callBridge('log', 'warn', '[preset] 条目开关回写被宿主拒绝 name=' + name); } catch (_e3) { /* noop */ }
+    safeWarn('[preset] pushPromptTogglesToPreset failed', ok);
+    return false;
 }
 
 async function callGenericPopupStub(content, type, defaultResult /*, options */) {
@@ -4312,6 +4448,15 @@ window.__rikkaEmit = function __rikkaEmit(name, payload) {
                 pullThirdPartySettings(true);
                 // [v250] 模型可能随助手/会话切换而变：同步给所有读 chatCompletionSettings 的脚本
                 try { pullChatCompletionSettings(); } catch (_eCm) { /* noop */ }
+                // [v253] 方向二诊断：预设管理页改完开关 → 宿主发 settings_updated → 这里必须重新拉真值。
+                // 若日志里看不到这一行，说明事件根本没到 WebView（宿主侧没发或 evaluateJavascript 没跑）。
+                try {
+                    const t = __promptToggleMap();
+                    const keys = Object.keys(t);
+                    const on = keys.filter((k) => t[k]).length;
+                    callBridge('log', 'info', '[preset] settings_updated 已到达 WebView，条目基线刷新 ' + on + '/' + keys.length + ' 开');
+                    __pulledPromptBaseline = t;
+                } catch (_eDiag) { /* noop */ }
                 const nextIphonieJson = JSON.stringify((state.thirdPartySettings && state.thirdPartySettings.stTtsDialogue) || null);
                 if (prevIphonieJson !== nextIphonieJson && loadedExtensionHooks) {
                     const ipKey = Object.keys(loadedExtensionHooks).find((k) => k.toLowerCase().includes('iphonie'));

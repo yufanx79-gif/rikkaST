@@ -3,6 +3,7 @@ package me.rerere.rikkahub.ui.pages.extensions
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -42,6 +44,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -55,6 +58,8 @@ import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Add01
+import me.rerere.hugeicons.stroke.ArrowDown01
+import me.rerere.hugeicons.stroke.ArrowRight01
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.FileImport
 import me.rerere.hugeicons.stroke.Share03
@@ -78,6 +83,11 @@ private val RegexJson = Json {
     encodeDefaults = true
 }
 
+/** “未分组”分组的内部键（真实预设组名 trim 后必非空白，不会与之冲突） */
+private const val UNGROUPED_GROUP_KEY = ""
+private const val UNGROUPED_GROUP_TITLE = "未分组"
+private const val UNGROUPED_GROUP_HINT = "用户自建 / 全局导入的脚本"
+
 @Composable
 fun RegexScriptsPage() {
     val settingsStore = koinInject<SettingsStore>()
@@ -91,6 +101,26 @@ fun RegexScriptsPage() {
 
     val updateList: (List<RegexScript>) -> Unit = { newList ->
         scope.launch { settingsStore.update(settings.copy(regexScripts = newList)) }
+    }
+
+    // 按来源预设分组：组名 = sourcePresetGroup（null/空白归入“未分组”，固定排最后）；组内保持原顺序
+    val groupedScripts: List<Pair<String, List<RegexScript>>> = remember(settings.regexScripts) {
+        val namedGroups = settings.regexScripts
+            .mapNotNull { script ->
+                script.sourcePresetGroup?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { it to script }
+            }
+            .groupBy({ it.first }, { it.second })
+            .toList()
+            .sortedBy { it.first }
+        val ungrouped = settings.regexScripts.filter { it.sourcePresetGroup.isNullOrBlank() }
+        if (ungrouped.isEmpty()) namedGroups else namedGroups + (UNGROUPED_GROUP_KEY to ungrouped)
+    }
+    // 只有 1 个分组时默认展开，否则默认全部收起
+    val groupKeys = groupedScripts.map { it.first }
+    var expandedGroups by remember(groupKeys) {
+        mutableStateOf(if (groupKeys.size == 1) groupKeys.toSet() else emptySet())
     }
 
     Scaffold(
@@ -132,44 +162,115 @@ fun RegexScriptsPage() {
                     )
                 }
             }
-            items(settings.regexScripts, key = { it.id }) { script ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { editing = script },
-                ) {
+            groupedScripts.forEach { (groupName, groupScripts) ->
+                val groupTitle =
+                    if (groupName == UNGROUPED_GROUP_KEY) UNGROUPED_GROUP_TITLE else groupName
+                val enabledCount = groupScripts.count { !it.disabled }
+                val allEnabled = enabledCount == groupScripts.size
+                val partiallyEnabled = enabledCount in 1 until groupScripts.size
+                val expanded = groupName in expandedGroups
+                item(key = "group:$groupName") {
                     Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                            .clickable {
+                                expandedGroups =
+                                    if (expanded) expandedGroups - groupName else expandedGroups + groupName
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                script.scriptName.ifBlank { "(unnamed)" },
+                                buildString {
+                                    append(groupTitle)
+                                    append(" (")
+                                    append(groupScripts.size)
+                                    append(")")
+                                    if (partiallyEnabled) append("（部分启用）")
+                                },
                                 style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            Text(
-                                scriptSummary(script),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            if (groupName == UNGROUPED_GROUP_KEY) {
+                                Text(
+                                    UNGROUPED_GROUP_HINT,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            } else if (partiallyEnabled) {
+                                Text(
+                                    "已启用 $enabledCount / ${groupScripts.size}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                         }
                         Switch(
-                            checked = !script.disabled,
+                            checked = allEnabled,
                             onCheckedChange = { enabled ->
+                                val groupIds = groupScripts.map { it.id }.toSet()
                                 updateList(
                                     settings.regexScripts.map {
-                                        if (it.id == script.id) it.copy(disabled = !enabled) else it
+                                        if (it.id in groupIds) it.copy(disabled = !enabled) else it
                                     }
                                 )
                             },
                         )
-                        IconButton(onClick = {
-                            updateList(settings.regexScripts.filterNot { it.id == script.id })
-                        }) { Icon(HugeIcons.Delete01, null) }
+                        Icon(
+                            if (expanded) HugeIcons.ArrowDown01 else HugeIcons.ArrowRight01,
+                            contentDescription = null,
+                        )
+                    }
+                }
+                if (expanded) {
+                    items(groupScripts, key = { it.id }) { script ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { editing = script },
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        script.scriptName.ifBlank { "(unnamed)" },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        scriptSummary(script),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Switch(
+                                    checked = !script.disabled,
+                                    onCheckedChange = { enabled ->
+                                        updateList(
+                                            settings.regexScripts.map {
+                                                if (it.id == script.id) it.copy(disabled = !enabled) else it
+                                            }
+                                        )
+                                    },
+                                )
+                                IconButton(onClick = {
+                                    updateList(settings.regexScripts.filterNot { it.id == script.id })
+                                }) { Icon(HugeIcons.Delete01, null) }
+                            }
+                        }
                     }
                 }
             }
